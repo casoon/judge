@@ -31,7 +31,7 @@ Requires Rust 1.95+ (edition 2024).
 ### Build from source
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/casoon/judge.git
 cd judge
 cargo build --release
 ./target/release/cargo-judge --help

@@ -111,3 +111,86 @@ where
         visit::visit_trait_item_fn(self, node);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::walk_functions;
+
+    #[test]
+    fn qualifies_names_across_mod_impl_and_trait() {
+        let file: syn::File = syn::parse_str(
+            r#"
+mod outer {
+    pub struct Foo;
+
+    impl Foo {
+        fn method(&self) {}
+    }
+
+    pub trait Greet {
+        fn hi(&self) {}
+        fn required(&self);
+    }
+
+    mod inner {
+        fn free_fn() {}
+    }
+}
+
+fn top_level() {}
+"#,
+        )
+        .unwrap();
+
+        let mut names = Vec::new();
+        walk_functions(&file, |site| names.push(site.qualified_name));
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                "outer::Foo::method".to_string(),
+                "outer::Greet::hi".to_string(),
+                "outer::inner::free_fn".to_string(),
+                "top_level".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_trait_methods_without_a_default_body() {
+        let file: syn::File = syn::parse_str(
+            r#"
+trait Required {
+    fn no_default(&self);
+}
+"#,
+        )
+        .unwrap();
+
+        let mut names = Vec::new();
+        walk_functions(&file, |site| names.push(site.qualified_name));
+
+        assert!(names.is_empty());
+    }
+
+    #[test]
+    fn declared_module_without_content_does_not_add_a_path_segment() {
+        // `mod outer;` (declared, not inline) has no items to walk into here,
+        // so this only checks that visiting it doesn't panic or push a path
+        // segment that leaks into later sibling items.
+        let file: syn::File = syn::parse_str(
+            r#"
+mod declared_elsewhere;
+
+fn sibling() {}
+"#,
+        )
+        .unwrap();
+
+        let mut names = Vec::new();
+        walk_functions(&file, |site| names.push(site.qualified_name));
+
+        assert_eq!(names, vec!["sibling".to_string()]);
+    }
+}

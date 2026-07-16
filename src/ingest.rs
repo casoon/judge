@@ -48,8 +48,12 @@ impl EntryPointKind {
     fn from_cargo_kind(kind: &TargetKind) -> Option<Self> {
         match kind {
             TargetKind::Bin => Some(Self::Bin),
-            TargetKind::Lib | TargetKind::RLib | TargetKind::DyLib | TargetKind::CDyLib
-            | TargetKind::StaticLib | TargetKind::ProcMacro => Some(Self::Lib),
+            TargetKind::Lib
+            | TargetKind::RLib
+            | TargetKind::DyLib
+            | TargetKind::CDyLib
+            | TargetKind::StaticLib
+            | TargetKind::ProcMacro => Some(Self::Lib),
             TargetKind::Example => Some(Self::Example),
             TargetKind::Test => Some(Self::Test),
             TargetKind::Bench => Some(Self::Bench),
@@ -163,4 +167,75 @@ fn collect_source_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::TempDir;
+
+    #[test]
+    fn load_discovers_crate_source_files_and_entry_points() {
+        let dir = TempDir::new("ingest-basic");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(dir.join("src/bin/tool.rs"), "fn main() {}\n").unwrap();
+
+        let manifest = dir.join("Cargo.toml");
+        let workspace = load(Some(&manifest)).unwrap();
+
+        assert_eq!(workspace.crates.len(), 1);
+        let krate = &workspace.crates[0];
+        assert_eq!(krate.name, "fixture");
+
+        let mut files: Vec<_> = krate
+            .source_files
+            .iter()
+            .map(|path| path.strip_prefix(&krate.root).unwrap().to_path_buf())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("src/bin/tool.rs"),
+                PathBuf::from("src/lib.rs")
+            ]
+        );
+
+        let kinds: Vec<_> = krate.entry_points.iter().map(|entry| entry.kind).collect();
+        assert!(kinds.contains(&EntryPointKind::Lib));
+        assert!(kinds.contains(&EntryPointKind::Bin));
+    }
+
+    #[test]
+    fn load_reports_metadata_error_for_a_missing_manifest() {
+        let dir = TempDir::new("ingest-missing-manifest");
+        let manifest = dir.join("Cargo.toml");
+
+        let err = load(Some(&manifest)).unwrap_err();
+        assert!(matches!(err, IngestError::Metadata(_)));
+    }
+
+    #[test]
+    fn collect_source_files_skips_the_target_directory() {
+        let dir = TempDir::new("ingest-skip-target");
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("target/debug/generated.rs"), "// generated\n").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+
+        let files = collect_source_files(&dir).unwrap();
+
+        assert_eq!(files, vec![dir.join("src/lib.rs")]);
+    }
 }

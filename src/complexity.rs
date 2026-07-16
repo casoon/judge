@@ -38,9 +38,10 @@ impl std::error::Error for ComplexityError {}
 /// Parses a single Rust source file and returns the complexity of every
 /// function, method, and default trait-method body it contains.
 pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
-    let source =
-        std::fs::read_to_string(path).map_err(|err| ComplexityError::Io(path.to_path_buf(), err))?;
-    let ast = syn::parse_file(&source).map_err(|err| ComplexityError::Parse(path.to_path_buf(), err))?;
+    let source = std::fs::read_to_string(path)
+        .map_err(|err| ComplexityError::Io(path.to_path_buf(), err))?;
+    let ast =
+        syn::parse_file(&source).map_err(|err| ComplexityError::Parse(path.to_path_buf(), err))?;
 
     let mut functions = Vec::new();
     walk_functions(&ast, |site| {
@@ -98,11 +99,10 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
             }
             Expr::Match(node) => {
                 self.complexity += node.arms.len().saturating_sub(1) as u32;
-                self.complexity += node.arms.iter().filter(|arm| arm.guard.is_some()).count() as u32;
+                self.complexity +=
+                    node.arms.iter().filter(|arm| arm.guard.is_some()).count() as u32;
             }
-            Expr::Binary(node)
-                if matches!(node.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) =>
-            {
+            Expr::Binary(node) if matches!(node.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) => {
                 self.complexity += 1;
             }
             _ => {}
@@ -111,4 +111,162 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
     }
 
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::TempDir;
+
+    #[test]
+    fn cyclomatic_complexity_counts_branches() {
+        let dir = TempDir::new("complexity-branches");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn straight_line() {
+    let _ = 1 + 1;
+}
+
+fn single_if(x: i32) {
+    if x > 0 {
+        let _ = x;
+    }
+}
+
+fn if_else_if(x: i32) {
+    if x > 0 {
+        let _ = x;
+    } else if x < 0 {
+        let _ = x;
+    }
+}
+
+fn boolean_operators(a: bool, b: bool) -> bool {
+    a && b || a
+}
+
+fn loops(x: i32) {
+    let mut i = 0;
+    while i < x {
+        i += 1;
+    }
+    for j in 0..x {
+        let _ = j;
+    }
+    loop {
+        break;
+    }
+}
+
+fn try_operator() -> Result<i32, ()> {
+    let x: Result<i32, ()> = Ok(1);
+    Ok(x?)
+}
+
+fn match_arms(x: i32) -> i32 {
+    match x {
+        1 => 1,
+        2 | 3 => 2,
+        n if n > 10 => 3,
+        _ => 0,
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let complexity = |name: &str| {
+            functions
+                .iter()
+                .find(|f| f.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing function {name}"))
+                .cyclomatic
+        };
+
+        assert_eq!(complexity("straight_line"), 1);
+        assert_eq!(complexity("single_if"), 2);
+        assert_eq!(complexity("if_else_if"), 3);
+        assert_eq!(complexity("boolean_operators"), 3);
+        assert_eq!(complexity("loops"), 4);
+        assert_eq!(complexity("try_operator"), 2);
+        assert_eq!(complexity("match_arms"), 5);
+    }
+
+    #[test]
+    fn nested_fn_is_analyzed_separately_and_excluded_from_outer() {
+        let dir = TempDir::new("complexity-nested-fn");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn outer(x: i32) -> i32 {
+    fn inner(y: i32) -> i32 {
+        if y > 0 { 1 } else { 0 }
+    }
+    if x > 0 {
+        inner(x)
+    } else {
+        0
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        assert_eq!(functions.len(), 2);
+
+        let outer = functions
+            .iter()
+            .find(|f| f.qualified_name == "outer")
+            .unwrap();
+        let inner = functions
+            .iter()
+            .find(|f| f.qualified_name == "inner")
+            .unwrap();
+        assert_eq!(outer.cyclomatic, 2);
+        assert_eq!(inner.cyclomatic, 2);
+    }
+
+    #[test]
+    fn analyze_file_reports_parse_errors() {
+        let dir = TempDir::new("complexity-parse-error");
+        let file = dir.join("broken.rs");
+        std::fs::write(&file, "fn broken( {").unwrap();
+
+        let err = analyze_file(&file).unwrap_err();
+        match err {
+            ComplexityError::Parse(path, _) => assert_eq!(path, file),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_file_reports_io_errors_for_missing_files() {
+        let missing = PathBuf::from("/nonexistent/judge-test-file-does-not-exist.rs");
+        let err = analyze_file(&missing).unwrap_err();
+        match err {
+            ComplexityError::Io(path, _) => assert_eq!(path, missing),
+            other => panic!("expected an io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn analyze_workspace_aggregates_functions_and_errors() {
+        let dir = TempDir::new("complexity-workspace");
+        let good = dir.join("good.rs");
+        let bad = dir.join("bad.rs");
+        std::fs::write(&good, "fn ok() {}").unwrap();
+        std::fs::write(&bad, "fn broken( {").unwrap();
+
+        let files = [good, bad];
+        let report = analyze_workspace(files.iter());
+
+        assert_eq!(report.functions.len(), 1);
+        assert_eq!(report.functions[0].qualified_name, "ok");
+        assert_eq!(report.errors.len(), 1);
+    }
 }

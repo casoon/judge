@@ -5,7 +5,10 @@ edition = "2024"
 rust-version = "1.95"
 description = "Codebase intelligence for Rust workspaces"
 license = "MIT"
-publish = false
+repository = "https://github.com/casoon/judge"
+keywords = ["cargo-plugin", "static-analysis", "code-quality", "complexity", "duplication"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+publish = true
 
 [lib]
 name = "judge"

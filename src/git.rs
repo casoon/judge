@@ -53,7 +53,9 @@ pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>
 
     for info in walk {
         let info = info.map_err(|err| GitError::Walk(err.to_string()))?;
-        let commit = info.object().map_err(|err| GitError::Walk(err.to_string()))?;
+        let commit = info
+            .object()
+            .map_err(|err| GitError::Walk(err.to_string()))?;
         let commit_time = commit
             .time()
             .map_err(|err| GitError::Walk(err.to_string()))?
@@ -62,7 +64,9 @@ pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>
             break;
         }
 
-        let tree = commit.tree().map_err(|err| GitError::Walk(err.to_string()))?;
+        let tree = commit
+            .tree()
+            .map_err(|err| GitError::Walk(err.to_string()))?;
         let parent_tree = match commit.parent_ids().next() {
             Some(parent_id) => parent_id
                 .object()
@@ -101,4 +105,94 @@ fn now_unix_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::TempDir;
+
+    /// Runs `git` in `dir` with a fixed test identity, so these tests don't
+    /// depend on the host's global git config being set up.
+    fn git(dir: &Path, args: &[&str]) {
+        run_git(dir, args, &[]);
+    }
+
+    fn run_git(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=judge-test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .envs(extra_env.iter().copied())
+            .status()
+            .expect("failed to run git — required for these fixtures");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn churn_counts_commits_touching_each_file() {
+        let dir = TempDir::new("git-churn");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch a again"]);
+
+        let counts = churn(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(counts.get(&PathBuf::from("a.rs")), Some(&2));
+        assert_eq!(counts.get(&PathBuf::from("b.rs")), Some(&1));
+    }
+
+    #[test]
+    fn churn_returns_empty_map_for_repo_without_commits() {
+        let dir = TempDir::new("git-no-commits");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let counts = churn(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn churn_errors_for_a_non_repository() {
+        let dir = TempDir::new("git-not-a-repo");
+
+        let err = churn(&dir, DEFAULT_WINDOW_DAYS).unwrap_err();
+        assert!(matches!(err, GitError::Open(_)));
+    }
+
+    #[test]
+    fn churn_ignores_commits_outside_the_window() {
+        let dir = TempDir::new("git-old-commit");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let old_date = [
+            ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00"),
+            ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00"),
+        ];
+        std::fs::write(dir.join("old.rs"), "fn old() {}\n").unwrap();
+        run_git(&dir, &["add", "."], &[]);
+        run_git(&dir, &["commit", "-q", "-m", "ancient"], &old_date);
+
+        std::fs::write(dir.join("new.rs"), "fn new() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "recent"]);
+
+        let counts = churn(&dir, 30).unwrap();
+
+        assert_eq!(counts.get(&PathBuf::from("new.rs")), Some(&1));
+        assert_eq!(counts.get(&PathBuf::from("old.rs")), None);
+    }
 }

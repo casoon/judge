@@ -5,6 +5,8 @@ pub mod duplication;
 mod functions;
 pub mod git;
 pub mod ingest;
+#[cfg(test)]
+mod test_util;
 
 /// Analysis tier selected for a run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
