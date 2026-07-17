@@ -1,10 +1,17 @@
 //! Codebase intelligence for Rust workspaces.
 
+pub mod baseline;
+pub mod boundaries;
 pub mod complexity;
+pub mod deps;
 pub mod duplication;
+pub mod finding;
 mod functions;
+pub mod gate;
 pub mod git;
 pub mod ingest;
+pub mod ownership;
+pub mod slop;
 #[cfg(test)]
 mod test_util;
 

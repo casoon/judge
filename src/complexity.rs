@@ -7,6 +7,7 @@ use syn::visit::{self, Visit};
 use syn::{Expr, ItemFn};
 
 use crate::functions::walk_functions;
+use crate::ingest::SourceFile;
 
 /// Cyclomatic complexity and size of a single function or method.
 #[derive(Debug, Clone)]
@@ -68,15 +69,26 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
 pub struct WorkspaceComplexity {
     pub functions: Vec<FunctionInfo>,
     pub errors: Vec<ComplexityError>,
+    /// Generated files skipped because `include_generated` was `false` (see
+    /// todo.md §3.A "Generated-Code-Policy").
+    pub excluded_generated: usize,
 }
 
-/// Runs [`analyze_file`] over every path in `source_files` and aggregates the results.
+/// Runs [`analyze_file`] over every file in `source_files` and aggregates the
+/// results. Generated files are skipped unless `include_generated` is set
+/// (see todo.md §3.A) — local quality metrics on generated code aren't
+/// actionable the way they are on authored code.
 pub fn analyze_workspace<'a>(
-    source_files: impl IntoIterator<Item = &'a PathBuf>,
+    source_files: impl IntoIterator<Item = &'a SourceFile>,
+    include_generated: bool,
 ) -> WorkspaceComplexity {
     let mut report = WorkspaceComplexity::default();
-    for path in source_files {
-        match analyze_file(path) {
+    for file in source_files {
+        if !include_generated && !file.kind.is_locally_reportable() {
+            report.excluded_generated += 1;
+            continue;
+        }
+        match analyze_file(&file.path) {
             Ok(mut functions) => report.functions.append(&mut functions),
             Err(err) => report.errors.push(err),
         }
@@ -254,6 +266,13 @@ fn outer(x: i32) -> i32 {
         }
     }
 
+    fn authored(path: PathBuf) -> SourceFile {
+        SourceFile {
+            path,
+            kind: crate::ingest::SourceKind::Authored,
+        }
+    }
+
     #[test]
     fn analyze_workspace_aggregates_functions_and_errors() {
         let dir = TempDir::new("complexity-workspace");
@@ -262,11 +281,38 @@ fn outer(x: i32) -> i32 {
         std::fs::write(&good, "fn ok() {}").unwrap();
         std::fs::write(&bad, "fn broken( {").unwrap();
 
-        let files = [good, bad];
-        let report = analyze_workspace(files.iter());
+        let files = [authored(good), authored(bad)];
+        let report = analyze_workspace(files.iter(), false);
 
         assert_eq!(report.functions.len(), 1);
         assert_eq!(report.functions[0].qualified_name, "ok");
         assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.excluded_generated, 0);
+    }
+
+    #[test]
+    fn analyze_workspace_skips_generated_files_unless_included() {
+        let dir = TempDir::new("complexity-generated");
+        let authored_file = dir.join("lib.rs");
+        let generated_file = dir.join("schema.rs");
+        std::fs::write(&authored_file, "fn ok() {}").unwrap();
+        std::fs::write(&generated_file, "fn also_ok() {}").unwrap();
+
+        let files = [
+            authored(authored_file),
+            SourceFile {
+                path: generated_file,
+                kind: crate::ingest::SourceKind::Generated,
+            },
+        ];
+
+        let excluded = analyze_workspace(files.iter(), false);
+        assert_eq!(excluded.functions.len(), 1);
+        assert_eq!(excluded.functions[0].qualified_name, "ok");
+        assert_eq!(excluded.excluded_generated, 1);
+
+        let included = analyze_workspace(files.iter(), true);
+        assert_eq!(included.functions.len(), 2);
+        assert_eq!(included.excluded_generated, 0);
     }
 }
