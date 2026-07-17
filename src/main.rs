@@ -227,7 +227,7 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
     };
 
     let mut findings = Vec::new();
-    let mut parse_errors = 0usize;
+    let mut analysis_errors = Vec::new();
     let mut rule_revisions = std::collections::HashMap::from([
         (
             judge::git::HOTSPOT_RULE.to_string(),
@@ -268,18 +268,22 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
         .iter()
         .flat_map(|krate| krate.source_files.iter());
     let complexity = judge::complexity::analyze_workspace(complexity_source_files, false);
-    parse_errors += complexity.errors.len();
-    let hotspots =
-        judge::git::hotspots(&workspace.root, &complexity.functions, judge::git::DEFAULT_WINDOW_DAYS)
-            .unwrap_or_default();
-    findings.extend(hotspots.iter().map(judge::git::Hotspot::to_finding));
+    analysis_errors.extend(complexity.errors.iter().map(ToString::to_string));
+    match judge::git::hotspots(
+        &workspace.root,
+        &complexity.functions,
+        judge::git::DEFAULT_WINDOW_DAYS,
+    ) {
+        Ok(hotspots) => findings.extend(hotspots.iter().map(judge::git::Hotspot::to_finding)),
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
 
     let slop_source_files = workspace
         .crates
         .iter()
         .flat_map(|krate| krate.source_files.iter());
     let slop = judge::slop::analyze_workspace(slop_source_files, false);
-    parse_errors += slop.errors.len();
+    analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
     findings.extend(slop.findings);
 
     let dupes_source_files = workspace
@@ -292,15 +296,18 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
         judge::duplication::DEFAULT_MIN_TOKENS,
         false,
     );
-    parse_errors += dupes.errors.len();
+    analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     findings.extend(dupes.to_findings());
 
     let deps = judge::deps::analyze_workspace(&workspace);
-    parse_errors += deps.errors.len();
+    analysis_errors.extend(deps.errors.iter().map(ToString::to_string));
     findings.extend(deps.findings);
 
     match judge::ownership::analyze_workspace(&workspace, judge::git::DEFAULT_WINDOW_DAYS) {
-        Ok(ownership) => findings.extend(ownership.findings),
+        Ok(ownership) => {
+            analysis_errors.extend(ownership.errors.iter().map(ToString::to_string));
+            findings.extend(ownership.findings);
+        }
         Err(err) => {
             eprintln!("error: {err}");
             std::process::exit(2);
@@ -353,24 +360,30 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
         handle_baseline(
             &workspace.root,
             &findings,
-            rule_revisions,
-            save_baseline,
-            baseline.as_deref(),
-            Path::new(DEFAULT_BASELINE_ALL),
-            format,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_ALL),
+                format,
+            },
         );
         return;
     }
 
     match format {
         OutputFormat::Json => {
-            let report = Report::new(findings);
+            let report = Report::with_errors(findings, analysis_errors);
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         OutputFormat::Tty => {
             println!("findings: {} (worst first)", findings.len());
-            if parse_errors > 0 {
-                println!("files skipped (parse errors): {parse_errors}");
+            if !analysis_errors.is_empty() {
+                println!("analysis errors: {}", analysis_errors.len());
+                for error in &analysis_errors {
+                    println!("  {error}");
+                }
             }
             println!(
                 "boundary rules checked: {boundary_rules_checked}{}",
@@ -402,22 +415,60 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
 /// Saves `findings` as a new baseline, or compares them against one and
 /// prints the delta (see todo.md §5, §14.2 P0#5). Returns `true` if baseline
 /// handling ran and the caller's normal report should be skipped.
+struct BaselineOptions<'a> {
+    rule_revisions: std::collections::HashMap<String, u32>,
+    save: bool,
+    compare_path: Option<&'a Path>,
+    default_save_path: &'a Path,
+    format: OutputFormat,
+}
+
 fn handle_baseline(
     workspace_root: &Path,
     findings: &[Finding],
-    rule_revisions: std::collections::HashMap<String, u32>,
-    save_baseline: bool,
-    baseline_path: Option<&Path>,
-    default_save_path: &Path,
-    format: OutputFormat,
+    analysis_errors: &[String],
+    options: BaselineOptions<'_>,
 ) -> bool {
-    if save_baseline {
-        let commit = judge::git::head_commit(workspace_root).unwrap_or_default();
-        let baseline = judge::baseline::Baseline::new(findings, commit, rule_revisions);
-        match judge::baseline::save(default_save_path, &baseline) {
+    let BaselineOptions {
+        rule_revisions,
+        save,
+        compare_path,
+        default_save_path,
+        format,
+    } = options;
+    let mut findings = findings.to_vec();
+    judge::finding::relativize_paths(&mut findings, workspace_root);
+
+    if !analysis_errors.is_empty() {
+        match format {
+            OutputFormat::Json => {
+                let report = Report::with_errors(findings, analysis_errors.to_vec());
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+            OutputFormat::Tty => {
+                eprintln!("error: analysis incomplete; baseline was not evaluated");
+                for error in analysis_errors {
+                    eprintln!("  {error}");
+                }
+            }
+        }
+        std::process::exit(2);
+    }
+
+    if save {
+        let commit = match judge::git::head_commit(workspace_root) {
+            Ok(commit) => commit,
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(2);
+            }
+        };
+        let baseline = judge::baseline::Baseline::new(&findings, commit, rule_revisions);
+        let save_path = workspace_root.join(default_save_path);
+        match judge::baseline::save(&save_path, &baseline) {
             Ok(()) => println!(
                 "baseline saved: {} ({} findings)",
-                default_save_path.display(),
+                save_path.display(),
                 findings.len()
             ),
             Err(err) => {
@@ -428,29 +479,27 @@ fn handle_baseline(
         return true;
     }
 
-    let Some(path) = baseline_path else {
+    let Some(path) = compare_path else {
         return false;
     };
-    let baseline = match judge::baseline::load(path) {
+    let mut baseline = match judge::baseline::load(path) {
         Ok(baseline) => baseline,
         Err(err) => {
             eprintln!("error: {err}");
             std::process::exit(2);
         }
     };
+    baseline.relativize_paths(workspace_root);
     let touched: std::collections::HashSet<PathBuf> =
         match judge::git::changed_files_since(workspace_root, &baseline.commit) {
-            Ok(relative) => relative
-                .into_iter()
-                .map(|path| workspace_root.join(path))
-                .collect(),
+            Ok(relative) => relative,
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(2);
             }
         };
 
-    let delta = judge::baseline::diff(findings, &baseline, &touched);
+    let delta = judge::baseline::diff(&findings, &baseline, &touched, &rule_revisions);
     let verdict = delta.verdict();
     match format {
         OutputFormat::Json => {
@@ -484,10 +533,7 @@ fn print_delta(delta: &judge::baseline::Delta, verdict: Verdict) {
         println!("  {}  {}", finding.rule, finding.file.display());
     }
 
-    println!(
-        "code-introduced (fails the verdict): {}",
-        delta.code_introduced.len()
-    );
+    println!("code-introduced: {}", delta.code_introduced.len());
     for finding in &delta.code_introduced {
         println!(
             "  {}  {}:{}",
@@ -537,6 +583,7 @@ fn run_dupes(
         min_tokens,
         include_generated,
     );
+    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
 
     if save_baseline || baseline.is_some() {
         let findings = report.to_findings();
@@ -547,18 +594,21 @@ fn run_dupes(
         handle_baseline(
             &workspace.root,
             &findings,
-            rule_revisions,
-            save_baseline,
-            baseline.as_deref(),
-            Path::new(DEFAULT_BASELINE_DUPES),
-            format,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_DUPES),
+                format,
+            },
         );
         return;
     }
 
     match format {
         OutputFormat::Json => {
-            let report = Report::new(report.to_findings());
+            let report = Report::with_errors(report.to_findings(), analysis_errors);
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         OutputFormat::Tty => {
@@ -612,6 +662,7 @@ fn run_deps(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>
     };
 
     let report = judge::deps::analyze_workspace(&workspace);
+    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
 
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([(
@@ -621,11 +672,14 @@ fn run_deps(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>
         handle_baseline(
             &workspace.root,
             &report.findings,
-            rule_revisions,
-            save_baseline,
-            baseline.as_deref(),
-            Path::new(DEFAULT_BASELINE_DEPS),
-            format,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_DEPS),
+                format,
+            },
         );
         return;
     }
@@ -636,6 +690,7 @@ fn run_deps(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>
                 "schema_version": judge::finding::SCHEMA_VERSION,
                 "findings": report.findings,
                 "feature_only_candidates": report.feature_only_candidates,
+                "errors": analysis_errors,
             });
             println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         }
@@ -739,11 +794,14 @@ fn run_boundaries(
         handle_baseline(
             &workspace.root,
             &boundaries.findings,
-            rule_revisions,
-            save_baseline,
-            baseline.as_deref(),
-            Path::new(DEFAULT_BASELINE_BOUNDARIES),
-            format,
+            &[],
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_BOUNDARIES),
+                format,
+            },
         );
         return;
     }
@@ -791,6 +849,7 @@ fn run_distribution(format: OutputFormat, save_baseline: bool, baseline: Option<
                 std::process::exit(2);
             }
         };
+    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
 
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([(
@@ -800,18 +859,21 @@ fn run_distribution(format: OutputFormat, save_baseline: bool, baseline: Option<
         handle_baseline(
             &workspace.root,
             &report.findings,
-            rule_revisions,
-            save_baseline,
-            baseline.as_deref(),
-            Path::new(DEFAULT_BASELINE_DISTRIBUTION),
-            format,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_DISTRIBUTION),
+                format,
+            },
         );
         return;
     }
 
     match format {
         OutputFormat::Json => {
-            let report = Report::new(report.findings);
+            let report = Report::with_errors(report.findings, analysis_errors);
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         OutputFormat::Tty => {
@@ -862,13 +924,23 @@ fn run_health(
         .iter()
         .flat_map(|krate| krate.source_files.iter());
     let report = judge::complexity::analyze_workspace(source_files, include_generated);
+    let mut analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
     let mut functions = report.functions;
     functions.sort_by_key(|function| std::cmp::Reverse(function.cyclomatic));
 
-    let hotspots =
-        judge::git::hotspots(&workspace.root, &functions, judge::git::DEFAULT_WINDOW_DAYS)
-            .unwrap_or_default();
-    let mut findings: Vec<_> = hotspots.iter().map(judge::git::Hotspot::to_finding).collect();
+    let (hotspots, hotspot_error) =
+        match judge::git::hotspots(&workspace.root, &functions, judge::git::DEFAULT_WINDOW_DAYS) {
+            Ok(hotspots) => (hotspots, None),
+            Err(err) => {
+                let error = err.to_string();
+                analysis_errors.push(error.clone());
+                (Vec::new(), Some(error))
+            }
+        };
+    let mut findings: Vec<_> = hotspots
+        .iter()
+        .map(judge::git::Hotspot::to_finding)
+        .collect();
 
     // AI-slop signals (see todo.md §G "AI-Slop-Signale", §12 "Entscheidungen":
     // "Der Slop-Block ist Teil von `health`, kein eigener Sub-Command") — a
@@ -879,9 +951,9 @@ fn run_health(
         .iter()
         .flat_map(|krate| krate.source_files.iter());
     let slop = judge::slop::analyze_workspace(slop_source_files, include_generated);
+    analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
     findings.extend(slop.findings);
 
-    let parse_errors = report.errors.len() + slop.errors.len();
     let excluded_generated = report.excluded_generated + slop.excluded_generated;
 
     if save_baseline || baseline.is_some() {
@@ -910,29 +982,29 @@ fn run_health(
         handle_baseline(
             &workspace.root,
             &findings,
-            rule_revisions,
-            save_baseline,
-            baseline.as_deref(),
-            Path::new(DEFAULT_BASELINE_HEALTH),
-            format,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_HEALTH),
+                format,
+            },
         );
         return;
     }
 
     match format {
         OutputFormat::Json => {
-            let report = Report::new(findings);
+            let report = Report::with_errors(findings, analysis_errors);
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         OutputFormat::Tty => {
             println!("functions analyzed: {}", functions.len());
-            if parse_errors > 0 {
-                println!("files skipped (parse errors): {parse_errors}");
-                for err in &report.errors {
-                    println!("  {err}");
-                }
-                for err in &slop.errors {
-                    println!("  {err}");
+            if !analysis_errors.is_empty() {
+                println!("analysis errors: {}", analysis_errors.len());
+                for error in &analysis_errors {
+                    println!("  {error}");
                 }
             }
             if excluded_generated > 0 {
@@ -952,7 +1024,11 @@ fn run_health(
             }
 
             println!();
-            print_hotspots(&hotspots, &findings, show_cascades);
+            if let Some(error) = hotspot_error {
+                println!("hotspots: unavailable ({error})");
+            } else {
+                print_hotspots(&hotspots, &findings, show_cascades);
+            }
 
             println!();
             print_slop(&findings, show_cascades);
@@ -973,7 +1049,11 @@ fn run_health(
 /// todo.md §14.2 P0#2) — currently a no-op, since nothing yet populates
 /// `caused_by` for hotspot findings, but the mechanism is exercised here so
 /// future detectors that do can rely on it.
-fn print_hotspots(hotspots: &[judge::git::Hotspot], findings: &[judge::finding::Finding], show_cascades: bool) {
+fn print_hotspots(
+    hotspots: &[judge::git::Hotspot],
+    findings: &[judge::finding::Finding],
+    show_cascades: bool,
+) {
     if hotspots.is_empty() {
         println!(
             "hotspots: none in the last {} days (no git history, or no file crosses both complexity and churn)",

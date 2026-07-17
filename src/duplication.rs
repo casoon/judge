@@ -34,6 +34,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use quote::ToTokens;
+use syn::spanned::Spanned;
+use syn::visit::Visit;
 
 use crate::finding::{Finding, Location, Origin, Severity};
 use crate::functions::walk_functions;
@@ -240,8 +242,14 @@ fn collect_function_tokens(
 
     let mut functions = Vec::new();
     walk_functions(&ast, |site| {
+        let mut nested_functions = NestedFunctionRanges::default();
+        nested_functions.visit_block(site.block);
         let mut tokens = Vec::new();
-        flatten_tokens(site.block.to_token_stream(), &mut tokens);
+        flatten_tokens(
+            site.block.to_token_stream(),
+            &mut tokens,
+            &nested_functions.ranges,
+        );
         if tokens.len() < min_tokens {
             return;
         }
@@ -259,15 +267,49 @@ fn collect_function_tokens(
 /// Flattens a token stream into a linear sequence, unwrapping `{}`/`()`/`[]`
 /// groups into explicit open/close tokens so windows can cross brace
 /// boundaries. Invisible (`Delimiter::None`) groups are transparent.
-fn flatten_tokens(stream: proc_macro2::TokenStream, out: &mut Vec<TokenUnit>) {
+#[derive(Default)]
+struct NestedFunctionRanges {
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl<'ast> Visit<'ast> for NestedFunctionRanges {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.ranges.push(node.span().byte_range());
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.ranges.push(node.span().byte_range());
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        if node.default.is_some() {
+            self.ranges.push(node.span().byte_range());
+        }
+    }
+}
+
+fn flatten_tokens(
+    stream: proc_macro2::TokenStream,
+    out: &mut Vec<TokenUnit>,
+    excluded_ranges: &[std::ops::Range<usize>],
+) {
     for tt in stream {
+        let token_range = tt.span().byte_range();
+        if excluded_ranges
+            .iter()
+            .any(|excluded| excluded.start <= token_range.start && token_range.end <= excluded.end)
+        {
+            continue;
+        }
         match tt {
             proc_macro2::TokenTree::Group(group) => match group.delimiter() {
-                proc_macro2::Delimiter::None => flatten_tokens(group.stream(), out),
+                proc_macro2::Delimiter::None => {
+                    flatten_tokens(group.stream(), out, excluded_ranges)
+                }
                 delimiter => {
                     let (open, close) = delimiter_chars(delimiter);
                     out.push(TokenUnit::new(group.span_open(), open.to_string()));
-                    flatten_tokens(group.stream(), out);
+                    flatten_tokens(group.stream(), out, excluded_ranges);
                     out.push(TokenUnit::new(group.span_close(), close.to_string()));
                 }
             },
@@ -373,8 +415,9 @@ fn find_clone_families(
                 if func_a == func_b {
                     continue;
                 }
-                let (sa, ea, sb, eb) =
-                    extend_match(functions, func_a, start_a, func_b, start_b, min_tokens, mode);
+                let (sa, ea, sb, eb) = extend_match(
+                    functions, func_a, start_a, func_b, start_b, min_tokens, mode,
+                );
                 matches.insert((func_a, sa, ea, func_b, sb, eb));
             }
         }
@@ -697,6 +740,7 @@ fn contains_dup_block(n: i32) -> i32 {
     for i in 0..n {
         total += i;
     }
+
     let c = a + b;
     c + total
 }
@@ -729,6 +773,34 @@ fn other_contains_dup_block(n: i32) -> i32 {
             .find(|m| m.qualified_name == "contains_dup_block")
             .unwrap();
         assert!(contains.start_token > 0);
+    }
+
+    #[test]
+    fn nested_function_is_not_reported_as_a_duplicate_of_its_parent() {
+        let dir = TempDir::new("dup-nested-function");
+        let file = dir.join("nested.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn outer() {
+    fn inner() {
+        let mut total = 0;
+        total += 1;
+        total += 2;
+        total += 3;
+        total += 4;
+        println!("{total}");
+    }
+    inner();
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, 8, false);
+
+        assert!(report.families.is_empty());
     }
 
     #[test]

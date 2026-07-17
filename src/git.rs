@@ -25,6 +25,7 @@ pub enum GitError {
     Open(Box<gix::open::Error>),
     Walk(String),
     RevParse(String, String),
+    Status(String),
 }
 
 impl std::fmt::Display for GitError {
@@ -33,6 +34,7 @@ impl std::fmt::Display for GitError {
             Self::Open(err) => write!(f, "failed to open git repository: {err}"),
             Self::Walk(msg) => write!(f, "failed to walk git history: {msg}"),
             Self::RevParse(spec, msg) => write!(f, "failed to resolve `{spec}`: {msg}"),
+            Self::Status(msg) => write!(f, "failed to read repository status: {msg}"),
         }
     }
 }
@@ -181,10 +183,9 @@ pub fn head_commit(repo_root: &Path) -> Result<String, GitError> {
     Ok(head_id.to_string())
 }
 
-/// Files that differ between `since_commit` and `HEAD`, relative to
-/// `repo_root`. Used to tell whether a finding's file was touched since a
-/// baseline was saved — an untouched file protects a finding's baseline
-/// entry from a rule-revision change (see todo.md §5 "Regelversions-Schutz").
+/// Files that differ between `since_commit` and the current checkout,
+/// relative to `repo_root`. This includes committed changes through `HEAD`,
+/// staged changes, unstaged changes, and untracked files.
 pub fn changed_files_since(
     repo_root: &Path,
     since_commit: &str,
@@ -222,6 +223,21 @@ pub fn changed_files_since(
         })
         .map_err(|err| GitError::Walk(err.to_string()))?;
 
+    let status = repo
+        .status(gix::progress::Discard)
+        .map_err(|err| GitError::Status(err.to_string()))?
+        .untracked_files(gix::status::UntrackedFiles::Files);
+    let status_items = status
+        .into_iter(Vec::<gix::bstr::BString>::new())
+        .map_err(|err| GitError::Status(err.to_string()))?;
+    for item in status_items {
+        let item = item.map_err(|err| GitError::Status(err.to_string()))?;
+        let location = item.location();
+        if !location.is_empty() {
+            changed.insert(PathBuf::from(location.to_str_lossy().into_owned()));
+        }
+    }
+
     Ok(changed)
 }
 
@@ -230,7 +246,10 @@ pub fn changed_files_since(
 /// "is this person still around at all", not per-file). Commits are walked
 /// from HEAD; an unborn HEAD (no commits yet) yields an empty set rather
 /// than an error, matching [`churn`]'s tolerance.
-pub fn active_authors_since(repo_root: &Path, window_days: i64) -> Result<HashSet<String>, GitError> {
+pub fn active_authors_since(
+    repo_root: &Path,
+    window_days: i64,
+) -> Result<HashSet<String>, GitError> {
     let repo = gix::open(repo_root)?;
     let mut authors = HashSet::new();
 
@@ -478,6 +497,28 @@ mod tests {
         assert!(!changed.contains(&PathBuf::from("b.rs")));
     }
 
+    #[test]
+    fn changed_files_since_includes_staged_unstaged_and_untracked_files() {
+        let dir = TempDir::new("git-changed-worktree");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("staged.rs"), "fn staged() {}\n").unwrap();
+        std::fs::write(dir.join("unstaged.rs"), "fn unstaged() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        let baseline_commit = commit_sha(&dir, "HEAD");
+
+        std::fs::write(dir.join("staged.rs"), "fn staged() { 1 }\n").unwrap();
+        git(&dir, &["add", "staged.rs"]);
+        std::fs::write(dir.join("unstaged.rs"), "fn unstaged() { 1 }\n").unwrap();
+        std::fs::write(dir.join("untracked.rs"), "fn untracked() {}\n").unwrap();
+
+        let changed = changed_files_since(&dir, &baseline_commit).unwrap();
+
+        assert!(changed.contains(&PathBuf::from("staged.rs")));
+        assert!(changed.contains(&PathBuf::from("unstaged.rs")));
+        assert!(changed.contains(&PathBuf::from("untracked.rs")));
+    }
+
     /// Like [`run_git`], but with a caller-supplied author identity instead
     /// of the fixed `judge-test` one — needed to give different commits
     /// different author emails.
@@ -519,7 +560,12 @@ mod tests {
 
         std::fs::write(dir.join("new.rs"), "fn new() {}\n").unwrap();
         run_git_as(&dir, "new@example.com", &["add", "."], &[]);
-        run_git_as(&dir, "new@example.com", &["commit", "-q", "-m", "recent"], &[]);
+        run_git_as(
+            &dir,
+            "new@example.com",
+            &["commit", "-q", "-m", "recent"],
+            &[],
+        );
 
         let authors = active_authors_since(&dir, 30).unwrap();
 

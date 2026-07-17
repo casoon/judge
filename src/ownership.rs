@@ -150,9 +150,10 @@ pub fn analyze_workspace(
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    result
-                        .errors
-                        .push(OwnershipError::Blame(source_file.path.clone(), err.to_string()));
+                    result.errors.push(OwnershipError::Blame(
+                        source_file.path.clone(),
+                        err.to_string(),
+                    ));
                     continue;
                 }
             };
@@ -180,7 +181,8 @@ fn file_ownership(
     repo: &gix::Repository,
     outcome: &gix::blame::Outcome,
 ) -> Result<FileOwnership, OwnershipError> {
-    let mut lines_by_email: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut lines_by_email: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     for entry in &outcome.entries {
         let commit = repo
             .find_commit(entry.commit_id)
@@ -316,15 +318,21 @@ mod tests {
         let file = dir.join("shared.rs");
         std::fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
         run_git_as(&dir, "one@example.com", &["add", "."], &[]);
-        run_git_as(&dir, "one@example.com", &["commit", "-q", "-m", "first half"], &[]);
+        run_git_as(
+            &dir,
+            "one@example.com",
+            &["commit", "-q", "-m", "first half"],
+            &[],
+        );
 
-        std::fs::write(
-            &file,
-            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n",
-        )
-        .unwrap();
+        std::fs::write(&file, "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n").unwrap();
         run_git_as(&dir, "two@example.com", &["add", "."], &[]);
-        run_git_as(&dir, "two@example.com", &["commit", "-q", "-m", "second half"], &[]);
+        run_git_as(
+            &dir,
+            "two@example.com",
+            &["commit", "-q", "-m", "second half"],
+            &[],
+        );
 
         let workspace = workspace_of(dir.to_path_buf(), file.clone());
         let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
@@ -344,7 +352,12 @@ mod tests {
         let file = dir.join("solo.rs");
         std::fs::write(&file, "fn a() {}\n").unwrap();
         run_git_as(&dir, "solo@example.com", &["add", "."], &[]);
-        run_git_as(&dir, "solo@example.com", &["commit", "-q", "-m", "initial"], &[]);
+        run_git_as(
+            &dir,
+            "solo@example.com",
+            &["commit", "-q", "-m", "initial"],
+            &[],
+        );
 
         let workspace = workspace_of(dir.to_path_buf(), file.clone());
         let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();

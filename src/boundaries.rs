@@ -364,99 +364,47 @@ fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
     }
 }
 
-/// Finds every cycle in the whole `graph` (not scoped to any one rule),
-/// structurally similar to [`crate::finding::check_for_cycles`]'s white/
-/// gray/black DFS, but over crate names, collecting every cycle rather than
-/// stopping at the first, and closed as `[a, b, c, a]` rather than erroring.
-/// Cycles that are rotations of each other (e.g. `a->b->c->a` and
-/// `b->c->a->b`) are deduplicated, canonicalized by rotating to start at the
-/// lexicographically smallest crate name.
+/// Finds every simple cycle in the whole `graph` (not scoped to any one rule).
+/// Each DFS is rooted at the lexicographically smallest node permitted in that
+/// traversal, so rotations of the same directed cycle are produced once.
 pub fn find_cycles(graph: &CrateGraph) -> Vec<Vec<String>> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mark {
-        White,
-        Gray,
-        Black,
-    }
-
     let mut node_names: Vec<String> = graph.edges.keys().cloned().collect();
     node_names.sort();
 
-    let mut marks: HashMap<String, Mark> = node_names
-        .iter()
-        .cloned()
-        .map(|name| (name, Mark::White))
-        .collect();
-    let mut stack: Vec<String> = Vec::new();
-    let mut raw_cycles: Vec<Vec<String>> = Vec::new();
-
-    fn visit(
-        node: &str,
+    fn visit_from(
+        start: &str,
+        current: &str,
         graph: &CrateGraph,
-        marks: &mut HashMap<String, Mark>,
-        stack: &mut Vec<String>,
-        raw_cycles: &mut Vec<Vec<String>>,
+        visited: &mut HashSet<String>,
+        path: &mut Vec<String>,
+        cycles: &mut HashSet<Vec<String>>,
     ) {
-        marks.insert(node.to_string(), Mark::Gray);
-        stack.push(node.to_string());
-
-        if let Some(neighbors) = graph.edges.get(node) {
+        if let Some(neighbors) = graph.edges.get(current) {
             for neighbor in neighbors {
-                match marks.get(neighbor.as_str()).copied().unwrap_or(Mark::White) {
-                    Mark::Black => continue,
-                    Mark::White => visit(neighbor, graph, marks, stack, raw_cycles),
-                    Mark::Gray => {
-                        let start = stack.iter().position(|n| n == neighbor).unwrap_or(0);
-                        let mut cycle = stack[start..].to_vec();
-                        cycle.push(neighbor.clone());
-                        raw_cycles.push(cycle);
-                    }
+                if neighbor == start {
+                    let mut cycle = path.clone();
+                    cycle.push(start.to_string());
+                    cycles.insert(cycle);
+                } else if neighbor.as_str() >= start && visited.insert(neighbor.clone()) {
+                    path.push(neighbor.clone());
+                    visit_from(start, neighbor, graph, visited, path, cycles);
+                    path.pop();
+                    visited.remove(neighbor);
                 }
             }
         }
-
-        stack.pop();
-        marks.insert(node.to_string(), Mark::Black);
     }
 
-    for name in &node_names {
-        if marks.get(name.as_str()).copied() == Some(Mark::White) {
-            visit(name, graph, &mut marks, &mut stack, &mut raw_cycles);
-        }
+    let mut found = HashSet::new();
+    for start in &node_names {
+        let mut visited = HashSet::from([start.clone()]);
+        let mut path = vec![start.clone()];
+        visit_from(start, start, graph, &mut visited, &mut path, &mut found);
     }
 
-    let mut seen: HashSet<Vec<String>> = HashSet::new();
-    let mut cycles: Vec<Vec<String>> = Vec::new();
-    for cycle in raw_cycles {
-        let canonical = canonicalize_cycle(&cycle);
-        if seen.insert(canonical.clone()) {
-            cycles.push(canonical);
-        }
-    }
+    let mut cycles: Vec<Vec<String>> = found.into_iter().collect();
     cycles.sort();
     cycles
-}
-
-/// Rotates a closed cycle path (`[a, b, c, a]`) so it starts at its
-/// lexicographically smallest crate name, then re-closes it. Used to
-/// deduplicate cycles found from different starting points.
-fn canonicalize_cycle(cycle: &[String]) -> Vec<String> {
-    let core = &cycle[..cycle.len() - 1];
-    let min_index = core
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, name)| name.as_str())
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-
-    let mut rotated: Vec<String> = core[min_index..]
-        .iter()
-        .chain(core[..min_index].iter())
-        .cloned()
-        .collect();
-    let first = rotated[0].clone();
-    rotated.push(first);
-    rotated
 }
 
 #[cfg(test)]
@@ -707,6 +655,33 @@ mod tests {
         let graph = CrateGraph { edges };
 
         assert!(find_cycles(&graph).is_empty());
+    }
+
+    #[test]
+    fn find_cycles_reports_overlapping_cycles() {
+        let graph = CrateGraph {
+            edges: HashMap::from([
+                ("a".to_string(), vec!["b".to_string(), "c".to_string()]),
+                ("b".to_string(), vec!["c".to_string()]),
+                ("c".to_string(), vec!["a".to_string()]),
+            ]),
+        };
+
+        let cycles = find_cycles(&graph);
+
+        assert_eq!(
+            cycles,
+            vec![
+                vec!["a", "b", "c", "a"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                vec!["a", "c", "a"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            ]
+        );
     }
 
     #[test]

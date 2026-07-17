@@ -127,7 +127,7 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
     let mut errors = Vec::new();
 
     for krate in &workspace.crates {
-        let (usage, crate_errors) = collect_crate_usage(krate);
+        let (usage, failed_domains, crate_errors) = collect_crate_usage(krate);
         errors.extend(crate_errors);
 
         for dep in &krate.dependencies {
@@ -137,16 +137,21 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
             let has_build = domains.is_some_and(|d| d.contains(&UsageDomain::Build));
             let used_anywhere = domains.is_some_and(|d| !d.is_empty());
 
-            if !used_anywhere && !dep.features.is_empty() {
+            if !used_anywhere && !dep.features.is_empty() && failed_domains.is_empty() {
                 feature_only_candidates.push(dep.name.clone());
                 continue;
             }
 
             let flagged = match dep.kind {
                 DependencyKind::Normal => {
-                    has_dev && !has_normal && dep.features.len() <= SHORT_FEATURE_LIST_MAX
+                    has_dev
+                        && !has_normal
+                        && dep.features.len() <= SHORT_FEATURE_LIST_MAX
+                        && !failed_domains.contains(&UsageDomain::Normal)
                 }
-                DependencyKind::Build => !has_build,
+                DependencyKind::Build => {
+                    !has_build && !failed_domains.contains(&UsageDomain::Build)
+                }
                 DependencyKind::Development => false,
             };
 
@@ -194,8 +199,13 @@ fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency)
 /// identifiers.
 fn collect_crate_usage(
     krate: &CrateInfo,
-) -> (HashMap<String, HashSet<UsageDomain>>, Vec<DepsError>) {
+) -> (
+    HashMap<String, HashSet<UsageDomain>>,
+    HashSet<UsageDomain>,
+    Vec<DepsError>,
+) {
     let mut usage: HashMap<String, HashSet<UsageDomain>> = HashMap::new();
+    let mut failed_domains = HashSet::new();
     let mut errors = Vec::new();
 
     for file in &krate.source_files {
@@ -211,11 +221,14 @@ fn collect_crate_usage(
                     usage.entry(ident).or_default().insert(domain);
                 }
             }
-            Err(err) => errors.push(err),
+            Err(err) => {
+                failed_domains.insert(domain);
+                errors.push(err);
+            }
         }
     }
 
-    (usage, errors)
+    (usage, failed_domains, errors)
 }
 
 /// Parses `path` and collects the first-segment identifier of every
@@ -438,6 +451,25 @@ edition = "2021"
         let workspace = crate::ingest::load(Some(&manifest)).unwrap();
         let report = analyze_workspace(&workspace);
 
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn a_parse_error_in_build_rs_does_not_claim_the_dependency_is_unused() {
+        let dir = TempDir::new("deps-build-parse-error");
+        let manifest = write_fixture(
+            &dir,
+            "[build-dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[("build.rs", "fn main( { depcrate::noop(); }\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert_eq!(report.errors.len(), 1);
         assert!(report.findings.is_empty());
     }
 

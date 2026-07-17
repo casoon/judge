@@ -58,6 +58,23 @@ impl Baseline {
                 .collect(),
         }
     }
+
+    /// Migrates baselines written by older judge versions in the same
+    /// checkout, which stored absolute paths in both `file` and `id`.
+    pub fn relativize_paths(&mut self, workspace_root: &Path) {
+        for finding in &mut self.findings {
+            let Ok(relative) = finding.file.strip_prefix(workspace_root) else {
+                continue;
+            };
+            let relative = relative.to_path_buf();
+            let absolute_text = finding.file.to_string_lossy();
+            let relative_text = relative.to_string_lossy();
+            finding.id = finding
+                .id
+                .replace(absolute_text.as_ref(), relative_text.as_ref());
+            finding.file = relative;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -95,7 +112,8 @@ pub fn save(path: &Path, baseline: &Baseline) -> Result<(), BaselineError> {
 pub fn load(path: &Path) -> Result<Baseline, BaselineError> {
     let content =
         std::fs::read_to_string(path).map_err(|err| BaselineError::Io(path.to_path_buf(), err))?;
-    serde_json::from_str(&content).map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))
+    serde_json::from_str(&content)
+        .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))
 }
 
 /// The result of comparing a fresh set of findings against a [`Baseline`].
@@ -118,7 +136,12 @@ pub struct Delta {
 /// not already in the baseline as `code_introduced` or `rule_introduced`
 /// depending on whether `touched_files` (paths changed since the baseline
 /// commit — see [`crate::git::changed_files_since`]) contains its file.
-pub fn diff(current: &[Finding], baseline: &Baseline, touched_files: &HashSet<PathBuf>) -> Delta {
+pub fn diff(
+    current: &[Finding],
+    baseline: &Baseline,
+    touched_files: &HashSet<PathBuf>,
+    current_rule_revisions: &HashMap<String, u32>,
+) -> Delta {
     let known_ids: HashSet<&str> = baseline.findings.iter().map(|f| f.id.as_str()).collect();
 
     let mut code_introduced = Vec::new();
@@ -126,12 +149,14 @@ pub fn diff(current: &[Finding], baseline: &Baseline, touched_files: &HashSet<Pa
     let mut unchanged_count = 0;
 
     for finding in current {
-        if known_ids.contains(finding.id.as_str()) {
+        let rule_changed =
+            baseline.rule_revisions.get(&finding.rule) != current_rule_revisions.get(&finding.rule);
+        if known_ids.contains(finding.id.as_str()) && !rule_changed {
             unchanged_count += 1;
-        } else if touched_files.contains(&finding.location.file) {
-            code_introduced.push(finding.clone());
-        } else {
+        } else if rule_changed && !touched_files.contains(&finding.location.file) {
             rule_introduced.push(finding.clone());
+        } else {
+            code_introduced.push(finding.clone());
         }
     }
 
@@ -159,10 +184,15 @@ pub enum Verdict {
 }
 
 impl Delta {
-    /// Only `code_introduced` findings can fail the verdict (see todo.md §6,
-    /// §5 "Regelversions-Schutz").
+    /// Only actionable (`Warn`/`Fail`) code-introduced findings can fail the
+    /// verdict. `Info` findings remain visible in the delta but are explicitly
+    /// descriptive, not pass/fail judgements.
     pub fn verdict(&self) -> Verdict {
-        if self.code_introduced.is_empty() {
+        if self
+            .code_introduced
+            .iter()
+            .all(|finding| finding.severity == crate::finding::Severity::Info)
+        {
             Verdict::Pass
         } else {
             Verdict::Fail
@@ -193,7 +223,15 @@ mod tests {
     }
 
     fn baseline_with(findings: &[Finding]) -> Baseline {
-        Baseline::new(findings, "abc123".to_string(), HashMap::new())
+        Baseline::new(
+            findings,
+            "abc123".to_string(),
+            HashMap::from([("duplicate-code".to_string(), 1)]),
+        )
+    }
+
+    fn current_revisions() -> HashMap<String, u32> {
+        HashMap::from([("duplicate-code".to_string(), 1)])
     }
 
     #[test]
@@ -215,7 +253,7 @@ mod tests {
         let baseline = baseline_with(&[finding("a", "src/a.rs")]);
         let current = [finding("a", "src/a.rs")];
 
-        let delta = diff(&current, &baseline, &HashSet::new());
+        let delta = diff(&current, &baseline, &HashSet::new(), &current_revisions());
 
         assert_eq!(delta.unchanged_count, 1);
         assert!(delta.code_introduced.is_empty());
@@ -229,7 +267,7 @@ mod tests {
         let current = [finding("new", "src/a.rs")];
         let touched = HashSet::from([PathBuf::from("src/a.rs")]);
 
-        let delta = diff(&current, &baseline, &touched);
+        let delta = diff(&current, &baseline, &touched, &current_revisions());
 
         assert_eq!(delta.code_introduced.len(), 1);
         assert!(delta.rule_introduced.is_empty());
@@ -241,7 +279,9 @@ mod tests {
         let baseline = baseline_with(&[]);
         let current = [finding("new", "src/a.rs")];
 
-        let delta = diff(&current, &baseline, &HashSet::new());
+        let mut revised = current_revisions();
+        revised.insert("duplicate-code".to_string(), 2);
+        let delta = diff(&current, &baseline, &HashSet::new(), &revised);
 
         assert!(delta.code_introduced.is_empty());
         assert_eq!(delta.rule_introduced.len(), 1);
@@ -252,9 +292,46 @@ mod tests {
     fn finding_missing_from_the_current_run_is_resolved() {
         let baseline = baseline_with(&[finding("gone", "src/a.rs")]);
 
-        let delta = diff(&[], &baseline, &HashSet::new());
+        let delta = diff(&[], &baseline, &HashSet::new(), &current_revisions());
 
         assert_eq!(delta.resolved.len(), 1);
         assert_eq!(delta.resolved[0].id, "gone");
+    }
+
+    #[test]
+    fn new_finding_without_a_rule_change_fails_even_in_an_untouched_file() {
+        let baseline = baseline_with(&[]);
+        let current = [finding("new", "src/a.rs")];
+
+        let delta = diff(&current, &baseline, &HashSet::new(), &current_revisions());
+
+        assert_eq!(delta.code_introduced.len(), 1);
+        assert!(delta.rule_introduced.is_empty());
+        assert_eq!(delta.verdict(), Verdict::Fail);
+    }
+
+    #[test]
+    fn changed_rule_rechecks_an_existing_finding() {
+        let baseline = baseline_with(&[finding("known", "src/a.rs")]);
+        let current = [finding("known", "src/a.rs")];
+        let revised = HashMap::from([("duplicate-code".to_string(), 2)]);
+
+        let delta = diff(&current, &baseline, &HashSet::new(), &revised);
+
+        assert_eq!(delta.unchanged_count, 0);
+        assert_eq!(delta.rule_introduced.len(), 1);
+    }
+
+    #[test]
+    fn informational_code_finding_does_not_fail_the_verdict() {
+        let baseline = baseline_with(&[]);
+        let mut info = finding("info", "src/a.rs");
+        info.severity = Severity::Info;
+        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
+
+        let delta = diff(&[info], &baseline, &touched, &current_revisions());
+
+        assert_eq!(delta.code_introduced.len(), 1);
+        assert_eq!(delta.verdict(), Verdict::Pass);
     }
 }

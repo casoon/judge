@@ -3,7 +3,7 @@
 //! entry point — doesn't present as dozens of unrelated findings (see
 //! todo.md §7 "Kausale Finding-Gruppen", §14.2 P0#1).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,13 +64,21 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct Report {
     pub schema_version: u32,
     pub findings: Vec<Finding>,
+    /// Analyzer failures that made the report incomplete. An empty list means
+    /// every requested detector completed successfully.
+    pub errors: Vec<String>,
 }
 
 impl Report {
     pub fn new(findings: Vec<Finding>) -> Self {
+        Self::with_errors(findings, Vec::new())
+    }
+
+    pub fn with_errors(findings: Vec<Finding>, errors: Vec<String>) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             findings,
+            errors,
         }
     }
 }
@@ -89,6 +97,28 @@ pub fn root_findings(findings: &[Finding]) -> Vec<&Finding> {
 /// don't exist yet; this is the part that doesn't).
 pub fn sort_by_severity_desc(findings: &mut [Finding]) {
     findings.sort_by_key(|finding| std::cmp::Reverse(finding.severity));
+}
+
+/// Rewrites workspace-local absolute paths to repository-relative paths.
+/// Finding ids embed their location in several detectors, so the id must be
+/// rebased together with the structured location to remain stable across
+/// different checkout directories.
+pub fn relativize_paths(findings: &mut [Finding], workspace_root: &Path) {
+    for finding in findings {
+        let Ok(relative) = finding.location.file.strip_prefix(workspace_root) else {
+            continue;
+        };
+        let relative = relative.to_path_buf();
+        let absolute_text = finding.location.file.to_string_lossy();
+        let relative_text = relative.to_string_lossy();
+        finding.id = finding
+            .id
+            .replace(absolute_text.as_ref(), relative_text.as_ref());
+        if finding.location.item_path == absolute_text {
+            finding.location.item_path = relative_text.into_owned();
+        }
+        finding.location.file = relative;
+    }
 }
 
 /// A cycle detected in the `causes` graph, reported as the sequence of
@@ -147,10 +177,7 @@ pub fn check_for_cycles(findings: &[Finding]) -> Result<(), CycleError> {
                 Mark::Done => continue,
                 Mark::Unvisited => visit(target_index, findings, index_by_id, marks, stack)?,
                 Mark::InProgress => {
-                    let start = stack
-                        .iter()
-                        .position(|id| id == target_id)
-                        .unwrap_or(0);
+                    let start = stack.iter().position(|id| id == target_id).unwrap_or(0);
                     let mut cycle = stack[start..].to_vec();
                     cycle.push(target_id.clone());
                     return Err(CycleError { cycle });
@@ -194,7 +221,11 @@ mod tests {
 
     #[test]
     fn acyclic_graph_passes() {
-        let findings = vec![finding("a", &["b"]), finding("b", &["c"]), finding("c", &[])];
+        let findings = vec![
+            finding("a", &["b"]),
+            finding("b", &["c"]),
+            finding("c", &[]),
+        ];
         assert!(check_for_cycles(&findings).is_ok());
     }
 
@@ -202,7 +233,10 @@ mod tests {
     fn direct_cycle_is_detected() {
         let findings = vec![finding("a", &["b"]), finding("b", &["a"])];
         let err = check_for_cycles(&findings).unwrap_err();
-        assert_eq!(err.cycle, vec!["a".to_string(), "b".to_string(), "a".to_string()]);
+        assert_eq!(
+            err.cycle,
+            vec!["a".to_string(), "b".to_string(), "a".to_string()]
+        );
     }
 
     #[test]
@@ -250,6 +284,7 @@ mod tests {
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["findings"][0]["severity"], "warn");
         assert_eq!(json["findings"][0]["origin"], "code");
+        assert_eq!(json["errors"], serde_json::json!([]));
     }
 
     #[test]
@@ -266,5 +301,21 @@ mod tests {
 
         let ids: Vec<_> = findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["fail", "warn", "info"]);
+    }
+
+    #[test]
+    fn relativize_paths_rebases_location_and_embedded_id() {
+        let mut finding = finding("hotspot:/tmp/project/src/lib.rs", &[]);
+        finding.location.file = PathBuf::from("/tmp/project/src/lib.rs");
+        finding.location.item_path = "/tmp/project/src/lib.rs".to_string();
+
+        relativize_paths(
+            std::slice::from_mut(&mut finding),
+            Path::new("/tmp/project"),
+        );
+
+        assert_eq!(finding.id, "hotspot:src/lib.rs");
+        assert_eq!(finding.location.file, PathBuf::from("src/lib.rs"));
+        assert_eq!(finding.location.item_path, "src/lib.rs");
     }
 }
