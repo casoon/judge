@@ -375,7 +375,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
-    use crate::duplication::{CloneFamily, CloneMember};
+    use crate::duplication::{CloneFamily, CloneMember, DupeMode};
     use crate::test_util::TempDir;
 
     fn write_crate(dir: &TempDir, name: &str, deps: &[(&str, &str)], lib_source: &str) {
@@ -601,6 +601,9 @@ resolver = "2"
             start_token: 0,
             end_token: 0,
             token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
         };
         let member_b = CloneMember {
             qualified_name: "clone_two".to_string(),
@@ -610,6 +613,9 @@ resolver = "2"
             start_token: 0,
             end_token: 0,
             token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
         };
         let duplication = WorkspaceDuplication {
             families: vec![CloneFamily {
@@ -669,6 +675,9 @@ fn clone_two() -> i32 {
             start_token: 0,
             end_token: 0,
             token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
         };
         let member_b = CloneMember {
             qualified_name: "clone_two".to_string(),
@@ -678,6 +687,9 @@ fn clone_two() -> i32 {
             start_token: 0,
             end_token: 0,
             token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
         };
         let duplication = WorkspaceDuplication {
             families: vec![CloneFamily {
@@ -735,6 +747,9 @@ resolver = "2"
             start_token: 0,
             end_token: 0,
             token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
         };
         let member_b = CloneMember {
             qualified_name: "clone_test_two".to_string(),
@@ -744,6 +759,9 @@ resolver = "2"
             start_token: 0,
             end_token: 0,
             token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
         };
         let duplication = WorkspaceDuplication {
             families: vec![CloneFamily {
