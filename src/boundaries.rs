@@ -64,11 +64,33 @@ pub struct BoundaryRule {
     pub allow_empty: bool,
 }
 
-/// The `judge.toml` `[[boundary]]` table (see todo.md §8).
+/// One named crate-type profile from `judge.toml` (see todo.md §4 "Health
+/// Score", point 3 "Kontextrelativ"). Findings from a crate listed here have
+/// their score deduction scaled by `deduction_multiplier` — e.g. a parser
+/// crate can legitimately carry more complexity than a CLI crate, without
+/// judge guessing that classification itself. Crates not named in any
+/// profile use a multiplier of `1.0`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CrateProfile {
+    pub name: String,
+    pub crates: Vec<String>,
+    #[serde(default = "CrateProfile::default_multiplier")]
+    pub deduction_multiplier: f64,
+}
+
+impl CrateProfile {
+    fn default_multiplier() -> f64 {
+        1.0
+    }
+}
+
+/// The `judge.toml` `[[boundary]]` and `[[crate_profile]]` tables (see todo.md §8).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BoundaryConfig {
     #[serde(rename = "boundary", default)]
     pub boundaries: Vec<BoundaryRule>,
+    #[serde(rename = "crate_profile", default)]
+    pub crate_profiles: Vec<CrateProfile>,
 }
 
 /// A configuration error, distinct from a [`Finding`] — this means the rule
@@ -468,6 +490,7 @@ mod tests {
         r.forbidden = vec!["db".to_string()];
         let config = BoundaryConfig {
             boundaries: vec![r],
+            crate_profiles: Vec::new(),
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -493,6 +516,7 @@ mod tests {
         r.forbidden = vec!["db".to_string()];
         let config = BoundaryConfig {
             boundaries: vec![r],
+            crate_profiles: Vec::new(),
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -513,6 +537,7 @@ mod tests {
         r.required = vec!["io-abstraction".to_string()];
         let config = BoundaryConfig {
             boundaries: vec![r],
+            crate_profiles: Vec::new(),
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -534,6 +559,7 @@ mod tests {
         r.required = vec!["io-abstraction".to_string()];
         let config = BoundaryConfig {
             boundaries: vec![r],
+            crate_profiles: Vec::new(),
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -555,6 +581,7 @@ mod tests {
         r.required = vec!["io-abstraction".to_string()];
         let config = BoundaryConfig {
             boundaries: vec![r],
+            crate_profiles: Vec::new(),
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -574,6 +601,7 @@ mod tests {
         r.forbidden = vec!["db".to_string()]; // "db" isn't a workspace crate
         let config = BoundaryConfig {
             boundaries: vec![r],
+            crate_profiles: Vec::new(),
         };
 
         let err = evaluate(&workspace, &config).unwrap_err();
@@ -593,6 +621,7 @@ mod tests {
         r.allow_empty = true;
         let config = BoundaryConfig {
             boundaries: vec![r],
+            crate_profiles: Vec::new(),
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -717,5 +746,27 @@ allow_empty = false
         );
         assert_eq!(config.boundaries[1].reach, Reach::Direct);
         assert!(!config.boundaries[1].allow_empty);
+    }
+
+    #[test]
+    fn toml_from_str_round_trips_crate_profiles() {
+        let source = r#"
+[[crate_profile]]
+name = "lenient"
+crates = ["parser"]
+deduction_multiplier = 0.5
+
+[[crate_profile]]
+name = "strict"
+crates = ["cli"]
+"#;
+        let config: BoundaryConfig = toml::from_str(source).unwrap();
+
+        assert_eq!(config.crate_profiles.len(), 2);
+        assert_eq!(config.crate_profiles[0].name, "lenient");
+        assert_eq!(config.crate_profiles[0].crates, vec!["parser".to_string()]);
+        assert_eq!(config.crate_profiles[0].deduction_multiplier, 0.5);
+        // Missing `deduction_multiplier` defaults to 1.0.
+        assert_eq!(config.crate_profiles[1].deduction_multiplier, 1.0);
     }
 }

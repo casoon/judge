@@ -9,6 +9,7 @@ pub mod finding;
 mod functions;
 pub mod gate;
 pub mod git;
+pub mod health_score;
 pub mod ingest;
 pub mod ownership;
 pub mod slop;

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::finding::{Finding, Origin};
+use crate::finding::{Finding, Origin, Severity};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -23,6 +23,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 pub struct BaselineFinding {
     pub id: String,
     pub rule: String,
+    pub severity: Severity,
     pub origin: Origin,
     pub file: PathBuf,
 }
@@ -37,21 +38,33 @@ pub struct Baseline {
     pub commit: String,
     /// Revision of every rule active when this baseline was saved.
     pub rule_revisions: HashMap<String, u32>,
+    /// Authored lines of code analyzed when this baseline was saved (see
+    /// [`crate::health_score`]) — lets a later run compute the historical
+    /// score density this baseline represents, not just its raw finding
+    /// count.
+    pub total_loc: usize,
     pub findings: Vec<BaselineFinding>,
 }
 
 impl Baseline {
-    pub fn new(findings: &[Finding], commit: String, rule_revisions: HashMap<String, u32>) -> Self {
+    pub fn new(
+        findings: &[Finding],
+        commit: String,
+        rule_revisions: HashMap<String, u32>,
+        total_loc: usize,
+    ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             judge_version: env!("CARGO_PKG_VERSION").to_string(),
             commit,
             rule_revisions,
+            total_loc,
             findings: findings
                 .iter()
                 .map(|finding| BaselineFinding {
                     id: finding.id.clone(),
                     rule: finding.rule.clone(),
+                    severity: finding.severity,
                     origin: finding.origin,
                     file: finding.location.file.clone(),
                 })
@@ -227,6 +240,7 @@ mod tests {
             findings,
             "abc123".to_string(),
             HashMap::from([("duplicate-code".to_string(), 1)]),
+            1000,
         )
     }
 

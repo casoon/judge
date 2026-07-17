@@ -367,6 +367,7 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
                 compare_path: baseline.as_deref(),
                 default_save_path: Path::new(DEFAULT_BASELINE_ALL),
                 format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
             },
         );
         return;
@@ -421,6 +422,9 @@ struct BaselineOptions<'a> {
     compare_path: Option<&'a Path>,
     default_save_path: &'a Path,
     format: OutputFormat,
+    /// Authored LOC analyzed this run (see `judge::health_score`) — stored on
+    /// a saved baseline so a later run can recompute its historical score.
+    total_loc: usize,
 }
 
 fn handle_baseline(
@@ -435,6 +439,7 @@ fn handle_baseline(
         compare_path,
         default_save_path,
         format,
+        total_loc,
     } = options;
     let mut findings = findings.to_vec();
     judge::finding::relativize_paths(&mut findings, workspace_root);
@@ -463,7 +468,7 @@ fn handle_baseline(
                 std::process::exit(2);
             }
         };
-        let baseline = judge::baseline::Baseline::new(&findings, commit, rule_revisions);
+        let baseline = judge::baseline::Baseline::new(&findings, commit, rule_revisions, total_loc);
         let save_path = workspace_root.join(default_save_path);
         match judge::baseline::save(&save_path, &baseline) {
             Ok(()) => println!(
@@ -601,6 +606,7 @@ fn run_dupes(
                 compare_path: baseline.as_deref(),
                 default_save_path: Path::new(DEFAULT_BASELINE_DUPES),
                 format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
             },
         );
         return;
@@ -679,6 +685,7 @@ fn run_deps(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>
                 compare_path: baseline.as_deref(),
                 default_save_path: Path::new(DEFAULT_BASELINE_DEPS),
                 format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
             },
         );
         return;
@@ -801,6 +808,7 @@ fn run_boundaries(
                 compare_path: baseline.as_deref(),
                 default_save_path: Path::new(DEFAULT_BASELINE_BOUNDARIES),
                 format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
             },
         );
         return;
@@ -866,6 +874,7 @@ fn run_distribution(format: OutputFormat, save_baseline: bool, baseline: Option<
                 compare_path: baseline.as_deref(),
                 default_save_path: Path::new(DEFAULT_BASELINE_DISTRIBUTION),
                 format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
             },
         );
         return;
@@ -955,6 +964,20 @@ fn run_health(
     findings.extend(slop.findings);
 
     let excluded_generated = report.excluded_generated + slop.excluded_generated;
+    let total_loc = judge::health_score::total_authored_loc(&workspace);
+
+    // Print the score trend before `handle_baseline` runs below, since a
+    // failing verdict there exits the process before reaching any code after
+    // it (see todo.md §4 point 4, "Trend vor Absolutwert" — the score is
+    // never shown without this). TTY only, matching the current-score
+    // display further down.
+    if show_score
+        && !save_baseline
+        && matches!(format, OutputFormat::Tty)
+        && let Some(path) = &baseline
+    {
+        print_score_trend(&workspace, &findings, total_loc, path);
+    }
 
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([
@@ -989,6 +1012,7 @@ fn run_health(
                 compare_path: baseline.as_deref(),
                 default_save_path: Path::new(DEFAULT_BASELINE_HEALTH),
                 format,
+                total_loc,
             },
         );
         return;
@@ -1035,12 +1059,82 @@ fn run_health(
 
             if show_score {
                 println!();
+                let config = load_judge_toml(&workspace.root);
+                let score = judge::health_score::compute(
+                    &findings,
+                    total_loc,
+                    &workspace,
+                    &config.crate_profiles,
+                );
                 println!(
-                    "health score: not implemented yet (needs baselines and crate-type profiles, see todo.md §4)"
+                    "health score: {:.1} ({}) — {} authored LOC, {} fail, {} warn",
+                    score.score,
+                    score.grade.label(),
+                    score.total_loc,
+                    score.fail_count,
+                    score.warn_count,
                 );
             }
         }
     }
+}
+
+/// Loads `judge.toml`'s `[[boundary]]`/`[[crate_profile]]` config, if
+/// present. Both are opt-in — a missing file is the default (empty) config,
+/// not an error.
+fn load_judge_toml(workspace_root: &Path) -> judge::boundaries::BoundaryConfig {
+    let config_path = workspace_root.join("judge.toml");
+    if !config_path.exists() {
+        return judge::boundaries::BoundaryConfig::default();
+    }
+    let config_text = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("error: {}: {err}", config_path.display());
+            std::process::exit(2);
+        }
+    };
+    match toml::from_str(&config_text) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("error: {}: failed to parse: {err}", config_path.display());
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Prints the current health score alongside the score a saved baseline
+/// represents (see todo.md §4 point 4, "Trend vor Absolutwert").
+fn print_score_trend(
+    workspace: &judge::ingest::Workspace,
+    findings: &[Finding],
+    total_loc: usize,
+    baseline_path: &Path,
+) {
+    let baseline = match judge::baseline::load(baseline_path) {
+        Ok(baseline) => baseline,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+    };
+    let config = load_judge_toml(&workspace.root);
+    let current = judge::health_score::compute(findings, total_loc, workspace, &config.crate_profiles);
+    let baseline_score = judge::health_score::baseline_score(&baseline);
+    let trend = judge::health_score::Trend {
+        current,
+        baseline_score: baseline_score.score,
+        baseline_grade: baseline_score.grade,
+    };
+
+    println!(
+        "health score: {:.1} ({}) — {:+.1} since baseline ({:.1} {})",
+        trend.current.score,
+        trend.current.grade.label(),
+        trend.delta(),
+        trend.baseline_score,
+        trend.baseline_grade.label(),
+    );
 }
 
 /// Hotspot = complexity × change frequency (see todo.md §3.E). Files with no
