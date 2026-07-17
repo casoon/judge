@@ -184,6 +184,43 @@ pub fn head_commit(repo_root: &Path) -> Result<String, GitError> {
     Ok(head_id.to_string())
 }
 
+/// Resolves `spec` (a commit-ish — branch, tag, or short/long sha) to its
+/// full hex object id (see `audit --since`, todo.md §5).
+pub fn resolve_commit(repo_root: &Path, spec: &str) -> Result<String, GitError> {
+    let repo = gix::open(repo_root)?;
+    let id = repo
+        .rev_parse_single(spec)
+        .map_err(|err| GitError::RevParse(spec.to_string(), err.to_string()))?;
+    Ok(id.to_string())
+}
+
+/// Whether `ancestor` is reachable from `descendant` — i.e. `descendant`'s
+/// history contains `ancestor` (equal commits count as ancestors of
+/// themselves). Used to guard `audit --since` against a saved baseline that
+/// has diverged from the requested `<ref>` (see todo.md §5): a genuinely
+/// diverged baseline must not silently produce a misleading delta.
+pub fn is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+    let repo = gix::open(repo_root)?;
+    let ancestor_id = repo
+        .rev_parse_single(ancestor)
+        .map_err(|err| GitError::RevParse(ancestor.to_string(), err.to_string()))?
+        .detach();
+    let descendant_id = repo
+        .rev_parse_single(descendant)
+        .map_err(|err| GitError::RevParse(descendant.to_string(), err.to_string()))?
+        .detach();
+
+    if ancestor_id == descendant_id {
+        return Ok(true);
+    }
+
+    match repo.merge_base(ancestor_id, descendant_id) {
+        Ok(base) => Ok(base.detach() == ancestor_id),
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
+        Err(err) => Err(GitError::Walk(err.to_string())),
+    }
+}
+
 /// Files that differ between `since_commit` and the current checkout,
 /// relative to `repo_root`. This includes committed changes through `HEAD`,
 /// staged changes, unstaged changes, and untracked files.
@@ -581,5 +618,77 @@ mod tests {
 
         let authors = active_authors_since(&dir, DEFAULT_WINDOW_DAYS).unwrap();
         assert!(authors.is_empty());
+    }
+
+    #[test]
+    fn resolve_commit_matches_git_rev_parse() {
+        let dir = TempDir::new("git-resolve-commit");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        assert_eq!(
+            resolve_commit(&dir, "HEAD").unwrap(),
+            commit_sha(&dir, "HEAD")
+        );
+    }
+
+    #[test]
+    fn is_ancestor_is_true_for_a_direct_ancestor() {
+        let dir = TempDir::new("git-is-ancestor-true");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        let base = commit_sha(&dir, "HEAD");
+
+        std::fs::write(dir.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "second"]);
+        let head = commit_sha(&dir, "HEAD");
+
+        assert!(is_ancestor(&dir, &base, &head).unwrap());
+        assert!(!is_ancestor(&dir, &head, &base).unwrap());
+    }
+
+    #[test]
+    fn is_ancestor_is_true_for_the_same_commit() {
+        let dir = TempDir::new("git-is-ancestor-same");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        let head = commit_sha(&dir, "HEAD");
+
+        assert!(is_ancestor(&dir, &head, &head).unwrap());
+    }
+
+    #[test]
+    fn is_ancestor_is_false_for_a_diverged_branch() {
+        let dir = TempDir::new("git-is-ancestor-diverged");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        let base = commit_sha(&dir, "HEAD");
+
+        git(&dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("feature.rs"), "fn feature() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "feature work"]);
+        let feature = commit_sha(&dir, "HEAD");
+
+        git(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join("main.rs"), "fn main_work() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "main work"]);
+        let main_tip = commit_sha(&dir, "HEAD");
+
+        assert!(!is_ancestor(&dir, &main_tip, &feature).unwrap());
+        assert!(!is_ancestor(&dir, &feature, &main_tip).unwrap());
+        // Both still share `base` as a common ancestor.
+        assert!(is_ancestor(&dir, &base, &main_tip).unwrap());
+        assert!(is_ancestor(&dir, &base, &feature).unwrap());
     }
 }

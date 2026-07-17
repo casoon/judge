@@ -60,6 +60,10 @@ pub struct DeclaredDependency {
     /// dependency.
     pub target: Option<String>,
     pub features: Vec<String>,
+    /// The dependency's version requirement, as declared (e.g. `"^1.0"`).
+    /// Used by `phantom-version` (see todo.md §14.2 G5) to check whether any
+    /// published, non-yanked version on crates.io satisfies it.
+    pub version_req: String,
 }
 
 /// Where a source file came from (see todo.md §3.A "Generated-Code-Policy").
@@ -243,6 +247,7 @@ pub fn load(manifest_path: Option<&Path>) -> Result<Workspace, IngestError> {
                     code_identifier,
                     target: dep.target.as_ref().map(ToString::to_string),
                     features: dep.features.clone(),
+                    version_req: dep.req.to_string(),
                 }
             })
             .collect();

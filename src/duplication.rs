@@ -100,7 +100,12 @@ impl CloneMember {
             },
             confidence: 1.0,
             origin: Origin::Code,
-            evidence: None,
+            // Carries the span's token count through to a `Finding` so a
+            // ratio gate (e.g. `audit --since`'s duplication gate, see
+            // todo.md §6) can use duplicated-token density as its numerator
+            // instead of a raw finding count, once findings have been
+            // diffed against a baseline and only the `Finding` survives.
+            evidence: Some(serde_json::json!({ "token_count": self.token_count })),
             caused_by: Vec::new(),
             causes: Vec::new(),
         }

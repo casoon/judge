@@ -196,6 +196,18 @@ pub enum Verdict {
     Fail,
 }
 
+/// A three-way verdict distinguishing `Warn` from `Fail` among
+/// `code_introduced` findings, instead of collapsing both into `Fail` like
+/// [`Delta::verdict`] does. Used by `audit --since` (see todo.md §6), which
+/// reports on `Warn`-severity findings rather than hard-failing on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TriVerdict {
+    Pass,
+    Warn,
+    Fail,
+}
+
 impl Delta {
     /// Only actionable (`Warn`/`Fail`) code-introduced findings can fail the
     /// verdict. `Info` findings remain visible in the delta but are explicitly
@@ -209,6 +221,24 @@ impl Delta {
             Verdict::Pass
         } else {
             Verdict::Fail
+        }
+    }
+
+    /// Like [`Delta::verdict`], but keeps `Warn` and `Fail` distinct instead
+    /// of collapsing both into `Fail` (see [`TriVerdict`]).
+    pub fn tri_verdict(&self) -> TriVerdict {
+        let mut has_warn = false;
+        for finding in &self.code_introduced {
+            match finding.severity {
+                crate::finding::Severity::Fail => return TriVerdict::Fail,
+                crate::finding::Severity::Warn => has_warn = true,
+                crate::finding::Severity::Info => {}
+            }
+        }
+        if has_warn {
+            TriVerdict::Warn
+        } else {
+            TriVerdict::Pass
         }
     }
 }
@@ -348,5 +378,45 @@ mod tests {
 
         assert_eq!(delta.code_introduced.len(), 1);
         assert_eq!(delta.verdict(), Verdict::Pass);
+    }
+
+    #[test]
+    fn tri_verdict_is_warn_for_warn_only_code_introduced_findings() {
+        let baseline = baseline_with(&[]);
+        let current = [finding("new", "src/a.rs")];
+        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
+
+        let delta = diff(&current, &baseline, &touched, &current_revisions());
+
+        assert_eq!(delta.tri_verdict(), TriVerdict::Warn);
+    }
+
+    #[test]
+    fn tri_verdict_is_fail_when_any_code_introduced_finding_fails() {
+        let baseline = baseline_with(&[]);
+        let mut fail = finding("fail", "src/a.rs");
+        fail.severity = Severity::Fail;
+        let warn = finding("warn", "src/a.rs");
+        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
+
+        let delta = diff(&[fail, warn], &baseline, &touched, &current_revisions());
+
+        assert_eq!(delta.tri_verdict(), TriVerdict::Fail);
+    }
+
+    #[test]
+    fn tri_verdict_is_pass_for_empty_or_info_only_code_introduced_findings() {
+        let baseline = baseline_with(&[]);
+        assert_eq!(
+            diff(&[], &baseline, &HashSet::new(), &current_revisions()).tri_verdict(),
+            TriVerdict::Pass
+        );
+
+        let mut info = finding("info", "src/a.rs");
+        info.severity = Severity::Info;
+        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
+        let delta = diff(&[info], &baseline, &touched, &current_revisions());
+
+        assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
     }
 }

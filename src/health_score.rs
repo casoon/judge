@@ -16,7 +16,8 @@
 //!    a saved baseline's stored findings, so the score is never shown
 //!    without its delta.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -77,7 +78,12 @@ pub struct HealthScore {
     pub deduction: f64,
 }
 
-fn score_from(fail_count: usize, warn_count: usize, deduction: f64, total_loc: usize) -> HealthScore {
+fn score_from(
+    fail_count: usize,
+    warn_count: usize,
+    deduction: f64,
+    total_loc: usize,
+) -> HealthScore {
     let density_deduction = if total_loc == 0 {
         0.0
     } else {
@@ -104,6 +110,26 @@ pub fn total_authored_loc(workspace: &Workspace) -> usize {
         .iter()
         .flat_map(|krate| krate.source_files.iter())
         .filter(|file| file.kind.is_locally_reportable())
+        .filter_map(|file| std::fs::read_to_string(&file.path).ok())
+        .map(|content| content.lines().count())
+        .sum()
+}
+
+/// Like [`total_authored_loc`], but scoped to `files` (repository-root
+/// relative paths — see [`crate::git::changed_files_since`]) — the LOC
+/// denominator for a ratio gate judged against only what changed (see
+/// `audit --since`, todo.md §6), not the whole workspace total.
+pub fn authored_loc_in(workspace: &Workspace, files: &HashSet<PathBuf>) -> usize {
+    workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter())
+        .filter(|file| file.kind.is_locally_reportable())
+        .filter(|file| {
+            file.path
+                .strip_prefix(&workspace.root)
+                .is_ok_and(|relative| files.contains(relative))
+        })
         .filter_map(|file| std::fs::read_to_string(&file.path).ok())
         .map(|content| content.lines().count())
         .sum()
@@ -305,6 +331,41 @@ mod tests {
         let score = compute(&findings, 0, &workspace, &[]);
 
         assert_eq!(score.score, 100.0);
+    }
+
+    #[test]
+    fn authored_loc_in_counts_only_the_given_files() {
+        let dir = crate::test_util::TempDir::new("health-score-authored-loc-in");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.rs"), "fn a() {}\nfn a2() {}\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "fn b() {}\n").unwrap();
+
+        let workspace = Workspace {
+            root: dir.to_path_buf(),
+            crates: vec![CrateInfo {
+                name: "fixture".to_string(),
+                version: "0.1.0".to_string(),
+                manifest_path: dir.join("Cargo.toml"),
+                root: dir.to_path_buf(),
+                source_files: vec![
+                    SourceFile {
+                        path: dir.join("src/a.rs"),
+                        kind: SourceKind::Authored,
+                    },
+                    SourceFile {
+                        path: dir.join("src/b.rs"),
+                        kind: SourceKind::Authored,
+                    },
+                ],
+                entry_points: Vec::new(),
+                dependencies: Vec::new(),
+            }],
+        };
+
+        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
+        let loc = authored_loc_in(&workspace, &touched);
+
+        assert_eq!(loc, 2);
     }
 
     #[test]

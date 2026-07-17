@@ -1,30 +1,41 @@
 //! Fast-tier AI-slop signal detection (see todo.md §G "AI-Slop-Signale", §G1
-//! "Error-Masking"). Only the four `G1` rules that are detectable from syntax
-//! alone via `syn` are implemented here — `silent-default` and
-//! `context-free-propagation` need real type information (is this
+//! "Error-Masking", §G2 "Stub- und Theater-Code"). The four `G1` rules and
+//! five of the six `G2` rules that are detectable from syntax alone via
+//! `syn` are implemented here — `silent-default` and
+//! `context-free-propagation` (G1) need real type information (is this
 //! expression's type actually a `Result`? does this `?` really cross a
 //! meaningful module boundary?) that isn't available without a type checker
 //! (Deep Tier, not built yet), so they are intentionally not attempted.
+//! `mock-of-sut` (G2) is intentionally skipped too, for a different reason:
+//! there is no structural signal in Rust that identifies "the system under
+//! test" for a given test function, so this isn't solvable syntactically —
+//! and it isn't solvable with type information either, since it requires
+//! knowing test *intent*, not types.
 //!
 //! Per todo.md §12 "Entscheidungen": "Der Slop-Block ist Teil von `health`,
 //! kein eigener Sub-Command" — this module has no CLI command of its own;
 //! `cargo judge health` merges its findings into its own report.
 //!
-//! `suppression-debt` (new/current `#[allow(...)]`/`#[expect(...)]`) is
-//! emitted here as `Severity::Info` findings for the *current* state only —
-//! the "trend against baseline" that todo.md calls for is already handled by
-//! the existing baseline/delta system (see [`crate::baseline`]); this module
+//! `suppression-debt` and `ignored-test-accumulation` are emitted here as
+//! `Severity::Info` findings for the *current* state only — the "trend
+//! against baseline" that todo.md calls for is already handled by the
+//! existing baseline/delta system (see [`crate::baseline`]); this module
 //! just reports what exists today.
+//!
+//! `assertion-free-test` and `ignored-test-accumulation` only match the
+//! literal `#[test]`/`#[ignore]` attributes, not third-party test-framework
+//! attributes (`#[tokio::test]`, `#[rstest]`, ...) — accepted v1 scope.
 
 use std::path::{Path, PathBuf};
 
+use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Expr, GenericArgument, ImplItemFn, ItemFn, ItemImpl, ItemMod, ItemTrait, Local,
-    Pat, Path as SynPath, PathArguments, Stmt, Token, TraitItemFn, Type, TypeParamBound,
-    Visibility,
+    Arm, Attribute, Block, Expr, ExprLit, ExprMethodCall, GenericArgument, ImplItemFn, ItemFn,
+    ItemImpl, ItemMod, ItemTrait, Lit, Local, Macro, Meta, Pat, Path as SynPath, PathArguments,
+    ReturnType, Stmt, Token, TraitItemFn, Type, TypeParamBound, Visibility,
 };
 
 use crate::finding::{Finding, Location, Origin, Severity};
@@ -51,6 +62,30 @@ pub const CATCH_ALL_ERROR_RULE_REVISION: u32 = 1;
 /// "wichtigster Rust-Slop-Marker" per todo.md §G1.
 pub const SUPPRESSION_DEBT_RULE: &str = "suppression-debt";
 pub const SUPPRESSION_DEBT_RULE_REVISION: u32 = 1;
+
+/// Rule id for `todo!()`/`unimplemented!()` outside a `#[cfg(feature =
+/// ...)]`-gated scope (see todo.md §G2).
+pub const MERGED_STUB_RULE: &str = "merged-stub";
+pub const MERGED_STUB_RULE_REVISION: u32 = 1;
+
+/// Rule id for a function/method/trait-default with a doc comment and a
+/// literally empty body (see todo.md §G2).
+pub const EMPTY_IMPL_RULE: &str = "empty-impl";
+pub const EMPTY_IMPL_RULE_REVISION: u32 = 1;
+
+/// Rule id for a `#[test]` fn (without `#[should_panic]`) whose body has no
+/// visible assertion path (see todo.md §G2).
+pub const ASSERTION_FREE_TEST_RULE: &str = "assertion-free-test";
+pub const ASSERTION_FREE_TEST_RULE_REVISION: u32 = 1;
+
+/// Rule id for `assert!(true)` / `assert_eq!(x, x)` (see todo.md §G2).
+pub const TAUTOLOGICAL_TEST_RULE: &str = "tautological-test";
+pub const TAUTOLOGICAL_TEST_RULE_REVISION: u32 = 1;
+
+/// Rule id for an `#[ignore]`/`#[ignore = "..."]` attribute occurrence (see
+/// todo.md §G2).
+pub const IGNORED_TEST_ACCUMULATION_RULE: &str = "ignored-test-accumulation";
+pub const IGNORED_TEST_ACCUMULATION_RULE_REVISION: u32 = 1;
 
 #[derive(Debug)]
 pub enum SlopError {
@@ -90,6 +125,7 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SlopError> {
         file: path,
         path: Vec::new(),
         findings: Vec::new(),
+        feature_gated_depth: 0,
     };
     visitor.visit_file(&ast);
     Ok(visitor.findings)
@@ -127,6 +163,10 @@ struct SlopVisitor<'a> {
     file: &'a Path,
     path: Vec<String>,
     findings: Vec<Finding>,
+    /// Depth of nesting inside a `#[cfg(feature = ...)]`-gated `mod`/`impl`/
+    /// `fn` — `merged-stub` doesn't flag `todo!()`/`unimplemented!()` while
+    /// this is non-zero (see [`has_feature_cfg`]).
+    feature_gated_depth: usize,
 }
 
 impl SlopVisitor<'_> {
@@ -148,6 +188,18 @@ impl SlopVisitor<'_> {
         confidence: f32,
         item_path: String,
     ) {
+        self.record_with_evidence(rule, span, severity, confidence, item_path, None);
+    }
+
+    fn record_with_evidence(
+        &mut self,
+        rule: &'static str,
+        span: proc_macro2::Span,
+        severity: Severity,
+        confidence: f32,
+        item_path: String,
+        evidence: Option<serde_json::Value>,
+    ) {
         let start = span.start();
         self.findings.push(Finding {
             id: format!(
@@ -165,7 +217,7 @@ impl SlopVisitor<'_> {
             },
             confidence,
             origin: Origin::Code,
-            evidence: None,
+            evidence,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });
@@ -189,10 +241,55 @@ impl SlopVisitor<'_> {
         let item_path = self.current_item_path();
         self.record(CATCH_ALL_ERROR_RULE, span, Severity::Warn, 0.9, item_path);
     }
+
+    /// A doc-commented function/method/trait-default with a literally empty
+    /// body (see todo.md §G2 `empty-impl`). Restricted to a *literally*
+    /// empty block deliberately — a one-liner like `{ Config::default() }`
+    /// never matches, since that's a legitimate (if terse) implementation,
+    /// not a stub.
+    fn check_empty_impl(&mut self, attrs: &[Attribute], block: &Block, span: proc_macro2::Span) {
+        if has_doc_comment(attrs) && block.stmts.is_empty() {
+            let item_path = self.current_item_path();
+            self.record(EMPTY_IMPL_RULE, span, Severity::Warn, 0.7, item_path);
+        }
+    }
+
+    /// A `#[test]` fn (without `#[should_panic]`) whose body has no visible
+    /// assertion path (see todo.md §G2 `assertion-free-test`).
+    fn check_assertion_free_test(&mut self, node: &ItemFn) {
+        if !node.attrs.iter().any(|attr| attr.path().is_ident("test"))
+            || node
+                .attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("should_panic"))
+        {
+            return;
+        }
+        let returns_result = returns_result_type(&node.sig.output);
+        let mut scanner = AssertionScanner {
+            found: false,
+            returns_result,
+        };
+        scanner.visit_block(&node.block);
+        if !scanner.found {
+            let item_path = self.current_item_path();
+            self.record(
+                ASSERTION_FREE_TEST_RULE,
+                node.span(),
+                Severity::Warn,
+                0.8,
+                item_path,
+            );
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     fn visit_item_mod(&mut self, node: &'ast ItemMod) {
+        let gated = has_feature_cfg(&node.attrs);
+        if gated {
+            self.feature_gated_depth += 1;
+        }
         if node.content.is_some() {
             self.path.push(node.ident.to_string());
             visit::visit_item_mod(self, node);
@@ -200,12 +297,22 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         } else {
             visit::visit_item_mod(self, node);
         }
+        if gated {
+            self.feature_gated_depth -= 1;
+        }
     }
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
+        let gated = has_feature_cfg(&node.attrs);
+        if gated {
+            self.feature_gated_depth += 1;
+        }
         self.path.push(type_name(&node.self_ty));
         visit::visit_item_impl(self, node);
         self.path.pop();
+        if gated {
+            self.feature_gated_depth -= 1;
+        }
     }
 
     fn visit_item_trait(&mut self, node: &'ast ItemTrait) {
@@ -217,19 +324,39 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.path.push(node.sig.ident.to_string());
         self.check_catch_all_error(&node.vis, &node.sig, node.span());
+        self.check_empty_impl(&node.attrs, &node.block, node.span());
+        self.check_assertion_free_test(node);
+        let gated = has_feature_cfg(&node.attrs);
+        if gated {
+            self.feature_gated_depth += 1;
+        }
         visit::visit_item_fn(self, node);
+        if gated {
+            self.feature_gated_depth -= 1;
+        }
         self.path.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         self.path.push(node.sig.ident.to_string());
         self.check_catch_all_error(&node.vis, &node.sig, node.span());
+        self.check_empty_impl(&node.attrs, &node.block, node.span());
+        let gated = has_feature_cfg(&node.attrs);
+        if gated {
+            self.feature_gated_depth += 1;
+        }
         visit::visit_impl_item_fn(self, node);
+        if gated {
+            self.feature_gated_depth -= 1;
+        }
         self.path.pop();
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast TraitItemFn) {
         self.path.push(node.sig.ident.to_string());
+        if let Some(default) = &node.default {
+            self.check_empty_impl(&node.attrs, default, node.span());
+        }
         visit::visit_trait_item_fn(self, node);
         self.path.pop();
     }
@@ -311,7 +438,9 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     }
 
     /// Every `#[allow(...)]`/`#[expect(...)]` attribute, anywhere (see
-    /// todo.md §G1 `suppression-debt`).
+    /// todo.md §G1 `suppression-debt`), and every `#[ignore]`/`#[ignore =
+    /// "..."]` attribute, anywhere (see todo.md §G2
+    /// `ignored-test-accumulation`).
     fn visit_attribute(&mut self, attr: &'ast Attribute) {
         if attr.path().is_ident("allow") || attr.path().is_ident("expect") {
             let item_path = attr
@@ -333,8 +462,76 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 1.0,
                 item_path,
             );
+        } else if attr.path().is_ident("ignore") {
+            let reason = match &attr.meta {
+                Meta::NameValue(name_value) => match &name_value.value {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(reason),
+                        ..
+                    }) => Some(reason.value()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let item_path = self.current_item_path();
+            self.record_with_evidence(
+                IGNORED_TEST_ACCUMULATION_RULE,
+                attr.span(),
+                Severity::Info,
+                1.0,
+                item_path,
+                reason.map(|reason| serde_json::json!({ "reason": reason })),
+            );
         }
         visit::visit_attribute(self, attr);
+    }
+
+    /// `todo!()`/`unimplemented!()` outside a `#[cfg(feature = ...)]`-gated
+    /// scope (see todo.md §G2 `merged-stub`), and tautological `assert!`s
+    /// (see todo.md §G2 `tautological-test`).
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        if (mac.path.is_ident("todo") || mac.path.is_ident("unimplemented"))
+            && self.feature_gated_depth == 0
+        {
+            let item_path = self.current_item_path();
+            self.record(MERGED_STUB_RULE, mac.span(), Severity::Warn, 0.9, item_path);
+        } else if mac.path.is_ident("assert") {
+            if let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                && let Some(Expr::Lit(ExprLit {
+                    lit: Lit::Bool(value),
+                    ..
+                })) = args.first()
+                && value.value
+            {
+                let item_path = self.current_item_path();
+                self.record(
+                    TAUTOLOGICAL_TEST_RULE,
+                    mac.span(),
+                    Severity::Warn,
+                    1.0,
+                    item_path,
+                );
+            }
+        } else if mac.path.is_ident("assert_eq")
+            && let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+            && let (Some(lhs), Some(rhs)) = (args.first(), args.get(1))
+            // Token-string comparison, not `Expr: PartialEq` (`syn`'s
+            // `extra-traits` feature isn't enabled here). This is an
+            // accepted false-positive trap: two expressions with identical
+            // source text can still differ at runtime if they have side
+            // effects, hence the lower confidence.
+            && quote!(#lhs).to_string() == quote!(#rhs).to_string()
+        {
+            let item_path = self.current_item_path();
+            self.record(
+                TAUTOLOGICAL_TEST_RULE,
+                mac.span(),
+                Severity::Warn,
+                0.7,
+                item_path,
+            );
+        }
+        visit::visit_macro(self, mac);
     }
 }
 
@@ -425,6 +622,90 @@ fn is_error_trait_object(trait_object: &syn::TypeTraitObject) -> bool {
             false
         }
     })
+}
+
+/// Whether any attribute in `attrs` is a `#[doc = ...]` (covers both `///`
+/// doc comments and explicit `#[doc]` attributes — `syn` desugars both the
+/// same way).
+fn has_doc_comment(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("doc"))
+}
+
+/// Whether any attribute in `attrs` is a `#[cfg(...)]` whose contents
+/// mention `feature` (see todo.md §G2 `merged-stub`). Only recognizes
+/// `cfg(feature = ...)`, not `cfg(test)` — a `todo!()` inside `#[cfg(test)]`
+/// is still flagged, matching the literal "Nicht-Feature-Branches" wording.
+fn has_feature_cfg(attrs: &[Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("cfg") && quote!(#attr).to_string().contains("feature"))
+}
+
+/// Whether a fn's return type's last path segment is `Result` (mirrors how
+/// [`contains_catch_all_error`] inspects types, but shallow — no need to
+/// recurse into generic arguments here).
+fn returns_result_type(output: &ReturnType) -> bool {
+    let ReturnType::Type(_, ty) = output else {
+        return false;
+    };
+    let Type::Path(type_path) = ty.as_ref() else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "Result")
+}
+
+/// Nested scanner run over a `#[test]` fn's body to find a visible assertion
+/// path (see todo.md §G2 `assertion-free-test`). Recurses into closures like
+/// any other `Visit` implementation, so an assert-free closure body still
+/// counts as "no assertion found" rather than being skipped.
+struct AssertionScanner {
+    found: bool,
+    /// Whether the enclosing fn's return type is `Result<..>` — a bare `?`
+    /// only counts as "the assertion" when the fn can actually propagate an
+    /// `Err` out as a test failure.
+    returns_result: bool,
+}
+
+impl<'ast> Visit<'ast> for AssertionScanner {
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        const ASSERT_MACROS: [&str; 8] = [
+            "assert",
+            "assert_eq",
+            "assert_ne",
+            "debug_assert",
+            "debug_assert_eq",
+            "debug_assert_ne",
+            "panic",
+            "unreachable",
+        ];
+        if ASSERT_MACROS.iter().any(|name| mac.path.is_ident(name)) {
+            self.found = true;
+        }
+        visit::visit_macro(self, mac);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        if matches!(
+            node.method.to_string().as_str(),
+            "unwrap" | "expect" | "unwrap_err" | "expect_err"
+        ) {
+            self.found = true;
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Try(_) = expr
+            && self.returns_result
+        {
+            self.found = true;
+        }
+        visit::visit_expr(self, expr);
+    }
 }
 
 #[cfg(test)]
@@ -641,5 +922,213 @@ fn f(r: Result<i32, ()>) {
 
         assert_eq!(report.errors.len(), 1);
         assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn ignored_test_is_flagged() {
+        let findings = findings_for(
+            "#[test]\n#[ignore]\nfn f() { assert_eq!(1 + 1, 2); }\n",
+            "slop-ignored-test",
+        );
+        let hits = rule_findings(&findings, IGNORED_TEST_ACCUMULATION_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Info);
+        assert_eq!(hits[0].confidence, 1.0);
+        assert_eq!(hits[0].evidence, None);
+    }
+
+    #[test]
+    fn ignored_test_with_reason_captures_evidence() {
+        let findings = findings_for(
+            "#[test]\n#[ignore = \"slow\"]\nfn f() { assert_eq!(1 + 1, 2); }\n",
+            "slop-ignored-test-reason",
+        );
+        let hits = rule_findings(&findings, IGNORED_TEST_ACCUMULATION_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].evidence,
+            Some(serde_json::json!({ "reason": "slow" }))
+        );
+    }
+
+    #[test]
+    fn test_without_ignore_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { assert_eq!(1 + 1, 2); }\n",
+            "slop-not-ignored-test",
+        );
+        assert!(rule_findings(&findings, IGNORED_TEST_ACCUMULATION_RULE).is_empty());
+    }
+
+    #[test]
+    fn assert_true_is_flagged() {
+        let findings = findings_for("fn f() { assert!(true); }\n", "slop-assert-true");
+        let hits = rule_findings(&findings, TAUTOLOGICAL_TEST_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 1.0);
+    }
+
+    #[test]
+    fn assert_condition_is_not_flagged() {
+        let findings = findings_for(
+            "fn f() { assert!(condition()); }\nfn condition() -> bool { true }\n",
+            "slop-assert-condition",
+        );
+        assert!(rule_findings(&findings, TAUTOLOGICAL_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn assert_eq_same_expr_is_flagged() {
+        let findings = findings_for(
+            "fn f(x: i32) { assert_eq!(x, x); }\n",
+            "slop-assert-eq-same",
+        );
+        let hits = rule_findings(&findings, TAUTOLOGICAL_TEST_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 0.7);
+    }
+
+    #[test]
+    fn assert_eq_different_exprs_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(a: i32, b: i32) { assert_eq!(a, b); }\n",
+            "slop-assert-eq-different",
+        );
+        assert!(rule_findings(&findings, TAUTOLOGICAL_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn doc_commented_empty_fn_is_flagged() {
+        let findings = findings_for("/// Does nothing yet.\nfn f() {}\n", "slop-empty-impl-fn");
+        let hits = rule_findings(&findings, EMPTY_IMPL_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Warn);
+        assert_eq!(hits[0].confidence, 0.7);
+    }
+
+    #[test]
+    fn doc_commented_nonempty_fn_is_not_flagged() {
+        let findings = findings_for(
+            "/// Returns a default.\nfn f() -> i32 { some_default() }\nfn some_default() -> i32 { 1 }\n",
+            "slop-empty-impl-nonempty",
+        );
+        assert!(rule_findings(&findings, EMPTY_IMPL_RULE).is_empty());
+    }
+
+    #[test]
+    fn empty_fn_without_doc_comment_is_not_flagged() {
+        let findings = findings_for("fn f() {}\n", "slop-empty-impl-no-doc");
+        assert!(rule_findings(&findings, EMPTY_IMPL_RULE).is_empty());
+    }
+
+    #[test]
+    fn doc_commented_empty_impl_method_is_flagged() {
+        let findings = findings_for(
+            "struct S;\nimpl S {\n    /// Does nothing yet.\n    fn f(&self) {}\n}\n",
+            "slop-empty-impl-method",
+        );
+        let hits = rule_findings(&findings, EMPTY_IMPL_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn doc_commented_empty_trait_default_is_flagged() {
+        let findings = findings_for(
+            "trait T {\n    /// Does nothing yet.\n    fn f(&self) {}\n}\n",
+            "slop-empty-impl-trait-default",
+        );
+        let hits = rule_findings(&findings, EMPTY_IMPL_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn todo_macro_is_flagged() {
+        let findings = findings_for("fn f() { todo!() }\n", "slop-merged-stub-todo");
+        let hits = rule_findings(&findings, MERGED_STUB_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 0.9);
+    }
+
+    #[test]
+    fn unimplemented_macro_is_flagged() {
+        let findings = findings_for(
+            "fn f() { unimplemented!() }\n",
+            "slop-merged-stub-unimplemented",
+        );
+        assert_eq!(rule_findings(&findings, MERGED_STUB_RULE).len(), 1);
+    }
+
+    #[test]
+    fn feature_gated_fn_todo_is_not_flagged() {
+        let findings = findings_for(
+            "#[cfg(feature = \"wip\")]\nfn f() { todo!() }\n",
+            "slop-merged-stub-gated-fn",
+        );
+        assert!(rule_findings(&findings, MERGED_STUB_RULE).is_empty());
+    }
+
+    #[test]
+    fn feature_gated_mod_todo_is_not_flagged() {
+        let findings = findings_for(
+            "#[cfg(feature = \"wip\")]\nmod m {\n    fn f() { todo!() }\n}\n",
+            "slop-merged-stub-gated-mod",
+        );
+        assert!(rule_findings(&findings, MERGED_STUB_RULE).is_empty());
+    }
+
+    #[test]
+    fn test_without_assertion_is_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { let x = 1 + 1; }\n",
+            "slop-assertion-free-test",
+        );
+        let hits = rule_findings(&findings, ASSERTION_FREE_TEST_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 0.8);
+    }
+
+    #[test]
+    fn test_with_assert_eq_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { assert_eq!(1 + 1, 2); }\n",
+            "slop-assertion-free-with-assert",
+        );
+        assert!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn test_with_unwrap_only_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { let x: Option<i32> = Some(1); x.unwrap(); }\n",
+            "slop-assertion-free-unwrap",
+        );
+        assert!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn test_returning_result_with_try_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() -> Result<(), String> { might_fail()?; Ok(()) }\nfn might_fail() -> Result<(), String> { Ok(()) }\n",
+            "slop-assertion-free-try",
+        );
+        assert!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn should_panic_test_without_assertion_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\n#[should_panic]\nfn f() { let x = 1 + 1; }\n",
+            "slop-assertion-free-should-panic",
+        );
+        assert!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn test_with_assert_free_closure_is_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { let closure = || { let y = 1 + 1; }; closure(); }\n",
+            "slop-assertion-free-closure",
+        );
+        assert_eq!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).len(), 1);
     }
 }

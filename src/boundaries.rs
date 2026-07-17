@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::finding::{Finding, Location, Origin, Severity};
 use crate::ingest::Workspace;
+use crate::slopsquat::SlopsquatConfig;
 
 /// Rule id used for both forbidden-edge and missing-required violations (see
 /// todo.md §14.2 P1/P2 bullet 1).
@@ -84,13 +85,18 @@ impl CrateProfile {
     }
 }
 
-/// The `judge.toml` `[[boundary]]` and `[[crate_profile]]` tables (see todo.md §8).
+/// The `judge.toml` `[[boundary]]`, `[[crate_profile]]`, and `[slopsquat]`
+/// tables (see todo.md §8). `[slopsquat]` lives here rather than in its own
+/// top-level config struct because this is already the one struct every
+/// `judge.toml` table deserializes into (see `main.rs`'s `load_judge_toml`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BoundaryConfig {
     #[serde(rename = "boundary", default)]
     pub boundaries: Vec<BoundaryRule>,
     #[serde(rename = "crate_profile", default)]
     pub crate_profiles: Vec<CrateProfile>,
+    #[serde(default)]
+    pub slopsquat: SlopsquatConfig,
 }
 
 /// A configuration error, distinct from a [`Finding`] — this means the rule
@@ -494,6 +500,7 @@ mod tests {
         let config = BoundaryConfig {
             boundaries: vec![r],
             crate_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -520,6 +527,7 @@ mod tests {
         let config = BoundaryConfig {
             boundaries: vec![r],
             crate_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -541,6 +549,7 @@ mod tests {
         let config = BoundaryConfig {
             boundaries: vec![r],
             crate_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -563,6 +572,7 @@ mod tests {
         let config = BoundaryConfig {
             boundaries: vec![r],
             crate_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -585,6 +595,7 @@ mod tests {
         let config = BoundaryConfig {
             boundaries: vec![r],
             crate_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let result = evaluate(&workspace, &config).unwrap();
@@ -605,6 +616,7 @@ mod tests {
         let config = BoundaryConfig {
             boundaries: vec![r],
             crate_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let err = evaluate(&workspace, &config).unwrap_err();
@@ -625,6 +637,7 @@ mod tests {
         let config = BoundaryConfig {
             boundaries: vec![r],
             crate_profiles: Vec::new(),
+            ..Default::default()
         };
 
         let result = evaluate(&workspace, &config).unwrap();
