@@ -61,6 +61,18 @@ cargo judge --baseline .judge/baseline.json
 cargo judge health --score     # health score (not implemented yet)
 ```
 
+## Provenance Attribution
+
+`cargo judge provenance` breaks churn, duplication, and suppression debt down
+by heuristically classified author class (commit trailers/markers like
+`Co-authored-by: Claude`, or a configured `[[provenance_label]]`). It is
+opt-in — not part of bare `cargo judge` — and always prints this caveat:
+
+> Provenance labels are a distribution trend, not a judgment on any single
+> commit or person. Trailers and metadata are incomplete and can be
+> manipulated; the heuristics are weak. Valid as a trend, not valid as a
+> gate. Using this to evaluate individual people is a misuse of this tool.
+
 ## Development
 
 ```bash

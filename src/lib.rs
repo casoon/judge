@@ -16,6 +16,7 @@ pub mod git;
 pub mod health_score;
 pub mod ingest;
 pub mod ownership;
+pub mod provenance;
 #[cfg(feature = "deep")]
 pub mod reachability;
 pub mod slop;

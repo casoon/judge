@@ -12,6 +12,7 @@ const DEFAULT_BASELINE_DEPS: &str = ".judge/baseline-deps.json";
 const DEFAULT_BASELINE_BOUNDARIES: &str = ".judge/baseline-boundaries.json";
 const DEFAULT_BASELINE_ALL: &str = ".judge/baseline.json";
 const DEFAULT_BASELINE_DISTRIBUTION: &str = ".judge/baseline-distribution.json";
+const DEFAULT_BASELINE_PROVENANCE: &str = ".judge/baseline-provenance.json";
 #[cfg(feature = "deep")]
 const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
@@ -121,6 +122,22 @@ enum Command {
     },
     /// Show ownership/bus-factor findings (see todo.md §3.E, §8).
     Distribution {
+        /// Output format.
+        #[arg(long, value_enum, default_value = "tty")]
+        format: OutputFormat,
+        /// Save the current findings as the baseline (see todo.md §5).
+        #[arg(long)]
+        save_baseline: bool,
+        /// Compare findings against a previously saved baseline.
+        #[arg(long, value_name = "PATH")]
+        baseline: Option<PathBuf>,
+    },
+    /// Show heuristic author-class breakdowns (churn, duplication rate,
+    /// suppression debt) from commit trailers/markers and optional
+    /// configured labels (see todo.md §3.G G6). A distribution trend, never
+    /// a per-commit or per-person judgement — see the printed caveat.
+    /// Subcommand-only: not part of bare `cargo judge`.
+    Provenance {
         /// Output format.
         #[arg(long, value_enum, default_value = "tty")]
         format: OutputFormat,
@@ -291,6 +308,11 @@ fn main() {
             save_baseline,
             baseline,
         }) => run_distribution(format, save_baseline, baseline),
+        Some(Command::Provenance {
+            format,
+            save_baseline,
+            baseline,
+        }) => run_provenance(format, save_baseline, baseline),
         Some(Command::DeadCode {
             include_tests,
             format,
@@ -1438,6 +1460,95 @@ fn run_distribution(format: OutputFormat, save_baseline: bool, baseline: Option<
                     "  [{severity}] {}  primary author: {}",
                     finding.location.file.display(),
                     finding.location.item_path
+                );
+            }
+        }
+    }
+}
+
+/// Heuristic author-class breakdowns of churn, duplication, and suppression
+/// debt (see todo.md §3.G G6). Subcommand-only: deliberately not wired into
+/// `collect_findings`/`run_all`/`SLOP_RULES`, matching `Distribution`/
+/// `DeadCode`'s own opt-in precedent. Reuses `git::DEFAULT_WINDOW_DAYS`, same
+/// as `run_distribution`.
+fn run_provenance(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>) {
+    let workspace = match judge::ingest::load(None) {
+        Ok(workspace) => workspace,
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+    };
+
+    let config = load_judge_toml(&workspace.root);
+
+    let breakdown = judge::provenance::analyze_workspace(
+        &workspace,
+        judge::git::DEFAULT_WINDOW_DAYS,
+        &config.provenance.labels,
+    );
+    let analysis_errors: Vec<String> = breakdown.errors.iter().map(ToString::to_string).collect();
+
+    if save_baseline || baseline.is_some() {
+        let rule_revisions = std::collections::HashMap::from([
+            (
+                judge::provenance::PROVENANCE_CHURN_RULE.to_string(),
+                judge::provenance::PROVENANCE_CHURN_RULE_REVISION,
+            ),
+            (
+                judge::provenance::PROVENANCE_DUPLICATION_RATE_RULE.to_string(),
+                judge::provenance::PROVENANCE_DUPLICATION_RATE_RULE_REVISION,
+            ),
+            (
+                judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE.to_string(),
+                judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE_REVISION,
+            ),
+        ]);
+        handle_baseline(
+            &workspace.root,
+            &breakdown.findings,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_PROVENANCE),
+                format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
+            },
+        );
+        return;
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let report = Report::with_errors(breakdown.findings, analysis_errors);
+            let mut envelope = serde_json::to_value(&report).unwrap();
+            envelope["caveat"] =
+                serde_json::Value::String(judge::provenance::PROVENANCE_CAVEAT.to_string());
+            println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+        }
+        OutputFormat::Tty => {
+            println!("{}", judge::provenance::PROVENANCE_CAVEAT);
+            println!();
+            if !analysis_errors.is_empty() {
+                println!("analysis errors: {}", analysis_errors.len());
+                for error in &analysis_errors {
+                    println!("  {error}");
+                }
+                println!();
+            }
+            println!(
+                "{:<24} {:>8} {:>12} {:>12}",
+                "class", "churn", "duplication", "suppression"
+            );
+            for summary in &breakdown.by_class {
+                println!(
+                    "{:<24} {:>8} {:>12} {:>12}",
+                    summary.class.key(),
+                    summary.churn,
+                    summary.duplication,
+                    summary.suppression_debt
                 );
             }
         }

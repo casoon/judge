@@ -106,6 +106,119 @@ pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>
     Ok(counts)
 }
 
+/// One commit's metadata needed for provenance classification (see
+/// `crate::provenance`, todo.md §3.G G6): author, timestamp, message
+/// trailers/text, and the files it touched.
+#[derive(Debug, Clone)]
+pub struct CommitInfo {
+    pub id: String,
+    pub author_email: String,
+    pub time: i64,
+    pub trailers: Vec<(String, String)>,
+    pub message_title: String,
+    pub message_body: String,
+    pub files_changed: Vec<PathBuf>,
+}
+
+/// Walks commits reachable from `HEAD` within `window_days` of now, in the
+/// same cutoff/tree-diff shape as [`churn`], but returning full per-commit
+/// metadata instead of a running file-touch count (see `crate::provenance`,
+/// todo.md §3.G G6). Same unborn-HEAD tolerance as [`churn`]: an empty
+/// `Vec`, not an error.
+pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo>, GitError> {
+    let repo = gix::open(repo_root)?;
+    let mut commits = Vec::new();
+
+    let Ok(head_id) = repo.head_id() else {
+        return Ok(commits);
+    };
+
+    let cutoff = now_unix_seconds() - window_days * 24 * 3600;
+
+    let walk = repo
+        .rev_walk(Some(head_id.detach()))
+        .all()
+        .map_err(|err| GitError::Walk(err.to_string()))?;
+
+    for info in walk {
+        let info = info.map_err(|err| GitError::Walk(err.to_string()))?;
+        let commit = info
+            .object()
+            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let commit_time = commit
+            .time()
+            .map_err(|err| GitError::Walk(err.to_string()))?
+            .seconds;
+        if commit_time < cutoff {
+            break;
+        }
+
+        let tree = commit
+            .tree()
+            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent_id) => parent_id
+                .object()
+                .map_err(|err| GitError::Walk(err.to_string()))?
+                .into_commit()
+                .tree()
+                .map_err(|err| GitError::Walk(err.to_string()))?,
+            None => repo.empty_tree(),
+        };
+
+        let mut files_changed = Vec::new();
+        parent_tree
+            .changes()
+            .map_err(|err| GitError::Walk(err.to_string()))?
+            .for_each_to_obtain_tree(&tree, |change| {
+                if let Some(path) = path_of(&change) {
+                    files_changed.push(path);
+                }
+                Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            })
+            .map_err(|err| GitError::Walk(err.to_string()))?;
+
+        let author = commit
+            .author()
+            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let author_email = author.email.to_str_lossy().trim().to_string();
+
+        let decoded = commit
+            .decode()
+            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let trailers = decoded
+            .attribution_trailers()
+            .map(|trailer| {
+                (
+                    trailer.token.to_str_lossy().into_owned(),
+                    trailer.value.to_str_lossy().into_owned(),
+                )
+            })
+            .collect();
+
+        let message = commit
+            .message()
+            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let message_title = message.title.to_str_lossy().trim().to_string();
+        let message_body = message
+            .body
+            .map(|body| body.to_str_lossy().trim().to_string())
+            .unwrap_or_default();
+
+        commits.push(CommitInfo {
+            id: commit.id.to_string(),
+            author_email,
+            time: commit_time,
+            trailers,
+            message_title,
+            message_body,
+            files_changed,
+        });
+    }
+
+    Ok(commits)
+}
+
 /// A file whose cyclomatic complexity and recent change frequency both stand
 /// out — `complexity × changes` (see todo.md §3.E, §4).
 #[derive(Debug, Clone)]
@@ -454,6 +567,85 @@ mod tests {
 
         assert_eq!(counts.get(&PathBuf::from("new.rs")), Some(&1));
         assert_eq!(counts.get(&PathBuf::from("old.rs")), None);
+    }
+
+    #[test]
+    fn walk_commits_parses_a_co_authored_by_trailer() {
+        let dir = TempDir::new("git-walk-commits-trailer");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "add a\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+            ],
+        );
+
+        let commits = walk_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].message_title, "add a");
+        assert_eq!(
+            commits[0].trailers,
+            vec![(
+                "Co-authored-by".to_string(),
+                "Claude <noreply@anthropic.com>".to_string()
+            )]
+        );
+        assert_eq!(commits[0].files_changed, vec![PathBuf::from("a.rs")]);
+    }
+
+    #[test]
+    fn walk_commits_returns_empty_trailers_for_a_plain_commit() {
+        let dir = TempDir::new("git-walk-commits-no-trailer");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add a"]);
+
+        let commits = walk_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].message_title, "add a");
+        assert!(commits[0].trailers.is_empty());
+    }
+
+    #[test]
+    fn walk_commits_ignores_commits_outside_the_window() {
+        let dir = TempDir::new("git-walk-commits-window");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let old_date = [
+            ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00"),
+            ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00"),
+        ];
+        std::fs::write(dir.join("old.rs"), "fn old() {}\n").unwrap();
+        run_git(&dir, &["add", "."], &[]);
+        run_git(&dir, &["commit", "-q", "-m", "ancient"], &old_date);
+
+        std::fs::write(dir.join("new.rs"), "fn new() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "recent"]);
+
+        let commits = walk_commits(&dir, 30).unwrap();
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].message_title, "recent");
+    }
+
+    #[test]
+    fn walk_commits_returns_empty_vec_for_repo_without_commits() {
+        let dir = TempDir::new("git-walk-commits-no-commits");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let commits = walk_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+        assert!(commits.is_empty());
     }
 
     fn function_info(file: PathBuf, cyclomatic: u32) -> FunctionInfo {

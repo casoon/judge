@@ -227,7 +227,7 @@ pub(crate) fn scan_comments(source: &str, item_spans: &[ItemSpan], file: &Path) 
 /// Near-certain AI-assistant framing leaking into a comment (see todo.md
 /// §3.G `conversational-artifact`). Fires regardless of where in the comment
 /// the phrase appears.
-const CONVERSATIONAL_TIER1: &[&str] = &[
+pub(crate) const CONVERSATIONAL_TIER1: &[&str] = &[
     "as an ai",
     "as an ai language model",
     "as a language model",
@@ -240,7 +240,7 @@ const CONVERSATIONAL_TIER1: &[&str] = &[
 /// first 8 whitespace-separated words of the comment — mitigates legitimate
 /// mid-sentence technical usage (e.g. "here is" showing up deep in an
 /// otherwise unremarkable explanation).
-const CONVERSATIONAL_TIER2: &[&str] = &[
+pub(crate) const CONVERSATIONAL_TIER2: &[&str] = &[
     "here is",
     "here's",
     "note that this is a simplified",

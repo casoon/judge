@@ -16,6 +16,26 @@ use crate::finding::{Finding, Location, Origin, Severity};
 use crate::ingest::Workspace;
 use crate::slopsquat::SlopsquatConfig;
 
+/// One user-configured `[[provenance_label]]` rule (see `crate::provenance`,
+/// todo.md §3.G G6): a trusted, explicitly-provided signal that wins outright
+/// over heuristic classification for any commit it matches.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvenanceLabel {
+    pub name: String,
+    #[serde(default)]
+    pub trailer_contains: Vec<String>,
+    #[serde(default)]
+    pub author_email_contains: Vec<String>,
+}
+
+/// The `judge.toml` `[[provenance_label]]` table (see `crate::provenance`,
+/// todo.md §3.G G6).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProvenanceConfig {
+    #[serde(rename = "provenance_label", default)]
+    pub labels: Vec<ProvenanceLabel>,
+}
+
 /// Rule id used for both forbidden-edge and missing-required violations (see
 /// todo.md §14.2 P1/P2 bullet 1).
 pub const BOUNDARY_VIOLATION_RULE: &str = "crate-boundary-violation";
@@ -97,6 +117,11 @@ pub struct BoundaryConfig {
     pub crate_profiles: Vec<CrateProfile>,
     #[serde(default)]
     pub slopsquat: SlopsquatConfig,
+    /// Flattened so `[[provenance_label]]` sits at the top level of
+    /// `judge.toml`, alongside `[[boundary]]`/`[[crate_profile]]`, rather
+    /// than nested under a `[provenance]` table.
+    #[serde(flatten)]
+    pub provenance: ProvenanceConfig,
 }
 
 /// A configuration error, distinct from a [`Finding`] — this means the rule
@@ -784,5 +809,33 @@ crates = ["cli"]
         assert_eq!(config.crate_profiles[0].deduction_multiplier, 0.5);
         // Missing `deduction_multiplier` defaults to 1.0.
         assert_eq!(config.crate_profiles[1].deduction_multiplier, 1.0);
+    }
+
+    #[test]
+    fn toml_from_str_round_trips_provenance_labels() {
+        let source = r#"
+[[provenance_label]]
+name = "contractor-x"
+trailer_contains = ["contractor-x@example.com"]
+author_email_contains = ["contractor-x@example.com"]
+
+[[provenance_label]]
+name = "internal-bot"
+trailer_contains = ["internal-ci-bot"]
+"#;
+        let config: BoundaryConfig = toml::from_str(source).unwrap();
+
+        assert_eq!(config.provenance.labels.len(), 2);
+        assert_eq!(config.provenance.labels[0].name, "contractor-x");
+        assert_eq!(
+            config.provenance.labels[0].trailer_contains,
+            vec!["contractor-x@example.com".to_string()]
+        );
+        assert_eq!(
+            config.provenance.labels[0].author_email_contains,
+            vec!["contractor-x@example.com".to_string()]
+        );
+        assert_eq!(config.provenance.labels[1].name, "internal-bot");
+        assert!(config.provenance.labels[1].author_email_contains.is_empty());
     }
 }
