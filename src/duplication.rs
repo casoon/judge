@@ -4,11 +4,20 @@
 //! body — a repeated chunk inside an otherwise unique function is detected
 //! too, at a granularity of `min_tokens` tokens.
 //!
-//! Two modes are implemented here (`weak`/`semantic` are not — see todo.md):
+//! Four modes are implemented here, from most to least literal (see
+//! [`DupeMode`] for the confidence each one gets):
 //! - [`DupeMode::Strict`]: byte-identical source for the matched span,
 //!   including whitespace and comments.
 //! - [`DupeMode::Mild`] (default): normalized token stream — whitespace and
 //!   comments between tokens are ignored, since tokenizing discards them.
+//! - [`DupeMode::Weak`]: like `Mild`, plus literal values are normalized to a
+//!   type-specific placeholder, so a span differing only in a literal's
+//!   value still matches.
+//! - [`DupeMode::Semantic`]: like `Weak`, plus bare local variable/parameter
+//!   identifiers are normalized to positional placeholders, so a
+//!   renamed-but-otherwise-identical clone still matches. See
+//!   [`assign_semantic_text`] for the identifier-role heuristic and its
+//!   known recall/precision limitations.
 //!
 //! ## Approach
 //!
@@ -52,6 +61,33 @@ pub const DUPLICATE_RULE_REVISION: u32 = 1;
 pub enum DupeMode {
     Strict,
     Mild,
+    /// Like [`DupeMode::Mild`], but literal values (`1`, `"x"`, `'c'`, `true`,
+    /// …) are normalized to a type-specific placeholder, so two spans that
+    /// differ only in a literal's value still match. Non-literal tokens are
+    /// compared exactly as in `Mild`. Confidence `0.85`.
+    Weak,
+    /// Like [`DupeMode::Weak`], plus bare local variable/parameter
+    /// identifiers are normalized to positional placeholders (`__ID_0__`,
+    /// `__ID_1__`, …) so a renamed-but-otherwise-identical clone still
+    /// matches. See [`assign_semantic_text`] for the identifier-role
+    /// heuristic and its known precision/recall limitations. Confidence
+    /// `0.55`.
+    Semantic,
+}
+
+/// Coarse literal category, used to pick a type-specific placeholder text at
+/// [`DupeMode::Weak`]/[`DupeMode::Semantic`] (see [`flatten_tokens`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiteralKind {
+    Str,
+    ByteStr,
+    Byte,
+    Char,
+    Int,
+    Float,
+    /// Anything `syn::Lit` doesn't recognize as one of the above — falls back
+    /// to a generic placeholder.
+    Verbatim,
 }
 
 /// Default minimum span length, in tokens. Chosen so a small multi-statement
@@ -76,13 +112,52 @@ pub struct CloneMember {
     /// token in the span, inclusive.
     pub end_token: usize,
     pub token_count: usize,
+    /// Mode this member was matched under; drives [`CloneMember::to_finding`]'s
+    /// confidence.
+    pub mode: DupeMode,
+    /// Deduplicated placeholder → original-identifier pairs, in
+    /// first-occurrence order, for identifiers positionally normalized
+    /// within this member's span. Only populated for [`DupeMode::Semantic`]
+    /// — empty for `Strict`/`Mild`/`Weak`.
+    pub identifier_mapping: Vec<(String, String)>,
+    /// Deduplicated literal-kind names (e.g. `"int"`, `"str"`) actually
+    /// normalized within this member's span. Only populated for
+    /// [`DupeMode::Weak`]/[`DupeMode::Semantic`] — empty for
+    /// `Strict`/`Mild`.
+    pub normalized_literal_kinds: Vec<String>,
 }
 
 impl CloneMember {
-    /// Renders this member as a [`Finding`]. Confidence is `1.0`: fast-tier
-    /// token matching is deterministic, not a heuristic guess (see todo.md
-    /// §7).
+    /// Renders this member as a [`Finding`]. Confidence reflects how
+    /// aggressively [`Self::mode`] normalized the matched tokens: `Strict`/
+    /// `Mild` are deterministic, exact-token matches (`1.0`); `Weak` and
+    /// `Semantic` are heuristic normalizations, so their confidence is lower
+    /// (`0.85`/`0.55` respectively — see todo.md §7).
     pub fn to_finding(&self) -> Finding {
+        let confidence = match self.mode {
+            DupeMode::Strict | DupeMode::Mild => 1.0,
+            DupeMode::Weak => 0.85,
+            DupeMode::Semantic => 0.55,
+        };
+        let mut evidence = serde_json::json!({ "token_count": self.token_count });
+        if !self.identifier_mapping.is_empty() {
+            let mapping: Vec<_> = self
+                .identifier_mapping
+                .iter()
+                .map(|(placeholder, identifier)| {
+                    serde_json::json!({ "placeholder": placeholder, "identifier": identifier })
+                })
+                .collect();
+            evidence["identifier_mapping"] = serde_json::Value::Array(mapping);
+        }
+        if !self.normalized_literal_kinds.is_empty() {
+            evidence["normalized_literal_kinds"] = serde_json::Value::Array(
+                self.normalized_literal_kinds
+                    .iter()
+                    .map(|kind| serde_json::Value::String(kind.clone()))
+                    .collect(),
+            );
+        }
         Finding {
             id: format!(
                 "{DUPLICATE_RULE}:{}:{}:{}-{}",
@@ -98,14 +173,14 @@ impl CloneMember {
                 line: self.start_line,
                 item_path: self.qualified_name.clone(),
             },
-            confidence: 1.0,
+            confidence,
             origin: Origin::Code,
             // Carries the span's token count through to a `Finding` so a
             // ratio gate (e.g. `audit --since`'s duplication gate, see
             // todo.md §6) can use duplicated-token density as its numerator
             // instead of a raw finding count, once findings have been
             // diffed against a baseline and only the `Finding` survives.
-            evidence: Some(serde_json::json!({ "token_count": self.token_count })),
+            evidence: Some(evidence),
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -172,6 +247,24 @@ struct TokenUnit {
     /// Normalized text used by [`DupeMode::Mild`] (identifier/literal/punct
     /// text, or a synthetic bracket character for group delimiters).
     mild_text: String,
+    /// Text used by [`DupeMode::Weak`]: same as `mild_text`, except literal
+    /// tokens (and the `true`/`false` bool idents) are replaced with a
+    /// type-specific placeholder.
+    weak_text: String,
+    /// Text used by [`DupeMode::Semantic`]: same as `weak_text`, except bare
+    /// local variable/parameter identifiers are replaced with a positional
+    /// placeholder (see [`assign_semantic_text`]).
+    semantic_text: String,
+    /// Set only for tokens built from `TokenTree::Literal` (never for the
+    /// `true`/`false` bool special case, which isn't a `Literal` token at
+    /// this layer — see [`flatten_tokens`]).
+    literal_kind: Option<LiteralKind>,
+    /// True only for tokens built from `TokenTree::Ident`, excluding the
+    /// `true`/`false` bool special case.
+    is_ident: bool,
+    /// Set only for tokens whose `semantic_text` was positionally renamed:
+    /// `(placeholder_text, original_identifier_text)`.
+    semantic_identifier_mapping: Option<(String, String)>,
     start_line: usize,
     end_line: usize,
 }
@@ -182,7 +275,12 @@ impl TokenUnit {
         Self {
             byte_start: range.start,
             byte_end: range.end,
+            weak_text: mild_text.clone(),
+            semantic_text: mild_text.clone(),
             mild_text,
+            literal_kind: None,
+            is_ident: false,
+            semantic_identifier_mapping: None,
             start_line: span.start().line,
             end_line: span.end().line,
         }
@@ -256,6 +354,7 @@ fn collect_function_tokens(
             &mut tokens,
             &nested_functions.ranges,
         );
+        assign_semantic_text(&mut tokens);
         if tokens.len() < min_tokens {
             return;
         }
@@ -320,13 +419,28 @@ fn flatten_tokens(
                 }
             },
             proc_macro2::TokenTree::Ident(ident) => {
-                out.push(TokenUnit::new(ident.span(), ident.to_string()));
+                let mild_text = ident.to_string();
+                let mut token = TokenUnit::new(ident.span(), mild_text.clone());
+                if mild_text == "true" || mild_text == "false" {
+                    token.weak_text = BOOL_LIT_PLACEHOLDER.to_string();
+                    token.semantic_text = BOOL_LIT_PLACEHOLDER.to_string();
+                } else {
+                    token.is_ident = true;
+                }
+                out.push(token);
             }
             proc_macro2::TokenTree::Punct(punct) => {
                 out.push(TokenUnit::new(punct.span(), punct.to_string()));
             }
             proc_macro2::TokenTree::Literal(lit) => {
-                out.push(TokenUnit::new(lit.span(), lit.to_string()));
+                let mild_text = lit.to_string();
+                let mut token = TokenUnit::new(lit.span(), mild_text);
+                let kind = literal_kind(&lit);
+                let placeholder = literal_placeholder(kind);
+                token.weak_text = placeholder.to_string();
+                token.semantic_text = placeholder.to_string();
+                token.literal_kind = Some(kind);
+                out.push(token);
             }
         }
     }
@@ -338,6 +452,147 @@ fn delimiter_chars(delimiter: proc_macro2::Delimiter) -> (&'static str, &'static
         proc_macro2::Delimiter::Brace => ("{", "}"),
         proc_macro2::Delimiter::Bracket => ("[", "]"),
         proc_macro2::Delimiter::None => ("", ""),
+    }
+}
+
+/// Placeholder for the `true`/`false` bool idents (see [`flatten_tokens`] —
+/// these arrive as `TokenTree::Ident`, not `TokenTree::Literal`, so they
+/// can't carry a [`LiteralKind`], but should still be treated as a literal
+/// rather than sent through positional identifier numbering).
+const BOOL_LIT_PLACEHOLDER: &str = "__BOOL_LIT__";
+
+/// Classifies a raw literal token via `syn::Lit::new` (never produces
+/// `Lit::Bool` — see [`BOOL_LIT_PLACEHOLDER`]).
+fn literal_kind(lit: &proc_macro2::Literal) -> LiteralKind {
+    match syn::Lit::new(lit.clone()) {
+        syn::Lit::Str(_) => LiteralKind::Str,
+        syn::Lit::ByteStr(_) => LiteralKind::ByteStr,
+        syn::Lit::Byte(_) => LiteralKind::Byte,
+        syn::Lit::Char(_) => LiteralKind::Char,
+        syn::Lit::Int(_) => LiteralKind::Int,
+        syn::Lit::Float(_) => LiteralKind::Float,
+        _ => LiteralKind::Verbatim,
+    }
+}
+
+/// Type-specific placeholder text for a literal, used by
+/// [`DupeMode::Weak`]/[`DupeMode::Semantic`].
+fn literal_placeholder(kind: LiteralKind) -> &'static str {
+    match kind {
+        LiteralKind::Str => "__STR_LIT__",
+        LiteralKind::ByteStr => "__BYTESTR_LIT__",
+        LiteralKind::Byte => "__BYTE_LIT__",
+        LiteralKind::Char => "__CHAR_LIT__",
+        LiteralKind::Int => "__INT_LIT__",
+        LiteralKind::Float => "__FLOAT_LIT__",
+        LiteralKind::Verbatim => "__LIT__",
+    }
+}
+
+/// Short name for a [`LiteralKind`], used in a [`CloneMember`]'s
+/// `normalized_literal_kinds` evidence.
+fn literal_kind_name(kind: LiteralKind) -> &'static str {
+    match kind {
+        LiteralKind::Str => "str",
+        LiteralKind::ByteStr => "bytestr",
+        LiteralKind::Byte => "byte",
+        LiteralKind::Char => "char",
+        LiteralKind::Int => "int",
+        LiteralKind::Float => "float",
+        LiteralKind::Verbatim => "verbatim",
+    }
+}
+
+/// Computes `semantic_text` for every ident token in one function's flattened
+/// token stream (called once per function, right after [`flatten_tokens`]).
+/// Literal tokens and the bool special case already have their
+/// `semantic_text` set to the same placeholder as `weak_text` by
+/// [`flatten_tokens`]; non-ident, non-literal tokens already have
+/// `semantic_text == mild_text` from [`TokenUnit::new`] — operators and
+/// delimiters are never normalized in any mode. This function only decides,
+/// for each `is_ident` token, whether it looks like a bare local
+/// variable/parameter (get a positional `__ID_n__` placeholder) or something
+/// else — a call/macro name, a path segment, a field/method access target, a
+/// keyword-like ident, or a probable type/const (`self`, `Self`, `crate`,
+/// `super`, or an uppercase-first-letter ident) — which stays literal.
+///
+/// The heuristic looks only at neighboring tokens' `mild_text`, never
+/// re-parses or consults the AST, so it can misclassify: a local closure
+/// variable called as `callback(x)` is indistinguishable at the token level
+/// from a real function call and is kept literal (under-normalization, a
+/// safe failure direction — it can only cost recall, never cause a false
+/// match). Likewise, struct-literal/pattern field names (`Foo { field: value
+/// }`) look identical to a local variable at this layer, so `field` gets
+/// normalized as if it were one — a bounded precision risk, consistent with
+/// `Semantic` mode's already-lower confidence.
+///
+/// Numbering is positional within the *whole function body*, assigned in
+/// first-occurrence order while scanning left-to-right — not re-numbered
+/// per matched window, since window boundaries aren't known yet at this
+/// point in the pipeline. This means a duplicated inner block embedded at
+/// different relative positions in two otherwise-different functions can
+/// get different placeholder numbers for identifiers introduced before the
+/// block starts, and fail to match even though the block itself is a
+/// genuine renamed clone — `Semantic` mode's recall is effectively scoped to
+/// near-whole-function clones, not the same sub-span granularity
+/// `Strict`/`Mild` have.
+/// Rust keywords (strict and reserved, 2018+). At the raw `TokenTree` layer
+/// keywords and identifiers are indistinguishable — both are just
+/// `TokenTree::Ident` — so without this list a keyword like `let`/`for`/`in`
+/// would otherwise look like a normalizable local-variable candidate.
+/// `self`/`Self`/`crate`/`super` are handled separately (see
+/// [`assign_semantic_text`]); `true`/`false` never reach this check (see the
+/// bool special case in [`flatten_tokens`]).
+const RUST_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "dyn", "else", "enum", "extern", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "static", "struct", "trait", "type", "unsafe", "use", "where", "while", "abstract",
+    "become", "box", "do", "final", "macro", "override", "priv", "try", "typeof", "unsized",
+    "virtual", "yield", "union",
+];
+
+fn is_rust_keyword(name: &str) -> bool {
+    RUST_KEYWORDS.contains(&name)
+}
+
+fn assign_semantic_text(tokens: &mut [TokenUnit]) {
+    let mut numbering: HashMap<String, usize> = HashMap::new();
+    for index in 0..tokens.len() {
+        if !tokens[index].is_ident {
+            continue;
+        }
+
+        let next = tokens.get(index + 1).map(|t| t.mild_text.as_str());
+        let next2 = tokens.get(index + 2).map(|t| t.mild_text.as_str());
+        let prev = index
+            .checked_sub(1)
+            .and_then(|i| tokens.get(i))
+            .map(|t| t.mild_text.as_str());
+        let prev2 = index
+            .checked_sub(2)
+            .and_then(|i| tokens.get(i))
+            .map(|t| t.mild_text.as_str());
+
+        let name = tokens[index].mild_text.as_str();
+        let keep_literal = next == Some("(")
+            || next == Some("!")
+            || (prev == Some(":") && prev2 == Some(":"))
+            || (next == Some(":") && next2 == Some(":"))
+            || prev == Some(".")
+            || matches!(name, "self" | "Self" | "crate" | "super")
+            || name.chars().next().is_some_and(char::is_uppercase)
+            || is_rust_keyword(name);
+
+        if keep_literal {
+            continue;
+        }
+
+        let name = tokens[index].mild_text.clone();
+        let next_n = numbering.len();
+        let n = *numbering.entry(name.clone()).or_insert(next_n);
+        let placeholder = format!("__ID_{n}__");
+        tokens[index].semantic_text = placeholder.clone();
+        tokens[index].semantic_identifier_mapping = Some((placeholder, name));
     }
 }
 
@@ -386,6 +641,16 @@ fn window_digest(func: &FuncTokens, mode: DupeMode, start: usize, end: usize) ->
         DupeMode::Mild => func.tokens[start..end]
             .iter()
             .map(|token| token.mild_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{0}"),
+        DupeMode::Weak => func.tokens[start..end]
+            .iter()
+            .map(|token| token.weak_text.as_str())
+            .collect::<Vec<_>>()
+            .join("\u{0}"),
+        DupeMode::Semantic => func.tokens[start..end]
+            .iter()
+            .map(|token| token.semantic_text.as_str())
             .collect::<Vec<_>>()
             .join("\u{0}"),
     }
@@ -438,8 +703,8 @@ fn find_clone_families(
         }
         let digest = window_digest(a, mode, sa, ea);
         let members = groups.entry(digest).or_default();
-        push_unique(members, member_from(a, sa, ea));
-        push_unique(members, member_from(b, sb, eb));
+        push_unique(members, member_from(a, sa, ea, mode));
+        push_unique(members, member_from(b, sb, eb, mode));
     }
 
     let mut families: Vec<CloneFamily> = groups
@@ -510,6 +775,10 @@ fn forward_step_matches(
             a.source[prev_a..next_a] == b.source[prev_b..next_b]
         }
         DupeMode::Mild => a.tokens[start_a + fwd].mild_text == b.tokens[start_b + fwd].mild_text,
+        DupeMode::Weak => a.tokens[start_a + fwd].weak_text == b.tokens[start_b + fwd].weak_text,
+        DupeMode::Semantic => {
+            a.tokens[start_a + fwd].semantic_text == b.tokens[start_b + fwd].semantic_text
+        }
     }
 }
 
@@ -535,6 +804,12 @@ fn backward_step_matches(
         DupeMode::Mild => {
             a.tokens[start_a - back - 1].mild_text == b.tokens[start_b - back - 1].mild_text
         }
+        DupeMode::Weak => {
+            a.tokens[start_a - back - 1].weak_text == b.tokens[start_b - back - 1].weak_text
+        }
+        DupeMode::Semantic => {
+            a.tokens[start_a - back - 1].semantic_text == b.tokens[start_b - back - 1].semantic_text
+        }
     }
 }
 
@@ -546,7 +821,32 @@ fn is_suppressed(func: &FuncTokens, start: usize, end: usize) -> bool {
         .any(|&(off, on)| off <= start_line && end_line <= on)
 }
 
-fn member_from(func: &FuncTokens, start: usize, end: usize) -> CloneMember {
+fn member_from(func: &FuncTokens, start: usize, end: usize, mode: DupeMode) -> CloneMember {
+    let mut identifier_mapping = Vec::new();
+    let mut normalized_literal_kinds = Vec::new();
+    // Only `Weak`/`Semantic` actually normalize literals/identifiers — leave
+    // this evidence empty for `Strict`/`Mild`, even though the underlying
+    // per-token data is always computed (see `flatten_tokens`/
+    // `assign_semantic_text`).
+    if matches!(mode, DupeMode::Weak | DupeMode::Semantic) {
+        for token in &func.tokens[start..end] {
+            if let Some(kind) = token.literal_kind {
+                let name = literal_kind_name(kind).to_string();
+                if !normalized_literal_kinds.contains(&name) {
+                    normalized_literal_kinds.push(name);
+                }
+            }
+        }
+    }
+    if mode == DupeMode::Semantic {
+        for token in &func.tokens[start..end] {
+            if let Some(mapping) = &token.semantic_identifier_mapping
+                && !identifier_mapping.contains(mapping)
+            {
+                identifier_mapping.push(mapping.clone());
+            }
+        }
+    }
     CloneMember {
         qualified_name: func.qualified_name.clone(),
         file: func.file.clone(),
@@ -555,6 +855,9 @@ fn member_from(func: &FuncTokens, start: usize, end: usize) -> CloneMember {
         start_token: start,
         end_token: end - 1,
         token_count: end - start,
+        mode,
+        identifier_mapping,
+        normalized_literal_kinds,
     }
 }
 
@@ -962,5 +1265,213 @@ fn dup_one(x: i32) -> i32 {
         let included = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, true);
         assert_eq!(included.families.len(), 1);
         assert_eq!(included.excluded_generated, 0);
+    }
+
+    #[test]
+    fn weak_mode_normalizes_literals() {
+        let dir = TempDir::new("dup-weak-literal");
+        let file = dir.join("lit.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn lit_one(x: i32) -> i32 {
+    let a = 1;
+    let b = 2;
+    let c = 3;
+    a + b + c + x
+}
+
+fn lit_two(x: i32) -> i32 {
+    let a = 1;
+    let b = 2;
+    let c = 99;
+    a + b + c + x
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+
+        let mild = analyze_workspace(files.iter(), DupeMode::Mild, 15, false);
+        assert!(mild.families.is_empty());
+
+        let weak = analyze_workspace(files.iter(), DupeMode::Weak, 15, false);
+        assert_eq!(weak.families.len(), 1);
+        let names: Vec<_> = weak.families[0]
+            .members
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(names, ["lit_one", "lit_two"]);
+    }
+
+    #[test]
+    fn semantic_mode_matches_renamed_clone() {
+        let dir = TempDir::new("dup-semantic-rename");
+        let file = dir.join("rename.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn semantic_one(x: i32) -> i32 {
+    let mut total = 0;
+    for i in 0..x {
+        total += i;
+    }
+    total
+}
+
+fn semantic_two(x: i32) -> i32 {
+    let mut sum = 0;
+    for idx in 0..x {
+        sum += idx;
+    }
+    sum
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+
+        let mild = analyze_workspace(files.iter(), DupeMode::Mild, 15, false);
+        assert!(mild.families.is_empty());
+
+        let semantic = analyze_workspace(files.iter(), DupeMode::Semantic, 15, false);
+        assert_eq!(semantic.families.len(), 1);
+        let members = &semantic.families[0].members;
+        let names: Vec<_> = members.iter().map(|m| m.qualified_name.as_str()).collect();
+        assert_eq!(names, ["semantic_one", "semantic_two"]);
+
+        let findings = WorkspaceDuplication {
+            families: semantic.families,
+            errors: Vec::new(),
+            excluded_generated: 0,
+        }
+        .to_findings();
+
+        let one_evidence = findings
+            .iter()
+            .find(|f| f.location.item_path == "semantic_one")
+            .unwrap()
+            .evidence
+            .clone()
+            .unwrap();
+        let one_mapping = one_evidence["identifier_mapping"].as_array().unwrap();
+        assert!(one_mapping.contains(&serde_json::json!({
+            "placeholder": "__ID_0__",
+            "identifier": "total"
+        })));
+        assert!(one_mapping.contains(&serde_json::json!({
+            "placeholder": "__ID_1__",
+            "identifier": "i"
+        })));
+
+        let two_evidence = findings
+            .iter()
+            .find(|f| f.location.item_path == "semantic_two")
+            .unwrap()
+            .evidence
+            .clone()
+            .unwrap();
+        let two_mapping = two_evidence["identifier_mapping"].as_array().unwrap();
+        assert!(two_mapping.contains(&serde_json::json!({
+            "placeholder": "__ID_0__",
+            "identifier": "sum"
+        })));
+        assert!(two_mapping.contains(&serde_json::json!({
+            "placeholder": "__ID_1__",
+            "identifier": "idx"
+        })));
+    }
+
+    #[test]
+    fn semantic_mode_does_not_collapse_different_identifier_reuse_patterns() {
+        let dir = TempDir::new("dup-semantic-reuse-pattern");
+        let file = dir.join("reuse.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn distinct_params(a: i32, b: i32) -> i32 {
+    let x = 1;
+    let y = 2;
+    let z = 3;
+    a + b + x + y + z
+}
+
+fn reused_param(a: i32) -> i32 {
+    let x = 1;
+    let y = 2;
+    let z = 3;
+    a + a + x + y + z
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Semantic, 19, false);
+
+        assert!(
+            report.families.is_empty(),
+            "a distinct a+b vs reused a+a pattern must not collapse into one family, got: {:?}",
+            report.families
+        );
+    }
+
+    #[test]
+    fn semantic_mode_keeps_call_names_literal() {
+        let dir = TempDir::new("dup-semantic-call-names");
+        let file = dir.join("calls.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn calls_helper_one(x: i32) -> i32 {
+    let y = 1;
+    let z = 2;
+    helper_one(x) + y + z
+}
+
+fn calls_helper_two(x: i32) -> i32 {
+    let y = 1;
+    let z = 2;
+    helper_two(x) + y + z
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Semantic, 12, false);
+
+        assert!(
+            report.families.is_empty(),
+            "calls to different helper functions must not collapse under Semantic mode, got: {:?}",
+            report.families
+        );
+    }
+
+    #[test]
+    fn weak_and_semantic_confidence_is_lower_than_strict() {
+        let dir = TempDir::new("dup-confidence");
+        let (file_a, file_b) = write_duplicate_fixtures(&dir);
+        let files = authored([file_a, file_b]);
+
+        for (mode, expected) in [
+            (DupeMode::Strict, 1.0),
+            (DupeMode::Mild, 1.0),
+            (DupeMode::Weak, 0.85),
+            (DupeMode::Semantic, 0.55),
+        ] {
+            let report = analyze_workspace(files.iter(), mode, DEFAULT_MIN_TOKENS, false);
+            let findings = report.to_findings();
+            assert!(
+                !findings.is_empty(),
+                "{mode:?} should find the fixture duplicate"
+            );
+            for finding in &findings {
+                assert_eq!(finding.confidence, expected, "{mode:?}");
+            }
+        }
     }
 }

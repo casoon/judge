@@ -220,6 +220,8 @@ enum OutputFormat {
 enum DupeModeArg {
     Strict,
     Mild,
+    Weak,
+    Semantic,
 }
 
 impl From<DupeModeArg> for DupeMode {
@@ -227,6 +229,8 @@ impl From<DupeModeArg> for DupeMode {
         match value {
             DupeModeArg::Strict => Self::Strict,
             DupeModeArg::Mild => Self::Mild,
+            DupeModeArg::Weak => Self::Weak,
+            DupeModeArg::Semantic => Self::Semantic,
         }
     }
 }
@@ -1090,6 +1094,8 @@ fn run_dupes(
                 match mode {
                     DupeModeArg::Strict => "strict",
                     DupeModeArg::Mild => "mild",
+                    DupeModeArg::Weak => "weak",
+                    DupeModeArg::Semantic => "semantic",
                 }
             );
             println!("min tokens: {min_tokens}");
@@ -1131,7 +1137,12 @@ fn run_dupes(
 /// `fresh-low-reputation-dep` need real crates.io network access and only run
 /// when `--check-crates-io` is passed — judge makes no network calls by
 /// default (see todo.md §1 "kein SaaS, keine Telemetrie, lokal deterministisch").
-fn run_deps(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>, check_crates_io: bool) {
+fn run_deps(
+    format: OutputFormat,
+    save_baseline: bool,
+    baseline: Option<PathBuf>,
+    check_crates_io: bool,
+) {
     let workspace = match judge::ingest::load(None) {
         Ok(workspace) => workspace,
         Err(err) => {
@@ -1161,7 +1172,8 @@ fn run_deps(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>
         let cache_root = workspace.root.join("target/judge/slopsquat-cache");
 
         let index_client = judge::slopsquat::SparseIndexClient::new(cache_root.clone());
-        let phantom_report = judge::slopsquat::analyze_phantom_dependencies(&workspace, &index_client);
+        let phantom_report =
+            judge::slopsquat::analyze_phantom_dependencies(&workspace, &index_client);
         findings.extend(phantom_report.findings);
         analysis_errors.extend(phantom_report.errors);
         rule_revisions.insert(
@@ -1174,8 +1186,11 @@ fn run_deps(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>
         );
 
         let metadata_client = judge::slopsquat::RestMetadataClient::new(cache_root);
-        let fresh_report =
-            judge::slopsquat::analyze_fresh_low_reputation(&workspace, &metadata_client, &slopsquat_config);
+        let fresh_report = judge::slopsquat::analyze_fresh_low_reputation(
+            &workspace,
+            &metadata_client,
+            &slopsquat_config,
+        );
         findings.extend(fresh_report.findings);
         analysis_errors.extend(fresh_report.errors);
         rule_revisions.insert(
