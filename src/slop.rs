@@ -25,6 +25,17 @@
 //! `assertion-free-test` and `ignored-test-accumulation` only match the
 //! literal `#[test]`/`#[ignore]` attributes, not third-party test-framework
 //! attributes (`#[tokio::test]`, `#[rstest]`, ...) — accepted v1 scope.
+//!
+//! `G3` ("Sprachliche Marker", see todo.md §3.G) splits across two modules.
+//! `generic-naming` and `doc-restates-signature` are structural/lexical
+//! checks over identifiers and `#[doc = ...]` attributes, so they extend
+//! [`SlopVisitor`] here exactly like the `G1`/`G2` rules above. The other
+//! three — `conversational-artifact`, `restating-comment`,
+//! `step-comment-inflation` — target plain `//`/`/* */` prose, which `syn`
+//! discards entirely during parsing (only `///`/`//!` doc comments survive,
+//! desugared to `#[doc = "..."]` attributes); there is no AST node for a
+//! regular comment, so those three live in [`crate::slop_text`], a
+//! raw-source-text scanner run alongside this visitor.
 
 use std::path::{Path, PathBuf};
 
@@ -87,6 +98,31 @@ pub const TAUTOLOGICAL_TEST_RULE_REVISION: u32 = 1;
 pub const IGNORED_TEST_ACCUMULATION_RULE: &str = "ignored-test-accumulation";
 pub const IGNORED_TEST_ACCUMULATION_RULE_REVISION: u32 = 1;
 
+/// Rule id for a phrase leaking AI-assistant framing into a plain comment
+/// (see todo.md §G3). Implemented in [`crate::slop_text`].
+pub const CONVERSATIONAL_ARTIFACT_RULE: &str = "conversational-artifact";
+pub const CONVERSATIONAL_ARTIFACT_RULE_REVISION: u32 = 1;
+
+/// Rule id for a comment that only paraphrases the code line it precedes
+/// (see todo.md §G3). Implemented in [`crate::slop_text`].
+pub const RESTATING_COMMENT_RULE: &str = "restating-comment";
+pub const RESTATING_COMMENT_RULE_REVISION: u32 = 1;
+
+/// Rule id for a `// Step N:` comment chain of three or more (see todo.md
+/// §G3). Implemented in [`crate::slop_text`].
+pub const STEP_COMMENT_INFLATION_RULE: &str = "step-comment-inflation";
+pub const STEP_COMMENT_INFLATION_RULE_REVISION: u32 = 1;
+
+/// Rule id for an identifier that is exactly a generic placeholder word
+/// (`data`, `temp`, `handler`, ...), see todo.md §G3.
+pub const GENERIC_NAMING_RULE: &str = "generic-naming";
+pub const GENERIC_NAMING_RULE_REVISION: u32 = 1;
+
+/// Rule id for a doc comment that is a pure signature echo (see todo.md
+/// §G3).
+pub const DOC_RESTATES_SIGNATURE_RULE: &str = "doc-restates-signature";
+pub const DOC_RESTATES_SIGNATURE_RULE_REVISION: u32 = 1;
+
 #[derive(Debug)]
 pub enum SlopError {
     Io(PathBuf, std::io::Error),
@@ -126,9 +162,16 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SlopError> {
         path: Vec::new(),
         findings: Vec::new(),
         feature_gated_depth: 0,
+        item_spans: Vec::new(),
     };
     visitor.visit_file(&ast);
-    Ok(visitor.findings)
+    let mut findings = visitor.findings;
+    findings.extend(crate::slop_text::scan_comments(
+        &source,
+        &visitor.item_spans,
+        path,
+    ));
+    Ok(findings)
 }
 
 /// Runs [`analyze_file`] over every file in `source_files` and aggregates the
@@ -153,6 +196,16 @@ pub fn analyze_workspace<'a>(
     report
 }
 
+/// The line range and qualified item path of one `fn`/method, indexed so
+/// [`crate::slop_text`]'s raw-text findings (which have no `syn` span to
+/// derive an item path from) can attribute a comment to its nearest
+/// enclosing function (see todo.md §3.G G3).
+pub(crate) struct ItemSpan {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub item_path: String,
+}
+
 /// Walks a whole parsed file (not just function bodies — attributes and
 /// public fn signatures can appear anywhere at item level), tracking the
 /// enclosing `mod`/`impl`/`trait`/`fn` path for a finding's `item_path` (same
@@ -167,6 +220,10 @@ struct SlopVisitor<'a> {
     /// `fn` — `merged-stub` doesn't flag `todo!()`/`unimplemented!()` while
     /// this is non-zero (see [`has_feature_cfg`]).
     feature_gated_depth: usize,
+    /// Every `fn`/method's line range and item path, collected while
+    /// walking — feeds [`crate::slop_text::scan_comments`]'s attribution of
+    /// raw-text findings (see [`ItemSpan`]).
+    pub(crate) item_spans: Vec<ItemSpan>,
 }
 
 impl SlopVisitor<'_> {
@@ -282,6 +339,143 @@ impl SlopVisitor<'_> {
             );
         }
     }
+
+    /// `let data1 = ...;` / `let temp2 = ...;` — a `let` binding whose name
+    /// is a generic placeholder word plus a numeric suffix (see todo.md §G3
+    /// `generic-naming`). Deliberately does NOT check the bare
+    /// (non-suffixed) local name — `let result = do_thing()?;` is completely
+    /// idiomatic Rust, and flagging every private local named `data` or
+    /// `result` would be pure noise. The numeric-suffix shape (`data1`,
+    /// `data2`, ...) is a distinctive enough signal on its own that it
+    /// doesn't need that mitigation.
+    fn check_generic_naming_local(&mut self, pat: &Pat, span: proc_macro2::Span) {
+        let Pat::Ident(pat_ident) = pat else {
+            return;
+        };
+        let name = pat_ident.ident.to_string();
+        let stripped = strip_trailing_digits(&name);
+        if stripped.len() == name.len() {
+            return;
+        }
+        if is_generic_word(stripped) {
+            let item_path = self.current_item_path();
+            self.record(GENERIC_NAMING_RULE, span, Severity::Info, 0.6, item_path);
+        }
+    }
+
+    /// A top-level `pub fn` whose name is exactly a generic placeholder word
+    /// (see todo.md §G3 `generic-naming`). Scoped to free `pub fn`s only —
+    /// not called from `visit_impl_item_fn`, since a method's name reads
+    /// very differently in context of its receiver type (`Cache::get` isn't
+    /// generic the way a free function named `get` would be); the public,
+    /// free-standing API surface is where a generic name is the clearest
+    /// naming problem.
+    fn check_generic_naming_item_fn(&mut self, node: &ItemFn) {
+        if !matches!(node.vis, Visibility::Public(_)) {
+            return;
+        }
+        if is_generic_word(&node.sig.ident.to_string()) {
+            let item_path = self.current_item_path();
+            self.record(
+                GENERIC_NAMING_RULE,
+                node.span(),
+                Severity::Info,
+                0.4,
+                item_path,
+            );
+        }
+    }
+
+    /// A `pub struct` whose name, or one of whose `pub` field names, is
+    /// exactly a generic placeholder word (see todo.md §G3 `generic-naming`).
+    fn check_generic_naming_item_struct(&mut self, node: &syn::ItemStruct) {
+        if matches!(node.vis, Visibility::Public(_)) && is_generic_word(&node.ident.to_string()) {
+            let item_path = self.current_item_path();
+            self.record(
+                GENERIC_NAMING_RULE,
+                node.span(),
+                Severity::Info,
+                0.4,
+                item_path,
+            );
+        }
+        for field in &node.fields {
+            if matches!(field.vis, Visibility::Public(_))
+                && let Some(ident) = &field.ident
+                && is_generic_word(&ident.to_string())
+            {
+                let item_path = self.current_item_path();
+                self.record(
+                    GENERIC_NAMING_RULE,
+                    field.span(),
+                    Severity::Info,
+                    0.4,
+                    item_path,
+                );
+            }
+        }
+    }
+
+    /// A `pub enum` whose name is exactly a generic placeholder word (see
+    /// todo.md §G3 `generic-naming`).
+    fn check_generic_naming_item_enum(&mut self, node: &syn::ItemEnum) {
+        if matches!(node.vis, Visibility::Public(_)) && is_generic_word(&node.ident.to_string()) {
+            let item_path = self.current_item_path();
+            self.record(
+                GENERIC_NAMING_RULE,
+                node.span(),
+                Severity::Info,
+                0.4,
+                item_path,
+            );
+        }
+    }
+
+    /// A doc comment that is a pure echo of the fn's signature — e.g.
+    /// `/// Returns the result.` over `fn f() -> Result<...>` (see todo.md
+    /// §G3 `doc-restates-signature`). Deliberately narrow: only fires when
+    /// the whole doc text is short (≤6 tokens) AND every content word in it
+    /// also appears in the signature, so real prose describing *what* or
+    /// *why* never matches.
+    fn check_doc_restates_signature(
+        &mut self,
+        attrs: &[Attribute],
+        sig: &syn::Signature,
+        span: proc_macro2::Span,
+    ) {
+        let doc_text = doc_comment_text(attrs);
+        let Some(doc_text) = doc_text else {
+            return;
+        };
+        let doc_tokens = tokenize(&doc_text);
+        if doc_tokens.is_empty() || doc_tokens.len() > 6 {
+            return;
+        }
+        const STOPWORDS: &[&str] = &[
+            "returns", "return", "get", "gets", "the", "a", "an", "of", "for",
+        ];
+        let content_tokens: Vec<&String> = doc_tokens
+            .iter()
+            .filter(|token| !STOPWORDS.contains(&token.as_str()))
+            .collect();
+        if content_tokens.is_empty() {
+            return;
+        }
+        let sig_tokens = signature_tokens(sig);
+        if content_tokens
+            .iter()
+            .all(|token| sig_tokens.contains(token.as_str()))
+        {
+            let item_path = self.current_item_path();
+            self.record(
+                DOC_RESTATES_SIGNATURE_RULE,
+                span,
+                Severity::Info,
+                0.5,
+                item_path,
+            );
+        }
+    }
 }
 
 impl<'ast> Visit<'ast> for SlopVisitor<'_> {
@@ -321,11 +515,32 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         self.path.pop();
     }
 
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        self.path.push(node.ident.to_string());
+        self.check_generic_naming_item_struct(node);
+        visit::visit_item_struct(self, node);
+        self.path.pop();
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        self.path.push(node.ident.to_string());
+        self.check_generic_naming_item_enum(node);
+        visit::visit_item_enum(self, node);
+        self.path.pop();
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.path.push(node.sig.ident.to_string());
+        self.item_spans.push(ItemSpan {
+            start_line: node.span().start().line,
+            end_line: node.span().end().line,
+            item_path: self.current_item_path(),
+        });
         self.check_catch_all_error(&node.vis, &node.sig, node.span());
         self.check_empty_impl(&node.attrs, &node.block, node.span());
         self.check_assertion_free_test(node);
+        self.check_generic_naming_item_fn(node);
+        self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
         let gated = has_feature_cfg(&node.attrs);
         if gated {
             self.feature_gated_depth += 1;
@@ -339,8 +554,14 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         self.path.push(node.sig.ident.to_string());
+        self.item_spans.push(ItemSpan {
+            start_line: node.span().start().line,
+            end_line: node.span().end().line,
+            item_path: self.current_item_path(),
+        });
         self.check_catch_all_error(&node.vis, &node.sig, node.span());
         self.check_empty_impl(&node.attrs, &node.block, node.span());
+        self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
         let gated = has_feature_cfg(&node.attrs);
         if gated {
             self.feature_gated_depth += 1;
@@ -377,6 +598,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 item_path,
             );
         }
+        self.check_generic_naming_local(&node.pat, node.span());
         visit::visit_local(self, node);
     }
 
@@ -656,6 +878,105 @@ fn returns_result_type(output: &ReturnType) -> bool {
         .segments
         .last()
         .is_some_and(|segment| segment.ident == "Result")
+}
+
+/// Placeholder words common in template/boilerplate naming (see todo.md §G3
+/// `generic-naming`). Matched as an exact, case-insensitive, whole-identifier
+/// comparison everywhere this list is used — never a substring match, so
+/// `ConnectionManager` never matches `manager`.
+const GENERIC_WORDS: &[&str] = &[
+    "data",
+    "result",
+    "temp",
+    "handler",
+    "manager",
+    "processor",
+    "helper",
+    "utils",
+];
+
+/// Whether `word`, lowercased, exactly equals one of [`GENERIC_WORDS`].
+fn is_generic_word(word: &str) -> bool {
+    let lower = word.to_lowercase();
+    GENERIC_WORDS.contains(&lower.as_str())
+}
+
+/// Strips a trailing run of ASCII digits from `name`, if any (`"data1"` ->
+/// `"data"`, `"data"` -> `"data"`).
+fn strip_trailing_digits(name: &str) -> &str {
+    name.trim_end_matches(|c: char| c.is_ascii_digit())
+}
+
+/// Collects every `#[doc = "..."]` attribute's string literal (covers both
+/// `///` doc comments and explicit `#[doc]` attributes, which `syn` desugars
+/// the same way — see [`has_doc_comment`]), joins them with spaces, and
+/// trims. `None` if there's no doc comment at all. Reuses the exact
+/// `Meta::NameValue`/`Lit::Str` extraction pattern already used for
+/// `#[ignore = "..."]` in `visit_attribute`.
+fn doc_comment_text(attrs: &[Attribute]) -> Option<String> {
+    let parts: Vec<String> = attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("doc"))
+        .filter_map(|attr| match &attr.meta {
+            Meta::NameValue(name_value) => match &name_value.value {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(text),
+                    ..
+                }) => Some(text.value()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join(" ").trim().to_string();
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
+/// Lowercases `text` and splits it on non-alphanumeric boundaries (used by
+/// [`SlopVisitor::check_doc_restates_signature`]; `crate::slop_text` has its
+/// own copy since it has no reason to depend on this module for a
+/// three-line helper).
+fn tokenize(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The token set a doc comment is compared against in
+/// [`SlopVisitor::check_doc_restates_signature`]: the fn's own name, its
+/// return type's last path segment name, and — if there's exactly one
+/// non-`self` parameter — that parameter's identifier and its type's last
+/// path segment, all lowercased.
+fn signature_tokens(sig: &syn::Signature) -> std::collections::HashSet<String> {
+    let mut tokens = std::collections::HashSet::new();
+    tokens.insert(sig.ident.to_string().to_lowercase());
+    if let ReturnType::Type(_, ty) = &sig.output {
+        tokens.insert(type_name(ty).to_lowercase());
+    }
+    let non_self_params: Vec<&syn::PatType> = sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(pat_type) => Some(pat_type),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    if let [pat_type] = non_self_params.as_slice() {
+        if let Pat::Ident(pat_ident) = pat_type.pat.as_ref() {
+            tokens.insert(pat_ident.ident.to_string().to_lowercase());
+        }
+        tokens.insert(type_name(&pat_type.ty).to_lowercase());
+    }
+    tokens
 }
 
 /// Nested scanner run over a `#[test]` fn's body to find a visible assertion
@@ -1130,5 +1451,153 @@ fn f(r: Result<i32, ()>) {
             "slop-assertion-free-closure",
         );
         assert_eq!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).len(), 1);
+    }
+
+    #[test]
+    fn generic_naming_numeric_suffix_locals_are_flagged() {
+        let findings = findings_for(
+            "fn f() { let data1 = 1; let data2 = 2; }\n",
+            "slop-generic-naming-numeric-suffix",
+        );
+        let hits = rule_findings(&findings, GENERIC_NAMING_RULE);
+        assert_eq!(hits.len(), 2);
+        for hit in &hits {
+            assert_eq!(hit.confidence, 0.6);
+        }
+    }
+
+    #[test]
+    fn generic_naming_private_bare_local_is_not_flagged() {
+        let findings = findings_for(
+            "fn g() -> Result<i32, String> { let result = do_thing()?; Ok(result) }\nfn do_thing() -> Result<i32, String> { Ok(1) }\n",
+            "slop-generic-naming-private-result",
+        );
+        assert!(rule_findings(&findings, GENERIC_NAMING_RULE).is_empty());
+    }
+
+    #[test]
+    fn generic_naming_pub_struct_exact_word_is_flagged() {
+        let findings = findings_for("pub struct Manager;\n", "slop-generic-naming-struct");
+        let hits = rule_findings(&findings, GENERIC_NAMING_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 0.4);
+    }
+
+    #[test]
+    fn generic_naming_pub_struct_substring_is_not_flagged() {
+        let findings = findings_for(
+            "pub struct ConnectionManager;\n",
+            "slop-generic-naming-struct-substring",
+        );
+        assert!(rule_findings(&findings, GENERIC_NAMING_RULE).is_empty());
+    }
+
+    #[test]
+    fn generic_naming_pub_fn_exact_word_is_flagged() {
+        let findings = findings_for("pub fn helper() {}\n", "slop-generic-naming-fn");
+        let hits = rule_findings(&findings, GENERIC_NAMING_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn generic_naming_pub_impl_method_is_not_flagged() {
+        let findings = findings_for(
+            "struct S;\nimpl S {\n    pub fn helper(&self) {}\n}\n",
+            "slop-generic-naming-impl-method",
+        );
+        assert!(rule_findings(&findings, GENERIC_NAMING_RULE).is_empty());
+    }
+
+    #[test]
+    fn doc_restates_signature_pure_echo_is_flagged() {
+        let findings = findings_for(
+            "/// Returns the result.\npub fn f() -> Result<(), String> { Ok(()) }\n",
+            "slop-doc-restates-signature-echo",
+        );
+        let hits = rule_findings(&findings, DOC_RESTATES_SIGNATURE_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 0.5);
+    }
+
+    #[test]
+    fn doc_restates_signature_real_prose_is_not_flagged() {
+        let findings = findings_for(
+            "/// Parses the config file and validates required fields.\nfn f() {}\n",
+            "slop-doc-restates-signature-prose",
+        );
+        assert!(rule_findings(&findings, DOC_RESTATES_SIGNATURE_RULE).is_empty());
+    }
+
+    #[test]
+    fn conversational_artifact_tier1_phrase_is_flagged() {
+        let findings = findings_for(
+            "fn f() {\n    // As an AI, I can't do that.\n}\n",
+            "slop-conversational-artifact-tier1",
+        );
+        let hits = rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Warn);
+        assert_eq!(hits[0].confidence, 0.9);
+    }
+
+    #[test]
+    fn conversational_artifact_doc_comment_is_excluded() {
+        let findings = findings_for(
+            "/// In a real implementation, this would also validate input.\nfn f() {}\n",
+            "slop-conversational-artifact-doc",
+        );
+        assert!(rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    #[test]
+    fn conversational_artifact_tier2_phrase_past_word_eight_is_not_flagged() {
+        let findings = findings_for(
+            "fn f() {\n    // This example function shows some basic arithmetic logic in a real implementation context.\n    let _ = 1;\n}\n",
+            "slop-conversational-artifact-tier2-position",
+        );
+        assert!(rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    #[test]
+    fn step_comment_inflation_three_step_chain_is_flagged() {
+        let findings = findings_for(
+            "fn f() {\n    // Step 1: initialize\n    let x = 1;\n    // Step 2: compute\n    let y = x + 1;\n    // Step 3: finish\n    let _ = y;\n}\n",
+            "slop-step-comment-inflation-chain",
+        );
+        let hits = rule_findings(&findings, STEP_COMMENT_INFLATION_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].evidence,
+            Some(serde_json::json!({ "chain_length": 3, "lines": [2, 4, 6] }))
+        );
+    }
+
+    #[test]
+    fn step_comment_inflation_single_step_is_not_flagged() {
+        let findings = findings_for(
+            "fn f() {\n    // Step 1: initialize\n    let x = 1;\n    let _ = x;\n}\n",
+            "slop-step-comment-inflation-single",
+        );
+        assert!(rule_findings(&findings, STEP_COMMENT_INFLATION_RULE).is_empty());
+    }
+
+    #[test]
+    fn restating_comment_short_comment_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(counter: &mut i32) {\n    // increment counter\n    *counter += 1;\n}\n",
+            "slop-restating-comment-short",
+        );
+        assert!(rule_findings(&findings, RESTATING_COMMENT_RULE).is_empty());
+    }
+
+    #[test]
+    fn restating_comment_verbose_paraphrase_is_flagged() {
+        let findings = findings_for(
+            "struct S { user_name_field: String }\nimpl S {\n    fn set(&mut self, given_value: String) {\n        // set the user name field to the given value\n        self.user_name_field = given_value;\n    }\n}\n",
+            "slop-restating-comment-verbose",
+        );
+        let hits = rule_findings(&findings, RESTATING_COMMENT_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].confidence, 0.4);
     }
 }

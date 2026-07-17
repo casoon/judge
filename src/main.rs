@@ -389,6 +389,26 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> CollectedFindings {
             judge::slop::IGNORED_TEST_ACCUMULATION_RULE_REVISION,
         ),
         (
+            judge::slop::CONVERSATIONAL_ARTIFACT_RULE.to_string(),
+            judge::slop::CONVERSATIONAL_ARTIFACT_RULE_REVISION,
+        ),
+        (
+            judge::slop::RESTATING_COMMENT_RULE.to_string(),
+            judge::slop::RESTATING_COMMENT_RULE_REVISION,
+        ),
+        (
+            judge::slop::STEP_COMMENT_INFLATION_RULE.to_string(),
+            judge::slop::STEP_COMMENT_INFLATION_RULE_REVISION,
+        ),
+        (
+            judge::slop::GENERIC_NAMING_RULE.to_string(),
+            judge::slop::GENERIC_NAMING_RULE_REVISION,
+        ),
+        (
+            judge::slop::DOC_RESTATES_SIGNATURE_RULE.to_string(),
+            judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
+        ),
+        (
             judge::ownership::LOW_BUS_FACTOR_RULE.to_string(),
             judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
         ),
@@ -1624,6 +1644,26 @@ fn run_health(
                 judge::slop::IGNORED_TEST_ACCUMULATION_RULE.to_string(),
                 judge::slop::IGNORED_TEST_ACCUMULATION_RULE_REVISION,
             ),
+            (
+                judge::slop::CONVERSATIONAL_ARTIFACT_RULE.to_string(),
+                judge::slop::CONVERSATIONAL_ARTIFACT_RULE_REVISION,
+            ),
+            (
+                judge::slop::RESTATING_COMMENT_RULE.to_string(),
+                judge::slop::RESTATING_COMMENT_RULE_REVISION,
+            ),
+            (
+                judge::slop::STEP_COMMENT_INFLATION_RULE.to_string(),
+                judge::slop::STEP_COMMENT_INFLATION_RULE_REVISION,
+            ),
+            (
+                judge::slop::GENERIC_NAMING_RULE.to_string(),
+                judge::slop::GENERIC_NAMING_RULE_REVISION,
+            ),
+            (
+                judge::slop::DOC_RESTATES_SIGNATURE_RULE.to_string(),
+                judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
+            ),
         ]);
         handle_baseline(
             &workspace.root,
@@ -1813,7 +1853,7 @@ fn print_hotspots(
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 9] = [
+const SLOP_RULES: [&str; 14] = [
     judge::slop::SWALLOWED_RESULT_RULE,
     judge::slop::EMPTY_ERROR_ARM_RULE,
     judge::slop::CATCH_ALL_ERROR_RULE,
@@ -1823,6 +1863,11 @@ const SLOP_RULES: [&str; 9] = [
     judge::slop::ASSERTION_FREE_TEST_RULE,
     judge::slop::TAUTOLOGICAL_TEST_RULE,
     judge::slop::IGNORED_TEST_ACCUMULATION_RULE,
+    judge::slop::CONVERSATIONAL_ARTIFACT_RULE,
+    judge::slop::RESTATING_COMMENT_RULE,
+    judge::slop::STEP_COMMENT_INFLATION_RULE,
+    judge::slop::GENERIC_NAMING_RULE,
+    judge::slop::DOC_RESTATES_SIGNATURE_RULE,
 ];
 
 fn print_slop(findings: &[judge::finding::Finding], show_cascades: bool) {
