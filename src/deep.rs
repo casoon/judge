@@ -89,6 +89,13 @@ impl DeepContext {
         self.host.analysis()
     }
 
+    /// The raw database, for callers that need `hir::Semantics` directly —
+    /// `Analysis`'s facade doesn't expose the lower-level HIR APIs needed for
+    /// call-edge classification (see [`crate::reachability::CallKind`]).
+    pub fn raw_database(&self) -> &ra_ap_ide::RootDatabase {
+        self.host.raw_database()
+    }
+
     /// Resolves an absolute file path to the `FileId` the loader assigned it,
     /// if the file was actually indexed (e.g. not excluded, and part of a
     /// crate the loader discovered).

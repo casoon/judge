@@ -338,6 +338,7 @@ fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) ->
         },
         confidence: 1.0,
         origin: Origin::Code,
+        evidence: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -363,6 +364,7 @@ fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) 
         },
         confidence: 1.0,
         origin: Origin::Code,
+        evidence: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -381,6 +383,7 @@ fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
         },
         confidence: 1.0,
         origin: Origin::Code,
+        evidence: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

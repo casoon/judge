@@ -189,6 +189,7 @@ fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency)
         },
         confidence: 0.7,
         origin: Origin::Code,
+        evidence: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

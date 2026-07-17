@@ -165,6 +165,7 @@ impl SlopVisitor<'_> {
             },
             confidence,
             origin: Origin::Code,
+            evidence: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });

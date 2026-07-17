@@ -1089,6 +1089,7 @@ fn run_explain(item_path: String, why_live: bool, include_tests: bool, format: O
                             "qualified_name": step.qualified_name,
                             "file": step.file,
                             "line": step.line,
+                            "call_kind": step.kind.map(|kind| kind.as_str()),
                         })).collect::<Vec<_>>(),
                     }),
                     judge::reachability::WhyLive::NotReachable => serde_json::json!({
@@ -1104,8 +1105,10 @@ fn run_explain(item_path: String, why_live: bool, include_tests: bool, format: O
                     println!("{item_path} is live:");
                     for (index, step) in path.iter().enumerate() {
                         let prefix = if index == 0 { "  " } else { "  called by " };
+                        let kind_suffix =
+                            step.kind.map_or(String::new(), |kind| format!(" [{kind}]"));
                         println!(
-                            "{prefix}{} ({}:{})",
+                            "{prefix}{} ({}:{}){kind_suffix}",
                             step.qualified_name,
                             step.file.display(),
                             step.line
@@ -1114,7 +1117,7 @@ fn run_explain(item_path: String, why_live: bool, include_tests: bool, format: O
                 }
                 judge::reachability::WhyLive::NotReachable => {
                     println!(
-                        "{item_path}: not reachable from any recognized entry point (`fn main` in a [[bin]]/[[example]] target)"
+                        "{item_path}: not reachable from any recognized entry point (`fn main` in a [[bin]]/[[example]] target, #[test]/#[bench] with --include-tests, or #[no_mangle]/#[export_name]/#[wasm_bindgen])"
                     );
                 }
             },

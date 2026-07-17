@@ -135,6 +135,7 @@ impl Hotspot {
             },
             confidence: 1.0,
             origin: Origin::Code,
+            evidence: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }

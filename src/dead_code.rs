@@ -4,8 +4,8 @@
 //!
 //! Scope: `unused-pub-workspace` only, for free functions, impl/trait
 //! methods ([`crate::functions::walk_functions`]'s items), and top-level
-//! structs/enums/traits/consts ([`walk_type_items`], below). Associated
-//! consts/types inside impls and statics aren't covered yet.
+//! structs/enums/traits/consts/statics plus associated consts/types inside
+//! impls ([`walk_type_items`], below).
 //!
 //! **Simplification, documented rather than hidden:** every workspace crate
 //! is treated as workspace-internal. todo.md §3.A distinguishes
@@ -21,7 +21,7 @@ use syn::visit::{self, Visit};
 
 use crate::deep::{DeepContext, DeepError, FileId};
 use crate::finding::{Finding, Location, Origin, Severity};
-use crate::functions::walk_functions;
+use crate::functions::{type_name, walk_functions};
 use crate::ingest::{SourceFile, Workspace};
 
 pub const UNUSED_PUB_WORKSPACE_RULE: &str = "unused-pub-workspace";
@@ -58,19 +58,20 @@ pub struct WorkspaceDeadCode {
     pub checked: usize,
 }
 
-/// A `pub` struct/enum/trait/const declaration discovered while walking a
-/// file — the type-level counterpart to
-/// [`crate::functions::walk_functions`]'s function-like items. Anonymous
-/// consts (`const _: () = ...`), associated consts/types inside impls, and
-/// statics aren't covered.
+/// A `pub` struct/enum/trait/const/static declaration, or a `pub` associated
+/// const/type inside an `impl` block, discovered while walking a file — the
+/// type-level counterpart to [`crate::functions::walk_functions`]'s
+/// function-like items. Anonymous consts (`const _: () = ...`) aren't
+/// covered.
 struct TypeItemSite<'ast> {
     qualified_name: String,
     ident_span: Span,
     vis: &'ast syn::Visibility,
 }
 
-/// Visits every top-level `struct`, `enum`, `trait`, and `const` in `file`,
-/// tracking the enclosing `mod`/`trait` path the same way
+/// Visits every top-level `struct`, `enum`, `trait`, `const`, and `static` in
+/// `file`, plus every associated const/type inside an `impl` block, tracking
+/// the enclosing `mod`/`impl`/`trait` path the same way
 /// [`crate::functions::walk_functions`] does, so the two produce consistent
 /// qualified names.
 fn walk_type_items<'ast>(file: &'ast syn::File, on_item: impl FnMut(TypeItemSite<'ast>)) {
@@ -131,9 +132,30 @@ fn walk_type_items<'ast>(file: &'ast syn::File, on_item: impl FnMut(TypeItemSite
             self.path.pop();
         }
 
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            self.path.push(type_name(&node.self_ty));
+            visit::visit_item_impl(self, node);
+            self.path.pop();
+        }
+
         fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
             self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
             visit::visit_item_const(self, node);
+        }
+
+        fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            visit::visit_item_static(self, node);
+        }
+
+        fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            visit::visit_impl_item_const(self, node);
+        }
+
+        fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            visit::visit_impl_item_type(self, node);
         }
     }
 
@@ -196,6 +218,8 @@ fn check_item(
         Ok(true) => {}
         Ok(false) => {
             let line = ident_span.start().line;
+            let searched_crates: std::collections::HashSet<&str> =
+                crate_of_file.values().copied().collect();
             report.findings.push(Finding {
                 id: format!(
                     "{UNUSED_PUB_WORKSPACE_RULE}:{}:{qualified_name}",
@@ -210,6 +234,14 @@ fn check_item(
                 },
                 confidence: 1.0,
                 origin: Origin::Code,
+                evidence: Some(serde_json::json!({
+                    "tier": "deep",
+                    "searched_crates": searched_crates.len(),
+                    "references_found": referencing.len(),
+                    "root_set_size": entry_keys.len(),
+                    "confidence_reason": "no reference from another workspace crate and unreachable \
+                        from any recognized entry point (fn main in a [[bin]] or [[example]] target)",
+                })),
                 caused_by: Vec::new(),
                 causes: Vec::new(),
             });
@@ -229,6 +261,11 @@ fn reachability_error(err: crate::reachability::ReachabilityError) -> DeadCodeEr
         ReachabilityError::Parse(path, parse_err) => DeadCodeError::Parse(path, parse_err),
         ReachabilityError::UnknownItem(item) => {
             DeadCodeError::Deep(DeepError::Cancelled(format!("unknown item: {item}")))
+        }
+        // `find_item_position`'s ambiguity is only reachable via `--why-live`'s
+        // CLI item-path lookup — `analyze_workspace` never calls it.
+        ReachabilityError::AmbiguousItem(item, _) => {
+            DeadCodeError::Deep(DeepError::Cancelled(format!("ambiguous item: {item}")))
         }
     }
 }
@@ -258,8 +295,8 @@ pub fn analyze_workspace(
         }
     }
 
-    let entries =
-        crate::reachability::entry_point_positions(workspace, &ctx).map_err(reachability_error)?;
+    let entries = crate::reachability::entry_point_positions(workspace, &ctx, include_tests)
+        .map_err(reachability_error)?;
     let entry_keys: std::collections::HashSet<(FileId, u32)> = entries
         .iter()
         .map(|(_, position)| crate::reachability::position_key(*position))
@@ -469,6 +506,13 @@ pub fn never_called() -> i32 {
         assert_eq!(finding.origin, Origin::Code);
         assert_eq!(finding.confidence, 1.0);
         assert_eq!(finding.location.item_path, "never_called");
+
+        let evidence = finding.evidence.as_ref().expect("evidence must be present");
+        assert_eq!(evidence["tier"], "deep");
+        assert_eq!(evidence["searched_crates"], 1);
+        assert_eq!(evidence["references_found"], 0);
+        assert_eq!(evidence["root_set_size"], 0);
+        assert!(evidence["confidence_reason"].is_string());
     }
 
     #[test]
@@ -526,6 +570,62 @@ pub fn run() -> i32 {
             );
         }
         for dead in ["DeadStruct", "DeadEnum", "DeadTrait", "DEAD_CONST"] {
+            assert!(names.contains(dead), "{dead} is never referenced and must be flagged");
+        }
+    }
+
+    #[test]
+    fn associated_consts_types_and_statics_are_checked_the_same_way_as_functions() {
+        let dir = TempDir::new("dead-code-assoc-items-and-statics");
+        write_crate(
+            &dir,
+            "core",
+            &[],
+            r#"pub struct Widget;
+
+impl Widget {
+    pub const USED_ASSOC_CONST: i32 = 1;
+    pub const DEAD_ASSOC_CONST: i32 = 2;
+}
+
+pub trait Converter {
+    type Output;
+}
+
+impl Converter for Widget {
+    type Output = i32;
+}
+
+pub static USED_STATIC: i32 = 1;
+pub static DEAD_STATIC: i32 = 2;
+"#,
+        );
+        write_crate(
+            &dir,
+            "consumer",
+            &[("core", "../core")],
+            r#"pub fn run() -> i32 {
+    core::USED_STATIC + core::Widget::USED_ASSOC_CONST
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["core", "consumer"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        for used in ["Widget::USED_ASSOC_CONST", "USED_STATIC"] {
+            assert!(
+                !names.contains(used),
+                "{used} is referenced from `consumer` and must not be flagged"
+            );
+        }
+        for dead in ["Widget::DEAD_ASSOC_CONST", "DEAD_STATIC"] {
             assert!(names.contains(dead), "{dead} is never referenced and must be flagged");
         }
     }
@@ -591,6 +691,43 @@ pub fn truly_dead() -> i32 {
         assert!(
             !names.contains("used_by_main"),
             "reachable from this crate's own `fn main` — must not be flagged even with no cross-crate reference"
+        );
+        assert!(
+            names.contains("truly_dead"),
+            "never referenced anywhere — must be flagged"
+        );
+    }
+
+    #[test]
+    fn an_item_only_used_by_a_no_mangle_export_is_not_flagged() {
+        let dir = TempDir::new("dead-code-no-mangle-entry");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"pub fn used_by_export() -> i32 {
+    1
+}
+
+pub fn truly_dead() -> i32 {
+    2
+}
+
+#[no_mangle]
+pub extern "C" fn exported() -> i32 {
+    used_by_export()
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, false).unwrap();
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            !names.contains("used_by_export"),
+            "reachable from a #[no_mangle] export — must not be flagged even in production-only mode"
         );
         assert!(
             names.contains("truly_dead"),

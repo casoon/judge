@@ -47,6 +47,11 @@ pub struct Finding {
     pub location: Location,
     pub confidence: f32,
     pub origin: Origin,
+    /// Free-form, rule-specific proof for why this finding fired — e.g. how
+    /// many crates/entry points were searched, and why `confidence` has the
+    /// value it does (see todo.md §7). `None` where a detector doesn't yet
+    /// populate it; not every rule does.
+    pub evidence: Option<serde_json::Value>,
     /// Findings that caused this one to appear (the root-cause direction).
     pub caused_by: Vec<FindingId>,
     /// Findings this one caused to appear (the cascade direction).
@@ -214,6 +219,7 @@ mod tests {
             },
             confidence: 1.0,
             origin: Origin::Code,
+            evidence: None,
             caused_by: Vec::new(),
             causes: causes.iter().map(|s| s.to_string()).collect(),
         }

@@ -28,6 +28,12 @@ pub struct FunctionSite<'ast> {
     /// trait itself. Same conditional allow as `ident_span`.
     #[cfg_attr(not(feature = "deep"), allow(dead_code))]
     pub vis: Option<&'ast syn::Visibility>,
+    /// The item's attributes (`#[test]`, `#[no_mangle]`, …) — used to
+    /// recognize entry points beyond `fn main` (see
+    /// [`crate::reachability::entry_point_positions`]). Same conditional
+    /// allow as `ident_span`.
+    #[cfg_attr(not(feature = "deep"), allow(dead_code))]
+    pub attrs: &'ast [syn::Attribute],
 }
 
 /// Visits every `fn`, impl method, and default trait-method body in `file`,
@@ -66,6 +72,7 @@ where
         block: &'ast Block,
         ident_span: Span,
         vis: Option<&'ast syn::Visibility>,
+        attrs: &'ast [syn::Attribute],
     ) {
         let qualified_name = self.qualified_name(name);
         (self.on_function)(FunctionSite {
@@ -74,11 +81,12 @@ where
             block,
             ident_span,
             vis,
+            attrs,
         });
     }
 }
 
-fn type_name(ty: &Type) -> String {
+pub(crate) fn type_name(ty: &Type) -> String {
     match ty {
         Type::Path(type_path) => type_path
             .path
@@ -122,6 +130,7 @@ where
             &node.block,
             node.sig.ident.span(),
             Some(&node.vis),
+            &node.attrs,
         );
         visit::visit_item_fn(self, node);
     }
@@ -133,6 +142,7 @@ where
             &node.block,
             node.sig.ident.span(),
             Some(&node.vis),
+            &node.attrs,
         );
         visit::visit_impl_item_fn(self, node);
     }
@@ -145,6 +155,7 @@ where
                 block,
                 node.sig.ident.span(),
                 None,
+                &node.attrs,
             );
         }
         visit::visit_trait_item_fn(self, node);
