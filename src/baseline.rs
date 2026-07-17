@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::finding::{Finding, Origin, Severity};
+use crate::health_score::ScoreContext;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -43,6 +44,13 @@ pub struct Baseline {
     /// score density this baseline represents, not just its raw finding
     /// count.
     pub total_loc: usize,
+    /// Score-formula conditions at save time (see
+    /// [`crate::health_score::ScoreContext`]). `None` for baselines saved by
+    /// older judge versions — the score trend then reports "not comparable"
+    /// instead of a delta computed under different conditions (see todo.md
+    /// §15.1).
+    #[serde(default)]
+    pub score_context: Option<ScoreContext>,
     pub findings: Vec<BaselineFinding>,
 }
 
@@ -52,6 +60,7 @@ impl Baseline {
         commit: String,
         rule_revisions: HashMap<String, u32>,
         total_loc: usize,
+        score_context: ScoreContext,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -59,6 +68,7 @@ impl Baseline {
             commit,
             rule_revisions,
             total_loc,
+            score_context: Some(score_context),
             findings: findings
                 .iter()
                 .map(|finding| BaselineFinding {
@@ -272,6 +282,7 @@ mod tests {
             "abc123".to_string(),
             HashMap::from([("duplicate-code".to_string(), 1)]),
             1000,
+            ScoreContext::from_profiles(&[]),
         )
     }
 
@@ -291,6 +302,25 @@ mod tests {
         assert_eq!(loaded.commit, baseline.commit);
         assert_eq!(loaded.findings.len(), 1);
         assert_eq!(loaded.findings[0].id, "a");
+        assert_eq!(loaded.score_context, baseline.score_context);
+    }
+
+    #[test]
+    fn baseline_without_score_context_still_loads() {
+        // A baseline saved before `score_context` existed (see todo.md
+        // §15.1) — must load as `None`, not fail.
+        let json = r#"{
+            "schema_version": 1,
+            "judge_version": "0.1.0",
+            "commit": "abc123",
+            "rule_revisions": {},
+            "total_loc": 1000,
+            "findings": []
+        }"#;
+
+        let baseline: Baseline = serde_json::from_str(json).unwrap();
+
+        assert!(baseline.score_context.is_none());
     }
 
     #[test]

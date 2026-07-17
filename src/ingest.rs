@@ -212,6 +212,27 @@ pub fn load(manifest_path: Option<&Path>) -> Result<Workspace, IngestError> {
     }
     let metadata = cmd.no_deps().exec()?;
 
+    // Roots of every known package: all workspace members plus every declared
+    // path dependency (path dependencies that are not workspace members do
+    // not appear in `metadata.packages` under `--no-deps`, but their resolved
+    // absolute `path` does). When walking one package's directory tree these
+    // roots act as exclusion boundaries, so a package nested inside another
+    // package's directory (vendored path dependency, nested workspace member)
+    // is never attributed to the enclosing package.
+    let mut package_roots: Vec<PathBuf> = Vec::new();
+    for package in &metadata.packages {
+        if let Some(root) = package.manifest_path.parent() {
+            package_roots.push(root.to_path_buf().into());
+        }
+        for dep in &package.dependencies {
+            if let Some(path) = &dep.path {
+                package_roots.push(path.clone().into());
+            }
+        }
+    }
+    package_roots.sort();
+    package_roots.dedup();
+
     let mut crates = Vec::new();
     for package in &metadata.packages {
         let manifest_path: PathBuf = package.manifest_path.clone().into();
@@ -219,7 +240,7 @@ pub fn load(manifest_path: Option<&Path>) -> Result<Workspace, IngestError> {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let source_files = collect_source_files(&root)?;
+        let source_files = collect_source_files(&root, &package_roots)?;
         let entry_points = package
             .targets
             .iter()
@@ -271,8 +292,15 @@ pub fn load(manifest_path: Option<&Path>) -> Result<Workspace, IngestError> {
 }
 
 /// Recursively collects `.rs` files under `root`, skipping `target/`
-/// directories, and classifies each by [`SourceKind`].
-fn collect_source_files(root: &Path) -> std::io::Result<Vec<SourceFile>> {
+/// directories and the roots of other known packages (`package_roots`, which
+/// may include `root` itself — the walk only ever compares subdirectories
+/// against it), and classifies each by [`SourceKind`]. Excluding foreign
+/// package roots keeps every file attributed to exactly one package: the one
+/// with the most specific root.
+fn collect_source_files(
+    root: &Path,
+    package_roots: &[PathBuf],
+) -> std::io::Result<Vec<SourceFile>> {
     let mut paths = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -283,7 +311,7 @@ fn collect_source_files(root: &Path) -> std::io::Result<Vec<SourceFile>> {
                 let is_target_or_hidden = path.file_name().is_some_and(|name| {
                     name == "target" || name.to_str().is_some_and(|name| name.starts_with('.'))
                 });
-                if is_target_or_hidden {
+                if is_target_or_hidden || package_roots.contains(&path) {
                     continue;
                 }
                 stack.push(path);
@@ -355,6 +383,114 @@ edition = "2021"
     }
 
     #[test]
+    fn a_nested_path_dependency_is_not_attributed_to_the_root_crate() {
+        let dir = TempDir::new("ingest-nested-path-dep");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dep = { path = "vendored/dep" }
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::create_dir_all(dir.join("vendored/dep/src")).unwrap();
+        std::fs::write(
+            dir.join("vendored/dep/Cargo.toml"),
+            r#"
+[package]
+name = "dep"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("vendored/dep/src/lib.rs"), "pub fn dep() {}\n").unwrap();
+
+        let manifest = dir.join("Cargo.toml");
+        let workspace = load(Some(&manifest)).unwrap();
+
+        // The path dependency is not a workspace member, so only the root
+        // crate is analyzed — and the dependency's sources are not counted
+        // as part of it.
+        assert_eq!(workspace.crates.len(), 1);
+        let krate = &workspace.crates[0];
+        assert_eq!(krate.name, "fixture");
+        let files: Vec<_> = krate
+            .source_files
+            .iter()
+            .map(|file| file.path.strip_prefix(&krate.root).unwrap().to_path_buf())
+            .collect();
+        assert_eq!(files, vec![PathBuf::from("src/lib.rs")]);
+    }
+
+    #[test]
+    fn a_workspace_member_nested_inside_another_member_owns_its_own_files() {
+        let dir = TempDir::new("ingest-nested-member");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["outer", "outer/inner"]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("outer/src")).unwrap();
+        std::fs::write(
+            dir.join("outer/Cargo.toml"),
+            r#"
+[package]
+name = "outer"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("outer/src/lib.rs"), "pub fn outer() {}\n").unwrap();
+        std::fs::create_dir_all(dir.join("outer/inner/src")).unwrap();
+        std::fs::write(
+            dir.join("outer/inner/Cargo.toml"),
+            r#"
+[package]
+name = "inner"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("outer/inner/src/lib.rs"), "pub fn inner() {}\n").unwrap();
+
+        let manifest = dir.join("Cargo.toml");
+        let workspace = load(Some(&manifest)).unwrap();
+
+        // Every file belongs to exactly one crate: the one with the most
+        // specific root.
+        assert_eq!(workspace.crates.len(), 2);
+        let files_of = |name: &str| -> Vec<PathBuf> {
+            let krate = workspace
+                .crates
+                .iter()
+                .find(|krate| krate.name == name)
+                .unwrap();
+            krate
+                .source_files
+                .iter()
+                .map(|file| file.path.strip_prefix(&krate.root).unwrap().to_path_buf())
+                .collect()
+        };
+        assert_eq!(files_of("outer"), vec![PathBuf::from("src/lib.rs")]);
+        assert_eq!(files_of("inner"), vec![PathBuf::from("src/lib.rs")]);
+    }
+
+    #[test]
     fn load_reports_metadata_error_for_a_missing_manifest() {
         let dir = TempDir::new("ingest-missing-manifest");
         let manifest = dir.join("Cargo.toml");
@@ -371,7 +507,7 @@ edition = "2021"
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
 
-        let files = collect_source_files(&dir).unwrap();
+        let files = collect_source_files(&dir, &[]).unwrap();
 
         assert_eq!(
             files,
@@ -394,7 +530,7 @@ edition = "2021"
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
 
-        let files = collect_source_files(&dir).unwrap();
+        let files = collect_source_files(&dir, &[]).unwrap();
 
         assert_eq!(
             files,
@@ -416,7 +552,7 @@ edition = "2021"
         )
         .unwrap();
 
-        let files = collect_source_files(&dir).unwrap();
+        let files = collect_source_files(&dir, &[]).unwrap();
 
         let kind_of = |name: &str| {
             files
@@ -437,7 +573,7 @@ edition = "2021"
         source.push_str("// @generated too late to count\n");
         std::fs::write(dir.join("src/lib.rs"), source).unwrap();
 
-        let files = collect_source_files(&dir).unwrap();
+        let files = collect_source_files(&dir, &[]).unwrap();
 
         assert_eq!(files[0].kind, SourceKind::Authored);
     }

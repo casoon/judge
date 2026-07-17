@@ -702,6 +702,21 @@ fn handle_baseline(
     analysis_errors: &[String],
     options: BaselineOptions<'_>,
 ) -> bool {
+    handle_baseline_with_trend(workspace_root, findings, analysis_errors, options, None)
+}
+
+/// Like [`handle_baseline`], but embeds the health score and its trend into
+/// the JSON delta envelope when `score_trend` is given (only `health --score
+/// --baseline` computes one — see todo.md §15.1: the trend is emitted in
+/// JSON too, with an explicit `comparable: false` reason instead of a false
+/// delta). TTY trend output stays in `run_health`, printed before this runs.
+fn handle_baseline_with_trend(
+    workspace_root: &Path,
+    findings: &[Finding],
+    analysis_errors: &[String],
+    options: BaselineOptions<'_>,
+    score_trend: Option<&judge::health_score::Trend>,
+) -> bool {
     let BaselineOptions {
         rule_revisions,
         save,
@@ -737,7 +752,14 @@ fn handle_baseline(
                 std::process::exit(2);
             }
         };
-        let baseline = judge::baseline::Baseline::new(&findings, commit, rule_revisions, total_loc);
+        let config = load_judge_toml(workspace_root);
+        let baseline = judge::baseline::Baseline::new(
+            &findings,
+            commit,
+            rule_revisions,
+            total_loc,
+            judge::health_score::ScoreContext::from_profiles(&config.crate_profiles),
+        );
         let save_path = workspace_root.join(default_save_path);
         match judge::baseline::save(&save_path, &baseline) {
             Ok(()) => println!(
@@ -777,11 +799,15 @@ fn handle_baseline(
     let verdict = delta.verdict();
     match format {
         OutputFormat::Json => {
-            let envelope = serde_json::json!({
+            let mut envelope = serde_json::json!({
                 "schema_version": judge::finding::SCHEMA_VERSION,
                 "verdict": verdict,
                 "delta": delta,
             });
+            if let Some(trend) = score_trend {
+                envelope["score"] = serde_json::to_value(trend.current()).unwrap();
+                envelope["trend"] = trend_json(trend);
+            }
             println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
         }
         OutputFormat::Tty => print_delta(&delta, verdict),
@@ -1879,19 +1905,40 @@ fn run_health(
     ));
 
     let excluded_generated = report.excluded_generated + slop.excluded_generated;
-    let total_loc = judge::health_score::total_authored_loc(&workspace);
 
-    // Print the score trend before `handle_baseline` runs below, since a
+    // The LOC denominator is only computed — and an unreadable file only
+    // fatal — where a score or a saved baseline depends on it (see todo.md
+    // §15.1: no score on an incomplete basis). Plain `health` keeps
+    // reporting per-file read problems as analysis errors instead.
+    let total_loc = if show_score || save_baseline || baseline.is_some() {
+        match judge::health_score::total_authored_loc_checked(&workspace) {
+            Ok(total_loc) => total_loc,
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        0 // unused: every consumer below sits behind one of the flags above
+    };
+
+    // Compute the score trend before `handle_baseline` runs below, since a
     // failing verdict there exits the process before reaching any code after
     // it (see todo.md §4 point 4, "Trend vor Absolutwert" — the score is
-    // never shown without this). TTY only, matching the current-score
-    // display further down.
-    if show_score
+    // never shown without this). Printed here for TTY; JSON gets it embedded
+    // in the delta envelope by `handle_baseline_with_trend`.
+    let score_trend = if show_score
         && !save_baseline
-        && matches!(format, OutputFormat::Tty)
         && let Some(path) = &baseline
     {
-        print_score_trend(&workspace, &findings, total_loc, path);
+        Some(compute_score_trend(&workspace, &findings, total_loc, path))
+    } else {
+        None
+    };
+    if matches!(format, OutputFormat::Tty)
+        && let Some(trend) = &score_trend
+    {
+        print_score_trend(trend);
     }
 
     if save_baseline || baseline.is_some() {
@@ -1973,7 +2020,7 @@ fn run_health(
                 judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
             ),
         ]);
-        handle_baseline(
+        handle_baseline_with_trend(
             &workspace.root,
             &findings,
             &analysis_errors,
@@ -1985,14 +2032,32 @@ fn run_health(
                 format,
                 total_loc,
             },
+            score_trend.as_ref(),
         );
         return;
     }
 
     match format {
         OutputFormat::Json => {
+            // With `--score`, the score is embedded next to the report
+            // fields (additive, so the plain report shape stays intact) —
+            // an unavailable score already exited with 2 above instead of
+            // being silently omitted (see todo.md §15.1).
+            let score = show_score.then(|| {
+                let config = load_judge_toml(&workspace.root);
+                require_score(judge::health_score::compute(
+                    &findings,
+                    total_loc,
+                    &workspace,
+                    &config.crate_profiles,
+                ))
+            });
             let report = Report::with_errors(findings, analysis_errors);
-            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            let mut value = serde_json::to_value(&report).unwrap();
+            if let Some(score) = score {
+                value["score"] = serde_json::to_value(&score).unwrap();
+            }
+            println!("{}", serde_json::to_string_pretty(&value).unwrap());
         }
         OutputFormat::Tty => {
             println!("functions analyzed: {}", functions.len());
@@ -2031,12 +2096,12 @@ fn run_health(
             if show_score {
                 println!();
                 let config = load_judge_toml(&workspace.root);
-                let score = judge::health_score::compute(
+                let score = require_score(judge::health_score::compute(
                     &findings,
                     total_loc,
                     &workspace,
                     &config.crate_profiles,
-                );
+                ));
                 println!(
                     "health score: {:.1} ({}) — {} authored LOC, {} fail, {} warn",
                     score.score,
@@ -2074,14 +2139,26 @@ fn load_judge_toml(workspace_root: &Path) -> judge::boundaries::BoundaryConfig {
     }
 }
 
-/// Prints the current health score alongside the score a saved baseline
-/// represents (see todo.md §4 point 4, "Trend vor Absolutwert").
-fn print_score_trend(
+/// Treats an unavailable score as the analyzer error it is — exit 2,
+/// matching `IngestError`/`GitError`/`BaselineError` (see todo.md §15.1).
+fn require_score(outcome: judge::health_score::ScoreOutcome) -> judge::health_score::HealthScore {
+    match outcome {
+        judge::health_score::ScoreOutcome::Available(score) => score,
+        judge::health_score::ScoreOutcome::Unavailable(reason) => {
+            eprintln!("error: health score unavailable: {reason}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Computes the current health score and its trend against the baseline at
+/// `baseline_path` (see todo.md §4 point 4, "Trend vor Absolutwert").
+fn compute_score_trend(
     workspace: &judge::ingest::Workspace,
     findings: &[Finding],
     total_loc: usize,
     baseline_path: &Path,
-) {
+) -> judge::health_score::Trend {
     let baseline = match judge::baseline::load(baseline_path) {
         Ok(baseline) => baseline,
         Err(err) => {
@@ -2090,23 +2167,60 @@ fn print_score_trend(
         }
     };
     let config = load_judge_toml(&workspace.root);
-    let current =
-        judge::health_score::compute(findings, total_loc, workspace, &config.crate_profiles);
-    let baseline_score = judge::health_score::baseline_score(&baseline);
-    let trend = judge::health_score::Trend {
-        current,
-        baseline_score: baseline_score.score,
-        baseline_grade: baseline_score.grade,
-    };
+    let current = require_score(judge::health_score::compute(
+        findings,
+        total_loc,
+        workspace,
+        &config.crate_profiles,
+    ));
+    judge::health_score::trend(current, &baseline, workspace, &config.crate_profiles)
+}
 
-    println!(
-        "health score: {:.1} ({}) — {:+.1} since baseline ({:.1} {})",
-        trend.current.score,
-        trend.current.grade.label(),
-        trend.delta(),
-        trend.baseline_score,
-        trend.baseline_grade.label(),
-    );
+/// Prints the current health score alongside the score a saved baseline
+/// represents — or the explicit reason the two aren't directly comparable
+/// (see todo.md §15.1), instead of a delta across different formulas.
+fn print_score_trend(trend: &judge::health_score::Trend) {
+    match trend {
+        judge::health_score::Trend::Comparable {
+            current,
+            baseline_score,
+            baseline_grade,
+        } => println!(
+            "health score: {:.1} ({}) — {:+.1} since baseline ({:.1} {})",
+            current.score,
+            current.grade.label(),
+            current.score - baseline_score,
+            baseline_score,
+            baseline_grade.label(),
+        ),
+        judge::health_score::Trend::NotComparable { current, reason } => println!(
+            "health score: {:.1} ({}) — baseline not directly comparable: {reason}",
+            current.score,
+            current.grade.label(),
+        ),
+    }
+}
+
+/// The `trend` JSON shape: `comparable` plus either the baseline score and
+/// delta, or the explicit reason no delta can be computed.
+fn trend_json(trend: &judge::health_score::Trend) -> serde_json::Value {
+    match trend {
+        judge::health_score::Trend::Comparable {
+            current,
+            baseline_score,
+            baseline_grade,
+        } => serde_json::json!({
+            "comparable": true,
+            "baseline_score": baseline_score,
+            "baseline_grade": baseline_grade,
+            "delta": current.score - baseline_score,
+        }),
+        judge::health_score::Trend::NotComparable { reason, .. } => serde_json::json!({
+            "comparable": false,
+            "reason": reason.code(),
+            "message": reason.to_string(),
+        }),
+    }
 }
 
 /// Hotspot = complexity × change frequency (see todo.md §3.E). Files with no
@@ -2394,6 +2508,7 @@ fn dup_two(x: i32) -> i32 {
             base_commit.clone(),
             baseline_collected.rule_revisions,
             judge::health_score::total_authored_loc(&workspace),
+            judge::health_score::ScoreContext::from_profiles(&[]),
         );
 
         // `judge::ingest::collect_source_files` walks the directory tree
@@ -2517,10 +2632,11 @@ fn dup_two(x: i32) -> i32 {
             causes: Vec::new(),
         };
         let baseline = judge::baseline::Baseline::new(
-            &[pre_existing.clone()],
+            std::slice::from_ref(&pre_existing),
             base_commit,
             std::collections::HashMap::from([(judge::duplication::DUPLICATE_RULE.to_string(), 1)]),
             0,
+            judge::health_score::ScoreContext::from_profiles(&[]),
         );
         let bumped_revisions =
             std::collections::HashMap::from([(judge::duplication::DUPLICATE_RULE.to_string(), 2)]);

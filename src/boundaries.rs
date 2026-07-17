@@ -13,6 +13,7 @@ use cargo_metadata::MetadataCommand;
 use serde::Deserialize;
 
 use crate::finding::{Finding, Location, Origin, Severity};
+use crate::health_score::DeductionMultiplier;
 use crate::ingest::Workspace;
 use crate::slopsquat::SlopsquatConfig;
 
@@ -95,14 +96,11 @@ pub struct BoundaryRule {
 pub struct CrateProfile {
     pub name: String,
     pub crates: Vec<String>,
-    #[serde(default = "CrateProfile::default_multiplier")]
-    pub deduction_multiplier: f64,
-}
-
-impl CrateProfile {
-    fn default_multiplier() -> f64 {
-        1.0
-    }
+    /// Validated at deserialization (see [`DeductionMultiplier`]) — an
+    /// out-of-range value is a config error, not a score. Missing means the
+    /// default `1.0`.
+    #[serde(default)]
+    pub deduction_multiplier: DeductionMultiplier,
 }
 
 /// The `judge.toml` `[[boundary]]`, `[[crate_profile]]`, and `[slopsquat]`
@@ -806,9 +804,9 @@ crates = ["cli"]
         assert_eq!(config.crate_profiles.len(), 2);
         assert_eq!(config.crate_profiles[0].name, "lenient");
         assert_eq!(config.crate_profiles[0].crates, vec!["parser".to_string()]);
-        assert_eq!(config.crate_profiles[0].deduction_multiplier, 0.5);
+        assert_eq!(config.crate_profiles[0].deduction_multiplier.value(), 0.5);
         // Missing `deduction_multiplier` defaults to 1.0.
-        assert_eq!(config.crate_profiles[1].deduction_multiplier, 1.0);
+        assert_eq!(config.crate_profiles[1].deduction_multiplier.value(), 1.0);
     }
 
     #[test]

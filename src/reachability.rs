@@ -22,7 +22,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
 use ra_ap_hir::{InFile, Semantics};
-use ra_ap_ide::{Analysis, CallHierarchyConfig, FilePosition, FileRange, RaFixtureConfig, RootDatabase};
+use ra_ap_ide::{
+    Analysis, CallHierarchyConfig, FilePosition, FileRange, RaFixtureConfig, RootDatabase,
+};
 use ra_ap_syntax::{AstNode, TextRange, ast};
 
 use crate::deep::{DeepContext, DeepError, FileId};
@@ -149,7 +151,9 @@ fn classify_call_kind(
     let source_file = sema.parse_guess_edition(file_id);
     let syntax = source_file.syntax();
 
-    let Some(token) = syntax.token_at_offset(range.start()).find(|token| token.text_range() == range)
+    let Some(token) = syntax
+        .token_at_offset(range.start())
+        .find(|token| token.text_range() == range)
     else {
         return CallKind::Unknown;
     };
@@ -175,7 +179,11 @@ fn classify_call_kind(
                 .receiver()
                 .and_then(|receiver| sema.type_of_expr(&receiver))
                 .is_some_and(|info| info.original.strip_references().as_dyn_trait().is_some());
-            return if is_dynamic { CallKind::Dynamic } else { CallKind::Static };
+            return if is_dynamic {
+                CallKind::Dynamic
+            } else {
+                CallKind::Static
+            };
         }
 
         if let Some(call_expr) = ast::CallExpr::cast(ancestor.clone()) {
@@ -217,11 +225,26 @@ pub enum WhyLive {
 
 /// Whether any of `attrs` has a path whose last segment is `ident` — matches
 /// both a bare attribute (`#[test]`) and a path-qualified one
-/// (`#[tokio::test]`, `#[wasm_bindgen::prelude::wasm_bindgen]`).
+/// (`#[tokio::test]`, `#[wasm_bindgen::prelude::wasm_bindgen]`), plus the
+/// Rust-2024 unsafe-attribute form (`#[unsafe(no_mangle)]`,
+/// `#[unsafe(export_name = "...")]`), which syn parses as a `Meta::List`
+/// whose path is the single ident `unsafe` wrapping the actual attribute.
 pub(crate) fn has_attr_ending_in(attrs: &[syn::Attribute], ident: &str) -> bool {
-    attrs
-        .iter()
-        .any(|attr| attr.path().segments.last().is_some_and(|segment| segment.ident == ident))
+    fn meta_ends_in(meta: &syn::Meta, ident: &str) -> bool {
+        if let syn::Meta::List(list) = meta
+            && list.path.is_ident("unsafe")
+        {
+            return list
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|inner| meta_ends_in(&inner, ident));
+        }
+        meta.path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == ident)
+    }
+
+    attrs.iter().any(|attr| meta_ends_in(&attr.meta, ident))
 }
 
 /// Finds every recognized entry point (see module docs): `fn main` in a
@@ -301,7 +324,11 @@ fn find_item_position(
 ) -> Result<FilePosition, ReachabilityError> {
     let (crates, name) = match item_path.split_once("::") {
         Some((prefix, rest)) if workspace.crates.iter().any(|krate| krate.name == prefix) => {
-            let crates: Vec<_> = workspace.crates.iter().filter(|krate| krate.name == prefix).collect();
+            let crates: Vec<_> = workspace
+                .crates
+                .iter()
+                .filter(|krate| krate.name == prefix)
+                .collect();
             (crates, rest)
         }
         _ => (workspace.crates.iter().collect(), item_path),
@@ -334,13 +361,18 @@ fn find_item_position(
         }
     }
 
-    matches.sort_by(|(_, path_a, line_a), (_, path_b, line_b)| (path_a, line_a).cmp(&(path_b, line_b)));
+    matches.sort_by(|(_, path_a, line_a), (_, path_b, line_b)| {
+        (path_a, line_a).cmp(&(path_b, line_b))
+    });
     match matches.len() {
         0 => Err(ReachabilityError::UnknownItem(item_path.to_string())),
         1 => Ok(matches.into_iter().next().unwrap().0),
         _ => Err(ReachabilityError::AmbiguousItem(
             item_path.to_string(),
-            matches.into_iter().map(|(_, path, line)| (path, line)).collect(),
+            matches
+                .into_iter()
+                .map(|(_, path, line)| (path, line))
+                .collect(),
         )),
     }
 }
@@ -363,22 +395,37 @@ fn deterministic_callers(
     config: &CallHierarchyConfig<'_>,
     position: FilePosition,
 ) -> Result<Vec<(FilePosition, String, Vec<FileRange>)>, ReachabilityError> {
+    // Three-state, not two: `None` means the position didn't resolve to a
+    // symbol the call hierarchy could start from — an analyzer error, not
+    // "no callers". Collapsing it to an empty caller set would let an
+    // unresolvable position turn into `NotReachable` (todo.md §15.1).
     let callers = analysis
         .incoming_calls(config, position)
         .map_err(|err| ReachabilityError::Deep(DeepError::Cancelled(format!("{err:?}"))))?
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            ReachabilityError::Deep(DeepError::UnresolvedSymbol(crate::deep::describe_position(
+                position,
+            )))
+        })?;
 
     let mut callers: Vec<_> = callers
         .into_iter()
         .map(|call_item| {
-            let focus = call_item.target.focus_range.unwrap_or(call_item.target.full_range);
+            let focus = call_item
+                .target
+                .focus_range
+                .unwrap_or(call_item.target.full_range);
             let caller_position = FilePosition {
                 file_id: call_item.target.file_id,
                 offset: focus.start(),
             };
             let mut ranges = call_item.ranges;
             ranges.sort_by_key(|range| (range.file_id, range.range.start()));
-            (caller_position, call_item.target.name.as_str().to_string(), ranges)
+            (
+                caller_position,
+                call_item.target.name.as_str().to_string(),
+                ranges,
+            )
         })
         .collect();
     callers.sort_by_key(|(position, _, _)| position_key(*position));
@@ -411,7 +458,8 @@ pub(crate) fn is_reachable_from_entry(
     let mut queue = VecDeque::from([target]);
 
     while let Some(position) = queue.pop_front() {
-        for (caller_position, _name, _ranges) in deterministic_callers(analysis, &config, position)? {
+        for (caller_position, _name, _ranges) in deterministic_callers(analysis, &config, position)?
+        {
             let key = position_key(caller_position);
             if entry_keys.contains(&key) {
                 return Ok(true);
@@ -448,8 +496,10 @@ pub fn why_live(
         .collect();
 
     let entries = entry_point_positions(workspace, &ctx, include_tests)?;
-    let entry_keys: HashSet<(FileId, u32)> =
-        entries.iter().map(|(_, position)| position_key(*position)).collect();
+    let entry_keys: HashSet<(FileId, u32)> = entries
+        .iter()
+        .map(|(_, position)| position_key(*position))
+        .collect();
 
     let target = find_item_position(workspace, &ctx, item_path)?;
     let (target_file, target_line) = describe_position(workspace, &ctx, target);
@@ -487,14 +537,14 @@ pub fn why_live(
                 continue;
             }
 
-            let kind = if file_source_kind.get(&caller_position.file_id) == Some(&SourceKind::Generated)
-            {
-                CallKind::Generated
-            } else if let Some(call_site) = ranges.first() {
-                classify_call_kind(&sema, db, call_site.file_id, call_site.range)
-            } else {
-                CallKind::Unknown
-            };
+            let kind =
+                if file_source_kind.get(&caller_position.file_id) == Some(&SourceKind::Generated) {
+                    CallKind::Generated
+                } else if let Some(call_site) = ranges.first() {
+                    classify_call_kind(&sema, db, call_site.file_id, call_site.range)
+                } else {
+                    CallKind::Unknown
+                };
 
             let (caller_file, caller_line) = describe_position(workspace, &ctx, caller_position);
             let mut new_path = path_so_far.clone();
@@ -520,7 +570,11 @@ pub fn why_live(
 /// file it came from, and the 1-based line at its offset — for display
 /// purposes only, computed by re-reading the file rather than threading a
 /// semantic line index through the whole search.
-fn describe_position(workspace: &Workspace, ctx: &DeepContext, position: FilePosition) -> (PathBuf, usize) {
+fn describe_position(
+    workspace: &Workspace,
+    ctx: &DeepContext,
+    position: FilePosition,
+) -> (PathBuf, usize) {
     for krate in &workspace.crates {
         for file in &krate.source_files {
             if ctx.file_id(&file.path) != Some(position.file_id) {
@@ -545,14 +599,25 @@ mod tests {
     use crate::test_util::TempDir;
 
     fn load_bin_workspace(dir: &TempDir, lib_source: &str, bin_source: &str) -> Workspace {
+        load_bin_workspace_with_edition(dir, "2021", lib_source, bin_source)
+    }
+
+    fn load_bin_workspace_with_edition(
+        dir: &TempDir,
+        edition: &str,
+        lib_source: &str,
+        bin_source: &str,
+    ) -> Workspace {
         std::fs::write(
             dir.join("Cargo.toml"),
-            r#"
+            format!(
+                r#"
 [package]
 name = "why-live-fixture"
 version = "0.1.0"
-edition = "2021"
-"#,
+edition = "{edition}"
+"#
+            ),
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("src/bin")).unwrap();
@@ -586,14 +651,22 @@ pub fn middle() -> i32 {
             panic!("expected a path, got NotReachable");
         };
 
-        let names: Vec<_> = path.iter().map(|step| step.qualified_name.as_str()).collect();
+        let names: Vec<_> = path
+            .iter()
+            .map(|step| step.qualified_name.as_str())
+            .collect();
         assert_eq!(names.first(), Some(&"deep_helper"));
         assert!(names.contains(&"middle"));
         assert_eq!(names.last(), Some(&"main"));
 
-        assert_eq!(path[0].kind, None, "the target's own step has no incoming edge");
+        assert_eq!(
+            path[0].kind, None,
+            "the target's own step has no incoming edge"
+        );
         assert!(
-            path[1..].iter().all(|step| step.kind == Some(CallKind::Static)),
+            path[1..]
+                .iter()
+                .all(|step| step.kind == Some(CallKind::Static)),
             "every call in this fixture is a direct static call: {:?}",
             path.iter().map(|s| s.kind).collect::<Vec<_>>()
         );
@@ -682,6 +755,58 @@ pub extern "C" fn exported() -> i32 {
         assert_eq!(
             path.last().map(|step| step.qualified_name.as_str()),
             Some("exported")
+        );
+    }
+
+    /// The Rust-2024 unsafe-attribute forms of the export attributes —
+    /// `#[unsafe(no_mangle)]` and `#[unsafe(export_name = "...")]` — mark
+    /// external roots exactly like their bare pre-2024 spellings (see
+    /// [`a_no_mangle_function_is_an_entry_point_regardless_of_include_tests`]).
+    /// The fixture is `edition = "2024"` because `unsafe(...)` in attributes
+    /// is only valid syntax from that edition on.
+    #[test]
+    fn an_unsafe_wrapped_export_attribute_is_an_entry_point_regardless_of_include_tests() {
+        let dir = TempDir::new("why-live-unsafe-attr-entry");
+        let workspace = load_bin_workspace_with_edition(
+            &dir,
+            "2024",
+            r#"pub fn helper_a() -> i32 {
+    1
+}
+
+pub fn helper_b() -> i32 {
+    2
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn exported_a() -> i32 {
+    helper_a()
+}
+
+#[unsafe(export_name = "exported_b_symbol")]
+pub extern "C" fn exported_b() -> i32 {
+    helper_b()
+}
+"#,
+            "fn main() {}\n",
+        );
+
+        let result = why_live(&workspace, "helper_a", false).unwrap();
+        let WhyLive::Path(path) = result else {
+            panic!("expected a path via the #[unsafe(no_mangle)] export, got NotReachable");
+        };
+        assert_eq!(
+            path.last().map(|step| step.qualified_name.as_str()),
+            Some("exported_a")
+        );
+
+        let result = why_live(&workspace, "helper_b", false).unwrap();
+        let WhyLive::Path(path) = result else {
+            panic!("expected a path via the #[unsafe(export_name = ...)] export, got NotReachable");
+        };
+        assert_eq!(
+            path.last().map(|step| step.qualified_name.as_str()),
+            Some("exported_b")
         );
     }
 

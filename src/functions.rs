@@ -85,6 +85,7 @@ impl<'ast, F> Walker<F>
 where
     F: FnMut(FunctionSite<'ast>),
 {
+    #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
         name: &str,

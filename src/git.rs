@@ -26,6 +26,7 @@ pub enum GitError {
     Walk(String),
     RevParse(String, String),
     Status(String),
+    InvalidWindow(i64),
 }
 
 impl std::fmt::Display for GitError {
@@ -35,6 +36,9 @@ impl std::fmt::Display for GitError {
             Self::Walk(msg) => write!(f, "failed to walk git history: {msg}"),
             Self::RevParse(spec, msg) => write!(f, "failed to resolve `{spec}`: {msg}"),
             Self::Status(msg) => write!(f, "failed to read repository status: {msg}"),
+            Self::InvalidWindow(days) => {
+                write!(f, "invalid lookback window: {days} days (must be positive)")
+            }
         }
     }
 }
@@ -47,10 +51,44 @@ impl From<gix::open::Error> for GitError {
     }
 }
 
+/// A validated, strictly positive lookback window in days (todo.md §15.1) —
+/// the walks below never see a zero or negative window as a raw `i64`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowDays(i64);
+
+impl WindowDays {
+    pub fn new(days: i64) -> Result<Self, GitError> {
+        if days > 0 {
+            Ok(Self(days))
+        } else {
+            Err(GitError::InvalidWindow(days))
+        }
+    }
+
+    /// Unix-epoch cutoff for this window ending now: commits at or after
+    /// this second are inside the window.
+    fn cutoff_seconds(self) -> i64 {
+        now_unix_seconds() - self.0 * 24 * 3600
+    }
+}
+
+/// Time-ordered traversal that prunes commits older than `cutoff` inside
+/// `gix` itself. Unlike the default breadth-first walk with a manual `break`
+/// on the first too-old commit, this still visits a recent commit that is
+/// only reachable through a merge's second parent behind an old first
+/// parent (todo.md §15.1).
+fn window_sorting(cutoff: i64) -> gix::revision::walk::Sorting {
+    gix::revision::walk::Sorting::ByCommitTimeCutoff {
+        order: gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        seconds: cutoff,
+    }
+}
+
 /// Number of commits touching each file within `window_days` of now, keyed
 /// by path relative to the repository root. Commits are walked from HEAD;
 /// an unborn HEAD (no commits yet) yields an empty map rather than an error.
 pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>, GitError> {
+    let window = WindowDays::new(window_days)?;
     let repo = gix::open(repo_root)?;
     let mut counts = HashMap::new();
 
@@ -58,10 +96,9 @@ pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>
         return Ok(counts);
     };
 
-    let cutoff = now_unix_seconds() - window_days * 24 * 3600;
-
     let walk = repo
         .rev_walk(Some(head_id.detach()))
+        .sorting(window_sorting(window.cutoff_seconds()))
         .all()
         .map_err(|err| GitError::Walk(err.to_string()))?;
 
@@ -70,13 +107,6 @@ pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>
         let commit = info
             .object()
             .map_err(|err| GitError::Walk(err.to_string()))?;
-        let commit_time = commit
-            .time()
-            .map_err(|err| GitError::Walk(err.to_string()))?
-            .seconds;
-        if commit_time < cutoff {
-            break;
-        }
 
         let tree = commit
             .tree()
@@ -126,6 +156,7 @@ pub struct CommitInfo {
 /// todo.md §3.G G6). Same unborn-HEAD tolerance as [`churn`]: an empty
 /// `Vec`, not an error.
 pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo>, GitError> {
+    let window = WindowDays::new(window_days)?;
     let repo = gix::open(repo_root)?;
     let mut commits = Vec::new();
 
@@ -133,10 +164,9 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
         return Ok(commits);
     };
 
-    let cutoff = now_unix_seconds() - window_days * 24 * 3600;
-
     let walk = repo
         .rev_walk(Some(head_id.detach()))
+        .sorting(window_sorting(window.cutoff_seconds()))
         .all()
         .map_err(|err| GitError::Walk(err.to_string()))?;
 
@@ -149,9 +179,6 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
             .time()
             .map_err(|err| GitError::Walk(err.to_string()))?
             .seconds;
-        if commit_time < cutoff {
-            break;
-        }
 
         let tree = commit
             .tree()
@@ -401,6 +428,7 @@ pub fn active_authors_since(
     repo_root: &Path,
     window_days: i64,
 ) -> Result<HashSet<String>, GitError> {
+    let window = WindowDays::new(window_days)?;
     let repo = gix::open(repo_root)?;
     let mut authors = HashSet::new();
 
@@ -408,10 +436,9 @@ pub fn active_authors_since(
         return Ok(authors);
     };
 
-    let cutoff = now_unix_seconds() - window_days * 24 * 3600;
-
     let walk = repo
         .rev_walk(Some(head_id.detach()))
+        .sorting(window_sorting(window.cutoff_seconds()))
         .all()
         .map_err(|err| GitError::Walk(err.to_string()))?;
 
@@ -420,13 +447,6 @@ pub fn active_authors_since(
         let commit = info
             .object()
             .map_err(|err| GitError::Walk(err.to_string()))?;
-        let commit_time = commit
-            .time()
-            .map_err(|err| GitError::Walk(err.to_string()))?
-            .seconds;
-        if commit_time < cutoff {
-            break;
-        }
 
         let author = commit
             .author()
@@ -796,6 +816,112 @@ mod tests {
             .status()
             .expect("failed to run git — required for these fixtures");
         assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// History whose HEAD is a merge with an *ancient* first parent and a
+    /// *recent* second parent:
+    ///
+    /// ```text
+    /// ancient (old@, 2000) ------------- merge feature (merger@, now)
+    ///        \                          /
+    ///         feature work (feature@, now)
+    /// ```
+    ///
+    /// The old breadth-first walk with a manual `break` visited `ancient`
+    /// right after the merge and stopped, never reaching `feature work`.
+    fn init_merge_with_old_first_parent(dir: &Path) {
+        git(dir, &["init", "-q", "-b", "main"]);
+
+        let old_date = [
+            ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00"),
+            ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00"),
+        ];
+        std::fs::write(dir.join("old.rs"), "fn old() {}\n").unwrap();
+        run_git_as(dir, "old@example.com", &["add", "."], &[]);
+        run_git_as(
+            dir,
+            "old@example.com",
+            &["commit", "-q", "-m", "ancient"],
+            &old_date,
+        );
+
+        git(dir, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(dir.join("feature.rs"), "fn feature() {}\n").unwrap();
+        run_git_as(dir, "feature@example.com", &["add", "."], &[]);
+        run_git_as(
+            dir,
+            "feature@example.com",
+            &["commit", "-q", "-m", "feature work"],
+            &[],
+        );
+
+        git(dir, &["checkout", "-q", "main"]);
+        run_git_as(
+            dir,
+            "merger@example.com",
+            &["merge", "-q", "--no-ff", "feature", "-m", "merge feature"],
+            &[],
+        );
+    }
+
+    #[test]
+    fn churn_counts_a_recent_second_parent_behind_an_old_first_parent() {
+        let dir = TempDir::new("git-churn-merge-window");
+        init_merge_with_old_first_parent(&dir);
+
+        let counts = churn(&dir, 30).unwrap();
+
+        // Once from the merge commit (diffed against its old first parent)
+        // and once from the feature commit itself.
+        assert_eq!(counts.get(&PathBuf::from("feature.rs")), Some(&2));
+        assert_eq!(counts.get(&PathBuf::from("old.rs")), None);
+    }
+
+    #[test]
+    fn active_authors_since_sees_a_recent_second_parent_behind_an_old_first_parent() {
+        let dir = TempDir::new("git-authors-merge-window");
+        init_merge_with_old_first_parent(&dir);
+
+        let authors = active_authors_since(&dir, 30).unwrap();
+
+        assert!(authors.contains("feature@example.com"));
+        assert!(authors.contains("merger@example.com"));
+        assert!(!authors.contains("old@example.com"));
+    }
+
+    #[test]
+    fn walk_commits_sees_a_recent_second_parent_behind_an_old_first_parent() {
+        let dir = TempDir::new("git-walk-commits-merge-window");
+        init_merge_with_old_first_parent(&dir);
+
+        let commits = walk_commits(&dir, 30).unwrap();
+        let titles: Vec<&str> = commits
+            .iter()
+            .map(|commit| commit.message_title.as_str())
+            .collect();
+
+        assert!(titles.contains(&"feature work"));
+        assert!(titles.contains(&"merge feature"));
+        assert!(!titles.contains(&"ancient"));
+    }
+
+    #[test]
+    fn a_non_positive_window_is_rejected() {
+        let dir = TempDir::new("git-invalid-window");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        assert!(matches!(
+            churn(&dir, 0).unwrap_err(),
+            GitError::InvalidWindow(0)
+        ));
+        assert!(matches!(
+            walk_commits(&dir, 0).unwrap_err(),
+            GitError::InvalidWindow(0)
+        ));
+        assert!(matches!(
+            active_authors_since(&dir, -1).unwrap_err(),
+            GitError::InvalidWindow(-1)
+        ));
     }
 
     #[test]

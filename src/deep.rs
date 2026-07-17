@@ -31,6 +31,13 @@ pub enum DeepError {
     /// never does after `load`, so in practice this indicates an internal
     /// rust-analyzer panic recovery, not a normal condition to retry.
     Cancelled(String),
+    /// The queried position did not resolve to a symbol at all (whitespace,
+    /// a comment, or `cfg`-inactive code, say) — rust-analyzer answered
+    /// `None`, not an empty result set. Kept distinct from a resolved
+    /// symbol with zero references: only the latter may mean "no
+    /// references"; treating this as an empty set would let "symbol not
+    /// resolvable" masquerade as dead code (see todo.md §15.1).
+    UnresolvedSymbol(String),
 }
 
 impl std::fmt::Display for DeepError {
@@ -38,6 +45,11 @@ impl std::fmt::Display for DeepError {
         match self {
             Self::Load(msg) => write!(f, "failed to load workspace for deep analysis: {msg}"),
             Self::Cancelled(msg) => write!(f, "semantic query canceled: {msg}"),
+            Self::UnresolvedSymbol(position) => write!(
+                f,
+                "semantic query at {position} did not resolve to a symbol — not the same as a \
+                 symbol with zero references"
+            ),
         }
     }
 }
@@ -146,6 +158,11 @@ impl DeepContext {
 /// todo.md §3.A's "getrennte Graphen für production, tests und all": `false`
 /// computes production-only reachability (test-only usages don't count),
 /// `true` counts every usage.
+///
+/// Three-state, not two: `find_all_refs` answering `None` means the position
+/// didn't resolve to a symbol at all, and comes back as
+/// [`DeepError::UnresolvedSymbol`] — only a `Some` result (possibly empty)
+/// may mean "no references".
 fn find_refs(
     analysis: &Analysis,
     position: FilePosition,
@@ -157,10 +174,21 @@ fn find_refs(
         exclude_imports: false,
         exclude_tests: !include_tests,
     };
-    let results = analysis
+    analysis
         .find_all_refs(position, &config)
-        .map_err(|err| DeepError::Cancelled(format!("{err:?}")))?;
-    Ok(results.unwrap_or_default())
+        .map_err(|err| DeepError::Cancelled(format!("{err:?}")))?
+        .ok_or_else(|| DeepError::UnresolvedSymbol(describe_position(position)))
+}
+
+/// The best identification of a `FilePosition` available without a
+/// `DeepContext` (queries only carry an `Analysis`): the vfs-assigned file id
+/// plus the byte offset. Used by [`DeepError::UnresolvedSymbol`].
+pub(crate) fn describe_position(position: FilePosition) -> String {
+    format!(
+        "{:?}, byte offset {}",
+        position.file_id,
+        u32::from(position.offset)
+    )
 }
 
 /// Counts genuine (non-declaration) references to the item at `position`,
@@ -375,6 +403,76 @@ pub fn count_used(files: &[SourceFile]) -> usize {
             "`used` is called once from b.rs, through an unannotated closure passed to \
              `Iterator::filter` — the shape that undercounted to zero without an explicit sysroot"
         );
+    }
+
+    /// A position that doesn't name a symbol (whitespace between items, the
+    /// inside of a comment) must come back as
+    /// [`DeepError::UnresolvedSymbol`], never as a resolved-but-empty
+    /// result — `Ok(0)` here is exactly what would let "symbol not
+    /// resolvable" turn into a dead-code finding downstream (todo.md §15.1).
+    #[test]
+    fn a_position_not_on_a_symbol_is_an_unresolved_error_not_zero_references() {
+        let dir = TempDir::new("deep-unresolved-position");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "deep-fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let lib_source = r#"// a comment, not a symbol
+pub fn item() -> i32 {
+    1
+}
+"#;
+        std::fs::write(dir.join("src/lib.rs"), lib_source).unwrap();
+
+        let ctx = DeepContext::load(&dir).expect("deep tier should load a trivial crate");
+        let analysis = ctx.analysis();
+        let file_id = ctx
+            .file_id(&dir.join("src/lib.rs"))
+            .expect("lib.rs should be indexed by the vfs");
+
+        // Strictly inside the leading comment's text.
+        let comment_offset = lib_source.find("comment").unwrap() as u32;
+        // Strictly inside the body's indentation whitespace (not on a token
+        // boundary, where rust-analyzer would pick an adjacent token).
+        let whitespace_offset = lib_source.find("    1").unwrap() as u32 + 1;
+
+        for offset in [comment_offset, whitespace_offset] {
+            let position = FilePosition {
+                file_id,
+                offset: offset.into(),
+            };
+            let count_err = reference_count(&analysis, position, true).unwrap_err();
+            assert!(
+                matches!(count_err, DeepError::UnresolvedSymbol(_)),
+                "offset {offset} names no symbol and must be UnresolvedSymbol, got: {count_err:?}"
+            );
+            let files_err = referencing_files(&analysis, position, true).unwrap_err();
+            assert!(
+                matches!(files_err, DeepError::UnresolvedSymbol(_)),
+                "offset {offset} names no symbol and must be UnresolvedSymbol, got: {files_err:?}"
+            );
+        }
+
+        // The control: a real identifier with zero references stays a
+        // successfully resolved empty result, not an error.
+        let item_offset = lib_source.find("item").unwrap() as u32;
+        let refs = reference_count(
+            &analysis,
+            FilePosition {
+                file_id,
+                offset: item_offset.into(),
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(refs, 0, "`item` resolves fine and simply has no references");
     }
 
     /// `set_test: true` is the other half of the load-bearing loading

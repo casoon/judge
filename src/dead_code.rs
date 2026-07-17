@@ -187,12 +187,12 @@ fn check_item(
     file_id: FileId,
     krate_name: &str,
     qualified_name: &str,
-    ident_span: Span,
+    offset: u32,
+    line: usize,
     include_tests: bool,
     report: &mut WorkspaceDeadCode,
 ) {
     report.checked += 1;
-    let offset = ident_span.byte_range().start as u32;
     let position = ra_ap_ide::FilePosition {
         file_id,
         offset: offset.into(),
@@ -214,10 +214,14 @@ fn check_item(
         return;
     }
 
-    match crate::reachability::is_reachable_from_entry(analysis, entry_keys, position, include_tests) {
+    match crate::reachability::is_reachable_from_entry(
+        analysis,
+        entry_keys,
+        position,
+        include_tests,
+    ) {
         Ok(true) => {}
         Ok(false) => {
-            let line = ident_span.start().line;
             let searched_crates: std::collections::HashSet<&str> =
                 crate_of_file.values().copied().collect();
             report.findings.push(Finding {
@@ -318,7 +322,9 @@ pub fn analyze_workspace(
             let source = match std::fs::read_to_string(&file.path) {
                 Ok(source) => source,
                 Err(err) => {
-                    report.errors.push(DeadCodeError::Io(file.path.clone(), err));
+                    report
+                        .errors
+                        .push(DeadCodeError::Io(file.path.clone(), err));
                     continue;
                 }
             };
@@ -344,7 +350,8 @@ pub fn analyze_workspace(
                     file_id,
                     &krate.name,
                     &site.qualified_name,
-                    site.ident_span,
+                    site.ident_span.byte_range().start as u32,
+                    site.ident_span.start().line,
                     include_tests,
                     &mut report,
                 );
@@ -362,7 +369,8 @@ pub fn analyze_workspace(
                     file_id,
                     &krate.name,
                     &site.qualified_name,
-                    site.ident_span,
+                    site.ident_span.byte_range().start as u32,
+                    site.ident_span.start().line,
                     include_tests,
                     &mut report,
                 );
@@ -381,14 +389,24 @@ mod tests {
     use crate::test_util::TempDir;
 
     fn load_single_crate_workspace(dir: &TempDir, lib_source: &str) -> Workspace {
+        load_single_crate_workspace_with_edition(dir, "2021", lib_source)
+    }
+
+    fn load_single_crate_workspace_with_edition(
+        dir: &TempDir,
+        edition: &str,
+        lib_source: &str,
+    ) -> Workspace {
         std::fs::write(
             dir.join("Cargo.toml"),
-            r#"
+            format!(
+                r#"
 [package]
 name = "dead-code-fixture"
 version = "0.1.0"
-edition = "2021"
-"#,
+edition = "{edition}"
+"#
+            ),
         )
         .unwrap();
         std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -570,7 +588,10 @@ pub fn run() -> i32 {
             );
         }
         for dead in ["DeadStruct", "DeadEnum", "DeadTrait", "DEAD_CONST"] {
-            assert!(names.contains(dead), "{dead} is never referenced and must be flagged");
+            assert!(
+                names.contains(dead),
+                "{dead} is never referenced and must be flagged"
+            );
         }
     }
 
@@ -626,7 +647,10 @@ pub static DEAD_STATIC: i32 = 2;
             );
         }
         for dead in ["Widget::DEAD_ASSOC_CONST", "DEAD_STATIC"] {
-            assert!(names.contains(dead), "{dead} is never referenced and must be flagged");
+            assert!(
+                names.contains(dead),
+                "{dead} is never referenced and must be flagged"
+            );
         }
     }
 
@@ -732,6 +756,123 @@ pub extern "C" fn exported() -> i32 {
         assert!(
             names.contains("truly_dead"),
             "never referenced anywhere — must be flagged"
+        );
+    }
+
+    /// The Rust-2024 unsafe-attribute spellings — `#[unsafe(no_mangle)]` and
+    /// `#[unsafe(export_name = "...")]` — mark external roots exactly like
+    /// their bare pre-2024 forms (see
+    /// [`an_item_only_used_by_a_no_mangle_export_is_not_flagged`]). The
+    /// fixture is `edition = "2024"` because `unsafe(...)` in attributes is
+    /// only valid syntax from that edition on.
+    #[test]
+    fn an_item_only_used_by_an_unsafe_wrapped_export_is_not_flagged() {
+        let dir = TempDir::new("dead-code-unsafe-attr-entry");
+        let workspace = load_single_crate_workspace_with_edition(
+            &dir,
+            "2024",
+            r#"pub fn used_by_no_mangle_export() -> i32 {
+    1
+}
+
+pub fn used_by_export_name_export() -> i32 {
+    2
+}
+
+pub fn truly_dead() -> i32 {
+    3
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn exported_a() -> i32 {
+    used_by_no_mangle_export()
+}
+
+#[unsafe(export_name = "exported_b_symbol")]
+pub extern "C" fn exported_b() -> i32 {
+    used_by_export_name_export()
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, false).unwrap();
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            !names.contains("used_by_no_mangle_export"),
+            "reachable from a #[unsafe(no_mangle)] export — must not be flagged"
+        );
+        assert!(
+            !names.contains("used_by_export_name_export"),
+            "reachable from a #[unsafe(export_name = ...)] export — must not be flagged"
+        );
+        assert!(
+            names.contains("truly_dead"),
+            "never referenced anywhere — must be flagged"
+        );
+    }
+
+    /// A position the Deep Tier cannot semantically resolve — here literally
+    /// on whitespace instead of on an identifier, the same probe
+    /// `crate::deep`'s own three-state test uses — must be collected as an
+    /// analyzer error and must never become a dead-code finding. Before the
+    /// three-state query modeling (todo.md §15.1), `find_all_refs`'s `None`
+    /// was collapsed into "zero references" and turned into exactly the
+    /// finding this test forbids. Exercised through [`check_item`] directly
+    /// because `analyze_workspace`'s positions always come from syn ident
+    /// spans, which by construction sit on identifiers.
+    #[test]
+    fn an_unresolvable_position_is_a_collected_error_not_a_finding() {
+        let dir = TempDir::new("dead-code-unresolvable-position");
+        let lib_source = "pub fn item() -> i32 {\n    1\n}\n";
+        let workspace = load_single_crate_workspace(&dir, lib_source);
+
+        let ctx = DeepContext::load(&workspace.root).unwrap();
+        let analysis = ctx.analysis();
+        let krate = &workspace.crates[0];
+        let file = krate
+            .source_files
+            .iter()
+            .find(|file| file.path.ends_with("src/lib.rs"))
+            .unwrap();
+        let file_id = ctx.file_id(&file.path).unwrap();
+        let crate_of_file = HashMap::from([(file_id, krate.name.as_str())]);
+        let entry_keys = std::collections::HashSet::new();
+
+        // Strictly inside the body's indentation whitespace — no symbol.
+        let offset = lib_source.find("    1").unwrap() as u32 + 1;
+
+        let mut report = WorkspaceDeadCode::default();
+        check_item(
+            &analysis,
+            &crate_of_file,
+            &entry_keys,
+            file,
+            file_id,
+            &krate.name,
+            "not_a_symbol",
+            offset,
+            2,
+            true,
+            &mut report,
+        );
+
+        assert!(
+            report.findings.is_empty(),
+            "an unresolvable position must never become a dead-code finding: {:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| matches!(err, DeadCodeError::Deep(DeepError::UnresolvedSymbol(_)))),
+            "the failed resolution must be collected as an analyzer error: {:?}",
+            report.errors
         );
     }
 }

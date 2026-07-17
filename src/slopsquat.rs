@@ -200,7 +200,10 @@ impl std::fmt::Display for SlopsquatError {
         match self {
             Self::Connection(msg) => write!(f, "crates.io unreachable: {msg}"),
             Self::CircuitOpen => {
-                write!(f, "crates.io lookups skipped after an earlier connection failure")
+                write!(
+                    f,
+                    "crates.io lookups skipped after an earlier connection failure"
+                )
             }
             Self::Other(msg) => write!(f, "crates.io lookup failed: {msg}"),
         }
@@ -524,12 +527,9 @@ impl CratesIoIndex for FixtureIndex {
         if let Some(message) = &self.forced_error {
             return Err(SlopsquatError::Other(message.clone()));
         }
-        Ok(self
-            .crates
-            .get(crate_name)
-            .map(|versions| IndexEntry {
-                versions: versions.clone(),
-            }))
+        Ok(self.crates.get(crate_name).map(|versions| IndexEntry {
+            versions: versions.clone(),
+        }))
     }
 }
 
@@ -633,7 +633,11 @@ fn phantom_crate_finding(krate: &CrateInfo, dep: &DeclaredDependency) -> Finding
 /// `None` if the declared requirement is satisfied by some published,
 /// non-yanked version (or if the requirement string doesn't parse — judge
 /// doesn't assert a claim it can't back with a real comparison).
-fn phantom_version_finding(krate: &CrateInfo, dep: &DeclaredDependency, entry: &IndexEntry) -> Option<Finding> {
+fn phantom_version_finding(
+    krate: &CrateInfo,
+    dep: &DeclaredDependency,
+    entry: &IndexEntry,
+) -> Option<Finding> {
     let Ok(req) = VersionReq::parse(&dep.version_req) else {
         return None;
     };
@@ -673,7 +677,11 @@ fn phantom_version_finding(krate: &CrateInfo, dep: &DeclaredDependency, entry: &
 fn nearest_versions(published: &[&IndexVersion], limit: usize) -> Vec<String> {
     let mut parsed: Vec<(Version, &str)> = published
         .iter()
-        .filter_map(|v| Version::parse(&v.vers).ok().map(|version| (version, v.vers.as_str())))
+        .filter_map(|v| {
+            Version::parse(&v.vers)
+                .ok()
+                .map(|version| (version, v.vers.as_str()))
+        })
         .collect();
     parsed.sort_by(|a, b| b.0.cmp(&a.0));
     parsed
@@ -751,9 +759,10 @@ pub fn analyze_fresh_low_reputation(
                     }
                 }
                 Err(SlopsquatError::Other(msg)) => {
-                    report
-                        .errors
-                        .push(format!("{}: crates.io metadata lookup failed: {msg}", dep.name));
+                    report.errors.push(format!(
+                        "{}: crates.io metadata lookup failed: {msg}",
+                        dep.name
+                    ));
                 }
             }
         }
@@ -776,9 +785,16 @@ fn is_fresh_low_reputation(metadata: &CrateMetadata, config: &SlopsquatConfig) -
     is_fresh && is_low_downloads && has_no_repo
 }
 
-fn fresh_low_reputation_finding(krate: &CrateInfo, dep: &DeclaredDependency, metadata: &CrateMetadata) -> Finding {
+fn fresh_low_reputation_finding(
+    krate: &CrateInfo,
+    dep: &DeclaredDependency,
+    metadata: &CrateMetadata,
+) -> Finding {
     Finding {
-        id: format!("{FRESH_LOW_REPUTATION_DEP_RULE}:{}:{}", krate.name, dep.name),
+        id: format!(
+            "{FRESH_LOW_REPUTATION_DEP_RULE}:{}:{}",
+            krate.name, dep.name
+        ),
         rule: FRESH_LOW_REPUTATION_DEP_RULE.to_string(),
         severity: Severity::Warn,
         location: Location {
@@ -1073,7 +1089,9 @@ edition = "2021"
         assert!(report.findings.is_empty());
 
         // A higher configured threshold does.
-        let strict_config = SlopsquatConfig { min_downloads: 10_000 };
+        let strict_config = SlopsquatConfig {
+            min_downloads: 10_000,
+        };
         let report = analyze_fresh_low_reputation(&workspace, &metadata_source, &strict_config);
         assert_eq!(report.findings.len(), 1);
     }

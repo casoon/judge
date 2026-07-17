@@ -245,7 +245,7 @@ pub fn analyze_workspace(
             class,
         })
         .collect();
-    by_class.sort_by(|a, b| a.class.key().cmp(&b.class.key()));
+    by_class.sort_by_key(|a| a.class.key());
 
     let cargo_toml = workspace.root.join("Cargo.toml");
     let findings = by_class
@@ -477,10 +477,10 @@ fn classify_heuristic(
 ) -> Option<Classification> {
     let mut signals = Vec::new();
 
-    if let Some(threshold) = size_threshold {
-        if commit.files_changed.len() as f64 > threshold {
-            signals.push("commit_size_outlier");
-        }
+    if let Some(threshold) = size_threshold
+        && commit.files_changed.len() as f64 > threshold
+    {
+        signals.push("commit_size_outlier");
     }
     if low_cv_authors.contains(&commit.author_email) {
         signals.push("time_distribution_anomaly");
