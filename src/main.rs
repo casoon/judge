@@ -140,6 +140,22 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         baseline: Option<PathBuf>,
     },
+    /// Explains a specific item (see todo.md §7). Currently only
+    /// `--why-live` is implemented.
+    Explain {
+        /// The qualified item path (e.g. `core::retry::backoff`) to explain.
+        item_path: String,
+        /// Show the shortest evidenced call path from a recognized entry
+        /// point. Needs the Deep Tier — build with `--features deep`.
+        #[arg(long)]
+        why_live: bool,
+        /// Count a `#[test]`-only call as reaching the item.
+        #[arg(long)]
+        include_tests: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "tty")]
+        format: OutputFormat,
+    },
     /// Initialize judge configuration in a workspace.
     Init,
     /// Show detected entry points, tiers, and cache status.
@@ -231,6 +247,12 @@ fn main() {
             save_baseline,
             baseline,
         }) => run_dead_code(include_tests, format, save_baseline, baseline),
+        Some(Command::Explain {
+            item_path,
+            why_live,
+            include_tests,
+            format,
+        }) => run_explain(item_path, why_live, include_tests, format),
         Some(Command::Init) => println!("judge init is not implemented yet"),
         Some(Command::Inspect) => run_inspect(),
     }
@@ -1019,6 +1041,83 @@ fn run_dead_code(
                     );
                 }
             }
+        }
+    }
+}
+
+/// `judge explain <item-path> --why-live` (see todo.md §7, §14.2 P1).
+/// Only `--why-live` is implemented; other explain modes (e.g. explaining a
+/// finding id) don't exist yet.
+#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
+fn run_explain(item_path: String, why_live: bool, include_tests: bool, format: OutputFormat) {
+    if !why_live {
+        eprintln!("error: `judge explain` currently only supports `--why-live`");
+        std::process::exit(2);
+    }
+    if !judge::AnalysisTier::Deep.is_available() {
+        eprintln!(
+            "error: --why-live needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)"
+        );
+        std::process::exit(2);
+    }
+
+    #[cfg(feature = "deep")]
+    {
+        let workspace = match judge::ingest::load(None) {
+            Ok(workspace) => workspace,
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(2);
+            }
+        };
+
+        let result = match judge::reachability::why_live(&workspace, &item_path, include_tests) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(2);
+            }
+        };
+
+        match format {
+            OutputFormat::Json => {
+                let json = match &result {
+                    judge::reachability::WhyLive::Path(path) => serde_json::json!({
+                        "item_path": item_path,
+                        "reachable": true,
+                        "path": path.iter().map(|step| serde_json::json!({
+                            "qualified_name": step.qualified_name,
+                            "file": step.file,
+                            "line": step.line,
+                        })).collect::<Vec<_>>(),
+                    }),
+                    judge::reachability::WhyLive::NotReachable => serde_json::json!({
+                        "item_path": item_path,
+                        "reachable": false,
+                        "path": [],
+                    }),
+                };
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            }
+            OutputFormat::Tty => match &result {
+                judge::reachability::WhyLive::Path(path) => {
+                    println!("{item_path} is live:");
+                    for (index, step) in path.iter().enumerate() {
+                        let prefix = if index == 0 { "  " } else { "  called by " };
+                        println!(
+                            "{prefix}{} ({}:{})",
+                            step.qualified_name,
+                            step.file.display(),
+                            step.line
+                        );
+                    }
+                }
+                judge::reachability::WhyLive::NotReachable => {
+                    println!(
+                        "{item_path}: not reachable from any recognized entry point (`fn main` in a [[bin]]/[[example]] target)"
+                    );
+                }
+            },
         }
     }
 }

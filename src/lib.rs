@@ -16,6 +16,8 @@ pub mod git;
 pub mod health_score;
 pub mod ingest;
 pub mod ownership;
+#[cfg(feature = "deep")]
+pub mod reachability;
 pub mod slop;
 #[cfg(test)]
 mod test_util;
