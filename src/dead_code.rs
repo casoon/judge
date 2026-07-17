@@ -2,10 +2,10 @@
 //! "Reachability & Dead Code", §14.2 P1). Requires the `deep` feature —
 //! semantic reachability isn't available at the Fast Tier.
 //!
-//! Scope: `unused-pub-workspace` only, and only for free functions and
-//! impl/trait methods — the items [`crate::functions::walk_functions`]
-//! already enumerates for `complexity`/`duplication`. Structs, enums,
-//! traits, consts, and statics aren't covered yet.
+//! Scope: `unused-pub-workspace` only, for free functions, impl/trait
+//! methods ([`crate::functions::walk_functions`]'s items), and top-level
+//! structs/enums/traits/consts ([`walk_type_items`], below). Associated
+//! consts/types inside impls and statics aren't covered yet.
 //!
 //! **Simplification, documented rather than hidden:** every workspace crate
 //! is treated as workspace-internal. todo.md §3.A distinguishes
@@ -16,10 +16,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use proc_macro2::Span;
+use syn::visit::{self, Visit};
+
 use crate::deep::{DeepContext, DeepError, FileId};
 use crate::finding::{Finding, Location, Origin, Severity};
 use crate::functions::walk_functions;
-use crate::ingest::Workspace;
+use crate::ingest::{SourceFile, Workspace};
 
 pub const UNUSED_PUB_WORKSPACE_RULE: &str = "unused-pub-workspace";
 /// Bump when the unused-pub-workspace rule's logic changes (see todo.md §5
@@ -49,9 +52,150 @@ impl std::error::Error for DeadCodeError {}
 pub struct WorkspaceDeadCode {
     pub findings: Vec<Finding>,
     pub errors: Vec<DeadCodeError>,
-    /// Number of `pub` functions/methods actually queried (see todo.md §7 —
-    /// evidence for how thorough the run was, not just its findings).
+    /// Number of `pub` items actually queried (functions, methods, structs,
+    /// enums, traits, consts — see todo.md §7, evidence for how thorough the
+    /// run was, not just its findings).
     pub checked: usize,
+}
+
+/// A `pub` struct/enum/trait/const declaration discovered while walking a
+/// file — the type-level counterpart to
+/// [`crate::functions::walk_functions`]'s function-like items. Anonymous
+/// consts (`const _: () = ...`), associated consts/types inside impls, and
+/// statics aren't covered.
+struct TypeItemSite<'ast> {
+    qualified_name: String,
+    ident_span: Span,
+    vis: &'ast syn::Visibility,
+}
+
+/// Visits every top-level `struct`, `enum`, `trait`, and `const` in `file`,
+/// tracking the enclosing `mod`/`trait` path the same way
+/// [`crate::functions::walk_functions`] does, so the two produce consistent
+/// qualified names.
+fn walk_type_items<'ast>(file: &'ast syn::File, on_item: impl FnMut(TypeItemSite<'ast>)) {
+    struct Walker<F> {
+        path: Vec<String>,
+        on_item: F,
+    }
+
+    impl<F> Walker<F> {
+        fn qualified_name(&self, name: &str) -> String {
+            if self.path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}::{name}", self.path.join("::"))
+            }
+        }
+    }
+
+    impl<'ast, F: FnMut(TypeItemSite<'ast>)> Walker<F> {
+        fn emit(&mut self, name: &str, ident_span: Span, vis: &'ast syn::Visibility) {
+            if name == "_" {
+                return;
+            }
+            let qualified_name = self.qualified_name(name);
+            (self.on_item)(TypeItemSite {
+                qualified_name,
+                ident_span,
+                vis,
+            });
+        }
+    }
+
+    impl<'ast, F: FnMut(TypeItemSite<'ast>)> Visit<'ast> for Walker<F> {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            if node.content.is_some() {
+                self.path.push(node.ident.to_string());
+                visit::visit_item_mod(self, node);
+                self.path.pop();
+            } else {
+                visit::visit_item_mod(self, node);
+            }
+        }
+
+        fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            visit::visit_item_struct(self, node);
+        }
+
+        fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            visit::visit_item_enum(self, node);
+        }
+
+        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            self.path.push(node.ident.to_string());
+            visit::visit_item_trait(self, node);
+            self.path.pop();
+        }
+
+        fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            visit::visit_item_const(self, node);
+        }
+    }
+
+    let mut walker = Walker {
+        path: Vec::new(),
+        on_item,
+    };
+    walker.visit_file(file);
+}
+
+/// Checks one `pub` item for cross-crate usage and records a finding if none
+/// was found — the shared logic both [`walk_functions`]'s and
+/// [`walk_type_items`]'s callbacks funnel into.
+#[allow(clippy::too_many_arguments)]
+fn check_item(
+    analysis: &ra_ap_ide::Analysis,
+    crate_of_file: &HashMap<FileId, &str>,
+    file: &SourceFile,
+    file_id: FileId,
+    krate_name: &str,
+    qualified_name: &str,
+    ident_span: Span,
+    include_tests: bool,
+    report: &mut WorkspaceDeadCode,
+) {
+    report.checked += 1;
+    let offset = ident_span.byte_range().start as u32;
+    let position = ra_ap_ide::FilePosition {
+        file_id,
+        offset: offset.into(),
+    };
+
+    match crate::deep::referencing_files(analysis, position, include_tests) {
+        Ok(referencing) => {
+            let used_externally = referencing.iter().any(|referencing_file| {
+                crate_of_file
+                    .get(referencing_file)
+                    .is_some_and(|owner| *owner != krate_name)
+            });
+            if !used_externally {
+                let line = ident_span.start().line;
+                report.findings.push(Finding {
+                    id: format!(
+                        "{UNUSED_PUB_WORKSPACE_RULE}:{}:{qualified_name}",
+                        file.path.display()
+                    ),
+                    rule: UNUSED_PUB_WORKSPACE_RULE.to_string(),
+                    severity: Severity::Warn,
+                    location: Location {
+                        file: file.path.clone(),
+                        line,
+                        item_path: qualified_name.to_string(),
+                    },
+                    confidence: 1.0,
+                    origin: Origin::Code,
+                    caused_by: Vec::new(),
+                    causes: Vec::new(),
+                });
+            }
+        }
+        Err(err) => report.errors.push(DeadCodeError::Deep(err)),
+    }
 }
 
 /// Finds `pub` functions/methods referenced only from their own defining
@@ -113,45 +257,34 @@ pub fn analyze_workspace(
                 let Some(syn::Visibility::Public(_)) = site.vis else {
                     return;
                 };
-                report.checked += 1;
-
-                let offset = site.ident_span.byte_range().start as u32;
-                let position = ra_ap_ide::FilePosition {
+                check_item(
+                    &analysis,
+                    &crate_of_file,
+                    file,
                     file_id,
-                    offset: offset.into(),
-                };
+                    &krate.name,
+                    &site.qualified_name,
+                    site.ident_span,
+                    include_tests,
+                    &mut report,
+                );
+            });
 
-                match crate::deep::referencing_files(&analysis, position, include_tests) {
-                    Ok(referencing) => {
-                        let used_externally = referencing.iter().any(|referencing_file| {
-                            crate_of_file
-                                .get(referencing_file)
-                                .is_some_and(|owner| *owner != krate.name)
-                        });
-                        if !used_externally {
-                            let line = site.ident_span.start().line;
-                            report.findings.push(Finding {
-                                id: format!(
-                                    "{UNUSED_PUB_WORKSPACE_RULE}:{}:{}",
-                                    file.path.display(),
-                                    site.qualified_name
-                                ),
-                                rule: UNUSED_PUB_WORKSPACE_RULE.to_string(),
-                                severity: Severity::Warn,
-                                location: Location {
-                                    file: file.path.clone(),
-                                    line,
-                                    item_path: site.qualified_name.clone(),
-                                },
-                                confidence: 1.0,
-                                origin: Origin::Code,
-                                caused_by: Vec::new(),
-                                causes: Vec::new(),
-                            });
-                        }
-                    }
-                    Err(err) => report.errors.push(DeadCodeError::Deep(err)),
+            walk_type_items(&ast, |site| {
+                if !matches!(site.vis, syn::Visibility::Public(_)) {
+                    return;
                 }
+                check_item(
+                    &analysis,
+                    &crate_of_file,
+                    file,
+                    file_id,
+                    &krate.name,
+                    &site.qualified_name,
+                    site.ident_span,
+                    include_tests,
+                    &mut report,
+                );
             });
         }
     }
@@ -161,6 +294,8 @@ pub fn analyze_workspace(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::test_util::TempDir;
 
@@ -290,5 +425,75 @@ pub fn never_called() -> i32 {
         assert_eq!(finding.origin, Origin::Code);
         assert_eq!(finding.confidence, 1.0);
         assert_eq!(finding.location.item_path, "never_called");
+    }
+
+    #[test]
+    fn structs_enums_traits_and_consts_are_checked_the_same_way_as_functions() {
+        let dir = TempDir::new("dead-code-type-items");
+        write_crate(
+            &dir,
+            "core",
+            &[],
+            r#"pub struct UsedStruct;
+pub struct DeadStruct;
+
+pub enum UsedEnum {
+    A,
+}
+pub enum DeadEnum {
+    A,
+}
+
+pub trait UsedTrait {}
+pub trait DeadTrait {}
+
+pub const USED_CONST: i32 = 1;
+pub const DEAD_CONST: i32 = 2;
+"#,
+        );
+        write_crate(
+            &dir,
+            "consumer",
+            &[("core", "../core")],
+            r#"struct Local;
+impl core::UsedTrait for Local {}
+
+pub fn run() -> i32 {
+    let _ = core::UsedStruct;
+    let _ = core::UsedEnum::A;
+    core::USED_CONST
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["core", "consumer"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        for used in ["UsedStruct", "UsedEnum", "UsedTrait", "USED_CONST"] {
+            assert!(
+                !names.contains(used),
+                "{used} is referenced from `consumer` and must not be flagged"
+            );
+        }
+        for dead in ["DeadStruct", "DeadEnum", "DeadTrait", "DEAD_CONST"] {
+            assert!(names.contains(dead), "{dead} is never referenced and must be flagged");
+        }
+    }
+
+    #[test]
+    fn a_private_struct_is_not_checked() {
+        let dir = TempDir::new("dead-code-private-struct");
+        let workspace = load_single_crate_workspace(&dir, "struct PrivateStruct;\n");
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(report.findings.is_empty());
+        assert_eq!(report.checked, 0);
     }
 }
