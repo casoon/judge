@@ -218,7 +218,7 @@ pub enum WhyLive {
 /// Whether any of `attrs` has a path whose last segment is `ident` — matches
 /// both a bare attribute (`#[test]`) and a path-qualified one
 /// (`#[tokio::test]`, `#[wasm_bindgen::prelude::wasm_bindgen]`).
-fn has_attr_ending_in(attrs: &[syn::Attribute], ident: &str) -> bool {
+pub(crate) fn has_attr_ending_in(attrs: &[syn::Attribute], ident: &str) -> bool {
     attrs
         .iter()
         .any(|attr| attr.path().segments.last().is_some_and(|segment| segment.ident == ident))

@@ -34,6 +34,17 @@ pub struct FunctionSite<'ast> {
     /// allow as `ident_span`.
     #[cfg_attr(not(feature = "deep"), allow(dead_code))]
     pub attrs: &'ast [syn::Attribute],
+    /// Whether this function is an `impl` method inside `impl TraitName for
+    /// SomeType { .. }` (i.e. the enclosing `ItemImpl.trait_.is_some()`).
+    /// `false` for free functions, inherent-impl methods, and trait default
+    /// methods (which live in the trait definition, not an impl block).
+    /// Used by [`crate::slop_structural_deep`] to exclude trait-dispatch
+    /// methods (`Display::fmt`, `Iterator::next`, …) from checks that rely
+    /// on literal `.method()` call-site references — those methods are
+    /// routinely invoked through operator/macro sugar a reference search
+    /// can't see. Same conditional allow as `ident_span`.
+    #[cfg_attr(not(feature = "deep"), allow(dead_code))]
+    pub in_trait_impl: bool,
 }
 
 /// Visits every `fn`, impl method, and default trait-method body in `file`,
@@ -41,6 +52,7 @@ pub struct FunctionSite<'ast> {
 pub fn walk_functions<'ast>(file: &'ast syn::File, on_function: impl FnMut(FunctionSite<'ast>)) {
     let mut walker = Walker {
         path: Vec::new(),
+        in_trait_impl: Vec::new(),
         on_function,
     };
     walker.visit_file(file);
@@ -48,6 +60,10 @@ pub fn walk_functions<'ast>(file: &'ast syn::File, on_function: impl FnMut(Funct
 
 struct Walker<F> {
     path: Vec<String>,
+    /// Stack of `in_trait_impl` flags, one per enclosing `impl` block —
+    /// mirrors `path`'s push/pop shape. A stack rather than a single flag
+    /// because an `impl` can (rarely) be nested inside a function body.
+    in_trait_impl: Vec<bool>,
     on_function: F,
 }
 
@@ -58,6 +74,10 @@ impl<F> Walker<F> {
         } else {
             format!("{}::{name}", self.path.join("::"))
         }
+    }
+
+    fn current_in_trait_impl(&self) -> bool {
+        self.in_trait_impl.last().copied().unwrap_or(false)
     }
 }
 
@@ -73,6 +93,7 @@ where
         ident_span: Span,
         vis: Option<&'ast syn::Visibility>,
         attrs: &'ast [syn::Attribute],
+        in_trait_impl: bool,
     ) {
         let qualified_name = self.qualified_name(name);
         (self.on_function)(FunctionSite {
@@ -82,6 +103,7 @@ where
             ident_span,
             vis,
             attrs,
+            in_trait_impl,
         });
     }
 }
@@ -113,7 +135,9 @@ where
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
         self.path.push(type_name(&node.self_ty));
+        self.in_trait_impl.push(node.trait_.is_some());
         visit::visit_item_impl(self, node);
+        self.in_trait_impl.pop();
         self.path.pop();
     }
 
@@ -131,11 +155,13 @@ where
             node.sig.ident.span(),
             Some(&node.vis),
             &node.attrs,
+            false,
         );
         visit::visit_item_fn(self, node);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
+        let in_trait_impl = self.current_in_trait_impl();
         self.emit(
             &node.sig.ident.to_string(),
             node,
@@ -143,6 +169,7 @@ where
             node.sig.ident.span(),
             Some(&node.vis),
             &node.attrs,
+            in_trait_impl,
         );
         visit::visit_impl_item_fn(self, node);
     }
@@ -156,6 +183,7 @@ where
                 node.sig.ident.span(),
                 None,
                 &node.attrs,
+                false,
             );
         }
         visit::visit_trait_item_fn(self, node);

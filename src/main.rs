@@ -1456,23 +1456,74 @@ fn run_dead_code(
             }
         };
 
-        let report = match judge::dead_code::analyze_workspace(&workspace, include_tests) {
+        let dead_code_report = match judge::dead_code::analyze_workspace(&workspace, include_tests)
+        {
             Ok(report) => report,
             Err(err) => {
                 eprintln!("error: {err}");
                 std::process::exit(2);
             }
         };
-        let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
+
+        // `duplicative-reinvention` needs clone-family membership — cheap,
+        // Fast Tier, same defaults `cargo judge health`/`dupes` already use.
+        let dupes_source_files = workspace
+            .crates
+            .iter()
+            .flat_map(|krate| krate.source_files.iter());
+        let dupes = judge::duplication::analyze_workspace(
+            dupes_source_files,
+            DupeMode::Mild,
+            judge::duplication::DEFAULT_MIN_TOKENS,
+            false,
+        );
+
+        // `connectivity-drop`/`duplicative-reinvention` load their own
+        // second `DeepContext` here rather than sharing `dead_code`'s —
+        // `dead_code::analyze_workspace` doesn't expose the `RootDatabase`
+        // it loads internally, and threading one through would widen that
+        // module's public API for a performance-only concern. Accepted,
+        // documented extra cost (a second full workspace load; see
+        // `judge::deep`'s own cost note), not a correctness one.
+        let structural_report =
+            match judge::slop_structural_deep::analyze_workspace(&workspace, &dupes, include_tests)
+            {
+                Ok(report) => report,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    std::process::exit(2);
+                }
+            };
+
+        let mut findings = dead_code_report.findings;
+        findings.extend(structural_report.findings);
+
+        let mut analysis_errors: Vec<String> = dead_code_report
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
+        analysis_errors.extend(structural_report.errors.iter().map(ToString::to_string));
 
         if save_baseline || baseline.is_some() {
-            let rule_revisions = std::collections::HashMap::from([(
-                judge::dead_code::UNUSED_PUB_WORKSPACE_RULE.to_string(),
-                judge::dead_code::UNUSED_PUB_WORKSPACE_RULE_REVISION,
-            )]);
+            let rule_revisions = std::collections::HashMap::from([
+                (
+                    judge::dead_code::UNUSED_PUB_WORKSPACE_RULE.to_string(),
+                    judge::dead_code::UNUSED_PUB_WORKSPACE_RULE_REVISION,
+                ),
+                (
+                    judge::slop_structural_deep::CONNECTIVITY_DROP_RULE.to_string(),
+                    judge::slop_structural_deep::CONNECTIVITY_DROP_RULE_REVISION,
+                ),
+                (
+                    judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE.to_string(),
+                    judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE_REVISION,
+                ),
+            ]);
             handle_baseline(
                 &workspace.root,
-                &report.findings,
+                &findings,
                 &analysis_errors,
                 BaselineOptions {
                     rule_revisions,
@@ -1488,25 +1539,44 @@ fn run_dead_code(
 
         match format {
             OutputFormat::Json => {
-                let report = Report::with_errors(report.findings, analysis_errors);
+                let report = Report::with_errors(findings, analysis_errors);
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             }
             OutputFormat::Tty => {
-                println!("pub items checked: {}", report.checked);
+                println!("pub items checked: {}", dead_code_report.checked);
+                println!(
+                    "functions checked (connectivity-drop): {}",
+                    structural_report.checked
+                );
                 if !analysis_errors.is_empty() {
                     println!("analysis errors: {}", analysis_errors.len());
                     for error in &analysis_errors {
                         println!("  {error}");
                     }
                 }
-                println!("unused-pub-workspace findings: {}", report.findings.len());
-                for finding in &report.findings {
-                    println!(
-                        "  [warn] {}:{}  {}",
-                        finding.location.file.display(),
-                        finding.location.line,
-                        finding.location.item_path
-                    );
+                for rule in [
+                    judge::dead_code::UNUSED_PUB_WORKSPACE_RULE,
+                    judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
+                    judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
+                ] {
+                    let rule_findings: Vec<&Finding> = findings
+                        .iter()
+                        .filter(|finding| finding.rule == rule)
+                        .collect();
+                    println!("{rule} findings: {}", rule_findings.len());
+                    for finding in rule_findings {
+                        let severity = match finding.severity {
+                            judge::finding::Severity::Fail => "fail",
+                            judge::finding::Severity::Warn => "warn",
+                            judge::finding::Severity::Info => "info",
+                        };
+                        println!(
+                            "  [{severity}] {}:{}  {}",
+                            finding.location.file.display(),
+                            finding.location.line,
+                            finding.location.item_path
+                        );
+                    }
                 }
             }
         }
