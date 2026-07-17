@@ -144,13 +144,23 @@ fn walk_type_items<'ast>(file: &'ast syn::File, on_item: impl FnMut(TypeItemSite
     walker.visit_file(file);
 }
 
-/// Checks one `pub` item for cross-crate usage and records a finding if none
-/// was found — the shared logic both [`walk_functions`]'s and
-/// [`walk_type_items`]'s callbacks funnel into.
+/// Checks one `pub` item for cross-crate usage and records a finding if
+/// neither that nor entry-point reachability found it live — the shared
+/// logic both [`walk_functions`]'s and [`walk_type_items`]'s callbacks
+/// funnel into.
+///
+/// The entry-point check matters most for single-crate workspaces — the
+/// common case — where cross-crate usage is vacuously impossible (there is
+/// no other crate), which would otherwise make every `pub` item look
+/// unused. An item reachable from its own crate's `fn main` is genuinely
+/// live even with zero cross-crate references (see
+/// [`crate::reachability::is_reachable_from_entry`]'s own entry-point scope
+/// caveats — this inherits them).
 #[allow(clippy::too_many_arguments)]
 fn check_item(
     analysis: &ra_ap_ide::Analysis,
     crate_of_file: &HashMap<FileId, &str>,
+    entry_keys: &std::collections::HashSet<(FileId, u32)>,
     file: &SourceFile,
     file_id: FileId,
     krate_name: &str,
@@ -166,35 +176,60 @@ fn check_item(
         offset: offset.into(),
     };
 
-    match crate::deep::referencing_files(analysis, position, include_tests) {
-        Ok(referencing) => {
-            let used_externally = referencing.iter().any(|referencing_file| {
-                crate_of_file
-                    .get(referencing_file)
-                    .is_some_and(|owner| *owner != krate_name)
-            });
-            if !used_externally {
-                let line = ident_span.start().line;
-                report.findings.push(Finding {
-                    id: format!(
-                        "{UNUSED_PUB_WORKSPACE_RULE}:{}:{qualified_name}",
-                        file.path.display()
-                    ),
-                    rule: UNUSED_PUB_WORKSPACE_RULE.to_string(),
-                    severity: Severity::Warn,
-                    location: Location {
-                        file: file.path.clone(),
-                        line,
-                        item_path: qualified_name.to_string(),
-                    },
-                    confidence: 1.0,
-                    origin: Origin::Code,
-                    caused_by: Vec::new(),
-                    causes: Vec::new(),
-                });
-            }
+    let referencing = match crate::deep::referencing_files(analysis, position, include_tests) {
+        Ok(referencing) => referencing,
+        Err(err) => {
+            report.errors.push(DeadCodeError::Deep(err));
+            return;
         }
-        Err(err) => report.errors.push(DeadCodeError::Deep(err)),
+    };
+    let used_externally = referencing.iter().any(|referencing_file| {
+        crate_of_file
+            .get(referencing_file)
+            .is_some_and(|owner| *owner != krate_name)
+    });
+    if used_externally {
+        return;
+    }
+
+    match crate::reachability::is_reachable_from_entry(analysis, entry_keys, position, include_tests) {
+        Ok(true) => {}
+        Ok(false) => {
+            let line = ident_span.start().line;
+            report.findings.push(Finding {
+                id: format!(
+                    "{UNUSED_PUB_WORKSPACE_RULE}:{}:{qualified_name}",
+                    file.path.display()
+                ),
+                rule: UNUSED_PUB_WORKSPACE_RULE.to_string(),
+                severity: Severity::Warn,
+                location: Location {
+                    file: file.path.clone(),
+                    line,
+                    item_path: qualified_name.to_string(),
+                },
+                confidence: 1.0,
+                origin: Origin::Code,
+                caused_by: Vec::new(),
+                causes: Vec::new(),
+            });
+        }
+        Err(err) => report.errors.push(reachability_error(err)),
+    }
+}
+
+/// Converts a [`crate::reachability::ReachabilityError`] into the closest
+/// matching [`DeadCodeError`] variant, so the two modules' errors can share
+/// one `errors` list.
+fn reachability_error(err: crate::reachability::ReachabilityError) -> DeadCodeError {
+    use crate::reachability::ReachabilityError;
+    match err {
+        ReachabilityError::Deep(deep_err) => DeadCodeError::Deep(deep_err),
+        ReachabilityError::Io(path, io_err) => DeadCodeError::Io(path, io_err),
+        ReachabilityError::Parse(path, parse_err) => DeadCodeError::Parse(path, parse_err),
+        ReachabilityError::UnknownItem(item) => {
+            DeadCodeError::Deep(DeepError::Cancelled(format!("unknown item: {item}")))
+        }
     }
 }
 
@@ -222,6 +257,13 @@ pub fn analyze_workspace(
             }
         }
     }
+
+    let entries =
+        crate::reachability::entry_point_positions(workspace, &ctx).map_err(reachability_error)?;
+    let entry_keys: std::collections::HashSet<(FileId, u32)> = entries
+        .iter()
+        .map(|(_, position)| crate::reachability::position_key(*position))
+        .collect();
 
     let mut report = WorkspaceDeadCode::default();
 
@@ -260,6 +302,7 @@ pub fn analyze_workspace(
                 check_item(
                     &analysis,
                     &crate_of_file,
+                    &entry_keys,
                     file,
                     file_id,
                     &krate.name,
@@ -277,6 +320,7 @@ pub fn analyze_workspace(
                 check_item(
                     &analysis,
                     &crate_of_file,
+                    &entry_keys,
                     file,
                     file_id,
                     &krate.name,
@@ -495,5 +539,62 @@ pub fn run() -> i32 {
 
         assert!(report.findings.is_empty());
         assert_eq!(report.checked, 0);
+    }
+
+    #[test]
+    fn a_single_crate_workspace_does_not_flag_items_reachable_from_its_own_main() {
+        // The common case this closes a real gap for: a single-crate
+        // workspace has no "other crate" to ever reference anything, so the
+        // cross-crate check alone would flag the entire public API. An item
+        // reachable from this crate's own `fn main` is genuinely live.
+        let dir = TempDir::new("dead-code-single-crate-entry");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r#"pub fn used_by_main() -> i32 {
+    1
+}
+
+pub fn truly_dead() -> i32 {
+    2
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/bin/tool.rs"),
+            r#"fn main() {
+    dead_code_fixture::used_by_main();
+}
+"#,
+        )
+        .unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            !names.contains("used_by_main"),
+            "reachable from this crate's own `fn main` — must not be flagged even with no cross-crate reference"
+        );
+        assert!(
+            names.contains("truly_dead"),
+            "never referenced anywhere — must be flagged"
+        );
     }
 }

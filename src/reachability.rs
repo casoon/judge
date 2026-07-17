@@ -15,7 +15,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
-use ra_ap_ide::{CallHierarchyConfig, FilePosition, RaFixtureConfig};
+use ra_ap_ide::{Analysis, CallHierarchyConfig, FilePosition, RaFixtureConfig};
 
 use crate::deep::{DeepContext, DeepError, FileId};
 use crate::functions::walk_functions;
@@ -68,8 +68,13 @@ pub enum WhyLive {
 }
 
 /// Finds every `fn main` in a `[[bin]]`/`[[example]]` target — the
-/// production entry points this module recognizes (see module docs).
-fn entry_point_positions(
+/// production entry points this module recognizes (see module docs). Also
+/// used by [`crate::dead_code`] to treat an item reachable from its own
+/// crate's entry point as live, even with no cross-crate reference — a
+/// single-crate workspace has no "other crate" to ever reference anything,
+/// which would otherwise make `unused-pub-workspace` flag the entire public
+/// API of the common case (see todo.md §14.2 P1).
+pub(crate) fn entry_point_positions(
     workspace: &Workspace,
     ctx: &DeepContext,
 ) -> Result<Vec<(String, FilePosition)>, ReachabilityError> {
@@ -144,8 +149,77 @@ fn find_item_position(
 
 /// A stable, sortable identity for a `FilePosition`, used to dedupe BFS
 /// visits and to give callers found in the same step a deterministic order.
-fn position_key(position: FilePosition) -> (FileId, u32) {
+pub(crate) fn position_key(position: FilePosition) -> (FileId, u32) {
     (position.file_id, position.offset.into())
+}
+
+/// Collects `position`'s callers via `incoming_calls`, resolved to a
+/// `FilePosition` at each caller's focus (or full) range, sorted by
+/// `(FileId, offset)` for a deterministic visitation order. Shared by
+/// [`why_live`] and [`is_reachable_from_entry`].
+fn deterministic_callers(
+    analysis: &Analysis,
+    config: &CallHierarchyConfig<'_>,
+    position: FilePosition,
+) -> Result<Vec<(FilePosition, String)>, ReachabilityError> {
+    let callers = analysis
+        .incoming_calls(config, position)
+        .map_err(|err| ReachabilityError::Deep(DeepError::Cancelled(format!("{err:?}"))))?
+        .unwrap_or_default();
+
+    let mut callers: Vec<_> = callers
+        .into_iter()
+        .map(|call_item| {
+            let focus = call_item.target.focus_range.unwrap_or(call_item.target.full_range);
+            let caller_position = FilePosition {
+                file_id: call_item.target.file_id,
+                offset: focus.start(),
+            };
+            (caller_position, call_item.target.name.as_str().to_string())
+        })
+        .collect();
+    callers.sort_by_key(|(position, _)| position_key(*position));
+    Ok(callers)
+}
+
+/// Whether `target` is reachable from any recognized entry point (see module
+/// docs) — the same reverse-BFS as [`why_live`], but without building the
+/// human-readable path, for use in a hot loop over many candidate items
+/// (see [`crate::dead_code`]). `entry_keys` is `entry_point_positions`'
+/// output, pre-converted with [`position_key`] — computed once by the
+/// caller and reused across every item, since it never changes within one
+/// analysis run.
+pub(crate) fn is_reachable_from_entry(
+    analysis: &Analysis,
+    entry_keys: &std::collections::HashSet<(FileId, u32)>,
+    target: FilePosition,
+    include_tests: bool,
+) -> Result<bool, ReachabilityError> {
+    if entry_keys.contains(&position_key(target)) {
+        return Ok(true);
+    }
+
+    let config = CallHierarchyConfig {
+        exclude_tests: !include_tests,
+        ra_fixture: RaFixtureConfig::default(),
+    };
+
+    let mut visited = HashSet::from([position_key(target)]);
+    let mut queue = VecDeque::from([target]);
+
+    while let Some(position) = queue.pop_front() {
+        for (caller_position, _name) in deterministic_callers(analysis, &config, position)? {
+            let key = position_key(caller_position);
+            if entry_keys.contains(&key) {
+                return Ok(true);
+            }
+            if visited.insert(key) {
+                queue.push_back(caller_position);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 /// Explains why `item_path` is (or isn't) reachable: the shortest call chain
@@ -191,24 +265,7 @@ pub fn why_live(
         VecDeque::from([(target, initial_path)]);
 
     while let Some((position, path_so_far)) = queue.pop_front() {
-        let callers = analysis
-            .incoming_calls(&config, position)
-            .map_err(|err| ReachabilityError::Deep(DeepError::Cancelled(format!("{err:?}"))))?
-            .unwrap_or_default();
-
-        let mut callers: Vec<_> = callers
-            .into_iter()
-            .map(|call_item| {
-                let focus = call_item.target.focus_range.unwrap_or(call_item.target.full_range);
-                let caller_position = FilePosition {
-                    file_id: call_item.target.file_id,
-                    offset: focus.start(),
-                };
-                (caller_position, call_item.target.name.as_str().to_string())
-            })
-            .collect();
-        // Deterministic tiebreak: sort by (file id, offset) before visiting.
-        callers.sort_by_key(|(position, _)| position_key(*position));
+        let callers = deterministic_callers(&analysis, &config, position)?;
 
         for (caller_position, caller_name) in callers {
             let key = position_key(caller_position);
