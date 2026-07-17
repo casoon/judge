@@ -180,6 +180,8 @@ dependencies = [
  "quote",
  "ra_ap_ide",
  "ra_ap_load-cargo",
+ "ra_ap_project_model",
+ "ra_ap_vfs",
  "serde",
  "serde_json",
  "syn",

@@ -12,6 +12,8 @@ const DEFAULT_BASELINE_DEPS: &str = ".judge/baseline-deps.json";
 const DEFAULT_BASELINE_BOUNDARIES: &str = ".judge/baseline-boundaries.json";
 const DEFAULT_BASELINE_ALL: &str = ".judge/baseline.json";
 const DEFAULT_BASELINE_DISTRIBUTION: &str = ".judge/baseline-distribution.json";
+#[cfg(feature = "deep")]
+const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
 #[derive(Debug, Parser)]
 #[command(name = "cargo judge", version, about)]
@@ -120,6 +122,24 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         baseline: Option<PathBuf>,
     },
+    /// Find `pub` items no other workspace crate references (see todo.md
+    /// §3.A, §14.2 P1). Needs the Deep Tier — build with `--features deep`.
+    DeadCode {
+        /// Count a `#[test]`-only reference as usage. Off by default: a
+        /// `pub` item only reachable from tests is still dead in production
+        /// (see todo.md §3.A "Reachability-Modi").
+        #[arg(long)]
+        include_tests: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "tty")]
+        format: OutputFormat,
+        /// Save the current findings as the baseline (see todo.md §5).
+        #[arg(long)]
+        save_baseline: bool,
+        /// Compare findings against a previously saved baseline.
+        #[arg(long, value_name = "PATH")]
+        baseline: Option<PathBuf>,
+    },
     /// Initialize judge configuration in a workspace.
     Init,
     /// Show detected entry points, tiers, and cache status.
@@ -205,6 +225,12 @@ fn main() {
             save_baseline,
             baseline,
         }) => run_distribution(format, save_baseline, baseline),
+        Some(Command::DeadCode {
+            include_tests,
+            format,
+            save_baseline,
+            baseline,
+        }) => run_dead_code(include_tests, format, save_baseline, baseline),
         Some(Command::Init) => println!("judge init is not implemented yet"),
         Some(Command::Inspect) => run_inspect(),
     }
@@ -907,6 +933,91 @@ fn run_distribution(format: OutputFormat, save_baseline: bool, baseline: Option<
                     finding.location.file.display(),
                     finding.location.item_path
                 );
+            }
+        }
+    }
+}
+
+/// `unused-pub-workspace` via the Deep Tier (see todo.md §3.A, §14.2 P1).
+/// Only available in a build compiled with `--features deep` — a Fast Tier
+/// build prints a clear error instead of silently doing nothing.
+#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
+fn run_dead_code(
+    include_tests: bool,
+    format: OutputFormat,
+    save_baseline: bool,
+    baseline: Option<PathBuf>,
+) {
+    if !judge::AnalysisTier::Deep.is_available() {
+        eprintln!(
+            "error: dead-code analysis needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)"
+        );
+        std::process::exit(2);
+    }
+
+    #[cfg(feature = "deep")]
+    {
+        let workspace = match judge::ingest::load(None) {
+            Ok(workspace) => workspace,
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(2);
+            }
+        };
+
+        let report = match judge::dead_code::analyze_workspace(&workspace, include_tests) {
+            Ok(report) => report,
+            Err(err) => {
+                eprintln!("error: {err}");
+                std::process::exit(2);
+            }
+        };
+        let analysis_errors: Vec<String> =
+            report.errors.iter().map(ToString::to_string).collect();
+
+        if save_baseline || baseline.is_some() {
+            let rule_revisions = std::collections::HashMap::from([(
+                judge::dead_code::UNUSED_PUB_WORKSPACE_RULE.to_string(),
+                judge::dead_code::UNUSED_PUB_WORKSPACE_RULE_REVISION,
+            )]);
+            handle_baseline(
+                &workspace.root,
+                &report.findings,
+                &analysis_errors,
+                BaselineOptions {
+                    rule_revisions,
+                    save: save_baseline,
+                    compare_path: baseline.as_deref(),
+                    default_save_path: Path::new(DEFAULT_BASELINE_DEAD_CODE),
+                    format,
+                    total_loc: judge::health_score::total_authored_loc(&workspace),
+                },
+            );
+            return;
+        }
+
+        match format {
+            OutputFormat::Json => {
+                let report = Report::with_errors(report.findings, analysis_errors);
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            }
+            OutputFormat::Tty => {
+                println!("pub items checked: {}", report.checked);
+                if !analysis_errors.is_empty() {
+                    println!("analysis errors: {}", analysis_errors.len());
+                    for error in &analysis_errors {
+                        println!("  {error}");
+                    }
+                }
+                println!("unused-pub-workspace findings: {}", report.findings.len());
+                for finding in &report.findings {
+                    println!(
+                        "  [warn] {}:{}  {}",
+                        finding.location.file.display(),
+                        finding.location.line,
+                        finding.location.item_path
+                    );
+                }
             }
         }
     }

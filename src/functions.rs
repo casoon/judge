@@ -16,6 +16,18 @@ pub struct FunctionSite<'ast> {
     pub qualified_name: String,
     pub span: Span,
     pub block: &'ast Block,
+    /// Span of just the function's identifier — narrower than `span`, which
+    /// covers the whole item. Needed to position a Deep Tier query exactly
+    /// on the name token (see [`crate::deep`]). Only consumed behind the
+    /// `deep` feature, hence the conditional allow — a Fast Tier build has
+    /// no reader for it.
+    #[cfg_attr(not(feature = "deep"), allow(dead_code))]
+    pub ident_span: Span,
+    /// The item's own written visibility. `None` for a trait's default
+    /// method, which has no visibility of its own — it's as visible as the
+    /// trait itself. Same conditional allow as `ident_span`.
+    #[cfg_attr(not(feature = "deep"), allow(dead_code))]
+    pub vis: Option<&'ast syn::Visibility>,
 }
 
 /// Visits every `fn`, impl method, and default trait-method body in `file`,
@@ -47,12 +59,21 @@ impl<'ast, F> Walker<F>
 where
     F: FnMut(FunctionSite<'ast>),
 {
-    fn emit(&mut self, name: &str, spanned: &impl Spanned, block: &'ast Block) {
+    fn emit(
+        &mut self,
+        name: &str,
+        spanned: &impl Spanned,
+        block: &'ast Block,
+        ident_span: Span,
+        vis: Option<&'ast syn::Visibility>,
+    ) {
         let qualified_name = self.qualified_name(name);
         (self.on_function)(FunctionSite {
             qualified_name,
             span: spanned.span(),
             block,
+            ident_span,
+            vis,
         });
     }
 }
@@ -95,18 +116,36 @@ where
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        self.emit(&node.sig.ident.to_string(), node, &node.block);
+        self.emit(
+            &node.sig.ident.to_string(),
+            node,
+            &node.block,
+            node.sig.ident.span(),
+            Some(&node.vis),
+        );
         visit::visit_item_fn(self, node);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        self.emit(&node.sig.ident.to_string(), node, &node.block);
+        self.emit(
+            &node.sig.ident.to_string(),
+            node,
+            &node.block,
+            node.sig.ident.span(),
+            Some(&node.vis),
+        );
         visit::visit_impl_item_fn(self, node);
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast TraitItemFn) {
         if let Some(block) = &node.default {
-            self.emit(&node.sig.ident.to_string(), node, block);
+            self.emit(
+                &node.sig.ident.to_string(),
+                node,
+                block,
+                node.sig.ident.span(),
+                None,
+            );
         }
         visit::visit_trait_item_fn(self, node);
     }
