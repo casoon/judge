@@ -324,7 +324,16 @@ pub fn active_authors_since(
     Ok(authors)
 }
 
+/// A tree diff reports a change for every entry that differs, including
+/// directories themselves (e.g. adding a new subdirectory full of files
+/// yields both an `Addition` for the directory *and* one for each file
+/// inside it) — `entry_mode` distinguishes them. Without this filter,
+/// `churn`/`changed_files_since` would treat a directory path as if it were
+/// a changed file.
 fn path_of(change: &gix::object::tree::diff::Change<'_, '_, '_>) -> Option<PathBuf> {
+    if !change.entry_mode().is_blob_or_symlink() {
+        return None;
+    }
     let location = change.location();
     if location.is_empty() {
         return None;
@@ -386,6 +395,25 @@ mod tests {
 
         assert_eq!(counts.get(&PathBuf::from("a.rs")), Some(&2));
         assert_eq!(counts.get(&PathBuf::from("b.rs")), Some(&1));
+    }
+
+    #[test]
+    fn churn_does_not_count_a_newly_added_directory_as_a_file() {
+        let dir = TempDir::new("git-churn-new-dir");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+
+        std::fs::create_dir_all(dir.join("newdir")).unwrap();
+        std::fs::write(dir.join("newdir/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("newdir/b.rs"), "fn b() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add newdir"]);
+
+        let counts = churn(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(counts.get(&PathBuf::from("newdir")), None);
+        assert_eq!(counts.get(&PathBuf::from("newdir/a.rs")), Some(&1));
+        assert_eq!(counts.get(&PathBuf::from("newdir/b.rs")), Some(&1));
     }
 
     #[test]

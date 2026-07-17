@@ -416,6 +416,22 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> CollectedFindings {
             judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
             judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
         ),
+        (
+            judge::slop_structural::CHURN_HOTSPOT_RULE.to_string(),
+            judge::slop_structural::CHURN_HOTSPOT_RULE_REVISION,
+        ),
+        (
+            judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
+            judge::slop_structural::COMPLEXITY_INFLATION_RULE_REVISION,
+        ),
+        (
+            judge::slop_structural::LEGACY_FREEZE_RULE.to_string(),
+            judge::slop_structural::LEGACY_FREEZE_RULE_REVISION,
+        ),
+        (
+            judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
+            judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
+        ),
     ]);
 
     let complexity_source_files = workspace
@@ -430,6 +446,40 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> CollectedFindings {
         judge::git::DEFAULT_WINDOW_DAYS,
     ) {
         Ok(hotspots) => findings.extend(hotspots.iter().map(judge::git::Hotspot::to_finding)),
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
+    findings.extend(judge::slop_structural::complexity_inflation(
+        &complexity.functions,
+    ));
+
+    // G4 structural slop: `churn-hotspot` (2-week window) and `legacy-freeze`
+    // (12-month window) each need their own [`judge::git::churn`] call at a
+    // different window than [`judge::git::hotspots`]'s internal one above —
+    // matching the precedent set by `churn-hotspot`'s own additional call.
+    match judge::git::churn(&workspace.root, 14) {
+        Ok(two_week_churn) => {
+            findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
+        }
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
+    match judge::git::churn(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
+        Ok(year_churn) => {
+            let all_files: Vec<PathBuf> = workspace
+                .crates
+                .iter()
+                .flat_map(|krate| krate.source_files.iter())
+                .filter_map(|file| {
+                    file.path
+                        .strip_prefix(&workspace.root)
+                        .ok()
+                        .map(Path::to_path_buf)
+                })
+                .collect();
+            findings.extend(judge::slop_structural::legacy_freeze(
+                &year_churn,
+                &all_files,
+            ));
+        }
         Err(err) => analysis_errors.push(err.to_string()),
     }
 
@@ -453,6 +503,14 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> CollectedFindings {
     );
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     findings.extend(dupes.to_findings());
+
+    let abstraction_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    findings.extend(judge::slop_structural::analyze_workspace_structural(
+        abstraction_source_files,
+    ));
 
     let deps = judge::deps::analyze_workspace(workspace);
     analysis_errors.extend(deps.errors.iter().map(ToString::to_string));
@@ -1586,6 +1644,44 @@ fn run_health(
     analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
     findings.extend(slop.findings);
 
+    // G4 structural slop (see todo.md §3.G): same whole-workspace scope as
+    // the analyzers above, so it's wired in here too rather than left
+    // `health`-only-missing.
+    findings.extend(judge::slop_structural::complexity_inflation(&functions));
+    match judge::git::churn(&workspace.root, 14) {
+        Ok(two_week_churn) => {
+            findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
+        }
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
+    match judge::git::churn(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
+        Ok(year_churn) => {
+            let all_files: Vec<PathBuf> = workspace
+                .crates
+                .iter()
+                .flat_map(|krate| krate.source_files.iter())
+                .filter_map(|file| {
+                    file.path
+                        .strip_prefix(&workspace.root)
+                        .ok()
+                        .map(Path::to_path_buf)
+                })
+                .collect();
+            findings.extend(judge::slop_structural::legacy_freeze(
+                &year_churn,
+                &all_files,
+            ));
+        }
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
+    let abstraction_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    findings.extend(judge::slop_structural::analyze_workspace_structural(
+        abstraction_source_files,
+    ));
+
     let excluded_generated = report.excluded_generated + slop.excluded_generated;
     let total_loc = judge::health_score::total_authored_loc(&workspace);
 
@@ -1663,6 +1759,22 @@ fn run_health(
             (
                 judge::slop::DOC_RESTATES_SIGNATURE_RULE.to_string(),
                 judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
+            ),
+            (
+                judge::slop_structural::CHURN_HOTSPOT_RULE.to_string(),
+                judge::slop_structural::CHURN_HOTSPOT_RULE_REVISION,
+            ),
+            (
+                judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
+                judge::slop_structural::COMPLEXITY_INFLATION_RULE_REVISION,
+            ),
+            (
+                judge::slop_structural::LEGACY_FREEZE_RULE.to_string(),
+                judge::slop_structural::LEGACY_FREEZE_RULE_REVISION,
+            ),
+            (
+                judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
+                judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
             ),
         ]);
         handle_baseline(
@@ -1853,7 +1965,7 @@ fn print_hotspots(
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 14] = [
+const SLOP_RULES: [&str; 18] = [
     judge::slop::SWALLOWED_RESULT_RULE,
     judge::slop::EMPTY_ERROR_ARM_RULE,
     judge::slop::CATCH_ALL_ERROR_RULE,
@@ -1868,6 +1980,10 @@ const SLOP_RULES: [&str; 14] = [
     judge::slop::STEP_COMMENT_INFLATION_RULE,
     judge::slop::GENERIC_NAMING_RULE,
     judge::slop::DOC_RESTATES_SIGNATURE_RULE,
+    judge::slop_structural::CHURN_HOTSPOT_RULE,
+    judge::slop_structural::COMPLEXITY_INFLATION_RULE,
+    judge::slop_structural::LEGACY_FREEZE_RULE,
+    judge::slop_structural::ABSTRACTION_INFLATION_RULE,
 ];
 
 fn print_slop(findings: &[judge::finding::Finding], show_cascades: bool) {

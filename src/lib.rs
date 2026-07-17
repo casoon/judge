@@ -19,6 +19,7 @@ pub mod ownership;
 #[cfg(feature = "deep")]
 pub mod reachability;
 pub mod slop;
+pub mod slop_structural;
 mod slop_text;
 pub mod slopsquat;
 #[cfg(test)]
