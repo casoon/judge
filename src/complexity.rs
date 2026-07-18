@@ -34,7 +34,14 @@ impl std::fmt::Display for ComplexityError {
     }
 }
 
-impl std::error::Error for ComplexityError {}
+impl std::error::Error for ComplexityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(_, err) => Some(err),
+            Self::Parse(_, err) => Some(err),
+        }
+    }
+}
 
 /// Parses a single Rust source file and returns the complexity of every
 /// function, method, and default trait-method body it contains.
@@ -314,5 +321,16 @@ fn outer(x: i32) -> i32 {
         let included = analyze_workspace(files.iter(), true);
         assert_eq!(included.functions.len(), 2);
         assert_eq!(included.excluded_generated, 0);
+    }
+
+    #[test]
+    fn complexity_error_source_preserves_the_underlying_error() {
+        let parse_err = syn::parse_str::<syn::File>("fn (")
+            .err()
+            .expect("`fn (` must not parse");
+        let err = ComplexityError::Parse(PathBuf::from("src/lib.rs"), parse_err);
+        let source = std::error::Error::source(&err).expect("Parse must carry a source");
+        assert!(source.downcast_ref::<syn::Error>().is_some());
+        assert!(err.to_string().starts_with("src/lib.rs: failed to parse: "));
     }
 }

@@ -92,18 +92,24 @@ impl FileOwnership {
 /// failure so one unblamable file doesn't abort the whole run.
 #[derive(Debug)]
 pub enum OwnershipError {
-    Blame(PathBuf, String),
+    Blame(PathBuf, Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl std::fmt::Display for OwnershipError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Blame(path, msg) => write!(f, "{}: failed to blame file: {msg}", path.display()),
+            Self::Blame(path, err) => write!(f, "{}: failed to blame file: {err}", path.display()),
         }
     }
 }
 
-impl std::error::Error for OwnershipError {}
+impl std::error::Error for OwnershipError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Blame(_, err) => Some(err.as_ref()),
+        }
+    }
+}
 
 /// Aggregated ownership results across a workspace.
 #[derive(Debug, Default)]
@@ -153,10 +159,9 @@ pub fn analyze_workspace(
             let outcome = match outcome {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    result.errors.push(OwnershipError::Blame(
-                        source_file.path.clone(),
-                        err.to_string(),
-                    ));
+                    result
+                        .errors
+                        .push(OwnershipError::Blame(source_file.path.clone(), err.into()));
                     continue;
                 }
             };
@@ -189,10 +194,10 @@ fn file_ownership(
     for entry in &outcome.entries {
         let commit = repo
             .find_commit(entry.commit_id)
-            .map_err(|err| OwnershipError::Blame(file.clone(), err.to_string()))?;
+            .map_err(|err| OwnershipError::Blame(file.clone(), err.into()))?;
         let author = commit
             .author()
-            .map_err(|err| OwnershipError::Blame(file.clone(), err.to_string()))?;
+            .map_err(|err| OwnershipError::Blame(file.clone(), err.into()))?;
         let email = author.email.to_str_lossy().trim().to_string();
         *lines_by_email.entry(email).or_insert(0) += entry.len.get();
     }
@@ -412,5 +417,16 @@ mod tests {
         assert!(report.files.is_empty());
         assert!(report.findings.is_empty());
         assert!(report.errors.is_empty());
+    }
+
+    #[test]
+    fn ownership_error_source_preserves_the_underlying_error() {
+        let err = OwnershipError::Blame(
+            PathBuf::from("src/lib.rs"),
+            Box::new(std::io::Error::other("boom")),
+        );
+        let source = std::error::Error::source(&err).expect("Blame must carry a source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(err.to_string(), "src/lib.rs: failed to blame file: boom");
     }
 }

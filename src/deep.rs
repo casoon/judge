@@ -25,7 +25,7 @@ pub use ra_ap_ide::FileId;
 pub enum DeepError {
     /// The workspace failed to load (manifest discovery, `cargo metadata`,
     /// or build-script execution failed inside `ra_ap_load-cargo`).
-    Load(String),
+    Load(Box<dyn std::error::Error + Send + Sync>),
     /// A semantic query was canceled — normally only happens if the
     /// underlying database was mutated concurrently, which this module
     /// never does after `load`, so in practice this indicates an internal
@@ -48,7 +48,18 @@ pub enum DeepError {
 impl std::fmt::Display for DeepError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Load(msg) => write!(f, "failed to load workspace for deep analysis: {msg}"),
+            Self::Load(err) => {
+                // Print the whole cause chain inline, matching the anyhow
+                // `{err:#}` rendering this message had before the source
+                // error was kept structured (see todo.md §15.2).
+                write!(f, "failed to load workspace for deep analysis: {err}")?;
+                let mut source = err.source();
+                while let Some(cause) = source {
+                    write!(f, ": {cause}")?;
+                    source = cause.source();
+                }
+                Ok(())
+            }
             Self::Cancelled(msg) => write!(f, "semantic query canceled: {msg}"),
             Self::UnresolvedSymbol(position) => write!(
                 f,
@@ -64,7 +75,14 @@ impl std::fmt::Display for DeepError {
     }
 }
 
-impl std::error::Error for DeepError {}
+impl std::error::Error for DeepError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Load(err) => Some(err.as_ref()),
+            Self::Cancelled(_) | Self::UnresolvedSymbol(_) | Self::InvalidPath(_) => None,
+        }
+    }
+}
 
 /// A loaded workspace, ready for semantic queries. Building this runs a full
 /// `cargo metadata`-equivalent workspace load and crate-graph construction —
@@ -131,7 +149,7 @@ impl DeepContext {
             &load_config,
             &|_progress| {},
         )
-        .map_err(|err| DeepError::Load(format!("{err:#}")))?;
+        .map_err(|err| DeepError::Load(err.into()))?;
 
         Ok(Self {
             host: AnalysisHost::with_database(db),
@@ -615,5 +633,17 @@ mod tests {
             without_tests, 0,
             "the same call must not count in production-only mode"
         );
+    }
+
+    #[test]
+    fn deep_error_load_source_preserves_the_underlying_error() {
+        let err = DeepError::Load(Box::new(std::io::Error::other("boom")));
+        let source = std::error::Error::source(&err).expect("Load must carry a source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(
+            err.to_string(),
+            "failed to load workspace for deep analysis: boom"
+        );
+        assert!(std::error::Error::source(&DeepError::InvalidPath(PathBuf::from("x"))).is_none());
     }
 }

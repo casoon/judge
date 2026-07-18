@@ -53,6 +53,17 @@ pub enum EvidenceClass {
     Heuristic,
 }
 
+impl EvidenceClass {
+    /// Whether findings of this class may affect a verdict/exit code or the
+    /// health score. [`EvidenceClass::Heuristic`] findings are advisory by
+    /// default — reported, but never gating (todo.md §17.2: "standardmäßig
+    /// nur Hinweis, kein Exitcode 1"). The single place this policy lives;
+    /// every verdict/score consumer goes through it.
+    pub const fn is_gating(self) -> bool {
+        !matches!(self, Self::Heuristic)
+    }
+}
+
 /// The single authoritative rule-id → [`EvidenceClass`] mapping (see the
 /// table on [`EvidenceClass`]). Used by detectors whose constructors take a
 /// rule id, and by the baseline v1→v2 migration, which must derive a class
@@ -128,18 +139,43 @@ pub struct Finding {
     pub causes: Vec<FindingId>,
 }
 
+impl Finding {
+    /// See [`EvidenceClass::is_gating`] — `false` means this finding is
+    /// advisory: shown, but with no effect on verdicts or the health score.
+    pub fn is_gating(&self) -> bool {
+        self.evidence_class.is_gating()
+    }
+}
+
 /// Current version of the JSON report schema (see todo.md §7). Bump whenever
 /// a field is removed or changes meaning; additive fields don't require it.
 /// v2: `Finding.confidence: f32` replaced by `Finding.evidence_class`
 /// (todo.md §17.5).
 pub const SCHEMA_VERSION: u32 = 2;
 
+/// How many of a report's findings can affect a verdict vs. how many are
+/// purely advisory (see [`EvidenceClass::is_gating`]). Additive report field
+/// — per-finding classification is already carried by
+/// `Finding.evidence_class`, this is just the pre-computed split so
+/// consumers don't have to re-derive the gating policy.
+#[derive(Debug, Clone, Serialize)]
+pub struct VerdictEffectCounts {
+    pub gating: usize,
+    pub advisory: usize,
+}
+
 /// The versioned, agent-readable output envelope (see todo.md §7). Always
 /// carries the full finding graph — TTY/Markdown reduce to root findings by
-/// default, JSON never does.
+/// default, JSON never does. `findings` includes advisory (heuristic)
+/// findings; `counts` records the gating/advisory split, and any verdict or
+/// exit code derived from a report reflects only the gating findings
+/// (todo.md §17.2, §17.5).
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub schema_version: u32,
+    /// Gating vs. advisory finding counts (additive in schema v2 — no
+    /// version bump; see [`VerdictEffectCounts`]).
+    pub counts: VerdictEffectCounts,
     pub findings: Vec<Finding>,
     /// Analyzer failures that made the report incomplete. An empty list means
     /// every requested detector completed successfully.
@@ -152,8 +188,13 @@ impl Report {
     }
 
     pub fn with_errors(findings: Vec<Finding>, errors: Vec<String>) -> Self {
+        let gating = findings.iter().filter(|f| f.is_gating()).count();
         Self {
             schema_version: SCHEMA_VERSION,
+            counts: VerdictEffectCounts {
+                gating,
+                advisory: findings.len() - gating,
+            },
             findings,
             errors,
         }
@@ -363,7 +404,24 @@ mod tests {
         assert_eq!(json["findings"][0]["severity"], "warn");
         assert_eq!(json["findings"][0]["origin"], "code");
         assert_eq!(json["findings"][0]["evidence_class"], "heuristic");
+        assert_eq!(json["counts"]["gating"], 0);
+        assert_eq!(json["counts"]["advisory"], 1);
         assert_eq!(json["errors"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn only_heuristic_findings_are_advisory() {
+        let mut gating = finding("gating", &[]);
+        gating.evidence_class = EvidenceClass::DerivedFact;
+        assert!(gating.is_gating());
+        gating.evidence_class = EvidenceClass::BoundedSemantic;
+        assert!(gating.is_gating());
+        gating.evidence_class = EvidenceClass::ExternalMeasurement;
+        assert!(gating.is_gating());
+
+        let advisory = finding("advisory", &[]);
+        assert_eq!(advisory.evidence_class, EvidenceClass::Heuristic);
+        assert!(!advisory.is_gating());
     }
 
     #[test]

@@ -2,6 +2,12 @@
 //! severity-weighted, LOC-density-normalized findings (see todo.md §4
 //! "Health Score & Decision Surface").
 //!
+//! Only *gating* findings are scored (see
+//! [`crate::finding::EvidenceClass::is_gating`]): heuristic findings are
+//! advisory by default (todo.md §17.2, §17.5) and produce no deduction, so
+//! the score speaks only about `derived_fact`/`bounded_semantic`/
+//! `external_measurement` findings.
+//!
 //! Deliberately narrow, matching §4's own guardrails:
 //! 1. **Erklärbar** — every input (fail/warn counts, total LOC, deduction) is
 //!    carried on [`HealthScore`] alongside the score, not hidden inside an
@@ -41,7 +47,11 @@ pub const WARN_WEIGHT: f64 = 3.0;
 /// normalization, grade cutoffs). Stored on saved baselines via
 /// [`ScoreContext`] so a trend is only computed when both scores used the
 /// same formula — bump this on any formula change.
-pub const SCORE_FORMULA_VERSION: u32 = 1;
+///
+/// v2: heuristic findings no longer deduct — the score covers only gating
+/// findings (see module docs). Baselines scored under v1 are
+/// [`Trend::NotComparable`], not a false delta.
+pub const SCORE_FORMULA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Grade {
@@ -307,9 +317,10 @@ fn multiplier_for(
         })
 }
 
-/// Computes a [`HealthScore`] from `findings` (only `Fail`/`Warn` severities
-/// count — `Info` findings are descriptive, not scored, matching
-/// `baseline::Delta::verdict`'s same carve-out) and `total_loc`, scaling each
+/// Computes a [`HealthScore`] from `findings` (only *gating* `Fail`/`Warn`
+/// findings count — `Info` findings are descriptive and heuristic findings
+/// advisory, neither is scored, matching `baseline::Delta::verdict`'s same
+/// carve-outs) and `total_loc`, scaling each
 /// finding's deduction by its crate's `deduction_multiplier` from
 /// `crate_profiles`, if configured (default `1.0`). A `total_loc` of zero is
 /// [`ScoreOutcome::Unavailable`] — even with fail findings there is no basis
@@ -329,6 +340,9 @@ pub fn compute(
     let mut deduction = 0.0;
 
     for finding in findings {
+        if !finding.is_gating() {
+            continue;
+        }
         let weight = match finding.severity {
             Severity::Fail => {
                 fail_count += 1;
@@ -508,6 +522,11 @@ pub fn trend(
     let mut deduction = 0.0;
 
     for finding in &baseline.findings {
+        // Same gating carve-out as `compute` — heuristic baseline findings
+        // are advisory and never deducted (see module docs).
+        if !finding.evidence_class.is_gating() {
+            continue;
+        }
         let weight = match finding.severity {
             Severity::Fail => {
                 fail_count += 1;
@@ -606,6 +625,28 @@ mod tests {
         let score = available(compute(&findings, 1000, &workspace, &[]));
 
         assert_eq!(score.score, 100.0);
+    }
+
+    #[test]
+    fn heuristic_findings_do_not_deduct_and_are_not_counted() {
+        let workspace = workspace_with_crate("/repo", "core");
+        let mut heuristic_fail = finding(Severity::Fail, "/repo/src/lib.rs");
+        heuristic_fail.evidence_class = crate::finding::EvidenceClass::Heuristic;
+        let mut heuristic_warn = finding(Severity::Warn, "/repo/src/lib.rs");
+        heuristic_warn.evidence_class = crate::finding::EvidenceClass::Heuristic;
+
+        let score = available(compute(
+            &[heuristic_fail, heuristic_warn],
+            1000,
+            &workspace,
+            &[],
+        ));
+
+        assert_eq!(score.score, 100.0);
+        assert_eq!(score.grade, Grade::A);
+        assert_eq!(score.fail_count, 0);
+        assert_eq!(score.warn_count, 0);
+        assert_eq!(score.deduction, 0.0);
     }
 
     #[test]
@@ -812,6 +853,31 @@ mod tests {
     }
 
     #[test]
+    fn trend_skips_heuristic_baseline_findings_like_compute_does() {
+        // Baseline stored under the current formula, containing one gating
+        // and one heuristic finding; the current run carries the same pair.
+        // Both sides must skip the heuristic finding, so the delta is zero —
+        // not a phantom improvement from the advisory carve-out.
+        let workspace = workspace_with_crate("/repo", "core");
+        let mut heuristic = finding(Severity::Warn, "/repo/src/lib.rs");
+        heuristic.evidence_class = crate::finding::EvidenceClass::Heuristic;
+        let findings = vec![finding(Severity::Warn, "/repo/src/lib.rs"), heuristic];
+        let baseline = Baseline::new(
+            &findings,
+            "abc123".to_string(),
+            std::collections::HashMap::new(),
+            1000,
+            ScoreContext::from_profiles(&[]),
+        );
+
+        let current = available(compute(&findings, 1000, &workspace, &[]));
+        assert_eq!(current.warn_count, 1);
+        let trend = trend(current, &baseline, &workspace, &[]);
+
+        assert_eq!(trend.delta(), Some(0.0));
+    }
+
+    #[test]
     fn formula_version_change_makes_the_trend_not_comparable() {
         let workspace = workspace_with_crate("/repo", "core");
         let findings = vec![finding(Severity::Warn, "/repo/src/lib.rs")];
@@ -822,7 +888,9 @@ mod tests {
             1000,
             ScoreContext::from_profiles(&[]),
         );
-        baseline.score_context.as_mut().unwrap().formula_version = 0;
+        // Version 1: the formula before heuristic findings became
+        // advisory-only.
+        baseline.score_context.as_mut().unwrap().formula_version = 1;
 
         let current = available(compute(&findings, 1000, &workspace, &[]));
         let trend = trend(current, &baseline, &workspace, &[]);

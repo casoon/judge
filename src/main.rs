@@ -647,7 +647,15 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         OutputFormat::Tty => {
-            println!("findings: {} (worst first)", collected.findings.len());
+            let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = collected
+                .findings
+                .iter()
+                .partition(|finding| finding.is_gating());
+            println!(
+                "findings: {} (worst first), {} advisory",
+                gating.len(),
+                advisory.len()
+            );
             if !collected.analysis_errors.is_empty() {
                 println!("analysis errors: {}", collected.analysis_errors.len());
                 for error in &collected.analysis_errors {
@@ -664,7 +672,7 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
                 }
             );
             println!();
-            for finding in &collected.findings {
+            let print_finding = |finding: &Finding| {
                 let severity = match finding.severity {
                     judge::finding::Severity::Fail => "fail",
                     judge::finding::Severity::Warn => "warn",
@@ -677,6 +685,19 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
                     finding.location.line,
                     finding.location.item_path
                 );
+            };
+            for finding in &gating {
+                print_finding(finding);
+            }
+            if !advisory.is_empty() {
+                println!();
+                println!(
+                    "advisory (heuristic) — no verdict effect: {}",
+                    advisory.len()
+                );
+                for finding in &advisory {
+                    print_finding(finding);
+                }
             }
         }
     }
@@ -833,8 +854,25 @@ fn print_delta(delta: &judge::baseline::Delta, verdict: Verdict) {
         println!("  {}  {}", finding.rule, finding.file.display());
     }
 
-    println!("code-introduced: {}", delta.code_introduced.len());
-    for finding in &delta.code_introduced {
+    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
+        .code_introduced
+        .iter()
+        .partition(|finding| finding.is_gating());
+    println!("code-introduced: {}", gating.len());
+    for finding in &gating {
+        println!(
+            "  {}  {}:{}",
+            finding.rule,
+            finding.location.file.display(),
+            finding.location.line
+        );
+    }
+
+    println!(
+        "code-introduced advisory (heuristic — no verdict effect): {}",
+        advisory.len()
+    );
+    for finding in &advisory {
         println!(
             "  {}  {}:{}",
             finding.rule,
@@ -1034,8 +1072,11 @@ fn print_audit(
         println!("  {}  {}", finding.rule, finding.file.display());
     }
 
-    println!("code-introduced: {}", delta.code_introduced.len());
-    for finding in &delta.code_introduced {
+    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
+        .code_introduced
+        .iter()
+        .partition(|finding| finding.is_gating());
+    let print_introduced = |finding: &Finding| {
         let severity = match finding.severity {
             judge::finding::Severity::Fail => "fail",
             judge::finding::Severity::Warn => "warn",
@@ -1047,6 +1088,18 @@ fn print_audit(
             finding.location.file.display(),
             finding.location.line
         );
+    };
+    println!("code-introduced: {}", gating.len());
+    for finding in &gating {
+        print_introduced(finding);
+    }
+
+    println!(
+        "code-introduced advisory (heuristic — no verdict effect): {}",
+        advisory.len()
+    );
+    for finding in &advisory {
+        print_introduced(finding);
     }
 
     println!(
@@ -2102,13 +2155,18 @@ fn run_health(
                     &workspace,
                     &config.crate_profiles,
                 ));
+                let advisory_count = findings
+                    .iter()
+                    .filter(|finding| !finding.is_gating())
+                    .count();
                 println!(
-                    "health score: {:.1} ({}) — {} authored LOC, {} fail, {} warn",
+                    "health score: {:.1} ({}) — {} authored LOC, {} fail, {} warn, {} advisory (not scored)",
                     score.score,
                     score.grade.label(),
                     score.total_loc,
                     score.fail_count,
                     score.warn_count,
+                    advisory_count,
                 );
             }
         }
@@ -2252,7 +2310,7 @@ fn print_hotspots(
     };
 
     println!(
-        "hotspots (complexity × changes in the last {} days):",
+        "hotspots (complexity × changes in the last {} days — advisory, no verdict effect):",
         judge::git::DEFAULT_WINDOW_DAYS
     );
     for hotspot in hotspots.iter().take(15) {
@@ -2314,7 +2372,13 @@ fn print_slop(findings: &[judge::finding::Finding], show_cascades: bool) {
         return;
     }
 
-    println!("slop signals: {}", shown.len());
+    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) =
+        shown.iter().partition(|finding| finding.is_gating());
+    println!(
+        "slop signals: {} ({} advisory)",
+        gating.len(),
+        advisory.len()
+    );
     for rule in SLOP_RULES {
         let count = shown.iter().filter(|finding| finding.rule == rule).count();
         if count > 0 {
@@ -2322,7 +2386,7 @@ fn print_slop(findings: &[judge::finding::Finding], show_cascades: bool) {
         }
     }
     println!();
-    for finding in &shown {
+    let print_finding = |finding: &Finding| {
         let severity = match finding.severity {
             judge::finding::Severity::Fail => "fail",
             judge::finding::Severity::Warn => "warn",
@@ -2335,6 +2399,19 @@ fn print_slop(findings: &[judge::finding::Finding], show_cascades: bool) {
             finding.location.line,
             finding.location.item_path
         );
+    };
+    for finding in &gating {
+        print_finding(finding);
+    }
+    if !advisory.is_empty() {
+        println!();
+        println!(
+            "advisory (heuristic) — no verdict effect: {}",
+            advisory.len()
+        );
+        for finding in &advisory {
+            print_finding(finding);
+        }
     }
 }
 
@@ -2647,6 +2724,101 @@ fn dup_two(x: i32) -> i32 {
         assert_eq!(delta.rule_introduced.len(), 1);
         assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
         assert_eq!(combine_verdict(delta.tri_verdict(), None), TriVerdict::Pass);
+    }
+
+    /// Tests todo.md §17.2/§17.5's advisory default at the wiring level: a
+    /// workspace whose only findings are heuristic (here: `churn-hotspot`)
+    /// (a) scores without deductions and reports an advisory count, and
+    /// (c) never breaks the delta/audit verdict with newly introduced
+    /// heuristic findings.
+    #[test]
+    fn heuristic_only_findings_pass_the_verdict_and_score_without_deductions() {
+        let dir = TempDir::new("advisory-heuristics-only");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        let base_commit = commit_sha(&dir, "HEAD");
+
+        let manifest = dir.join("Cargo.toml");
+        let workspace = judge::ingest::load(Some(&manifest)).unwrap();
+        let baseline_collected = collect_findings(&workspace);
+        assert!(baseline_collected.analysis_errors.is_empty());
+        let baseline = judge::baseline::Baseline::new(
+            &baseline_collected.findings,
+            base_commit.clone(),
+            baseline_collected.rule_revisions,
+            judge::health_score::total_authored_loc(&workspace),
+            judge::health_score::ScoreContext::from_profiles(&[]),
+        );
+
+        // Five more commits to the same file, all inside `churn-hotspot`'s
+        // 14-day window — enough churn for the (heuristic) rule to fire,
+        // without introducing any derived-fact (G1–G3) pattern.
+        for revision in 1..=5 {
+            std::fs::write(
+                dir.join("src/lib.rs"),
+                format!("pub fn hello() -> u32 {{ {revision} }}\n"),
+            )
+            .unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", &format!("rev {revision}")]);
+        }
+
+        let workspace = judge::ingest::load(Some(&manifest)).unwrap();
+        let mut collected = collect_findings(&workspace);
+        assert!(collected.analysis_errors.is_empty());
+        judge::finding::relativize_paths(&mut collected.findings, &workspace.root);
+
+        assert!(
+            collected
+                .findings
+                .iter()
+                .any(|finding| finding.rule == judge::slop_structural::CHURN_HOTSPOT_RULE),
+            "fixture should provoke a churn-hotspot finding"
+        );
+        let gating_rules: Vec<&String> = collected
+            .findings
+            .iter()
+            .filter(|finding| finding.is_gating())
+            .map(|finding| &finding.rule)
+            .collect();
+        assert!(
+            gating_rules.is_empty(),
+            "fixture should only produce heuristic (advisory) findings, got gating: {gating_rules:?}"
+        );
+
+        // (c) Newly introduced heuristic findings stay visible in the delta
+        // but never break the verdict.
+        let touched = judge::git::changed_files_since(&dir, &base_commit).unwrap();
+        let delta = judge::baseline::diff(
+            &collected.findings,
+            &baseline,
+            &touched,
+            &collected.rule_revisions,
+        );
+        assert!(!delta.code_introduced.is_empty());
+        assert_eq!(delta.verdict(), Verdict::Pass);
+        assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
+        assert_eq!(combine_verdict(delta.tri_verdict(), None), TriVerdict::Pass);
+
+        // (a) The score takes no deductions from advisory findings, and the
+        // report envelope records them as advisory.
+        let total_loc = judge::health_score::total_authored_loc(&workspace);
+        let score =
+            match judge::health_score::compute(&collected.findings, total_loc, &workspace, &[]) {
+                judge::health_score::ScoreOutcome::Available(score) => score,
+                judge::health_score::ScoreOutcome::Unavailable(reason) => {
+                    panic!("score unavailable: {reason}")
+                }
+            };
+        assert_eq!(score.score, 100.0);
+        assert_eq!(score.fail_count, 0);
+        assert_eq!(score.warn_count, 0);
+
+        let report = Report::new(collected.findings);
+        assert_eq!(report.counts.gating, 0);
+        assert!(report.counts.advisory > 0);
     }
 
     #[test]

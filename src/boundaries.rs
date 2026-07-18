@@ -149,7 +149,14 @@ impl std::fmt::Display for BoundaryConfigError {
     }
 }
 
-impl std::error::Error for BoundaryConfigError {}
+impl std::error::Error for BoundaryConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Metadata(err) => Some(err),
+            Self::UnknownCrate { .. } => None,
+        }
+    }
+}
 
 /// The workspace-internal crate dependency graph: crate name -> names of
 /// workspace crates it depends on. Dependency `kind` (normal/dev/build)
@@ -835,5 +842,13 @@ trailer_contains = ["internal-ci-bot"]
         );
         assert_eq!(config.provenance.labels[1].name, "internal-bot");
         assert!(config.provenance.labels[1].author_email_contains.is_empty());
+    }
+
+    #[test]
+    fn boundary_config_error_source_preserves_the_metadata_error() {
+        let err =
+            build_crate_graph(Some(Path::new("/nonexistent/judge-test/Cargo.toml"))).unwrap_err();
+        let source = std::error::Error::source(&err).expect("Metadata must carry a source");
+        assert!(source.downcast_ref::<cargo_metadata::Error>().is_some());
     }
 }

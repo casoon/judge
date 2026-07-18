@@ -189,7 +189,14 @@ impl std::fmt::Display for IngestError {
     }
 }
 
-impl std::error::Error for IngestError {}
+impl std::error::Error for IngestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Metadata(err) => Some(err),
+            Self::Io(err) => Some(err),
+        }
+    }
+}
 
 impl From<cargo_metadata::Error> for IngestError {
     fn from(err: cargo_metadata::Error) -> Self {
@@ -576,5 +583,13 @@ edition = "2021"
         let files = collect_source_files(&dir, &[]).unwrap();
 
         assert_eq!(files[0].kind, SourceKind::Authored);
+    }
+
+    #[test]
+    fn ingest_error_source_preserves_the_underlying_error() {
+        let err = IngestError::Io(std::io::Error::other("boom"));
+        let source = std::error::Error::source(&err).expect("Io must carry a source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(err.to_string(), "failed to walk source files: boom");
     }
 }

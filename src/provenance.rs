@@ -144,7 +144,15 @@ impl std::fmt::Display for ProvenanceError {
     }
 }
 
-impl std::error::Error for ProvenanceError {}
+impl std::error::Error for ProvenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Git(err) => Some(err),
+            Self::Duplication(err) => Some(err),
+            Self::Slop(err) => Some(err),
+        }
+    }
+}
 
 /// Everything `cargo judge provenance` reports: one [`Finding`] per
 /// non-zero `(metric, AuthorClass)` combination, the raw per-class counts
@@ -1091,5 +1099,12 @@ mod tests {
             counts.get(&AuthorClass::Agent("claude".to_string())),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn provenance_error_source_preserves_the_wrapped_domain_error() {
+        let err = ProvenanceError::Git(GitError::InvalidWindow(0));
+        let source = std::error::Error::source(&err).expect("Git must carry a source");
+        assert!(source.downcast_ref::<GitError>().is_some());
     }
 }

@@ -225,7 +225,15 @@ impl std::fmt::Display for DuplicationError {
     }
 }
 
-impl std::error::Error for DuplicationError {}
+impl std::error::Error for DuplicationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(_, err) => Some(err),
+            Self::Parse(_, err) => Some(err),
+            Self::MissingSuppressionReason(_, _) => None,
+        }
+    }
+}
 
 /// Aggregated duplication results across a set of files, keeping clone
 /// families separate from files that could not be parsed.
@@ -1738,5 +1746,15 @@ fn calls_helper_two(x: i32) -> i32 {
                 assert_eq!(finding.evidence_class, expected, "{mode:?}");
             }
         }
+    }
+
+    #[test]
+    fn duplication_error_source_preserves_the_underlying_error() {
+        let err = DuplicationError::Io(PathBuf::from("src/lib.rs"), std::io::Error::other("boom"));
+        let source = std::error::Error::source(&err).expect("Io must carry a source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(err.to_string(), "src/lib.rs: failed to read file: boom");
+        let no_reason = DuplicationError::MissingSuppressionReason(PathBuf::from("a.rs"), 1);
+        assert!(std::error::Error::source(&no_reason).is_none());
     }
 }

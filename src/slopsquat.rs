@@ -185,32 +185,39 @@ pub enum SlopsquatError {
     /// and similar. Distinct from a 404 (a valid "crate not found"
     /// response), because it means the network itself isn't reachable, not
     /// that this particular crate doesn't exist.
-    Connection(String),
+    Connection(Box<dyn std::error::Error + Send + Sync>),
     /// The connectivity circuit breaker has already tripped (see
     /// [`SparseIndexClient`]/[`RestMetadataClient`] docs) — no network
     /// attempt was made for this call.
     CircuitOpen,
     /// Any other network/parse failure for this specific lookup (e.g. an
     /// unexpected HTTP status, a response body that couldn't be read).
-    Other(String),
+    Other(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl std::fmt::Display for SlopsquatError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Connection(msg) => write!(f, "crates.io unreachable: {msg}"),
+            Self::Connection(err) => write!(f, "crates.io unreachable: {err}"),
             Self::CircuitOpen => {
                 write!(
                     f,
                     "crates.io lookups skipped after an earlier connection failure"
                 )
             }
-            Self::Other(msg) => write!(f, "crates.io lookup failed: {msg}"),
+            Self::Other(err) => write!(f, "crates.io lookup failed: {err}"),
         }
     }
 }
 
-impl std::error::Error for SlopsquatError {}
+impl std::error::Error for SlopsquatError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connection(err) | Self::Other(err) => Some(err.as_ref()),
+            Self::CircuitOpen => None,
+        }
+    }
+}
 
 /// One published version, as recorded in the crates.io sparse index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,15 +409,15 @@ impl CratesIoIndex for SparseIndexClient {
             }
             Err(err) if is_connection_error(&err) => {
                 self.circuit_open.set(true);
-                return Err(SlopsquatError::Connection(err.to_string()));
+                return Err(SlopsquatError::Connection(err.into()));
             }
-            Err(err) => return Err(SlopsquatError::Other(err.to_string())),
+            Err(err) => return Err(SlopsquatError::Other(err.into())),
         };
 
         let body = response
             .body_mut()
             .read_to_string()
-            .map_err(|err| SlopsquatError::Other(err.to_string()))?;
+            .map_err(|err| SlopsquatError::Other(err.into()))?;
 
         // Each line is an independent JSON object; a malformed line is
         // skipped rather than failing the whole fetch.
@@ -479,17 +486,17 @@ impl CratesIoMetadata for RestMetadataClient {
             }
             Err(err) if is_connection_error(&err) => {
                 self.circuit_open.set(true);
-                return Err(SlopsquatError::Connection(err.to_string()));
+                return Err(SlopsquatError::Connection(err.into()));
             }
-            Err(err) => return Err(SlopsquatError::Other(err.to_string())),
+            Err(err) => return Err(SlopsquatError::Other(err.into())),
         };
 
         let body = response
             .body_mut()
             .read_to_string()
-            .map_err(|err| SlopsquatError::Other(err.to_string()))?;
+            .map_err(|err| SlopsquatError::Other(err.into()))?;
         let parsed: RestCrateResponse =
-            serde_json::from_str(&body).map_err(|err| SlopsquatError::Other(err.to_string()))?;
+            serde_json::from_str(&body).map_err(|err| SlopsquatError::Other(err.into()))?;
 
         write_cache(&path, &Some(parsed.krate.clone()));
         Ok(Some(parsed.krate))
@@ -525,7 +532,7 @@ impl FixtureIndex {
 impl CratesIoIndex for FixtureIndex {
     fn lookup(&self, crate_name: &str) -> Result<Option<IndexEntry>, SlopsquatError> {
         if let Some(message) = &self.forced_error {
-            return Err(SlopsquatError::Other(message.clone()));
+            return Err(SlopsquatError::Other(message.clone().into()));
         }
         Ok(self.crates.get(crate_name).map(|versions| IndexEntry {
             versions: versions.clone(),
@@ -1124,5 +1131,14 @@ edition = "2021"
         let d = doy - (153 * mp + 2) / 5 + 1;
         let m = if mp < 10 { mp + 3 } else { mp - 9 };
         (if m <= 2 { y + 1 } else { y }, m, d)
+    }
+
+    #[test]
+    fn slopsquat_error_source_preserves_the_underlying_error() {
+        let err = SlopsquatError::Other(Box::new(std::io::Error::other("boom")));
+        let source = std::error::Error::source(&err).expect("Other must carry a source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(err.to_string(), "crates.io lookup failed: boom");
+        assert!(std::error::Error::source(&SlopsquatError::CircuitOpen).is_none());
     }
 }

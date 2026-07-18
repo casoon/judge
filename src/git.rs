@@ -23,9 +23,9 @@ pub const HOTSPOT_RULE_REVISION: u32 = 1;
 #[derive(Debug)]
 pub enum GitError {
     Open(Box<gix::open::Error>),
-    Walk(String),
-    RevParse(String, String),
-    Status(String),
+    Walk(Box<dyn std::error::Error + Send + Sync>),
+    RevParse(String, Box<dyn std::error::Error + Send + Sync>),
+    Status(Box<dyn std::error::Error + Send + Sync>),
     InvalidWindow(i64),
 }
 
@@ -33,9 +33,9 @@ impl std::fmt::Display for GitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Open(err) => write!(f, "failed to open git repository: {err}"),
-            Self::Walk(msg) => write!(f, "failed to walk git history: {msg}"),
-            Self::RevParse(spec, msg) => write!(f, "failed to resolve `{spec}`: {msg}"),
-            Self::Status(msg) => write!(f, "failed to read repository status: {msg}"),
+            Self::Walk(err) => write!(f, "failed to walk git history: {err}"),
+            Self::RevParse(spec, err) => write!(f, "failed to resolve `{spec}`: {err}"),
+            Self::Status(err) => write!(f, "failed to read repository status: {err}"),
             Self::InvalidWindow(days) => {
                 write!(f, "invalid lookback window: {days} days (must be positive)")
             }
@@ -43,7 +43,15 @@ impl std::fmt::Display for GitError {
     }
 }
 
-impl std::error::Error for GitError {}
+impl std::error::Error for GitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Open(err) => Some(err),
+            Self::Walk(err) | Self::RevParse(_, err) | Self::Status(err) => Some(err.as_ref()),
+            Self::InvalidWindow(_) => None,
+        }
+    }
+}
 
 impl From<gix::open::Error> for GitError {
     fn from(err: gix::open::Error) -> Self {
@@ -100,37 +108,33 @@ pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>
         .rev_walk(Some(head_id.detach()))
         .sorting(window_sorting(window.cutoff_seconds()))
         .all()
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+        .map_err(|err| GitError::Walk(err.into()))?;
 
     for info in walk {
-        let info = info.map_err(|err| GitError::Walk(err.to_string()))?;
-        let commit = info
-            .object()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let info = info.map_err(|err| GitError::Walk(err.into()))?;
+        let commit = info.object().map_err(|err| GitError::Walk(err.into()))?;
 
-        let tree = commit
-            .tree()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let tree = commit.tree().map_err(|err| GitError::Walk(err.into()))?;
         let parent_tree = match commit.parent_ids().next() {
             Some(parent_id) => parent_id
                 .object()
-                .map_err(|err| GitError::Walk(err.to_string()))?
+                .map_err(|err| GitError::Walk(err.into()))?
                 .into_commit()
                 .tree()
-                .map_err(|err| GitError::Walk(err.to_string()))?,
+                .map_err(|err| GitError::Walk(err.into()))?,
             None => repo.empty_tree(),
         };
 
         parent_tree
             .changes()
-            .map_err(|err| GitError::Walk(err.to_string()))?
+            .map_err(|err| GitError::Walk(err.into()))?
             .for_each_to_obtain_tree(&tree, |change| {
                 if let Some(path) = path_of(&change) {
                     *counts.entry(path).or_insert(0u32) += 1;
                 }
                 Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
             })
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+            .map_err(|err| GitError::Walk(err.into()))?;
     }
 
     Ok(counts)
@@ -168,51 +172,43 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
         .rev_walk(Some(head_id.detach()))
         .sorting(window_sorting(window.cutoff_seconds()))
         .all()
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+        .map_err(|err| GitError::Walk(err.into()))?;
 
     for info in walk {
-        let info = info.map_err(|err| GitError::Walk(err.to_string()))?;
-        let commit = info
-            .object()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let info = info.map_err(|err| GitError::Walk(err.into()))?;
+        let commit = info.object().map_err(|err| GitError::Walk(err.into()))?;
         let commit_time = commit
             .time()
-            .map_err(|err| GitError::Walk(err.to_string()))?
+            .map_err(|err| GitError::Walk(err.into()))?
             .seconds;
 
-        let tree = commit
-            .tree()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let tree = commit.tree().map_err(|err| GitError::Walk(err.into()))?;
         let parent_tree = match commit.parent_ids().next() {
             Some(parent_id) => parent_id
                 .object()
-                .map_err(|err| GitError::Walk(err.to_string()))?
+                .map_err(|err| GitError::Walk(err.into()))?
                 .into_commit()
                 .tree()
-                .map_err(|err| GitError::Walk(err.to_string()))?,
+                .map_err(|err| GitError::Walk(err.into()))?,
             None => repo.empty_tree(),
         };
 
         let mut files_changed = Vec::new();
         parent_tree
             .changes()
-            .map_err(|err| GitError::Walk(err.to_string()))?
+            .map_err(|err| GitError::Walk(err.into()))?
             .for_each_to_obtain_tree(&tree, |change| {
                 if let Some(path) = path_of(&change) {
                     files_changed.push(path);
                 }
                 Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
             })
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+            .map_err(|err| GitError::Walk(err.into()))?;
 
-        let author = commit
-            .author()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let author = commit.author().map_err(|err| GitError::Walk(err.into()))?;
         let author_email = author.email.to_str_lossy().trim().to_string();
 
-        let decoded = commit
-            .decode()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let decoded = commit.decode().map_err(|err| GitError::Walk(err.into()))?;
         let trailers = decoded
             .attribution_trailers()
             .map(|trailer| {
@@ -223,9 +219,7 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
             })
             .collect();
 
-        let message = commit
-            .message()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let message = commit.message().map_err(|err| GitError::Walk(err.into()))?;
         let message_title = message.title.to_str_lossy().trim().to_string();
         let message_body = message
             .body
@@ -320,9 +314,7 @@ pub fn hotspots(
 /// `first_seen_commit`).
 pub fn head_commit(repo_root: &Path) -> Result<String, GitError> {
     let repo = gix::open(repo_root)?;
-    let head_id = repo
-        .head_id()
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+    let head_id = repo.head_id().map_err(|err| GitError::Walk(err.into()))?;
     Ok(head_id.to_string())
 }
 
@@ -332,7 +324,7 @@ pub fn resolve_commit(repo_root: &Path, spec: &str) -> Result<String, GitError> 
     let repo = gix::open(repo_root)?;
     let id = repo
         .rev_parse_single(spec)
-        .map_err(|err| GitError::RevParse(spec.to_string(), err.to_string()))?;
+        .map_err(|err| GitError::RevParse(spec.to_string(), err.into()))?;
     Ok(id.to_string())
 }
 
@@ -345,11 +337,11 @@ pub fn is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result
     let repo = gix::open(repo_root)?;
     let ancestor_id = repo
         .rev_parse_single(ancestor)
-        .map_err(|err| GitError::RevParse(ancestor.to_string(), err.to_string()))?
+        .map_err(|err| GitError::RevParse(ancestor.to_string(), err.into()))?
         .detach();
     let descendant_id = repo
         .rev_parse_single(descendant)
-        .map_err(|err| GitError::RevParse(descendant.to_string(), err.to_string()))?
+        .map_err(|err| GitError::RevParse(descendant.to_string(), err.into()))?
         .detach();
 
     if ancestor_id == descendant_id {
@@ -359,7 +351,7 @@ pub fn is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> Result
     match repo.merge_base(ancestor_id, descendant_id) {
         Ok(base) => Ok(base.detach() == ancestor_id),
         Err(gix::repository::merge_base::Error::NotFound { .. }) => Ok(false),
-        Err(err) => Err(GitError::Walk(err.to_string())),
+        Err(err) => Err(GitError::Walk(err.into())),
     }
 }
 
@@ -373,45 +365,43 @@ pub fn changed_files_since(
     let repo = gix::open(repo_root)?;
     let since_id = repo
         .rev_parse_single(since_commit)
-        .map_err(|err| GitError::RevParse(since_commit.to_string(), err.to_string()))?;
-    let head_id = repo
-        .head_id()
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+        .map_err(|err| GitError::RevParse(since_commit.to_string(), err.into()))?;
+    let head_id = repo.head_id().map_err(|err| GitError::Walk(err.into()))?;
 
     let since_tree = since_id
         .object()
-        .map_err(|err| GitError::Walk(err.to_string()))?
+        .map_err(|err| GitError::Walk(err.into()))?
         .into_commit()
         .tree()
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+        .map_err(|err| GitError::Walk(err.into()))?;
     let head_tree = head_id
         .object()
-        .map_err(|err| GitError::Walk(err.to_string()))?
+        .map_err(|err| GitError::Walk(err.into()))?
         .into_commit()
         .tree()
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+        .map_err(|err| GitError::Walk(err.into()))?;
 
     let mut changed = std::collections::HashSet::new();
     since_tree
         .changes()
-        .map_err(|err| GitError::Walk(err.to_string()))?
+        .map_err(|err| GitError::Walk(err.into()))?
         .for_each_to_obtain_tree(&head_tree, |change| {
             if let Some(path) = path_of(&change) {
                 changed.insert(path);
             }
             Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
         })
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+        .map_err(|err| GitError::Walk(err.into()))?;
 
     let status = repo
         .status(gix::progress::Discard)
-        .map_err(|err| GitError::Status(err.to_string()))?
+        .map_err(|err| GitError::Status(err.into()))?
         .untracked_files(gix::status::UntrackedFiles::Files);
     let status_items = status
         .into_iter(Vec::<gix::bstr::BString>::new())
-        .map_err(|err| GitError::Status(err.to_string()))?;
+        .map_err(|err| GitError::Status(err.into()))?;
     for item in status_items {
-        let item = item.map_err(|err| GitError::Status(err.to_string()))?;
+        let item = item.map_err(|err| GitError::Status(err.into()))?;
         let location = item.location();
         if !location.is_empty() {
             changed.insert(PathBuf::from(location.to_str_lossy().into_owned()));
@@ -442,17 +432,13 @@ pub fn active_authors_since(
         .rev_walk(Some(head_id.detach()))
         .sorting(window_sorting(window.cutoff_seconds()))
         .all()
-        .map_err(|err| GitError::Walk(err.to_string()))?;
+        .map_err(|err| GitError::Walk(err.into()))?;
 
     for info in walk {
-        let info = info.map_err(|err| GitError::Walk(err.to_string()))?;
-        let commit = info
-            .object()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let info = info.map_err(|err| GitError::Walk(err.into()))?;
+        let commit = info.object().map_err(|err| GitError::Walk(err.into()))?;
 
-        let author = commit
-            .author()
-            .map_err(|err| GitError::Walk(err.to_string()))?;
+        let author = commit.author().map_err(|err| GitError::Walk(err.into()))?;
         authors.insert(author.email.to_str_lossy().trim().to_string());
     }
 
@@ -1038,5 +1024,14 @@ mod tests {
         // Both still share `base` as a common ancestor.
         assert!(is_ancestor(&dir, &base, &main_tip).unwrap());
         assert!(is_ancestor(&dir, &base, &feature).unwrap());
+    }
+
+    #[test]
+    fn git_error_source_preserves_the_underlying_error() {
+        let err = GitError::Walk(Box::new(std::io::Error::other("boom")));
+        let source = std::error::Error::source(&err).expect("Walk must carry a source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(err.to_string(), "failed to walk git history: boom");
+        assert!(std::error::Error::source(&GitError::InvalidWindow(0)).is_none());
     }
 }

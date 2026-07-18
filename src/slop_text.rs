@@ -315,7 +315,10 @@ fn conversational_artifact_findings(
 /// documentation).
 fn step_number(text: &str) -> Option<u32> {
     let trimmed = text.trim_start();
-    if trimmed.len() < 4 || !trimmed[..4].eq_ignore_ascii_case("step") {
+    // `get(..4)` instead of `[..4]`: byte 4 may fall inside a multi-byte
+    // character (e.g. a comment starting `v1 — …`), which would panic.
+    let prefix = trimmed.get(..4)?;
+    if !prefix.eq_ignore_ascii_case("step") {
         return None;
     }
     let rest = trimmed[4..].trim_start();
@@ -503,6 +506,15 @@ fn restating_comment_findings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_multibyte_char_at_byte_four_does_not_panic_step_number() {
+        // Regression: `trimmed[..4]` panicked when byte 4 fell inside a
+        // multi-byte character, aborting the whole analysis run.
+        assert_eq!(step_number("v1 — new format"), None);
+        assert_eq!(step_number("äöü"), None);
+        assert_eq!(step_number("Step 3:"), Some(3));
+    }
 
     #[test]
     fn string_literal_containing_comment_markers_is_not_a_comment() {

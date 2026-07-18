@@ -98,7 +98,14 @@ impl std::fmt::Display for DepsError {
     }
 }
 
-impl std::error::Error for DepsError {}
+impl std::error::Error for DepsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(_, err) => Some(err),
+            Self::Parse(_, err) => Some(err),
+        }
+    }
+}
 
 /// Aggregated dependency-hygiene results across a workspace.
 #[derive(Debug, Default)]
@@ -555,5 +562,13 @@ edition = "2021"
             classify_domain(Path::new("src/lib.rs")),
             UsageDomain::Normal
         );
+    }
+
+    #[test]
+    fn deps_error_source_preserves_the_underlying_error() {
+        let err = DepsError::Io(PathBuf::from("src/lib.rs"), std::io::Error::other("boom"));
+        let source = std::error::Error::source(&err).expect("Io must carry a source");
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(err.to_string(), "src/lib.rs: failed to read file: boom");
     }
 }

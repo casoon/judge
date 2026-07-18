@@ -298,13 +298,16 @@ pub enum TriVerdict {
 }
 
 impl Delta {
-    /// Only actionable (`Warn`/`Fail`) code-introduced findings can fail the
-    /// verdict. `Info` findings remain visible in the delta but are explicitly
-    /// descriptive, not pass/fail judgements.
+    /// Only actionable (`Warn`/`Fail`) *gating* code-introduced findings can
+    /// fail the verdict. `Info` findings remain visible in the delta but are
+    /// explicitly descriptive, not pass/fail judgements — and advisory
+    /// (heuristic) findings never gate regardless of severity (see
+    /// [`crate::finding::EvidenceClass::is_gating`], todo.md §17.2).
     pub fn verdict(&self) -> Verdict {
         if self
             .code_introduced
             .iter()
+            .filter(|finding| finding.is_gating())
             .all(|finding| finding.severity == crate::finding::Severity::Info)
         {
             Verdict::Pass
@@ -314,10 +317,11 @@ impl Delta {
     }
 
     /// Like [`Delta::verdict`], but keeps `Warn` and `Fail` distinct instead
-    /// of collapsing both into `Fail` (see [`TriVerdict`]).
+    /// of collapsing both into `Fail` (see [`TriVerdict`]). Applies the same
+    /// advisory carve-out: heuristic findings never force `Warn`/`Fail`.
     pub fn tri_verdict(&self) -> TriVerdict {
         let mut has_warn = false;
-        for finding in &self.code_introduced {
+        for finding in self.code_introduced.iter().filter(|f| f.is_gating()) {
             match finding.severity {
                 crate::finding::Severity::Fail => return TriVerdict::Fail,
                 crate::finding::Severity::Warn => has_warn = true,
@@ -648,6 +652,46 @@ mod tests {
 
         let delta = diff(&[fail, warn], &baseline, &touched, &current_revisions());
 
+        assert_eq!(delta.tri_verdict(), TriVerdict::Fail);
+    }
+
+    #[test]
+    fn heuristic_code_introduced_findings_are_advisory_and_do_not_fail() {
+        // A new heuristic finding in a touched file still classifies as
+        // code-introduced (it stays visible in the delta), but it can't
+        // gate: heuristics are advisory by default (todo.md §17.2, §17.5).
+        let baseline = baseline_with(&[]);
+        let mut heuristic_fail = finding("hotspot:src/a.rs", "src/a.rs");
+        heuristic_fail.rule = "hotspot".to_string();
+        heuristic_fail.severity = Severity::Fail;
+        heuristic_fail.evidence_class = EvidenceClass::Heuristic;
+        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
+
+        let delta = diff(&[heuristic_fail], &baseline, &touched, &current_revisions());
+
+        assert_eq!(delta.code_introduced.len(), 1);
+        assert_eq!(delta.verdict(), Verdict::Pass);
+        assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
+    }
+
+    #[test]
+    fn gating_fail_still_fails_alongside_advisory_findings() {
+        let baseline = baseline_with(&[]);
+        let mut derived_fail = finding("fail", "src/a.rs");
+        derived_fail.severity = Severity::Fail;
+        let mut heuristic = finding("hotspot:src/a.rs", "src/a.rs");
+        heuristic.rule = "hotspot".to_string();
+        heuristic.evidence_class = EvidenceClass::Heuristic;
+        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
+
+        let delta = diff(
+            &[derived_fail, heuristic],
+            &baseline,
+            &touched,
+            &current_revisions(),
+        );
+
+        assert_eq!(delta.verdict(), Verdict::Fail);
         assert_eq!(delta.tri_verdict(), TriVerdict::Fail);
     }
 
