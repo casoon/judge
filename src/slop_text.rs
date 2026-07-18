@@ -166,7 +166,6 @@ fn build_finding(
     file: &Path,
     item_spans: &[ItemSpan],
     severity: Severity,
-    confidence: f32,
     evidence: Option<serde_json::Value>,
 ) -> Finding {
     Finding {
@@ -178,7 +177,7 @@ fn build_finding(
             line,
             item_path: nearest_item_path(item_spans, line, file),
         },
-        confidence,
+        evidence_class: crate::finding::evidence_class_for_rule(rule),
         origin: Origin::Code,
         evidence,
         caused_by: Vec::new(),
@@ -285,7 +284,6 @@ fn conversational_artifact_findings(
                 file,
                 item_spans,
                 Severity::Warn,
-                0.9,
                 None,
             ));
             continue;
@@ -303,7 +301,6 @@ fn conversational_artifact_findings(
                 file,
                 item_spans,
                 Severity::Info,
-                0.5,
                 None,
             ));
         }
@@ -409,7 +406,6 @@ fn flush_step_chain(
             file,
             item_spans,
             Severity::Info,
-            0.7,
             Some(serde_json::json!({ "chain_length": chain.len(), "lines": lines })),
         ));
     }
@@ -497,7 +493,6 @@ fn restating_comment_findings(
                 file,
                 item_spans,
                 Severity::Info,
-                0.4,
                 None,
             ));
         }

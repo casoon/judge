@@ -242,10 +242,9 @@ impl SlopVisitor<'_> {
         rule: &'static str,
         span: proc_macro2::Span,
         severity: Severity,
-        confidence: f32,
         item_path: String,
     ) {
-        self.record_with_evidence(rule, span, severity, confidence, item_path, None);
+        self.record_with_evidence(rule, span, severity, item_path, None);
     }
 
     fn record_with_evidence(
@@ -253,7 +252,6 @@ impl SlopVisitor<'_> {
         rule: &'static str,
         span: proc_macro2::Span,
         severity: Severity,
-        confidence: f32,
         item_path: String,
         evidence: Option<serde_json::Value>,
     ) {
@@ -272,7 +270,7 @@ impl SlopVisitor<'_> {
                 line: start.line,
                 item_path,
             },
-            confidence,
+            evidence_class: crate::finding::evidence_class_for_rule(rule),
             origin: Origin::Code,
             evidence,
             caused_by: Vec::new(),
@@ -296,7 +294,7 @@ impl SlopVisitor<'_> {
             return;
         }
         let item_path = self.current_item_path();
-        self.record(CATCH_ALL_ERROR_RULE, span, Severity::Warn, 0.9, item_path);
+        self.record(CATCH_ALL_ERROR_RULE, span, Severity::Warn, item_path);
     }
 
     /// A doc-commented function/method/trait-default with a literally empty
@@ -307,7 +305,7 @@ impl SlopVisitor<'_> {
     fn check_empty_impl(&mut self, attrs: &[Attribute], block: &Block, span: proc_macro2::Span) {
         if has_doc_comment(attrs) && block.stmts.is_empty() {
             let item_path = self.current_item_path();
-            self.record(EMPTY_IMPL_RULE, span, Severity::Warn, 0.7, item_path);
+            self.record(EMPTY_IMPL_RULE, span, Severity::Warn, item_path);
         }
     }
 
@@ -334,7 +332,6 @@ impl SlopVisitor<'_> {
                 ASSERTION_FREE_TEST_RULE,
                 node.span(),
                 Severity::Warn,
-                0.8,
                 item_path,
             );
         }
@@ -359,7 +356,7 @@ impl SlopVisitor<'_> {
         }
         if is_generic_word(stripped) {
             let item_path = self.current_item_path();
-            self.record(GENERIC_NAMING_RULE, span, Severity::Info, 0.6, item_path);
+            self.record(GENERIC_NAMING_RULE, span, Severity::Info, item_path);
         }
     }
 
@@ -376,13 +373,7 @@ impl SlopVisitor<'_> {
         }
         if is_generic_word(&node.sig.ident.to_string()) {
             let item_path = self.current_item_path();
-            self.record(
-                GENERIC_NAMING_RULE,
-                node.span(),
-                Severity::Info,
-                0.4,
-                item_path,
-            );
+            self.record(GENERIC_NAMING_RULE, node.span(), Severity::Info, item_path);
         }
     }
 
@@ -391,13 +382,7 @@ impl SlopVisitor<'_> {
     fn check_generic_naming_item_struct(&mut self, node: &syn::ItemStruct) {
         if matches!(node.vis, Visibility::Public(_)) && is_generic_word(&node.ident.to_string()) {
             let item_path = self.current_item_path();
-            self.record(
-                GENERIC_NAMING_RULE,
-                node.span(),
-                Severity::Info,
-                0.4,
-                item_path,
-            );
+            self.record(GENERIC_NAMING_RULE, node.span(), Severity::Info, item_path);
         }
         for field in &node.fields {
             if matches!(field.vis, Visibility::Public(_))
@@ -405,13 +390,7 @@ impl SlopVisitor<'_> {
                 && is_generic_word(&ident.to_string())
             {
                 let item_path = self.current_item_path();
-                self.record(
-                    GENERIC_NAMING_RULE,
-                    field.span(),
-                    Severity::Info,
-                    0.4,
-                    item_path,
-                );
+                self.record(GENERIC_NAMING_RULE, field.span(), Severity::Info, item_path);
             }
         }
     }
@@ -421,13 +400,7 @@ impl SlopVisitor<'_> {
     fn check_generic_naming_item_enum(&mut self, node: &syn::ItemEnum) {
         if matches!(node.vis, Visibility::Public(_)) && is_generic_word(&node.ident.to_string()) {
             let item_path = self.current_item_path();
-            self.record(
-                GENERIC_NAMING_RULE,
-                node.span(),
-                Severity::Info,
-                0.4,
-                item_path,
-            );
+            self.record(GENERIC_NAMING_RULE, node.span(), Severity::Info, item_path);
         }
     }
 
@@ -467,13 +440,7 @@ impl SlopVisitor<'_> {
             .all(|token| sig_tokens.contains(token.as_str()))
         {
             let item_path = self.current_item_path();
-            self.record(
-                DOC_RESTATES_SIGNATURE_RULE,
-                span,
-                Severity::Info,
-                0.5,
-                item_path,
-            );
+            self.record(DOC_RESTATES_SIGNATURE_RULE, span, Severity::Info, item_path);
         }
     }
 }
@@ -594,7 +561,6 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 SWALLOWED_RESULT_RULE,
                 node.span(),
                 Severity::Warn,
-                0.8,
                 item_path,
             );
         }
@@ -615,7 +581,6 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 SWALLOWED_RESULT_RULE,
                 call.span(),
                 Severity::Warn,
-                0.8,
                 item_path,
             );
         }
@@ -627,13 +592,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     fn visit_arm(&mut self, arm: &'ast Arm) {
         if is_err_wildcard_pat(&arm.pat) && is_empty_block_expr(&arm.body) {
             let item_path = self.current_item_path();
-            self.record(
-                EMPTY_ERROR_ARM_RULE,
-                arm.span(),
-                Severity::Warn,
-                1.0,
-                item_path,
-            );
+            self.record(EMPTY_ERROR_ARM_RULE, arm.span(), Severity::Warn, item_path);
         }
         visit::visit_arm(self, arm);
     }
@@ -652,7 +611,6 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 EMPTY_ERROR_ARM_RULE,
                 if_expr.span(),
                 Severity::Warn,
-                1.0,
                 item_path,
             );
         }
@@ -681,7 +639,6 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 SUPPRESSION_DEBT_RULE,
                 attr.span(),
                 Severity::Info,
-                1.0,
                 item_path,
             );
         } else if attr.path().is_ident("ignore") {
@@ -700,7 +657,6 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 IGNORED_TEST_ACCUMULATION_RULE,
                 attr.span(),
                 Severity::Info,
-                1.0,
                 item_path,
                 reason.map(|reason| serde_json::json!({ "reason": reason })),
             );
@@ -716,7 +672,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
             && self.feature_gated_depth == 0
         {
             let item_path = self.current_item_path();
-            self.record(MERGED_STUB_RULE, mac.span(), Severity::Warn, 0.9, item_path);
+            self.record(MERGED_STUB_RULE, mac.span(), Severity::Warn, item_path);
         } else if mac.path.is_ident("assert") {
             if let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
                 && let Some(Expr::Lit(ExprLit {
@@ -730,7 +686,6 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                     TAUTOLOGICAL_TEST_RULE,
                     mac.span(),
                     Severity::Warn,
-                    1.0,
                     item_path,
                 );
             }
@@ -741,7 +696,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
             // `extra-traits` feature isn't enabled here). This is an
             // accepted false-positive trap: two expressions with identical
             // source text can still differ at runtime if they have side
-            // effects, hence the lower confidence.
+            // effects — an accepted, documented imprecision of this syntax fact.
             && quote!(#lhs).to_string() == quote!(#rhs).to_string()
         {
             let item_path = self.current_item_path();
@@ -749,7 +704,6 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 TAUTOLOGICAL_TEST_RULE,
                 mac.span(),
                 Severity::Warn,
-                0.7,
                 item_path,
             );
         }
@@ -1032,6 +986,7 @@ impl<'ast> Visit<'ast> for AssertionScanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::finding::EvidenceClass;
     use crate::ingest::SourceKind;
     use crate::test_util::TempDir;
 
@@ -1062,7 +1017,7 @@ mod tests {
         let hits = rule_findings(&findings, SWALLOWED_RESULT_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].severity, Severity::Warn);
-        assert_eq!(hits[0].confidence, 0.8);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1108,7 +1063,7 @@ fn f(r: Result<i32, ()>) {
         );
         let hits = rule_findings(&findings, EMPTY_ERROR_ARM_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 1.0);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1154,7 +1109,7 @@ fn f(r: Result<i32, ()>) {
         );
         let hits = rule_findings(&findings, CATCH_ALL_ERROR_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 0.9);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1195,7 +1150,7 @@ fn f(r: Result<i32, ()>) {
         assert_eq!(hits.len(), 2);
         for hit in &hits {
             assert_eq!(hit.severity, Severity::Info);
-            assert_eq!(hit.confidence, 1.0);
+            assert_eq!(hit.evidence_class, EvidenceClass::DerivedFact);
         }
         let item_paths: Vec<_> = hits.iter().map(|f| f.location.item_path.as_str()).collect();
         assert!(item_paths.contains(&"dead_code"));
@@ -1254,7 +1209,7 @@ fn f(r: Result<i32, ()>) {
         let hits = rule_findings(&findings, IGNORED_TEST_ACCUMULATION_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].severity, Severity::Info);
-        assert_eq!(hits[0].confidence, 1.0);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
         assert_eq!(hits[0].evidence, None);
     }
 
@@ -1286,7 +1241,7 @@ fn f(r: Result<i32, ()>) {
         let findings = findings_for("fn f() { assert!(true); }\n", "slop-assert-true");
         let hits = rule_findings(&findings, TAUTOLOGICAL_TEST_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 1.0);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1306,7 +1261,7 @@ fn f(r: Result<i32, ()>) {
         );
         let hits = rule_findings(&findings, TAUTOLOGICAL_TEST_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 0.7);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1324,7 +1279,7 @@ fn f(r: Result<i32, ()>) {
         let hits = rule_findings(&findings, EMPTY_IMPL_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].severity, Severity::Warn);
-        assert_eq!(hits[0].confidence, 0.7);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1367,7 +1322,7 @@ fn f(r: Result<i32, ()>) {
         let findings = findings_for("fn f() { todo!() }\n", "slop-merged-stub-todo");
         let hits = rule_findings(&findings, MERGED_STUB_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 0.9);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1405,7 +1360,7 @@ fn f(r: Result<i32, ()>) {
         );
         let hits = rule_findings(&findings, ASSERTION_FREE_TEST_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 0.8);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1462,7 +1417,7 @@ fn f(r: Result<i32, ()>) {
         let hits = rule_findings(&findings, GENERIC_NAMING_RULE);
         assert_eq!(hits.len(), 2);
         for hit in &hits {
-            assert_eq!(hit.confidence, 0.6);
+            assert_eq!(hit.evidence_class, EvidenceClass::DerivedFact);
         }
     }
 
@@ -1480,7 +1435,7 @@ fn f(r: Result<i32, ()>) {
         let findings = findings_for("pub struct Manager;\n", "slop-generic-naming-struct");
         let hits = rule_findings(&findings, GENERIC_NAMING_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 0.4);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1516,7 +1471,7 @@ fn f(r: Result<i32, ()>) {
         );
         let hits = rule_findings(&findings, DOC_RESTATES_SIGNATURE_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 0.5);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1537,7 +1492,7 @@ fn f(r: Result<i32, ()>) {
         let hits = rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].severity, Severity::Warn);
-        assert_eq!(hits[0].confidence, 0.9);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
     #[test]
@@ -1598,6 +1553,6 @@ fn f(r: Result<i32, ()>) {
         );
         let hits = rule_findings(&findings, RESTATING_COMMENT_RULE);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].confidence, 0.4);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 }

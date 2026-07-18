@@ -2625,7 +2625,7 @@ fn dup_two(x: i32) -> i32 {
                 line: 1,
                 item_path: "hello".to_string(),
             },
-            confidence: 1.0,
+            evidence_class: judge::finding::EvidenceClass::DerivedFact,
             origin: judge::finding::Origin::Code,
             evidence: None,
             caused_by: Vec::new(),

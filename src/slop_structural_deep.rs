@@ -42,7 +42,7 @@
 //!   of the reference-search approach, not something `deep.rs` can fix.
 //!
 //! Both are "this candidate should never have been considered", not "keep
-//! but lower confidence" — flagging a test function or a `Display` impl as
+//! but weaker evidence" — flagging a test function or a `Display` impl as
 //! structurally unwired would actively mislead, and a false positive here
 //! costs more trust than the false negatives it avoids are worth (todo.md
 //! §3.A).
@@ -54,7 +54,7 @@ use serde_json::json;
 
 use crate::deep::{DeepContext, DeepError, FileId};
 use crate::duplication::WorkspaceDuplication;
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::functions::walk_functions;
 use crate::ingest::Workspace;
 use crate::reachability::has_attr_ending_in;
@@ -223,9 +223,9 @@ fn collect_function_fan_in(
 /// brand-new private helper function that's only ever used within its own
 /// file *by design* is completely normal Rust, not a slop signal — this
 /// rule can't distinguish that from genuinely unwired, never-integrated
-/// code. Hence `confidence: 0.5` (the reference resolution itself is exact;
-/// framing "no cross-file callers" as a slop signal is interpretive) and
-/// `Severity::Info` rather than `Warn`.
+/// code. Hence `evidence_class: heuristic` (the reference resolution itself
+/// is exact; framing "no cross-file callers" as a slop signal is
+/// interpretive) and `Severity::Info` rather than `Warn`.
 fn connectivity_drop_findings(records: &[FunctionFanIn]) -> Vec<Finding> {
     records
         .iter()
@@ -243,7 +243,7 @@ fn connectivity_drop_findings(records: &[FunctionFanIn]) -> Vec<Finding> {
                 line: record.line,
                 item_path: record.qualified_name.clone(),
             },
-            confidence: 0.5,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: Some(json!({
                 "tier": "deep",
@@ -327,7 +327,7 @@ fn duplicative_reinvention_findings(
                 line: anchor.start_line,
                 item_path: anchor.qualified_name.clone(),
             },
-            confidence: 0.5,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: Some(json!({
                 "tier": "deep",
@@ -564,7 +564,7 @@ resolver = "2"
             .find(|f| f.rule == CONNECTIVITY_DROP_RULE)
             .expect("isolated() must be flagged");
         assert_eq!(finding.severity, Severity::Info);
-        assert_eq!(finding.confidence, 0.5);
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
         assert_eq!(finding.origin, Origin::Code);
         assert_eq!(
             finding.evidence,
@@ -632,7 +632,7 @@ resolver = "2"
             .find(|f| f.rule == DUPLICATIVE_REINVENTION_RULE)
             .expect("a family whose members are never referenced in `records` must be flagged");
         assert_eq!(hit.severity, Severity::Info);
-        assert_eq!(hit.confidence, 0.5);
+        assert_eq!(hit.evidence_class, EvidenceClass::Heuristic);
         assert_eq!(hit.location.item_path, "clone_one");
         assert_eq!(hit.evidence.as_ref().unwrap()["member_count"], 2);
     }

@@ -32,7 +32,7 @@ use semver::{Version, VersionReq};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::ingest::{CrateInfo, DeclaredDependency, Workspace};
 
 pub const NAME_COLLISION_RISK_RULE: &str = "name-collision-risk";
@@ -141,9 +141,9 @@ pub fn analyze_name_collision(workspace: &Workspace) -> Vec<Finding> {
     findings
 }
 
-/// Renders a `name-collision-risk` finding. Confidence is deliberately low
-/// (`0.45`) — edit-distance proximity is a heuristic prone to false
-/// positives (unrelated crates just happen to be a typo apart), not proof of
+/// Renders a `name-collision-risk` finding. Its evidence class is
+/// `heuristic` — edit-distance proximity is prone to false positives
+/// (unrelated crates just happen to be a typo apart), not proof of
 /// typosquatting.
 fn name_collision_finding(
     krate: &CrateInfo,
@@ -160,7 +160,7 @@ fn name_collision_finding(
             line: 1,
             item_path: dep.name.clone(),
         },
-        confidence: 0.45,
+        evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: Some(serde_json::json!({
             "nearest_popular_crate": nearest_popular_crate,
@@ -619,7 +619,7 @@ fn phantom_crate_finding(krate: &CrateInfo, dep: &DeclaredDependency) -> Finding
             line: 1,
             item_path: dep.name.clone(),
         },
-        confidence: 0.9,
+        evidence_class: EvidenceClass::ExternalMeasurement,
         origin: Origin::Code,
         evidence: Some(serde_json::json!({
             "lookup": "sparse-index",
@@ -659,7 +659,7 @@ fn phantom_version_finding(
             line: 1,
             item_path: dep.name.clone(),
         },
-        confidence: 0.85,
+        evidence_class: EvidenceClass::ExternalMeasurement,
         origin: Origin::Code,
         evidence: Some(serde_json::json!({
             "requirement": dep.version_req,
@@ -802,7 +802,7 @@ fn fresh_low_reputation_finding(
             line: 1,
             item_path: dep.name.clone(),
         },
-        confidence: 0.6,
+        evidence_class: EvidenceClass::ExternalMeasurement,
         origin: Origin::Code,
         evidence: Some(serde_json::json!({
             "created_at": metadata.created_at,

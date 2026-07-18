@@ -21,6 +21,76 @@ pub enum Severity {
     Fail,
 }
 
+/// How a finding's claim is backed — the categorical replacement for the
+/// former numeric `confidence` score (todo.md §17.2, §17.5: numbers like
+/// `0.95` suggest a calibrated probability that never existed).
+///
+/// Rule → class mapping (see [`evidence_class_for_rule`], todo.md §17.3):
+///
+/// | Rule | Class |
+/// |---|---|
+/// | `swallowed-result`, `empty-error-arm`, `catch-all-error`, `suppression-debt`, `merged-stub`, `empty-impl`, `assertion-free-test`, `tautological-test`, `ignored-test-accumulation`, `conversational-artifact`, `restating-comment`, `step-comment-inflation`, `generic-naming`, `doc-restates-signature` | `derived_fact` (G1–G3: the reported pattern is a syntax fact) |
+/// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::duplication::CloneMember::to_finding`]) |
+/// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
+/// | `phantom-crate`, `phantom-version`, `fresh-low-reputation-dep` | `external_measurement` (a crates.io lookup snapshot) |
+/// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt` | `heuristic` (reproducible interpretation, not proof) |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceClass {
+    /// Exactly derived from the declared inputs — syntax facts, strict/mild
+    /// token duplicates, manifest facts, suppressions (todo.md §17.2).
+    DerivedFact,
+    /// Semantically backed, but only within a fully described analysis view —
+    /// e.g. "no reference found in the loaded workspace for the searched
+    /// crates/entry points" (todo.md §17.2).
+    BoundedSemantic,
+    /// The result of a concrete external run/snapshot — e.g. a crates.io
+    /// index/API query. Valid for that snapshot, not a timeless truth
+    /// (todo.md §17.2).
+    ExternalMeasurement,
+    /// A reproducible interpretation of facts/measurements — a hint by
+    /// default, never proof (todo.md §17.2).
+    Heuristic,
+}
+
+/// The single authoritative rule-id → [`EvidenceClass`] mapping (see the
+/// table on [`EvidenceClass`]). Used by detectors whose constructors take a
+/// rule id, and by the baseline v1→v2 migration, which must derive a class
+/// from nothing but the stored rule id.
+///
+/// `duplicate-code` maps to its `Strict`/`Mild` (default-mode, fact-backed)
+/// class here; `Weak`/`Semantic` creation sites override to `Heuristic` at
+/// the source (see [`crate::duplication::CloneMember::to_finding`]) — a
+/// migrated v1 baseline entry can't recover the mode, and baseline entries
+/// only serve identity matching. Unknown rule ids (e.g. from a v1 baseline
+/// written by a different judge) conservatively map to `Heuristic`.
+pub fn evidence_class_for_rule(rule: &str) -> EvidenceClass {
+    match rule {
+        "swallowed-result"
+        | "empty-error-arm"
+        | "catch-all-error"
+        | "suppression-debt"
+        | "merged-stub"
+        | "empty-impl"
+        | "assertion-free-test"
+        | "tautological-test"
+        | "ignored-test-accumulation"
+        | "conversational-artifact"
+        | "restating-comment"
+        | "step-comment-inflation"
+        | "generic-naming"
+        | "doc-restates-signature"
+        | "duplicate-code" => EvidenceClass::DerivedFact,
+        "unused-pub-workspace" | "crate-boundary-violation" | "dependency-cycle" => {
+            EvidenceClass::BoundedSemantic
+        }
+        "phantom-crate" | "phantom-version" | "fresh-low-reputation-dep" => {
+            EvidenceClass::ExternalMeasurement
+        }
+        _ => EvidenceClass::Heuristic,
+    }
+}
+
 /// Where a finding comes from. Distinguishes an actual code issue from a
 /// finding about judge's own configuration or analyzer state, which must
 /// not be suppressed or baselined the same way (see todo.md §14.2 P0#1).
@@ -45,12 +115,12 @@ pub struct Finding {
     pub rule: String,
     pub severity: Severity,
     pub location: Location,
-    pub confidence: f32,
+    pub evidence_class: EvidenceClass,
     pub origin: Origin,
     /// Free-form, rule-specific proof for why this finding fired — e.g. how
-    /// many crates/entry points were searched, and why `confidence` has the
-    /// value it does (see todo.md §7). `None` where a detector doesn't yet
-    /// populate it; not every rule does.
+    /// many crates/entry points were searched, and what backs
+    /// `evidence_class` (see todo.md §7). `None` where a detector doesn't
+    /// yet populate it; not every rule does.
     pub evidence: Option<serde_json::Value>,
     /// Findings that caused this one to appear (the root-cause direction).
     pub caused_by: Vec<FindingId>,
@@ -60,7 +130,9 @@ pub struct Finding {
 
 /// Current version of the JSON report schema (see todo.md §7). Bump whenever
 /// a field is removed or changes meaning; additive fields don't require it.
-pub const SCHEMA_VERSION: u32 = 1;
+/// v2: `Finding.confidence: f32` replaced by `Finding.evidence_class`
+/// (todo.md §17.5).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The versioned, agent-readable output envelope (see todo.md §7). Always
 /// carries the full finding graph — TTY/Markdown reduce to root findings by
@@ -217,7 +289,7 @@ mod tests {
                 line: 1,
                 item_path: "crate::lib".to_string(),
             },
-            confidence: 1.0,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: None,
             caused_by: Vec::new(),
@@ -290,6 +362,7 @@ mod tests {
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
         assert_eq!(json["findings"][0]["severity"], "warn");
         assert_eq!(json["findings"][0]["origin"], "code");
+        assert_eq!(json["findings"][0]["evidence_class"], "heuristic");
         assert_eq!(json["errors"], serde_json::json!([]));
     }
 

@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use gix::bstr::{BStr, ByteSlice};
 
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::git::GitError;
 use crate::ingest::Workspace;
 
@@ -56,8 +56,10 @@ impl FileOwnership {
     /// finding here — there's no author to attribute knowledge loss to).
     /// `Severity::Fail` if the sole author is no longer active anywhere in
     /// the repo (see todo.md §4's Decision Surface example); `Severity::Warn`
-    /// if they still are. Confidence is `1.0`: blame is exact historical
-    /// fact, not a heuristic guess.
+    /// if they still are. The evidence class is `heuristic`: the blame
+    /// counts are exact historical facts, but "bus factor 1 = knowledge
+    /// risk" is an interpretation of them — blame measures line authorship,
+    /// not knowledge (todo.md §17.3).
     pub fn to_finding(&self, active_authors: &HashSet<String>) -> Option<Finding> {
         if self.bus_factor != 1 {
             return None;
@@ -77,7 +79,7 @@ impl FileOwnership {
                 line: 1,
                 item_path: primary.email.clone(),
             },
-            confidence: 1.0,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: None,
             caused_by: Vec::new(),

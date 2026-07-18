@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 use syn::{ItemUse, UseTree};
 
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::ingest::{CrateInfo, DependencyKind, Workspace};
 
 /// Rule id used for misplaced-dependency-kind findings (see todo.md §3.B).
@@ -168,10 +168,11 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
     }
 }
 
-/// Renders a misplaced-dependency-kind finding. Confidence is `0.7`, not
-/// `1.0`: usage-domain classification is a directory-convention heuristic,
-/// not full module-graph resolution (see todo.md §2.1), so this is
-/// suggestive rather than proven. `location.file` is the crate's manifest
+/// Renders a misplaced-dependency-kind finding. Its evidence class is
+/// `heuristic` (todo.md §17.3: a wrong dependency kind is an
+/// interpretation): usage-domain classification is a directory-convention
+/// heuristic, not full module-graph resolution (see todo.md §2.1), so this
+/// is suggestive rather than proven. `location.file` is the crate's manifest
 /// path — the "location" of a dependency-kind mismatch is `Cargo.toml`, not
 /// a source file — and `location.item_path` is the dependency name.
 fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency) -> Finding {
@@ -187,7 +188,7 @@ fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency)
             line: 1,
             item_path: dep.name.clone(),
         },
-        confidence: 0.7,
+        evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: None,
         caused_by: Vec::new(),
@@ -534,7 +535,7 @@ edition = "2021"
         assert_eq!(finding.rule, MISPLACED_DEPENDENCY_KIND_RULE);
         assert_eq!(finding.severity, Severity::Warn);
         assert_eq!(finding.origin, Origin::Code);
-        assert_eq!(finding.confidence, 0.7);
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
         assert_eq!(finding.location.file, workspace.crates[0].manifest_path);
     }
 

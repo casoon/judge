@@ -12,7 +12,7 @@
 //! libraries — the API is undocumented for external use and version-pinned
 //! (`=0.0.342`) for exactly that reason (see todo.md §11 "ra_ap_*-Wartungslast").
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ra_ap_ide::{Analysis, AnalysisHost, FilePosition, FindAllRefsConfig, RaFixtureConfig};
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
@@ -38,6 +38,11 @@ pub enum DeepError {
     /// references"; treating this as an empty set would let "symbol not
     /// resolvable" masquerade as dead code (see todo.md §15.1).
     UnresolvedSymbol(String),
+    /// A path could not be converted into the absolute UTF-8 form the
+    /// analysis vfs requires (it was relative, or not valid UTF-8). The
+    /// panicking `AbsPathBuf::assert_utf8` conversion used to make this a
+    /// library panic (see todo.md §15.2); now it is a propagatable error.
+    InvalidPath(PathBuf),
 }
 
 impl std::fmt::Display for DeepError {
@@ -49,6 +54,11 @@ impl std::fmt::Display for DeepError {
                 f,
                 "semantic query at {position} did not resolve to a symbol — not the same as a \
                  symbol with zero references"
+            ),
+            Self::InvalidPath(path) => write!(
+                f,
+                "path is not absolute UTF-8 and cannot be mapped into the analysis vfs: {}",
+                path.display()
             ),
         }
     }
@@ -144,12 +154,33 @@ impl DeepContext {
     /// Resolves an absolute file path to the `FileId` the loader assigned it,
     /// if the file was actually indexed (e.g. not excluded, and part of a
     /// crate the loader discovered).
+    ///
+    /// A path that is not absolute UTF-8 (see [`validated_utf8_abs`]) cannot
+    /// name a vfs file at all and comes back as `None` — the same conservative
+    /// "skip this file" answer as "not indexed", never a panic.
     pub fn file_id(&self, path: &Path) -> Option<FileId> {
-        let abs_path = AbsPathBuf::assert_utf8(path.to_path_buf());
+        let abs_path = validated_utf8_abs(path).ok()?;
         let vfs_path = VfsPath::from(abs_path);
         self.vfs
             .file_id(&vfs_path)
             .map(|(file_id, _excluded)| file_id)
+    }
+}
+
+/// Fallibly converts `path` into the absolute UTF-8 form the analysis vfs
+/// requires. This is the non-panicking replacement for
+/// `AbsPathBuf::assert_utf8`, which panics on exactly these two conditions
+/// (relative path, non-UTF-8 path) — both come back as
+/// [`DeepError::InvalidPath`] instead (todo.md §15.2). In practice every path
+/// reaching the Deep Tier comes from `crate::ingest` (`cargo metadata` targets
+/// and a walk rooted at each absolute manifest directory), so it is always
+/// absolute — this boundary exists so a caller-constructed path can never
+/// panic the library.
+pub(crate) fn validated_utf8_abs(path: &Path) -> Result<AbsPathBuf, DeepError> {
+    if path.is_absolute() && path.to_str().is_some() {
+        Ok(AbsPathBuf::assert_utf8(path.to_path_buf()))
+    } else {
+        Err(DeepError::InvalidPath(path.to_path_buf()))
     }
 }
 
@@ -297,6 +328,49 @@ pub fn caller() -> i32 {
             "`dead` has no callers and must show 0 references"
         );
         assert_eq!(used_refs, 1, "`used` is called once, from `caller`");
+
+        // Piggybacked on the already-loaded (expensive) context: a relative
+        // path used to panic inside `AbsPathBuf::assert_utf8` and must now be
+        // the same conservative `None` as "not indexed" (todo.md §15.2).
+        assert_eq!(
+            ctx.file_id(Path::new("src/lib.rs")),
+            None,
+            "a relative path names no vfs file and must be None, not a panic"
+        );
+    }
+
+    /// A relative path must come back as [`DeepError::InvalidPath`] from the
+    /// conversion boundary — the panic-free half of todo.md §15.2. Tested
+    /// directly against the conversion function: `analyze_workspace` itself
+    /// never constructs such paths (ingest walks absolute manifest
+    /// directories), so no integration path can reach this case.
+    #[test]
+    fn a_relative_path_is_an_invalid_path_error_not_a_panic() {
+        let err = validated_utf8_abs(Path::new("src/lib.rs")).unwrap_err();
+        assert!(
+            matches!(&err, DeepError::InvalidPath(path) if path == Path::new("src/lib.rs")),
+            "expected InvalidPath carrying the offending path, got: {err:?}"
+        );
+    }
+
+    /// Same boundary, other panic condition: a non-UTF-8 path (constructible
+    /// from raw bytes on unix) must be [`DeepError::InvalidPath`], not a
+    /// panic.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_path_is_an_invalid_path_error_not_a_panic() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let non_utf8 = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff-not-utf8.rs"));
+        assert!(
+            non_utf8.is_absolute() && non_utf8.to_str().is_none(),
+            "fixture must isolate the UTF-8 condition from the absoluteness condition"
+        );
+        let err = validated_utf8_abs(non_utf8).unwrap_err();
+        assert!(
+            matches!(&err, DeepError::InvalidPath(path) if path == non_utf8),
+            "expected InvalidPath carrying the offending path, got: {err:?}"
+        );
     }
 
     /// Same load-bearing assumption as

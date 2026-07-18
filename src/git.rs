@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gix::bstr::ByteSlice;
 
 use crate::complexity::FunctionInfo;
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 
 /// Default lookback window for churn: 12 months.
 pub const DEFAULT_WINDOW_DAYS: i64 = 365;
@@ -262,7 +262,9 @@ impl Hotspot {
 
     /// Renders this hotspot as a [`Finding`]. Severity is `Info`: there is no
     /// health-score threshold yet (see todo.md §4), so this is descriptive,
-    /// not a pass/fail judgement.
+    /// not a pass/fail judgement. The evidence class is `heuristic`: churn
+    /// and complexity counts are facts, but framing their product as risk
+    /// is an interpretation (todo.md §17.3).
     pub fn to_finding(&self) -> Finding {
         Finding {
             id: format!("{HOTSPOT_RULE}:{}", self.file.display()),
@@ -273,7 +275,7 @@ impl Hotspot {
                 line: 1,
                 item_path: self.file.display().to_string(),
             },
-            confidence: 1.0,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: None,
             caused_by: Vec::new(),

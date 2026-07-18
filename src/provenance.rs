@@ -20,7 +20,7 @@ use gix::bstr::BStr;
 
 use crate::boundaries::ProvenanceLabel;
 use crate::duplication::{CloneFamily, DupeMode, DuplicationError};
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::git::{self, CommitInfo, GitError};
 use crate::ingest::Workspace;
 use crate::slop::SlopError;
@@ -305,7 +305,7 @@ fn metric_finding(
     rule: &str,
     class_key: &str,
     count: u32,
-    confidence: f32,
+    classification_confidence: f32,
     label: &str,
     cargo_toml: &Path,
 ) -> Finding {
@@ -322,17 +322,20 @@ fn metric_finding(
             line: 1,
             item_path: format!("{label} by class: {class_key}"),
         },
-        // The count itself is exact; `confidence` here instead reflects how
-        // trustworthy the *classification* behind this bucket is (see
-        // `ClassSummary::confidence`) — a `heuristic`-only bucket must not
-        // read as confidently as a labeled or trailer-based one.
-        confidence,
+        // The count itself is exact, but the classification behind the
+        // bucket is an interpretation of trailers/markers/heuristics —
+        // never proof of authorship (todo.md §17.4), hence `Heuristic`.
+        evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: Some(serde_json::json!({
             "basis": "aggregate",
-            "evidence_class": "heuristic",
             "class": class_key,
             "count": count,
+            // How trustworthy the *classification* behind this bucket is
+            // (see `ClassSummary::confidence`) — a heuristics-only bucket
+            // must not read as confidently as a labeled or trailer-based
+            // one. Kept as evidence, not as a finding-level truth scale.
+            "classification_confidence": classification_confidence,
             "caveat": PROVENANCE_CAVEAT,
         })),
         caused_by: Vec::new(),
@@ -929,11 +932,12 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_finding_confidence_reflects_the_classification_not_a_hardcoded_one() {
+    fn aggregate_finding_evidence_reflects_the_classification_not_a_hardcoded_one() {
         // A trailer-based classification (0.85) must not be reported as if
-        // it were certain (1.0) just because the resulting *count* is
-        // exact — the count is a derived_fact, the classification behind
-        // it stays heuristic (see `ClassSummary::confidence`'s doc comment).
+        // it were certain just because the resulting *count* is exact —
+        // the finding stays `heuristic`, and the classification confidence
+        // survives as evidence (see `ClassSummary::confidence`'s doc
+        // comment).
         let dir = TempDir::new("provenance-confidence");
         git(&dir, &["init", "-q", "-b", "main"]);
         let file = dir.join("a.rs");
@@ -959,7 +963,11 @@ mod tests {
             .iter()
             .find(|f| f.rule == PROVENANCE_CHURN_RULE && f.id.ends_with("agent-claude"))
             .expect("a Claude-trailer commit must produce a churn-by-class finding");
-        assert_eq!(claude_churn.confidence, 0.85);
+        assert_eq!(claude_churn.evidence_class, EvidenceClass::Heuristic);
+        let evidence = claude_churn.evidence.as_ref().unwrap();
+        let classification_confidence =
+            evidence["classification_confidence"].as_f64().unwrap() as f32;
+        assert_eq!(classification_confidence, 0.85);
     }
 
     #[test]
@@ -1070,7 +1078,7 @@ mod tests {
                 line: 1,
                 item_path: "dead_code".to_string(),
             },
-            confidence: 1.0,
+            evidence_class: EvidenceClass::DerivedFact,
             origin: Origin::Code,
             evidence: None,
             caused_by: Vec::new(),

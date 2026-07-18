@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::finding::{Finding, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Origin, Severity, evidence_class_for_rule};
 use crate::health_score::ScoreContext;
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// v2: findings carry `evidence_class` instead of the removed numeric
+/// `confidence` (todo.md §17.5) — see [`migrate`] for the v1→v2 step.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The minimal record kept per finding in a baseline file — enough to tell
 /// whether a current finding was already known, and where to look when
@@ -25,6 +27,7 @@ pub struct BaselineFinding {
     pub id: String,
     pub rule: String,
     pub severity: Severity,
+    pub evidence_class: EvidenceClass,
     pub origin: Origin,
     pub file: PathBuf,
 }
@@ -75,6 +78,7 @@ impl Baseline {
                     id: finding.id.clone(),
                     rule: finding.rule.clone(),
                     severity: finding.severity,
+                    evidence_class: finding.evidence_class,
                     origin: finding.origin,
                     file: finding.location.file.clone(),
                 })
@@ -168,14 +172,43 @@ pub fn load(path: &Path) -> Result<Baseline, BaselineError> {
 /// Deserializes a parsed baseline, migrating explicitly per `schema_version`.
 /// Every supported version gets its own arm; anything else — in particular a
 /// version written by a newer judge — is rejected instead of being silently
-/// processed under wrong assumptions. A future schema bump adds its migration
-/// step here (e.g. `Some(1)` rewriting the value before falling through to
-/// the current deserialization).
-fn migrate(path: &Path, value: serde_json::Value) -> Result<Baseline, BaselineError> {
+/// processed under wrong assumptions.
+///
+/// v1 → v2: v1 findings carried a numeric `confidence` and no
+/// `evidence_class`. `confidence` is discarded (it was never a calibrated
+/// probability — todo.md §17.5) and `evidence_class` is derived
+/// deterministically from the stored rule id via
+/// [`evidence_class_for_rule`]; unknown rule ids conservatively become
+/// `heuristic`.
+fn migrate(path: &Path, mut value: serde_json::Value) -> Result<Baseline, BaselineError> {
     let found = value
         .get("schema_version")
         .and_then(serde_json::Value::as_u64);
     match found {
+        Some(1) => {
+            if let Some(findings) = value
+                .get_mut("findings")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for finding in findings {
+                    let Some(finding) = finding.as_object_mut() else {
+                        continue;
+                    };
+                    finding.remove("confidence");
+                    let class = finding
+                        .get("rule")
+                        .and_then(serde_json::Value::as_str)
+                        .map_or(EvidenceClass::Heuristic, evidence_class_for_rule);
+                    finding.insert(
+                        "evidence_class".to_string(),
+                        serde_json::to_value(class).map_err(BaselineError::Serialize)?,
+                    );
+                }
+            }
+            value["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+            serde_json::from_value(value)
+                .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))
+        }
         Some(version) if version == u64::from(SCHEMA_VERSION) => serde_json::from_value(value)
             .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err)),
         _ => Err(BaselineError::UnsupportedSchemaVersion {
@@ -314,7 +347,7 @@ mod tests {
                 line: 1,
                 item_path: "f".to_string(),
             },
-            confidence: 1.0,
+            evidence_class: EvidenceClass::DerivedFact,
             origin: Origin::Code,
             evidence: None,
             caused_by: Vec::new(),
@@ -361,12 +394,12 @@ mod tests {
     #[test]
     fn baseline_without_score_context_still_loads() {
         // A baseline saved before `score_context` existed (see todo.md
-        // §15.1) — same `schema_version`, so `load` must tolerate the
-        // missing field and yield `None`, not fail or migrate.
+        // §15.1) — `load` must tolerate the missing field and yield `None`,
+        // not fail.
         let (_dir, path) = write_baseline_json(
             "baseline-no-score-context",
             r#"{
-                "schema_version": 1,
+                "schema_version": 2,
                 "judge_version": "0.1.0",
                 "commit": "abc123",
                 "rule_revisions": {},
@@ -382,11 +415,90 @@ mod tests {
     }
 
     #[test]
+    fn v1_baseline_with_confidence_migrates_to_evidence_classes() {
+        // A v1 baseline stored numeric `confidence` per finding and no
+        // `evidence_class`. Migration must discard `confidence` and derive
+        // the class from the rule id — unknown rules conservatively become
+        // `heuristic` (todo.md §17.5).
+        let (_dir, path) = write_baseline_json(
+            "baseline-v1-migration",
+            r#"{
+                "schema_version": 1,
+                "judge_version": "0.1.0",
+                "commit": "abc123",
+                "rule_revisions": {},
+                "total_loc": 1000,
+                "findings": [
+                    {
+                        "id": "duplicate-code:src/a.rs:f:0-20",
+                        "rule": "duplicate-code",
+                        "severity": "warn",
+                        "origin": "code",
+                        "confidence": 1.0,
+                        "file": "src/a.rs"
+                    },
+                    {
+                        "id": "unused-pub-workspace:src/b.rs:g",
+                        "rule": "unused-pub-workspace",
+                        "severity": "warn",
+                        "origin": "code",
+                        "confidence": 1.0,
+                        "file": "src/b.rs"
+                    },
+                    {
+                        "id": "phantom-crate:app:dep",
+                        "rule": "phantom-crate",
+                        "severity": "fail",
+                        "origin": "code",
+                        "confidence": 0.9,
+                        "file": "Cargo.toml"
+                    },
+                    {
+                        "id": "hotspot:src/c.rs",
+                        "rule": "hotspot",
+                        "severity": "info",
+                        "origin": "code",
+                        "confidence": 1.0,
+                        "file": "src/c.rs"
+                    },
+                    {
+                        "id": "some-retired-rule:src/d.rs",
+                        "rule": "some-retired-rule",
+                        "severity": "warn",
+                        "origin": "code",
+                        "confidence": 0.7,
+                        "file": "src/d.rs"
+                    }
+                ]
+            }"#,
+        );
+
+        let baseline = load(&path).unwrap();
+
+        assert_eq!(baseline.schema_version, SCHEMA_VERSION);
+        let classes: Vec<EvidenceClass> = baseline
+            .findings
+            .iter()
+            .map(|finding| finding.evidence_class)
+            .collect();
+        assert_eq!(
+            classes,
+            vec![
+                EvidenceClass::DerivedFact,
+                EvidenceClass::BoundedSemantic,
+                EvidenceClass::ExternalMeasurement,
+                EvidenceClass::Heuristic,
+                EvidenceClass::Heuristic,
+            ]
+        );
+    }
+
+    #[test]
     fn baseline_with_future_schema_version_is_rejected() {
         let (_dir, path) = write_baseline_json(
             "baseline-future-schema",
             r#"{
-                "schema_version": 2,
+                "schema_version": 3,
                 "judge_version": "9.9.9",
                 "commit": "abc123",
                 "rule_revisions": {},
@@ -399,11 +511,11 @@ mod tests {
 
         assert!(matches!(
             err,
-            BaselineError::UnsupportedSchemaVersion { found: Some(2), .. }
+            BaselineError::UnsupportedSchemaVersion { found: Some(3), .. }
         ));
         let message = err.to_string();
-        assert!(message.contains("schema_version 2"), "{message}");
-        assert!(message.contains("supports version 1"), "{message}");
+        assert!(message.contains("schema_version 3"), "{message}");
+        assert!(message.contains("supports version 2"), "{message}");
     }
 
     #[test]

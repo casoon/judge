@@ -20,7 +20,7 @@ use proc_macro2::Span;
 use syn::visit::{self, Visit};
 
 use crate::deep::{DeepContext, DeepError, FileId};
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::functions::{type_name, walk_functions};
 use crate::ingest::{SourceFile, Workspace};
 
@@ -236,14 +236,14 @@ fn check_item(
                     line,
                     item_path: qualified_name.to_string(),
                 },
-                confidence: 1.0,
+                evidence_class: EvidenceClass::BoundedSemantic,
                 origin: Origin::Code,
                 evidence: Some(serde_json::json!({
                     "tier": "deep",
                     "searched_crates": searched_crates.len(),
                     "references_found": referencing.len(),
                     "root_set_size": entry_keys.len(),
-                    "confidence_reason": "no reference from another workspace crate and unreachable \
+                    "reason": "no reference from another workspace crate and unreachable \
                         from any recognized entry point (fn main in a [[bin]] or [[example]] target)",
                 })),
                 caused_by: Vec::new(),
@@ -522,7 +522,7 @@ pub fn never_called() -> i32 {
         assert_eq!(finding.rule, UNUSED_PUB_WORKSPACE_RULE);
         assert_eq!(finding.severity, Severity::Warn);
         assert_eq!(finding.origin, Origin::Code);
-        assert_eq!(finding.confidence, 1.0);
+        assert_eq!(finding.evidence_class, EvidenceClass::BoundedSemantic);
         assert_eq!(finding.location.item_path, "never_called");
 
         let evidence = finding.evidence.as_ref().expect("evidence must be present");
@@ -530,7 +530,7 @@ pub fn never_called() -> i32 {
         assert_eq!(evidence["searched_crates"], 1);
         assert_eq!(evidence["references_found"], 0);
         assert_eq!(evidence["root_set_size"], 0);
-        assert!(evidence["confidence_reason"].is_string());
+        assert!(evidence["reason"].is_string());
     }
 
     #[test]

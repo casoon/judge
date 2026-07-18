@@ -551,7 +551,7 @@ mod tests {
                 line: 1,
                 item_path: "item".to_string(),
             },
-            confidence: 1.0,
+            evidence_class: crate::finding::EvidenceClass::DerivedFact,
             origin: Origin::Code,
             evidence: None,
             caused_by: Vec::new(),

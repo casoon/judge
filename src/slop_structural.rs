@@ -27,7 +27,7 @@ use syn::{
 };
 
 use crate::complexity::FunctionInfo;
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::ingest::{SourceFile, SourceKind};
 
 /// Rule id for a file reworked often within a short window (see todo.md
@@ -86,7 +86,7 @@ pub fn churn_hotspots(churn: &HashMap<PathBuf, u32>) -> Vec<Finding> {
                 line: 1,
                 item_path: file.display().to_string(),
             },
-            confidence: 0.55,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: Some(json!({
                 "commits_in_window": count,
@@ -133,7 +133,7 @@ pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
                 line: function.line,
                 item_path: function.qualified_name.clone(),
             },
-            confidence: 0.5,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: Some(json!({
                 "lines_of_code": function.lines_of_code,
@@ -188,7 +188,7 @@ pub fn legacy_freeze(churn_12mo: &HashMap<PathBuf, u32>, all_files: &[PathBuf]) 
                 line: 1,
                 item_path: file.display().to_string(),
             },
-            confidence: 0.5,
+            evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: Some(json!({
                 "active_siblings": active_siblings,
@@ -201,17 +201,6 @@ pub fn legacy_freeze(churn_12mo: &HashMap<PathBuf, u32>, all_files: &[PathBuf]) 
     findings
 }
 
-/// Confidence for `single-impl-trait`: a trait that only ever gets one impl
-/// is a plausible-but-not-certain sign of unnecessary indirection — some
-/// single-impl traits exist deliberately (e.g. for future extension points
-/// or object safety), hence a mid-range confidence rather than a high one.
-const SINGLE_IMPL_TRAIT_CONFIDENCE: f32 = 0.6;
-/// Confidence for `delegating-wrapper`/`builder-for-small-struct`: both are
-/// weaker signals than `single-impl-trait` — a wrapper newtype or a small
-/// builder is frequently intentional (newtype pattern, forward-compatible
-/// API), so these fire at lower confidence.
-const DELEGATING_WRAPPER_CONFIDENCE: f32 = 0.4;
-const BUILDER_FOR_SMALL_STRUCT_CONFIDENCE: f32 = 0.4;
 /// Builders targeting a struct with at most this many fields are considered
 /// "small enough that a builder is unnecessary ceremony" (todo.md §3.G:
 /// "Builder für Struct mit ≤2 Feldern").
@@ -397,7 +386,6 @@ fn abstraction_finding(
     file: &Path,
     line: usize,
     item_path: String,
-    confidence: f32,
     evidence: serde_json::Value,
 ) -> Finding {
     Finding {
@@ -412,7 +400,7 @@ fn abstraction_finding(
             line,
             item_path,
         },
-        confidence,
+        evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: Some(evidence),
         caused_by: Vec::new(),
@@ -489,7 +477,6 @@ pub fn analyze_workspace_structural<'a>(
                     &file.path,
                     record.line,
                     record.name.clone(),
-                    DELEGATING_WRAPPER_CONFIDENCE,
                     json!({
                         "kind": "delegating-wrapper",
                         "struct": record.name,
@@ -537,7 +524,6 @@ pub fn analyze_workspace_structural<'a>(
             file,
             *line,
             format!("<{self_type} as {trait_name}>"),
-            SINGLE_IMPL_TRAIT_CONFIDENCE,
             json!({
                 "kind": "single-impl-trait",
                 "trait": trait_name,
@@ -559,7 +545,6 @@ pub fn analyze_workspace_structural<'a>(
             file,
             *line,
             builder_name.clone(),
-            BUILDER_FOR_SMALL_STRUCT_CONFIDENCE,
             json!({
                 "kind": "builder-for-small-struct",
                 "builder": builder_name,

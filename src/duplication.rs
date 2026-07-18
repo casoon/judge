@@ -5,7 +5,7 @@
 //! too, at a granularity of `min_tokens` tokens.
 //!
 //! Four modes are implemented here, from most to least literal (see
-//! [`DupeMode`] for the confidence each one gets):
+//! [`DupeMode`] for the evidence class each one gets):
 //! - [`DupeMode::Strict`]: byte-identical source for the matched span,
 //!   including whitespace and comments.
 //! - [`DupeMode::Mild`] (default): normalized token stream — whitespace and
@@ -55,7 +55,7 @@ use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::functions::walk_functions;
 use crate::ingest::SourceFile;
 
@@ -122,7 +122,7 @@ pub struct CloneMember {
     pub end_token: usize,
     pub token_count: usize,
     /// Mode this member was matched under; drives [`CloneMember::to_finding`]'s
-    /// confidence.
+    /// evidence class.
     pub mode: DupeMode,
     /// Deduplicated placeholder → original-identifier pairs, in
     /// first-occurrence order, for identifiers positionally normalized
@@ -137,16 +137,15 @@ pub struct CloneMember {
 }
 
 impl CloneMember {
-    /// Renders this member as a [`Finding`]. Confidence reflects how
+    /// Renders this member as a [`Finding`]. The evidence class reflects how
     /// aggressively [`Self::mode`] normalized the matched tokens: `Strict`/
-    /// `Mild` are deterministic, exact-token matches (`1.0`); `Weak` and
-    /// `Semantic` are heuristic normalizations, so their confidence is lower
-    /// (`0.85`/`0.55` respectively — see todo.md §7).
+    /// `Mild` are deterministic, exact-token matches (`derived_fact`); `Weak`
+    /// and `Semantic` are heuristic normalizations (`heuristic` — see
+    /// todo.md §17.3).
     pub fn to_finding(&self) -> Finding {
-        let confidence = match self.mode {
-            DupeMode::Strict | DupeMode::Mild => 1.0,
-            DupeMode::Weak => 0.85,
-            DupeMode::Semantic => 0.55,
+        let evidence_class = match self.mode {
+            DupeMode::Strict | DupeMode::Mild => EvidenceClass::DerivedFact,
+            DupeMode::Weak | DupeMode::Semantic => EvidenceClass::Heuristic,
         };
         let mut evidence = serde_json::json!({ "token_count": self.token_count });
         if !self.identifier_mapping.is_empty() {
@@ -182,7 +181,7 @@ impl CloneMember {
                 line: self.start_line,
                 item_path: self.qualified_name.clone(),
             },
-            confidence,
+            evidence_class,
             origin: Origin::Code,
             // Carries the span's token count through to a `Finding` so a
             // ratio gate (e.g. `audit --since`'s duplication gate, see
@@ -533,7 +532,7 @@ fn literal_kind_name(kind: LiteralKind) -> &'static str {
 /// match). Likewise, struct-literal/pattern field names (`Foo { field: value
 /// }`) look identical to a local variable at this layer, so `field` gets
 /// normalized as if it were one — a bounded precision risk, consistent with
-/// `Semantic` mode's already-lower confidence.
+/// `Semantic` mode's `heuristic` evidence class.
 ///
 /// Numbering is positional within the *whole function body*, assigned in
 /// first-occurrence order while scanning left-to-right — not re-numbered
@@ -1718,16 +1717,16 @@ fn calls_helper_two(x: i32) -> i32 {
     }
 
     #[test]
-    fn weak_and_semantic_confidence_is_lower_than_strict() {
-        let dir = TempDir::new("dup-confidence");
+    fn weak_and_semantic_are_heuristic_while_strict_and_mild_are_derived_facts() {
+        let dir = TempDir::new("dup-evidence-class");
         let (file_a, file_b) = write_duplicate_fixtures(&dir);
         let files = authored([file_a, file_b]);
 
         for (mode, expected) in [
-            (DupeMode::Strict, 1.0),
-            (DupeMode::Mild, 1.0),
-            (DupeMode::Weak, 0.85),
-            (DupeMode::Semantic, 0.55),
+            (DupeMode::Strict, EvidenceClass::DerivedFact),
+            (DupeMode::Mild, EvidenceClass::DerivedFact),
+            (DupeMode::Weak, EvidenceClass::Heuristic),
+            (DupeMode::Semantic, EvidenceClass::Heuristic),
         ] {
             let report = analyze_workspace(files.iter(), mode, DEFAULT_MIN_TOKENS, false);
             let findings = report.to_findings();
@@ -1736,7 +1735,7 @@ fn calls_helper_two(x: i32) -> i32 {
                 "{mode:?} should find the fixture duplicate"
             );
             for finding in &findings {
-                assert_eq!(finding.confidence, expected, "{mode:?}");
+                assert_eq!(finding.evidence_class, expected, "{mode:?}");
             }
         }
     }

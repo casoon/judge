@@ -12,7 +12,7 @@ use std::path::Path;
 use cargo_metadata::MetadataCommand;
 use serde::Deserialize;
 
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
 use crate::health_score::DeductionMultiplier;
 use crate::ingest::Workspace;
 use crate::slopsquat::SlopsquatConfig;
@@ -365,7 +365,7 @@ fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) ->
             line: 1,
             item_path: format!("{} [{}]: {path_str}", rule.name, rule.reach.label()),
         },
-        confidence: 1.0,
+        evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: None,
         caused_by: Vec::new(),
@@ -391,7 +391,7 @@ fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) 
                 rule.required.join(", ")
             ),
         },
-        confidence: 1.0,
+        evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: None,
         caused_by: Vec::new(),
@@ -410,7 +410,7 @@ fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
             line: 1,
             item_path: path_str,
         },
-        confidence: 1.0,
+        evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: None,
         caused_by: Vec::new(),
