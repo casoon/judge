@@ -1,14 +1,48 @@
 //! The common output unit for detectors: a `Finding`. Findings can reference
 //! each other (`caused_by`/`causes`) so a single root cause — e.g. a missed
 //! entry point — doesn't present as dozens of unrelated findings (see
-//! todo.md §7 "Kausale Finding-Gruppen", §14.2 P0#1).
+//! todo.md §7 "Kausale Finding-Gruppen", §14.2 P0#1). Causal edges are owned
+//! exclusively by [`FindingGraph`] (todo.md §15.2): detectors emit findings
+//! without edges, the graph stores each edge once, and the per-finding
+//! `caused_by`/`causes` fields are derived from that single edge set on
+//! export.
 
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier for a finding, referenced by `caused_by`/`causes` links.
-pub type FindingId = String;
+/// A newtype around the existing id string (e.g. `hotspot:src/lib.rs`) — the
+/// id computation is unchanged, the type only makes graph indexing explicit.
+/// Serializes transparently as that string, so the JSON schema is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FindingId(String);
+
+impl FindingId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for FindingId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for FindingId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl std::fmt::Display for FindingId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 /// Ordered `Info < Warn < Fail` (derive order follows declaration order) so
 /// findings can be sorted worst-first across detectors — see
@@ -122,7 +156,11 @@ pub struct Location {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
-    pub id: FindingId,
+    /// The raw id string (wrapped as [`FindingId`] wherever findings are
+    /// indexed, e.g. in [`FindingGraph`]). Kept a plain `String` because
+    /// every detector builds it inline and several rebase it via
+    /// [`relativize_paths`].
+    pub id: String,
     pub rule: String,
     pub severity: Severity,
     pub location: Location,
@@ -134,16 +172,57 @@ pub struct Finding {
     /// yet populate it; not every rule does.
     pub evidence: Option<serde_json::Value>,
     /// Findings that caused this one to appear (the root-cause direction).
-    pub caused_by: Vec<FindingId>,
-    /// Findings this one caused to appear (the cascade direction).
-    pub causes: Vec<FindingId>,
+    /// Derived from [`FindingGraph`]'s edge set on export — `pub(crate)` so
+    /// the public API cannot set it independently of `causes` (todo.md
+    /// §15.2: one stored truth, the reverse direction is derived).
+    pub(crate) caused_by: Vec<FindingId>,
+    /// Findings this one caused to appear (the cascade direction). Same
+    /// ownership rule as `caused_by`: only [`FindingGraph`] populates it.
+    pub(crate) causes: Vec<FindingId>,
 }
 
 impl Finding {
+    /// Constructs a finding without causal edges — the only way to attach
+    /// edges is [`FindingGraph::add_edge`], which validates ids, duplicates,
+    /// and cycles.
+    pub fn new(
+        id: String,
+        rule: String,
+        severity: Severity,
+        location: Location,
+        evidence_class: EvidenceClass,
+        origin: Origin,
+        evidence: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            id,
+            rule,
+            severity,
+            location,
+            evidence_class,
+            origin,
+            evidence,
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+
     /// See [`EvidenceClass::is_gating`] — `false` means this finding is
     /// advisory: shown, but with no effect on verdicts or the health score.
     pub fn is_gating(&self) -> bool {
         self.evidence_class.is_gating()
+    }
+
+    /// Findings that caused this one (read-only; derived from
+    /// [`FindingGraph`]'s edge set on export).
+    pub fn caused_by(&self) -> &[FindingId] {
+        &self.caused_by
+    }
+
+    /// Findings this one caused (read-only; derived from
+    /// [`FindingGraph`]'s edge set on export).
+    pub fn causes(&self) -> &[FindingId] {
+        &self.causes
     }
 }
 
@@ -152,6 +231,155 @@ impl Finding {
 /// v2: `Finding.confidence: f32` replaced by `Finding.evidence_class`
 /// (todo.md §17.5).
 pub const SCHEMA_VERSION: u32 = 2;
+
+/// Tri-state status of an analysis capability, so a tier where a capability
+/// has no meaning at all doesn't have to report a false `true`/`false`: the
+/// Fast Tier is a syntactic pass that never expands anything, and
+/// `proc_macro_expansion: false` there would read like a Deep-Tier-style
+/// fidelity trade-off instead of "no such dimension exists here"
+/// (todo.md §17.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FidelityStatus {
+    /// The capability was active during analysis.
+    Enabled,
+    /// The capability exists for this tier but was deliberately off — a
+    /// real, documented fidelity trade-off (e.g. the Deep Tier loads without
+    /// a proc-macro server and without running build scripts; see
+    /// `judge::deep`'s `DeepContext::load`).
+    Disabled,
+    /// The capability has no meaning for this tier — nothing was traded off.
+    NotApplicable,
+}
+
+/// What the analysis actually looked at — the report-level answer to "what
+/// is this report even a claim about?" (todo.md §17.5, §0): source snapshot,
+/// examined targets, feature selection, platform, entry-point model, test
+/// and generated-code policy, expansion fidelity, and the judge version.
+///
+/// Lives on [`Report`], not on each [`Finding`]: one report is one analysis
+/// view, and repeating the universe per finding (as todo.md §7's schema
+/// sketch shows) would be massively redundant. Should a future detector ever
+/// produce findings under a *different* view than the enclosing report's
+/// (none does today), a per-finding override would be follow-up work — not
+/// part of this type.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisUniverse {
+    /// Full hex object id of `HEAD` at analysis time — the source snapshot
+    /// the claims are about. `None` outside a git repository (or when the
+    /// workspace root is not itself the repository root, matching how
+    /// `crate::git` opens repositories everywhere else).
+    pub commit: Option<String>,
+    /// Cargo target kinds discovered in the workspace, deduped and sorted —
+    /// the ingest layer's labels: `lib`, `bin`, `example`, `test`, `bench`,
+    /// `build-script` (see `crate::ingest::EntryPointKind::label`).
+    pub targets: Vec<String>,
+    /// The cargo feature selection the analyzed view was resolved under.
+    /// Deep Tier: `["default"]` — the rust-analyzer loader resolves default
+    /// features. Fast Tier: empty — the syntactic pass is feature-blind and
+    /// parses every `cfg`-gated line regardless of any selection.
+    pub features: Vec<String>,
+    /// Host platform the analysis ran on, as `<arch>-<os>` from
+    /// `std::env::consts`.
+    pub platform: String,
+    /// Entry-point kinds the reachability root set recognizes (see
+    /// `crate::reachability`): `fn-main-bin`, `fn-main-example`, `test` and
+    /// `bench` only with `--include-tests`, plus `no-mangle`, `export-name`,
+    /// `wasm-bindgen` unconditionally. Empty at the Fast Tier, which makes
+    /// no reachability claims and therefore has no entry-point model.
+    pub entry_points: Vec<String>,
+    /// Whether test code counted as usage/entry points (`--include-tests`).
+    /// Always `true` at the Fast Tier: its test-focused rules
+    /// (assertion-free-test, tautological-test, …) require parsing test
+    /// code, so tests are always part of the examined universe there.
+    pub include_tests: bool,
+    /// Whether generated files were analyzed as finding targets
+    /// (`--include-generated`). Generated code stays part of the graph
+    /// either way (see `crate::ingest::SourceKind`) — this only says whether
+    /// findings were reported *about* it.
+    pub include_generated: bool,
+    /// Whether proc-macros were expanded. [`FidelityStatus::Disabled`] at
+    /// the Deep Tier — it deliberately loads without a proc-macro server, so
+    /// macro-generated references are invisible (the documented trade-off on
+    /// `judge::deep`'s `DeepContext::load`). [`FidelityStatus::NotApplicable`]
+    /// at the Fast Tier.
+    pub proc_macro_expansion: FidelityStatus,
+    /// Whether build scripts ran (`OUT_DIR` code visible). Same tier logic
+    /// as `proc_macro_expansion`: [`FidelityStatus::Disabled`] at the Deep
+    /// Tier, [`FidelityStatus::NotApplicable`] at the Fast Tier.
+    pub build_scripts: FidelityStatus,
+    /// The judge version that produced this report (`CARGO_PKG_VERSION`).
+    pub judge_version: String,
+    /// Which tier produced this view: `"fast"` or `"deep"` (see
+    /// `crate::AnalysisTier`).
+    pub tier: String,
+}
+
+impl AnalysisUniverse {
+    /// The Deep Tier view (`dead-code`, `explain --why-live`): a semantic
+    /// workspace load under default features, deliberately without a
+    /// proc-macro server and without build scripts (see `judge::deep`).
+    /// `include_generated` is fixed to `false`: generated files stay in the
+    /// semantic graph but are never finding targets at the Deep Tier (see
+    /// `crate::dead_code`).
+    pub fn deep(workspace: &crate::ingest::Workspace, include_tests: bool) -> Self {
+        let mut entry_points = vec!["fn-main-bin".to_string(), "fn-main-example".to_string()];
+        if include_tests {
+            entry_points.push("test".to_string());
+            entry_points.push("bench".to_string());
+        }
+        entry_points.extend(
+            ["no-mangle", "export-name", "wasm-bindgen"]
+                .iter()
+                .map(ToString::to_string),
+        );
+        Self {
+            features: vec!["default".to_string()],
+            entry_points,
+            include_tests,
+            proc_macro_expansion: FidelityStatus::Disabled,
+            build_scripts: FidelityStatus::Disabled,
+            tier: "deep".to_string(),
+            ..Self::base(workspace)
+        }
+    }
+
+    /// The Fast Tier view (`health`, bare `cargo judge`): a feature-blind
+    /// syntactic pass over every discovered source file — no reachability
+    /// (empty `entry_points`), tests always parsed, and nothing that could
+    /// be expanded (both fidelity fields [`FidelityStatus::NotApplicable`]).
+    pub fn fast(workspace: &crate::ingest::Workspace, include_generated: bool) -> Self {
+        Self {
+            include_generated,
+            ..Self::base(workspace)
+        }
+    }
+
+    /// The fields shared by both tiers, with Fast Tier defaults.
+    fn base(workspace: &crate::ingest::Workspace) -> Self {
+        let mut targets: Vec<String> = workspace
+            .crates
+            .iter()
+            .flat_map(|krate| &krate.entry_points)
+            .map(|entry| entry.kind.label().to_string())
+            .collect();
+        targets.sort();
+        targets.dedup();
+        Self {
+            commit: crate::git::head_commit(&workspace.root).ok(),
+            targets,
+            features: Vec::new(),
+            platform: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+            entry_points: Vec::new(),
+            include_tests: true,
+            include_generated: false,
+            proc_macro_expansion: FidelityStatus::NotApplicable,
+            build_scripts: FidelityStatus::NotApplicable,
+            judge_version: env!("CARGO_PKG_VERSION").to_string(),
+            tier: "fast".to_string(),
+        }
+    }
+}
 
 /// How many of a report's findings can affect a verdict vs. how many are
 /// purely advisory (see [`EvidenceClass::is_gating`]). Additive report field
@@ -173,6 +401,13 @@ pub struct VerdictEffectCounts {
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub schema_version: u32,
+    /// The analysis view this report's findings are claims about (see
+    /// [`AnalysisUniverse`]). Additive in schema v2 — no version bump; the
+    /// field is omitted from JSON when absent, so universe-less v2 reports
+    /// stay valid. The Deep Tier always fills it (todo.md §0); Fast Tier
+    /// commands may.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_universe: Option<AnalysisUniverse>,
     /// Gating vs. advisory finding counts (additive in schema v2 — no
     /// version bump; see [`VerdictEffectCounts`]).
     pub counts: VerdictEffectCounts,
@@ -191,6 +426,7 @@ impl Report {
         let gating = findings.iter().filter(|f| f.is_gating()).count();
         Self {
             schema_version: SCHEMA_VERSION,
+            analysis_universe: None,
             counts: VerdictEffectCounts {
                 gating,
                 advisory: findings.len() - gating,
@@ -198,6 +434,14 @@ impl Report {
             findings,
             errors,
         }
+    }
+
+    /// Attaches the analysis view — builder-style, so the many existing
+    /// [`Report::new`]/[`Report::with_errors`] call sites stay untouched and
+    /// only the commands that describe their universe opt in.
+    pub fn with_universe(mut self, universe: AnalysisUniverse) -> Self {
+        self.analysis_universe = Some(universe);
+        self
     }
 }
 
@@ -220,175 +464,418 @@ pub fn sort_by_severity_desc(findings: &mut [Finding]) {
 /// Rewrites workspace-local absolute paths to repository-relative paths.
 /// Finding ids embed their location in several detectors, so the id must be
 /// rebased together with the structured location to remain stable across
-/// different checkout directories.
+/// different checkout directories. Causal edge references are rebased along
+/// with the ids they point to, so exported `caused_by`/`causes` never dangle
+/// after a rebase.
 pub fn relativize_paths(findings: &mut [Finding], workspace_root: &Path) {
-    for finding in findings {
+    let mut renames: HashMap<FindingId, FindingId> = HashMap::new();
+    for finding in findings.iter_mut() {
         let Ok(relative) = finding.location.file.strip_prefix(workspace_root) else {
             continue;
         };
         let relative = relative.to_path_buf();
         let absolute_text = finding.location.file.to_string_lossy();
         let relative_text = relative.to_string_lossy();
-        finding.id = finding
+        let rebased_id = finding
             .id
             .replace(absolute_text.as_ref(), relative_text.as_ref());
+        if rebased_id != finding.id {
+            renames.insert(
+                FindingId::from(finding.id.as_str()),
+                FindingId::from(rebased_id.as_str()),
+            );
+        }
+        finding.id = rebased_id;
         if finding.location.item_path == absolute_text {
             finding.location.item_path = relative_text.into_owned();
         }
         finding.location.file = relative;
     }
-}
-
-/// A cycle detected in the `causes` graph, reported as the sequence of
-/// finding IDs that closes the loop (first and last entry are the same id).
-#[derive(Debug, PartialEq, Eq)]
-pub struct CycleError {
-    pub cycle: Vec<FindingId>,
-}
-
-impl std::fmt::Display for CycleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "cycle in finding graph: {}", self.cycle.join(" -> "))
+    if renames.is_empty() {
+        return;
     }
-}
-
-impl std::error::Error for CycleError {}
-
-/// Validates that the `causes` edges among `findings` form a DAG. Edges to
-/// ids outside the given slice are ignored — aggregation may run over a
-/// subset (e.g. one detector's output) and dangling references there are
-/// not a cycle.
-pub fn check_for_cycles(findings: &[Finding]) -> Result<(), CycleError> {
-    use std::collections::HashMap;
-
-    let index_by_id: HashMap<&str, usize> = findings
-        .iter()
-        .enumerate()
-        .map(|(index, finding)| (finding.id.as_str(), index))
-        .collect();
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mark {
-        Unvisited,
-        InProgress,
-        Done,
-    }
-
-    let mut marks = vec![Mark::Unvisited; findings.len()];
-    let mut stack = Vec::new();
-
-    fn visit(
-        index: usize,
-        findings: &[Finding],
-        index_by_id: &HashMap<&str, usize>,
-        marks: &mut [Mark],
-        stack: &mut Vec<FindingId>,
-    ) -> Result<(), CycleError> {
-        marks[index] = Mark::InProgress;
-        stack.push(findings[index].id.clone());
-
-        for target_id in &findings[index].causes {
-            let Some(&target_index) = index_by_id.get(target_id.as_str()) else {
-                continue;
-            };
-            match marks[target_index] {
-                Mark::Done => continue,
-                Mark::Unvisited => visit(target_index, findings, index_by_id, marks, stack)?,
-                Mark::InProgress => {
-                    let start = stack.iter().position(|id| id == target_id).unwrap_or(0);
-                    let mut cycle = stack[start..].to_vec();
-                    cycle.push(target_id.clone());
-                    return Err(CycleError { cycle });
-                }
+    for finding in findings {
+        for edge_id in finding
+            .caused_by
+            .iter_mut()
+            .chain(finding.causes.iter_mut())
+        {
+            if let Some(rebased) = renames.get(edge_id) {
+                *edge_id = rebased.clone();
             }
         }
+    }
+}
 
-        stack.pop();
-        marks[index] = Mark::Done;
+/// Rejected [`FindingGraph`] mutations. Every invalid state is an error, not
+/// a panic — callers decide how to surface it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GraphError {
+    /// `add_finding` saw an id that is already in the graph.
+    DuplicateFinding(FindingId),
+    /// `add_edge` referenced an id with no finding in the graph.
+    UnknownFinding(FindingId),
+    /// `add_edge` saw a cause → effect pair that is already stored.
+    DuplicateEdge { cause: FindingId, effect: FindingId },
+    /// `add_edge` would close a loop; the path lists the finding ids that
+    /// would form it (first and last entry are the same id).
+    Cycle { cycle: Vec<FindingId> },
+}
+
+impl std::fmt::Display for GraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateFinding(id) => write!(f, "duplicate finding id: {id}"),
+            Self::UnknownFinding(id) => write!(f, "edge references unknown finding id: {id}"),
+            Self::DuplicateEdge { cause, effect } => {
+                write!(f, "duplicate edge: {cause} -> {effect}")
+            }
+            Self::Cycle { cycle } => {
+                let path: Vec<&str> = cycle.iter().map(FindingId::as_str).collect();
+                write!(f, "cycle in finding graph: {}", path.join(" -> "))
+            }
+        }
+    }
+}
+
+impl std::error::Error for GraphError {}
+
+/// Sole owner of findings and their causal edges (todo.md §15.2). Each edge
+/// is stored exactly once as a cause → effect pair; the per-finding
+/// `caused_by`/`causes` views are derived from that one set, so root
+/// reduction and cycle checking can never read diverging truths.
+/// [`FindingGraph::into_findings`] exports findings with both directions
+/// filled in, keeping the schema-v2 JSON shape unchanged.
+#[derive(Debug, Default)]
+pub struct FindingGraph {
+    findings: Vec<Finding>,
+    ids: Vec<FindingId>,
+    index_by_id: HashMap<FindingId, usize>,
+    /// `(cause, effect)` index pairs — the single stored edge direction.
+    edges: BTreeSet<(usize, usize)>,
+}
+
+impl FindingGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a finding, rejecting ids already present in the graph. Callers
+    /// pass findings without edges (detectors never set them; edges are
+    /// attached via [`FindingGraph::add_edge`]).
+    pub fn add_finding(&mut self, finding: Finding) -> Result<(), GraphError> {
+        debug_assert!(
+            finding.caused_by.is_empty() && finding.causes.is_empty(),
+            "edges are owned by the graph; add them via add_edge"
+        );
+        let id = FindingId::from(finding.id.as_str());
+        if self.index_by_id.contains_key(&id) {
+            return Err(GraphError::DuplicateFinding(id));
+        }
+        self.index_by_id.insert(id.clone(), self.findings.len());
+        self.ids.push(id);
+        self.findings.push(finding);
         Ok(())
     }
 
-    for index in 0..findings.len() {
-        if marks[index] == Mark::Unvisited {
-            visit(index, findings, &index_by_id, &mut marks, &mut stack)?;
+    /// Records that `cause` caused `effect`. Rejects unknown ids, duplicate
+    /// edges, and any edge that would close a cycle (including self-edges).
+    pub fn add_edge(&mut self, cause: &FindingId, effect: &FindingId) -> Result<(), GraphError> {
+        let cause_index = *self
+            .index_by_id
+            .get(cause)
+            .ok_or_else(|| GraphError::UnknownFinding(cause.clone()))?;
+        let effect_index = *self
+            .index_by_id
+            .get(effect)
+            .ok_or_else(|| GraphError::UnknownFinding(effect.clone()))?;
+        if self.edges.contains(&(cause_index, effect_index)) {
+            return Err(GraphError::DuplicateEdge {
+                cause: cause.clone(),
+                effect: effect.clone(),
+            });
         }
+        if cause_index == effect_index {
+            return Err(GraphError::Cycle {
+                cycle: vec![cause.clone(), cause.clone()],
+            });
+        }
+        let mut visited = vec![false; self.findings.len()];
+        let mut path = Vec::new();
+        if self.find_path(effect_index, cause_index, &mut visited, &mut path) {
+            // `path` runs effect -> … -> cause; prepending the cause closes
+            // the reported loop (first and last entry are the same id).
+            let mut cycle = Vec::with_capacity(path.len() + 1);
+            cycle.push(cause.clone());
+            cycle.extend(path.iter().map(|&index| self.ids[index].clone()));
+            return Err(GraphError::Cycle { cycle });
+        }
+        self.edges.insert((cause_index, effect_index));
+        Ok(())
     }
-    Ok(())
+
+    /// Depth-first search for a path `from` -> … -> `to` along stored edges,
+    /// recording the node path when one exists.
+    fn find_path(
+        &self,
+        from: usize,
+        to: usize,
+        visited: &mut [bool],
+        path: &mut Vec<usize>,
+    ) -> bool {
+        path.push(from);
+        if from == to {
+            return true;
+        }
+        visited[from] = true;
+        for &(_, next) in self.edges.range((from, usize::MIN)..=(from, usize::MAX)) {
+            if !visited[next] && self.find_path(next, to, visited, path) {
+                return true;
+            }
+        }
+        path.pop();
+        false
+    }
+
+    /// Findings with no recorded cause, in insertion order — the same edge
+    /// set the cycle check validates.
+    pub fn roots(&self) -> Vec<&Finding> {
+        let mut has_cause = vec![false; self.findings.len()];
+        for &(_, effect) in &self.edges {
+            has_cause[effect] = true;
+        }
+        self.findings
+            .iter()
+            .zip(&has_cause)
+            .filter(|(_, has_cause)| !**has_cause)
+            .map(|(finding, _)| finding)
+            .collect()
+    }
+
+    /// Findings that `id` caused (the cascade direction), derived from the
+    /// stored edges. Unknown ids yield an empty list.
+    pub fn causes_of(&self, id: &FindingId) -> Vec<&Finding> {
+        let Some(&index) = self.index_by_id.get(id) else {
+            return Vec::new();
+        };
+        self.edges
+            .range((index, usize::MIN)..=(index, usize::MAX))
+            .map(|&(_, effect)| &self.findings[effect])
+            .collect()
+    }
+
+    /// Findings that caused `id` (the root-cause direction), derived from
+    /// the stored edges. Unknown ids yield an empty list.
+    pub fn caused_by_of(&self, id: &FindingId) -> Vec<&Finding> {
+        let Some(&index) = self.index_by_id.get(id) else {
+            return Vec::new();
+        };
+        self.edges
+            .iter()
+            .filter(|&&(_, effect)| effect == index)
+            .map(|&(cause, _)| &self.findings[cause])
+            .collect()
+    }
+
+    /// Consumes the graph and returns the findings in insertion order with
+    /// `caused_by`/`causes` filled in from the single stored edge set — the
+    /// serialized schema-v2 shape is exactly what it was when the fields
+    /// were set directly.
+    pub fn into_findings(mut self) -> Vec<Finding> {
+        for &(cause, effect) in &self.edges {
+            let cause_id = self.ids[cause].clone();
+            let effect_id = self.ids[effect].clone();
+            self.findings[cause].causes.push(effect_id);
+            self.findings[effect].caused_by.push(cause_id);
+        }
+        self.findings
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn finding(id: &str, causes: &[&str]) -> Finding {
-        Finding {
-            id: id.to_string(),
-            rule: "test-rule".to_string(),
-            severity: Severity::Warn,
-            location: Location {
+    fn finding(id: &str) -> Finding {
+        Finding::new(
+            id.to_string(),
+            "test-rule".to_string(),
+            Severity::Warn,
+            Location {
                 file: PathBuf::from("src/lib.rs"),
                 line: 1,
                 item_path: "crate::lib".to_string(),
             },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: None,
-            caused_by: Vec::new(),
-            causes: causes.iter().map(|s| s.to_string()).collect(),
+            EvidenceClass::Heuristic,
+            Origin::Code,
+            None,
+        )
+    }
+
+    fn id(value: &str) -> FindingId {
+        FindingId::from(value)
+    }
+
+    fn graph_of(ids: &[&str]) -> FindingGraph {
+        let mut graph = FindingGraph::new();
+        for finding_id in ids {
+            graph.add_finding(finding(finding_id)).unwrap();
         }
+        graph
     }
 
     #[test]
-    fn acyclic_graph_passes() {
-        let findings = vec![
-            finding("a", &["b"]),
-            finding("b", &["c"]),
-            finding("c", &[]),
-        ];
-        assert!(check_for_cycles(&findings).is_ok());
+    fn graph_rejects_duplicate_finding_ids() {
+        let mut graph = graph_of(&["a"]);
+        let err = graph.add_finding(finding("a")).unwrap_err();
+        assert_eq!(err, GraphError::DuplicateFinding(id("a")));
+        assert_eq!(graph.into_findings().len(), 1);
     }
 
     #[test]
-    fn direct_cycle_is_detected() {
-        let findings = vec![finding("a", &["b"]), finding("b", &["a"])];
-        let err = check_for_cycles(&findings).unwrap_err();
+    fn graph_rejects_edges_to_unknown_findings() {
+        let mut graph = graph_of(&["a"]);
+        let err = graph.add_edge(&id("a"), &id("dangling")).unwrap_err();
+        assert_eq!(err, GraphError::UnknownFinding(id("dangling")));
+        let err = graph.add_edge(&id("dangling"), &id("a")).unwrap_err();
+        assert_eq!(err, GraphError::UnknownFinding(id("dangling")));
+    }
+
+    #[test]
+    fn graph_rejects_duplicate_edges() {
+        let mut graph = graph_of(&["a", "b"]);
+        graph.add_edge(&id("a"), &id("b")).unwrap();
+        let err = graph.add_edge(&id("a"), &id("b")).unwrap_err();
         assert_eq!(
-            err.cycle,
-            vec!["a".to_string(), "b".to_string(), "a".to_string()]
+            err,
+            GraphError::DuplicateEdge {
+                cause: id("a"),
+                effect: id("b"),
+            }
         );
     }
 
     #[test]
-    fn indirect_cycle_is_detected() {
-        let findings = vec![
-            finding("a", &["b"]),
-            finding("b", &["c"]),
-            finding("c", &["a"]),
-        ];
-        assert!(check_for_cycles(&findings).is_err());
+    fn graph_rejects_self_cycles() {
+        let mut graph = graph_of(&["a"]);
+        let err = graph.add_edge(&id("a"), &id("a")).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::Cycle {
+                cycle: vec![id("a"), id("a")],
+            }
+        );
     }
 
     #[test]
-    fn self_cycle_is_detected() {
-        let findings = vec![finding("a", &["a"])];
-        let err = check_for_cycles(&findings).unwrap_err();
-        assert_eq!(err.cycle, vec!["a".to_string(), "a".to_string()]);
+    fn graph_rejects_direct_cycles() {
+        let mut graph = graph_of(&["a", "b"]);
+        graph.add_edge(&id("a"), &id("b")).unwrap();
+        let err = graph.add_edge(&id("b"), &id("a")).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::Cycle {
+                cycle: vec![id("b"), id("a"), id("b")],
+            }
+        );
     }
 
     #[test]
-    fn dangling_edges_outside_the_given_set_are_ignored() {
-        let findings = vec![finding("a", &["not-in-this-batch"])];
-        assert!(check_for_cycles(&findings).is_ok());
+    fn graph_rejects_indirect_cycles_and_accepts_acyclic_edges() {
+        let mut graph = graph_of(&["a", "b", "c"]);
+        graph.add_edge(&id("a"), &id("b")).unwrap();
+        graph.add_edge(&id("b"), &id("c")).unwrap();
+        let err = graph.add_edge(&id("c"), &id("a")).unwrap_err();
+        assert_eq!(
+            err,
+            GraphError::Cycle {
+                cycle: vec![id("c"), id("a"), id("b"), id("c")],
+            }
+        );
+    }
+
+    #[test]
+    fn graph_roots_are_findings_without_a_recorded_cause() {
+        let mut graph = graph_of(&["a", "b", "c"]);
+        graph.add_edge(&id("a"), &id("b")).unwrap();
+        let root_ids: Vec<&str> = graph.roots().iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(root_ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn edge_directions_are_derived_from_the_single_stored_edge_set() {
+        let mut graph = graph_of(&["a", "b", "c"]);
+        graph.add_edge(&id("a"), &id("b")).unwrap();
+        graph.add_edge(&id("a"), &id("c")).unwrap();
+
+        let effects: Vec<&str> = graph
+            .causes_of(&id("a"))
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        assert_eq!(effects, ["b", "c"]);
+
+        let causes: Vec<&str> = graph
+            .caused_by_of(&id("b"))
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect();
+        assert_eq!(causes, ["a"]);
+
+        assert!(graph.causes_of(&id("missing")).is_empty());
+        assert!(graph.caused_by_of(&id("missing")).is_empty());
+    }
+
+    #[test]
+    fn graph_export_serializes_identically_to_the_v2_finding_shape() {
+        let mut graph = graph_of(&["a", "b"]);
+        graph.add_edge(&id("a"), &id("b")).unwrap();
+        let findings = graph.into_findings();
+        let json = serde_json::to_value(&findings).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {
+                    "id": "a",
+                    "rule": "test-rule",
+                    "severity": "warn",
+                    "location": {
+                        "file": "src/lib.rs",
+                        "line": 1,
+                        "item_path": "crate::lib",
+                    },
+                    "evidence_class": "heuristic",
+                    "origin": "code",
+                    "evidence": null,
+                    "caused_by": [],
+                    "causes": ["b"],
+                },
+                {
+                    "id": "b",
+                    "rule": "test-rule",
+                    "severity": "warn",
+                    "location": {
+                        "file": "src/lib.rs",
+                        "line": 1,
+                        "item_path": "crate::lib",
+                    },
+                    "evidence_class": "heuristic",
+                    "origin": "code",
+                    "evidence": null,
+                    "caused_by": ["a"],
+                    "causes": [],
+                },
+            ])
+        );
     }
 
     #[test]
     fn root_findings_excludes_those_with_a_recorded_cause() {
-        let mut root = finding("a", &["b"]);
-        let mut dependent = finding("b", &[]);
-        dependent.caused_by = vec!["a".to_string()];
-        root.causes = vec!["b".to_string()];
+        let mut graph = graph_of(&["a", "b"]);
+        graph.add_edge(&id("a"), &id("b")).unwrap();
+        let findings = graph.into_findings();
 
-        let findings = vec![root, dependent];
         let roots = root_findings(&findings);
 
         assert_eq!(roots.len(), 1);
@@ -397,7 +884,7 @@ mod tests {
 
     #[test]
     fn report_serializes_with_schema_version_and_snake_case_enums() {
-        let report = Report::new(vec![finding("a", &[])]);
+        let report = Report::new(vec![finding("a")]);
         let json = serde_json::to_value(&report).unwrap();
 
         assert_eq!(json["schema_version"], SCHEMA_VERSION);
@@ -411,7 +898,7 @@ mod tests {
 
     #[test]
     fn only_heuristic_findings_are_advisory() {
-        let mut gating = finding("gating", &[]);
+        let mut gating = finding("gating");
         gating.evidence_class = EvidenceClass::DerivedFact;
         assert!(gating.is_gating());
         gating.evidence_class = EvidenceClass::BoundedSemantic;
@@ -419,18 +906,18 @@ mod tests {
         gating.evidence_class = EvidenceClass::ExternalMeasurement;
         assert!(gating.is_gating());
 
-        let advisory = finding("advisory", &[]);
+        let advisory = finding("advisory");
         assert_eq!(advisory.evidence_class, EvidenceClass::Heuristic);
         assert!(!advisory.is_gating());
     }
 
     #[test]
     fn sort_by_severity_desc_puts_fail_before_warn_before_info() {
-        let mut info = finding("info", &[]);
+        let mut info = finding("info");
         info.severity = Severity::Info;
-        let mut warn = finding("warn", &[]);
+        let mut warn = finding("warn");
         warn.severity = Severity::Warn;
-        let mut fail = finding("fail", &[]);
+        let mut fail = finding("fail");
         fail.severity = Severity::Fail;
 
         let mut findings = vec![info, warn, fail];
@@ -442,7 +929,7 @@ mod tests {
 
     #[test]
     fn relativize_paths_rebases_location_and_embedded_id() {
-        let mut finding = finding("hotspot:/tmp/project/src/lib.rs", &[]);
+        let mut finding = finding("hotspot:/tmp/project/src/lib.rs");
         finding.location.file = PathBuf::from("/tmp/project/src/lib.rs");
         finding.location.item_path = "/tmp/project/src/lib.rs".to_string();
 
@@ -454,5 +941,143 @@ mod tests {
         assert_eq!(finding.id, "hotspot:src/lib.rs");
         assert_eq!(finding.location.file, PathBuf::from("src/lib.rs"));
         assert_eq!(finding.location.item_path, "src/lib.rs");
+    }
+
+    #[test]
+    fn relativize_paths_rebases_edge_references_alongside_ids() {
+        let mut graph = FindingGraph::new();
+        let mut cause = finding("hotspot:/tmp/project/src/lib.rs");
+        cause.location.file = PathBuf::from("/tmp/project/src/lib.rs");
+        graph.add_finding(cause).unwrap();
+        graph.add_finding(finding("other")).unwrap();
+        graph
+            .add_edge(&id("hotspot:/tmp/project/src/lib.rs"), &id("other"))
+            .unwrap();
+        let mut findings = graph.into_findings();
+
+        relativize_paths(&mut findings, Path::new("/tmp/project"));
+
+        assert_eq!(findings[0].id, "hotspot:src/lib.rs");
+        assert_eq!(findings[0].causes, vec![id("other")]);
+        assert_eq!(findings[1].caused_by, vec![id("hotspot:src/lib.rs")]);
+    }
+
+    /// A minimal real workspace with a lib and a bin target, loaded through
+    /// the ingest layer — [`AnalysisUniverse`] describes an ingested
+    /// workspace, so its tests need one. Not a git repository, so `commit`
+    /// is honestly `None`.
+    fn fixture_workspace(dir: &crate::test_util::TempDir) -> crate::ingest::Workspace {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "universe-fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap()
+    }
+
+    #[test]
+    fn deep_universe_is_fully_populated_and_reflects_include_tests() {
+        let dir = crate::test_util::TempDir::new("universe-deep");
+        let workspace = fixture_workspace(&dir);
+
+        let with_tests = AnalysisUniverse::deep(&workspace, true);
+        assert_eq!(with_tests.tier, "deep");
+        assert_eq!(with_tests.commit, None, "fixture is not a git repository");
+        assert_eq!(with_tests.targets, ["bin", "lib"]);
+        assert_eq!(with_tests.features, ["default"]);
+        assert!(!with_tests.platform.is_empty());
+        assert!(with_tests.include_tests);
+        assert!(!with_tests.include_generated);
+        assert_eq!(
+            with_tests.entry_points,
+            [
+                "fn-main-bin",
+                "fn-main-example",
+                "test",
+                "bench",
+                "no-mangle",
+                "export-name",
+                "wasm-bindgen"
+            ]
+        );
+        assert_eq!(with_tests.proc_macro_expansion, FidelityStatus::Disabled);
+        assert_eq!(with_tests.build_scripts, FidelityStatus::Disabled);
+        assert_eq!(with_tests.judge_version, env!("CARGO_PKG_VERSION"));
+
+        let without_tests = AnalysisUniverse::deep(&workspace, false);
+        assert!(!without_tests.include_tests);
+        assert!(
+            !without_tests.entry_points.iter().any(|kind| kind == "test")
+                && !without_tests
+                    .entry_points
+                    .iter()
+                    .any(|kind| kind == "bench"),
+            "test/bench entry-point kinds must only be listed with --include-tests"
+        );
+    }
+
+    #[test]
+    fn fast_universe_reports_not_applicable_fidelity_and_no_entry_point_model() {
+        let dir = crate::test_util::TempDir::new("universe-fast");
+        let workspace = fixture_workspace(&dir);
+
+        let universe = AnalysisUniverse::fast(&workspace, true);
+        assert_eq!(universe.tier, "fast");
+        assert_eq!(universe.targets, ["bin", "lib"]);
+        assert!(
+            universe.features.is_empty(),
+            "the Fast Tier is feature-blind and must not claim a feature selection"
+        );
+        assert!(
+            universe.entry_points.is_empty(),
+            "the Fast Tier makes no reachability claims and has no entry-point model"
+        );
+        assert!(universe.include_tests);
+        assert!(universe.include_generated);
+        assert_eq!(universe.proc_macro_expansion, FidelityStatus::NotApplicable);
+        assert_eq!(universe.build_scripts, FidelityStatus::NotApplicable);
+        assert_eq!(universe.judge_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn report_serializes_universe_when_present_and_omits_it_when_absent() {
+        let bare = Report::new(Vec::new());
+        let bare_json = serde_json::to_value(&bare).unwrap();
+        assert!(
+            bare_json.get("analysis_universe").is_none(),
+            "a universe-less v2 report must omit the field, not emit null"
+        );
+        assert_eq!(bare_json["schema_version"], SCHEMA_VERSION);
+
+        let dir = crate::test_util::TempDir::new("universe-serialize");
+        let workspace = fixture_workspace(&dir);
+        let report =
+            Report::new(Vec::new()).with_universe(AnalysisUniverse::deep(&workspace, true));
+        let json = serde_json::to_value(&report).unwrap();
+
+        let universe = &json["analysis_universe"];
+        assert_eq!(universe["tier"], "deep");
+        assert_eq!(universe["commit"], serde_json::Value::Null);
+        assert_eq!(universe["targets"], serde_json::json!(["bin", "lib"]));
+        assert_eq!(universe["features"], serde_json::json!(["default"]));
+        assert_eq!(universe["include_tests"], true);
+        assert_eq!(universe["include_generated"], false);
+        assert_eq!(universe["proc_macro_expansion"], "disabled");
+        assert_eq!(universe["build_scripts"], "disabled");
+        assert_eq!(universe["judge_version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            universe["entry_points"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("fn-main-bin"))
+        );
     }
 }

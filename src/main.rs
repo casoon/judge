@@ -643,7 +643,10 @@ fn run_all(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>)
 
     match format {
         OutputFormat::Json => {
-            let report = Report::with_errors(collected.findings, collected.analysis_errors);
+            // Bare `cargo judge` analyzes with the generated-code default
+            // (excluded — see `collect_findings`), so the universe says so.
+            let report = Report::with_errors(collected.findings, collected.analysis_errors)
+                .with_universe(judge::finding::AnalysisUniverse::fast(&workspace, false));
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
         OutputFormat::Tty => {
@@ -1634,6 +1637,42 @@ fn run_provenance(format: OutputFormat, save_baseline: bool, baseline: Option<Pa
     }
 }
 
+/// Compact TTY rendering of the analysis universe (see
+/// [`judge::finding::AnalysisUniverse`]) — the JSON report carries the same
+/// data structured; TTY gets the human-readable echo so the Deep Tier's
+/// output always states what it makes a claim about (todo.md §0, §17.5).
+#[cfg(feature = "deep")]
+fn print_universe_tty(universe: &judge::finding::AnalysisUniverse) {
+    let fidelity = |status: judge::finding::FidelityStatus| match status {
+        judge::finding::FidelityStatus::Enabled => "enabled",
+        judge::finding::FidelityStatus::Disabled => "disabled",
+        judge::finding::FidelityStatus::NotApplicable => "not applicable",
+    };
+    println!(
+        "analysis universe: {} tier, judge {}, {}, commit {}",
+        universe.tier,
+        universe.judge_version,
+        universe.platform,
+        universe
+            .commit
+            .as_deref()
+            .unwrap_or("none (no git repository)")
+    );
+    println!(
+        "  targets: {}; features: {}; entry points: {}",
+        universe.targets.join(", "),
+        universe.features.join(", "),
+        universe.entry_points.join(", ")
+    );
+    println!(
+        "  include tests: {}; include generated: {}; proc-macro expansion: {}; build scripts: {}",
+        universe.include_tests,
+        universe.include_generated,
+        fidelity(universe.proc_macro_expansion),
+        fidelity(universe.build_scripts)
+    );
+}
+
 /// `unused-pub-workspace` via the Deep Tier (see todo.md §3.A, §14.2 P1).
 /// Only available in a build compiled with `--features deep` — a Fast Tier
 /// build prints a clear error instead of silently doing nothing.
@@ -1742,12 +1781,16 @@ fn run_dead_code(
             return;
         }
 
+        // §0 demands the Deep Tier fully describes what its claims are
+        // about — JSON carries the structured universe, TTY a compact echo.
+        let universe = judge::finding::AnalysisUniverse::deep(&workspace, include_tests);
         match format {
             OutputFormat::Json => {
-                let report = Report::with_errors(findings, analysis_errors);
+                let report = Report::with_errors(findings, analysis_errors).with_universe(universe);
                 println!("{}", serde_json::to_string_pretty(&report).unwrap());
             }
             OutputFormat::Tty => {
+                print_universe_tty(&universe);
                 println!("pub items checked: {}", dead_code_report.checked);
                 println!(
                     "functions checked (connectivity-drop): {}",
@@ -1824,6 +1867,10 @@ fn run_explain(item_path: String, why_live: bool, include_tests: bool, format: O
 
         match format {
             OutputFormat::Json => {
+                // Not a `Report` (no findings), but the same §0 obligation
+                // applies: a Deep Tier answer states what it is a claim
+                // about (see `judge::finding::AnalysisUniverse`).
+                let universe = judge::finding::AnalysisUniverse::deep(&workspace, include_tests);
                 let json = match &result {
                     judge::reachability::WhyLive::Path(path) => serde_json::json!({
                         "item_path": item_path,
@@ -1834,11 +1881,13 @@ fn run_explain(item_path: String, why_live: bool, include_tests: bool, format: O
                             "line": step.line,
                             "call_kind": step.kind.map(|kind| kind.as_str()),
                         })).collect::<Vec<_>>(),
+                        "analysis_universe": universe,
                     }),
                     judge::reachability::WhyLive::NotReachable => serde_json::json!({
                         "item_path": item_path,
                         "reachable": false,
                         "path": [],
+                        "analysis_universe": universe,
                     }),
                 };
                 println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -2105,7 +2154,9 @@ fn run_health(
                     &config.crate_profiles,
                 ))
             });
-            let report = Report::with_errors(findings, analysis_errors);
+            let report = Report::with_errors(findings, analysis_errors).with_universe(
+                judge::finding::AnalysisUniverse::fast(&workspace, include_generated),
+            );
             let mut value = serde_json::to_value(&report).unwrap();
             if let Some(score) = score {
                 value["score"] = serde_json::to_value(&score).unwrap();
@@ -2693,21 +2744,19 @@ fn dup_two(x: i32) -> i32 {
         assert!(!touched.contains(&PathBuf::from("src/lib.rs")));
         assert!(judge::git::is_ancestor(&dir, &base_commit, &head_commit).unwrap());
 
-        let pre_existing = judge::finding::Finding {
-            id: "duplicate-code:src/lib.rs:hello:0-20".to_string(),
-            rule: judge::duplication::DUPLICATE_RULE.to_string(),
-            severity: judge::finding::Severity::Warn,
-            location: judge::finding::Location {
+        let pre_existing = judge::finding::Finding::new(
+            "duplicate-code:src/lib.rs:hello:0-20".to_string(),
+            judge::duplication::DUPLICATE_RULE.to_string(),
+            judge::finding::Severity::Warn,
+            judge::finding::Location {
                 file: PathBuf::from("src/lib.rs"),
                 line: 1,
                 item_path: "hello".to_string(),
             },
-            evidence_class: judge::finding::EvidenceClass::DerivedFact,
-            origin: judge::finding::Origin::Code,
-            evidence: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        };
+            judge::finding::EvidenceClass::DerivedFact,
+            judge::finding::Origin::Code,
+            None,
+        );
         let baseline = judge::baseline::Baseline::new(
             std::slice::from_ref(&pre_existing),
             base_commit,
