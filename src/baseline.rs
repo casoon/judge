@@ -105,6 +105,13 @@ pub enum BaselineError {
     Io(PathBuf, std::io::Error),
     Serialize(serde_json::Error),
     Deserialize(PathBuf, serde_json::Error),
+    /// The baseline declares a `schema_version` this judge has no migration
+    /// for — typically one written by a newer judge. `found` is `None` when
+    /// the field is missing entirely.
+    UnsupportedSchemaVersion {
+        path: PathBuf,
+        found: Option<u64>,
+    },
 }
 
 impl std::fmt::Display for BaselineError {
@@ -114,6 +121,24 @@ impl std::fmt::Display for BaselineError {
             Self::Serialize(err) => write!(f, "failed to serialize baseline: {err}"),
             Self::Deserialize(path, err) => {
                 write!(f, "{}: failed to parse baseline: {err}", path.display())
+            }
+            Self::UnsupportedSchemaVersion { path, found } => {
+                match found {
+                    Some(found) => write!(
+                        f,
+                        "{}: unsupported baseline schema_version {found} (this judge supports version {SCHEMA_VERSION})",
+                        path.display()
+                    )?,
+                    None => write!(
+                        f,
+                        "{}: baseline has no schema_version (this judge supports version {SCHEMA_VERSION})",
+                        path.display()
+                    )?,
+                }
+                write!(
+                    f,
+                    " — re-save it with a matching judge via `cargo judge --save-baseline`"
+                )
             }
         }
     }
@@ -135,8 +160,29 @@ pub fn save(path: &Path, baseline: &Baseline) -> Result<(), BaselineError> {
 pub fn load(path: &Path) -> Result<Baseline, BaselineError> {
     let content =
         std::fs::read_to_string(path).map_err(|err| BaselineError::Io(path.to_path_buf(), err))?;
-    serde_json::from_str(&content)
-        .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))?;
+    migrate(path, value)
+}
+
+/// Deserializes a parsed baseline, migrating explicitly per `schema_version`.
+/// Every supported version gets its own arm; anything else — in particular a
+/// version written by a newer judge — is rejected instead of being silently
+/// processed under wrong assumptions. A future schema bump adds its migration
+/// step here (e.g. `Some(1)` rewriting the value before falling through to
+/// the current deserialization).
+fn migrate(path: &Path, value: serde_json::Value) -> Result<Baseline, BaselineError> {
+    let found = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64);
+    match found {
+        Some(version) if version == u64::from(SCHEMA_VERSION) => serde_json::from_value(value)
+            .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err)),
+        _ => Err(BaselineError::UnsupportedSchemaVersion {
+            path: path.to_path_buf(),
+            found,
+        }),
+    }
 }
 
 /// The result of comparing a fresh set of findings against a [`Baseline`].
@@ -305,22 +351,81 @@ mod tests {
         assert_eq!(loaded.score_context, baseline.score_context);
     }
 
+    fn write_baseline_json(name: &str, json: &str) -> (crate::test_util::TempDir, PathBuf) {
+        let dir = crate::test_util::TempDir::new(name);
+        let path = dir.join("baseline.json");
+        std::fs::write(&path, json).unwrap();
+        (dir, path)
+    }
+
     #[test]
     fn baseline_without_score_context_still_loads() {
         // A baseline saved before `score_context` existed (see todo.md
-        // §15.1) — must load as `None`, not fail.
-        let json = r#"{
-            "schema_version": 1,
-            "judge_version": "0.1.0",
-            "commit": "abc123",
-            "rule_revisions": {},
-            "total_loc": 1000,
-            "findings": []
-        }"#;
+        // §15.1) — same `schema_version`, so `load` must tolerate the
+        // missing field and yield `None`, not fail or migrate.
+        let (_dir, path) = write_baseline_json(
+            "baseline-no-score-context",
+            r#"{
+                "schema_version": 1,
+                "judge_version": "0.1.0",
+                "commit": "abc123",
+                "rule_revisions": {},
+                "total_loc": 1000,
+                "findings": []
+            }"#,
+        );
 
-        let baseline: Baseline = serde_json::from_str(json).unwrap();
+        let baseline = load(&path).unwrap();
 
         assert!(baseline.score_context.is_none());
+        assert_eq!(baseline.commit, "abc123");
+    }
+
+    #[test]
+    fn baseline_with_future_schema_version_is_rejected() {
+        let (_dir, path) = write_baseline_json(
+            "baseline-future-schema",
+            r#"{
+                "schema_version": 2,
+                "judge_version": "9.9.9",
+                "commit": "abc123",
+                "rule_revisions": {},
+                "total_loc": 1000,
+                "findings": []
+            }"#,
+        );
+
+        let err = load(&path).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BaselineError::UnsupportedSchemaVersion { found: Some(2), .. }
+        ));
+        let message = err.to_string();
+        assert!(message.contains("schema_version 2"), "{message}");
+        assert!(message.contains("supports version 1"), "{message}");
+    }
+
+    #[test]
+    fn baseline_without_schema_version_is_rejected() {
+        let (_dir, path) = write_baseline_json(
+            "baseline-missing-schema",
+            r#"{
+                "judge_version": "0.1.0",
+                "commit": "abc123",
+                "rule_revisions": {},
+                "total_loc": 1000,
+                "findings": []
+            }"#,
+        );
+
+        let err = load(&path).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BaselineError::UnsupportedSchemaVersion { found: None, .. }
+        ));
+        assert!(err.to_string().contains("no schema_version"), "{err}");
     }
 
     #[test]

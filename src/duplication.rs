@@ -23,20 +23,29 @@
 //!
 //! Each function body is flattened into a linear sequence of tokens (nested
 //! `{}`/`()`/`[]` groups are unwrapped into explicit open/close tokens so a
-//! window can cross brace boundaries). For every function, every window of
-//! exactly `min_tokens` tokens is hashed into a shared table keyed by its
-//! digest text; windows from *different* functions that land in the same
-//! bucket are seed matches. Each seed is then extended one token at a time,
-//! forward and backward, for as long as the two sides keep matching — which
-//! yields the maximal duplicated span for that particular alignment. This is
-//! the "hash all `min_tokens`-windows, then extend/merge per function pair"
-//! strategy: simpler than a cross-function suffix automaton, and sufficient
-//! at fast-tier scale.
+//! window can cross brace boundaries). Token texts are interned to integer
+//! ids per mode (`Strict` fingerprints raw source bytes instead, since its
+//! matches include inter-token whitespace/comments), and every window of
+//! exactly `min_tokens` tokens is fingerprinted with an O(1) polynomial
+//! rolling hash into a shared table — no per-window `String` is ever built
+//! (see [`build_fingerprints`]). Windows from *different* functions that
+//! land in the same bucket are seed matches; a hash bucket can contain
+//! collisions, so every seed pair is verified with an exact slice comparison
+//! before use. Seed pairs that can be extended one token backward are
+//! skipped: the pair one position to the left lands in the same bucket and
+//! extends to the identical maximal span, so only the leftmost seed of each
+//! alignment does the work. Each surviving seed is extended one token at a
+//! time, forward and backward, for as long as the two sides keep matching —
+//! which yields the maximal duplicated span for that particular alignment.
+//! This is the "fingerprint all `min_tokens`-windows, then extend/merge per
+//! function pair" strategy: simpler than a cross-function suffix automaton,
+//! and sufficient at fast-tier scale.
 //!
 //! Maximal spans that share identical content are grouped into one clone
-//! family (same idea as the old whole-body digest grouping, now applied to
-//! spans). Spans fully contained in a larger reported span for the same
-//! function are dropped — only the maximal match is worth reporting.
+//! family (bucketed by span fingerprint and length, then verified exactly —
+//! same idea as the old whole-body digest grouping, now applied to spans).
+//! Spans fully contained in a larger reported span for the same function are
+//! dropped — only the maximal match is worth reporting.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -629,30 +638,166 @@ fn suppressed_ranges(path: &Path, source: &str) -> Result<Vec<(usize, usize)>, D
     Ok(ranges)
 }
 
-/// Digest text for the token window `[start, end)` of `func`, in `mode`.
-/// [`DupeMode::Strict`] re-slices the raw source, so whitespace and comments
-/// between tokens make two otherwise-equal windows differ; [`DupeMode::Mild`]
-/// joins each token's normalized text instead, ignoring both.
-fn window_digest(func: &FuncTokens, mode: DupeMode, start: usize, end: usize) -> String {
-    match mode {
-        DupeMode::Strict => {
-            func.source[func.tokens[start].byte_start..func.tokens[end - 1].byte_end].to_string()
+/// Multiplier for the polynomial rolling hash (an odd 64-bit constant, the
+/// FNV-64 prime); arithmetic wraps mod 2^64. Hash equality is only a bucket
+/// key — exact equality is always re-verified via [`Fingerprints::spans_equal`],
+/// so collisions cost time, never correctness.
+const FINGERPRINT_BASE: u64 = 0x0000_0100_0000_01b3;
+
+/// Per-function fingerprint data: the replacement for the old per-window
+/// digest `String`s. Building it costs O(tokens) (or O(source bytes) for
+/// [`DupeMode::Strict`]) per function, after which any window's fingerprint
+/// is an O(1) prefix-hash difference.
+struct FuncFingerprint {
+    /// Interned id per token for the run's mode. Empty for
+    /// [`DupeMode::Strict`], which fingerprints the raw source bytes instead
+    /// (a strict match includes inter-token whitespace and comments, so
+    /// per-token ids can't represent it).
+    ids: Vec<u64>,
+    /// `prefix[i]` = polynomial hash of the first `i` units, where a unit is
+    /// a token id (`Mild`/`Weak`/`Semantic`) or a byte of the function's
+    /// source slice (`Strict`).
+    prefix: Vec<u64>,
+    /// [`DupeMode::Strict`] only: byte offset of the function's first token
+    /// in `source`, the origin of `prefix`'s byte indexing.
+    byte_base: usize,
+}
+
+struct Fingerprints {
+    per_func: Vec<FuncFingerprint>,
+    /// `pow[k]` = [`FINGERPRINT_BASE`]^k (wrapping), sized to the longest
+    /// unit sequence of any function.
+    pow: Vec<u64>,
+}
+
+/// Interns each token's mode-normalized text into an integer id (shared
+/// across all functions, so equal texts get equal ids workspace-wide) and
+/// precomputes per-function prefix hashes over the id sequence. `Strict`
+/// instead prefix-hashes the raw bytes of each function's source slice, so a
+/// window fingerprint covers inter-token whitespace/comments exactly like
+/// the old raw-source digest did.
+fn build_fingerprints(functions: &[FuncTokens], mode: DupeMode) -> Fingerprints {
+    fn prefix_hashes(units: impl Iterator<Item = u64>, capacity: usize) -> Vec<u64> {
+        let mut prefix = Vec::with_capacity(capacity + 1);
+        let mut hash = 0u64;
+        prefix.push(hash);
+        for unit in units {
+            hash = hash.wrapping_mul(FINGERPRINT_BASE).wrapping_add(unit);
+            prefix.push(hash);
         }
-        DupeMode::Mild => func.tokens[start..end]
-            .iter()
-            .map(|token| token.mild_text.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{0}"),
-        DupeMode::Weak => func.tokens[start..end]
-            .iter()
-            .map(|token| token.weak_text.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{0}"),
-        DupeMode::Semantic => func.tokens[start..end]
-            .iter()
-            .map(|token| token.semantic_text.as_str())
-            .collect::<Vec<_>>()
-            .join("\u{0}"),
+        prefix
+    }
+
+    let mut interner: HashMap<String, u64> = HashMap::new();
+    let mut per_func = Vec::with_capacity(functions.len());
+    for func in functions {
+        let fingerprint = if mode == DupeMode::Strict {
+            let byte_base = func.tokens[0].byte_start;
+            let byte_end = func.tokens[func.tokens.len() - 1].byte_end;
+            let bytes = func.source[byte_base..byte_end].as_bytes();
+            FuncFingerprint {
+                ids: Vec::new(),
+                prefix: prefix_hashes(bytes.iter().map(|&b| u64::from(b) + 1), bytes.len()),
+                byte_base,
+            }
+        } else {
+            let mut ids = Vec::with_capacity(func.tokens.len());
+            for token in &func.tokens {
+                let text = match mode {
+                    DupeMode::Strict => unreachable!(),
+                    DupeMode::Mild => &token.mild_text,
+                    DupeMode::Weak => &token.weak_text,
+                    DupeMode::Semantic => &token.semantic_text,
+                };
+                let id = match interner.get(text.as_str()) {
+                    Some(&id) => id,
+                    None => {
+                        let id = interner.len() as u64 + 1;
+                        interner.insert(text.clone(), id);
+                        id
+                    }
+                };
+                ids.push(id);
+            }
+            let prefix = prefix_hashes(ids.iter().copied(), ids.len());
+            FuncFingerprint {
+                ids,
+                prefix,
+                byte_base: 0,
+            }
+        };
+        per_func.push(fingerprint);
+    }
+
+    let max_units = per_func
+        .iter()
+        .map(|fingerprint| fingerprint.prefix.len())
+        .max()
+        .unwrap_or(1);
+    let mut pow = Vec::with_capacity(max_units);
+    pow.push(1u64);
+    for k in 1..max_units {
+        pow.push(pow[k - 1].wrapping_mul(FINGERPRINT_BASE));
+    }
+    Fingerprints { per_func, pow }
+}
+
+impl Fingerprints {
+    /// O(1) rolling-hash fingerprint of the token window `[start, end)` of
+    /// function `func`. Equal window contents (per `mode`'s equality — raw
+    /// source bytes for `Strict`, normalized token texts otherwise) always
+    /// fingerprint equal; the converse is enforced by [`Self::spans_equal`].
+    fn window_hash(
+        &self,
+        functions: &[FuncTokens],
+        mode: DupeMode,
+        func: usize,
+        start: usize,
+        end: usize,
+    ) -> u64 {
+        let fingerprint = &self.per_func[func];
+        let (from, to) = match mode {
+            DupeMode::Strict => {
+                let tokens = &functions[func].tokens;
+                (
+                    tokens[start].byte_start - fingerprint.byte_base,
+                    tokens[end - 1].byte_end - fingerprint.byte_base,
+                )
+            }
+            DupeMode::Mild | DupeMode::Weak | DupeMode::Semantic => (start, end),
+        };
+        fingerprint.prefix[to]
+            .wrapping_sub(fingerprint.prefix[from].wrapping_mul(self.pow[to - from]))
+    }
+
+    /// Exact equality of two token spans under `mode` — the verification
+    /// step behind every fingerprint bucket hit, which is what keeps hash
+    /// collisions harmless. A raw slice comparison, no allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn spans_equal(
+        &self,
+        functions: &[FuncTokens],
+        mode: DupeMode,
+        func_a: usize,
+        start_a: usize,
+        end_a: usize,
+        func_b: usize,
+        start_b: usize,
+        end_b: usize,
+    ) -> bool {
+        match mode {
+            DupeMode::Strict => {
+                let a = &functions[func_a];
+                let b = &functions[func_b];
+                a.source[a.tokens[start_a].byte_start..a.tokens[end_a - 1].byte_end]
+                    == b.source[b.tokens[start_b].byte_start..b.tokens[end_b - 1].byte_end]
+            }
+            DupeMode::Mild | DupeMode::Weak | DupeMode::Semantic => {
+                end_a - start_a == end_b - start_b
+                    && self.per_func[func_a].ids[start_a..end_a]
+                        == self.per_func[func_b].ids[start_b..end_b]
+            }
+        }
     }
 }
 
@@ -663,15 +808,18 @@ fn find_clone_families(
     mode: DupeMode,
     min_tokens: usize,
 ) -> Vec<CloneFamily> {
-    let mut seeds: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let fingerprints = build_fingerprints(functions, mode);
+
+    let mut seeds: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
     for (func_index, func) in functions.iter().enumerate() {
         let n = func.tokens.len();
         if n < min_tokens {
             continue;
         }
         for start in 0..=(n - min_tokens) {
-            let digest = window_digest(func, mode, start, start + min_tokens);
-            seeds.entry(digest).or_default().push((func_index, start));
+            let hash =
+                fingerprints.window_hash(functions, mode, func_index, start, start + min_tokens);
+            seeds.entry(hash).or_default().push((func_index, start));
         }
     }
 
@@ -686,6 +834,42 @@ fn find_clone_families(
                 if func_a == func_b {
                     continue;
                 }
+                // Leftmost-seed filter: if this pair extends one token
+                // backward, then the windows one to the left are also equal
+                // (drop the last token from the equal windows, prepend the
+                // matching predecessor), land in the same bucket, and extend
+                // to the identical maximal span — so this pair is redundant.
+                // On a hash-collision pair the skip is also safe: it would
+                // have produced nothing anyway. This turns repetitive code
+                // from O(pairs × span) extension work into one extension per
+                // alignment.
+                if start_a > 0
+                    && start_b > 0
+                    && backward_step_matches(
+                        &functions[func_a],
+                        &functions[func_b],
+                        start_a,
+                        start_b,
+                        0,
+                        mode,
+                    )
+                {
+                    continue;
+                }
+                // Buckets are keyed by rolling hash, so verify the windows
+                // really match before extending.
+                if !fingerprints.spans_equal(
+                    functions,
+                    mode,
+                    func_a,
+                    start_a,
+                    start_a + min_tokens,
+                    func_b,
+                    start_b,
+                    start_b + min_tokens,
+                ) {
+                    continue;
+                }
                 let (sa, ea, sb, eb) = extend_match(
                     functions, func_a, start_a, func_b, start_b, min_tokens, mode,
                 );
@@ -694,21 +878,44 @@ fn find_clone_families(
         }
     }
 
-    let mut groups: HashMap<String, Vec<CloneMember>> = HashMap::new();
+    // Group maximal spans with identical content: bucket by (fingerprint,
+    // token length), then verify candidates exactly against each group's
+    // representative span — same content-equality grouping as the old
+    // digest-string keying, without materializing the span text.
+    let mut group_members: Vec<Vec<CloneMember>> = Vec::new();
+    let mut group_reps: Vec<(usize, usize, usize)> = Vec::new();
+    let mut group_index: HashMap<(u64, usize), Vec<usize>> = HashMap::new();
     for (func_a, sa, ea, func_b, sb, eb) in matches {
         let a = &functions[func_a];
         let b = &functions[func_b];
         if is_suppressed(a, sa, ea) || is_suppressed(b, sb, eb) {
             continue;
         }
-        let digest = window_digest(a, mode, sa, ea);
-        let members = groups.entry(digest).or_default();
+        let hash = fingerprints.window_hash(functions, mode, func_a, sa, ea);
+        let candidates = group_index.entry((hash, ea - sa)).or_default();
+        let group = candidates
+            .iter()
+            .copied()
+            .find(|&group| {
+                let (rep_func, rep_start, rep_end) = group_reps[group];
+                fingerprints.spans_equal(
+                    functions, mode, rep_func, rep_start, rep_end, func_a, sa, ea,
+                )
+            })
+            .unwrap_or_else(|| {
+                let group = group_members.len();
+                group_members.push(Vec::new());
+                group_reps.push((func_a, sa, ea));
+                candidates.push(group);
+                group
+            });
+        let members = &mut group_members[group];
         push_unique(members, member_from(a, sa, ea, mode));
         push_unique(members, member_from(b, sb, eb, mode));
     }
 
-    let mut families: Vec<CloneFamily> = groups
-        .into_values()
+    let mut families: Vec<CloneFamily> = group_members
+        .into_iter()
         .filter(|members| members.len() > 1)
         .map(|mut members| {
             members.sort_by(|x, y| x.file.cmp(&y.file).then(x.start_line.cmp(&y.start_line)));
@@ -1448,6 +1655,65 @@ fn calls_helper_two(x: i32) -> i32 {
             report.families.is_empty(),
             "calls to different helper functions must not collapse under Semantic mode, got: {:?}",
             report.families
+        );
+    }
+
+    /// Two functions whose bodies are `reps` repetitions of the same small
+    /// two-line block — the pathological input for duplication detection.
+    fn write_repetitive_fixture(dir: &TempDir, reps: usize) -> PathBuf {
+        let file = dir.join("repetitive.rs");
+        let mut source = String::new();
+        for name in ["rep_one", "rep_two"] {
+            source.push_str(&format!("fn {name}(x: i32) -> i32 {{\n"));
+            source.push_str("    let mut total = 0;\n");
+            for _ in 0..reps {
+                source.push_str("    total += x * 3 + 1;\n");
+                source.push_str("    total -= x / 2;\n");
+            }
+            source.push_str("    total\n}\n");
+        }
+        std::fs::write(&file, source).unwrap();
+        file
+    }
+
+    /// Perf guard for the fingerprint pipeline (todo.md §15.3): a strongly
+    /// repetitive file — two functions, each 1000× the same small block —
+    /// must terminate in reasonable time.
+    ///
+    /// Measured on this fixture (release build, single run, Apple Silicon):
+    /// - Old per-window-`String` + extend-every-seed-pair detector:
+    ///   50 reps 78 ms, 100 reps 519 ms, 200 reps 4.26 s (≈×8 per doubling,
+    ///   i.e. ~cubic in repetitions); 1000 reps aborted after 150 s.
+    /// - Fingerprint pipeline (interning → rolling hash → exact-slice
+    ///   verification, leftmost-seed extension): 50 reps 2.6 ms, 100 reps
+    ///   6.3 ms, 200 reps 17.8 ms; 1000 reps 304 ms (1.7 s debug).
+    ///
+    /// Complexity of the new pipeline, with T total tokens, W windows, P
+    /// bucket pairs, and A distinct match alignments of span length S:
+    /// O(T) interning/prefix-hash memory and time, O(W) window fingerprints
+    /// (O(1) each, no per-window allocation), O(P) constant-time bucket-pair
+    /// checks, and O(A·S) extension — instead of O(W·min_tokens) digest
+    /// strings and O(P·S) extension before.
+    #[test]
+    fn strongly_repetitive_file_terminates_in_reasonable_time() {
+        let dir = TempDir::new("dup-repetitive");
+        let file = write_repetitive_fixture(&dir, 1000);
+
+        let files = authored([file]);
+        let started = std::time::Instant::now();
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+        let elapsed = started.elapsed();
+
+        // The two identical bodies collapse into one whole-body family; every
+        // shifted alignment is strictly contained in it and deduped away.
+        assert_eq!(report.families.len(), 1);
+        let members = &report.families[0].members;
+        let names: Vec<_> = members.iter().map(|m| m.qualified_name.as_str()).collect();
+        assert_eq!(names, ["rep_one", "rep_two"]);
+        assert!(members.iter().all(|m| m.token_count > 16_000));
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "repetitive file took {elapsed:?}"
         );
     }
 
