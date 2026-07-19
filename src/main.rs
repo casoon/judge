@@ -238,12 +238,13 @@ struct AuditOptions {
     /// writes).
     #[arg(long, value_name = "PATH")]
     baseline: Option<PathBuf>,
-    /// Minimum touched authored LOC before the duplication ratio gate is
-    /// evaluated. Must be given together with `--max-duplication-ratio`
-    /// — without both, the gate is skipped and reported as not
-    /// evaluated rather than assuming a threshold (see todo.md §6, §11
-    /// "nicht optimierbar": a fixed ratio is a policy decision judge
-    /// deliberately doesn't invent a default for).
+    /// Minimum touched authored LOC before a ratio gate is evaluated.
+    /// Shared by both ratio gates; a gate additionally needs its own
+    /// threshold flag (`--max-duplication-ratio` /
+    /// `--max-suppression-ratio`) — without both, that gate is skipped
+    /// and reported as not evaluated rather than assuming a threshold
+    /// (see todo.md §6, §11 "nicht optimierbar": a fixed ratio is a
+    /// policy decision judge deliberately doesn't invent a default for).
     #[arg(long, value_name = "N")]
     audit_min_sample: Option<u64>,
     /// Maximum allowed ratio of duplicated tokens (falling back to a
@@ -251,6 +252,12 @@ struct AuditOptions {
     /// authored LOC before the duplication gate fails.
     #[arg(long, value_name = "RATIO")]
     max_duplication_ratio: Option<f64>,
+    /// Maximum allowed ratio of code-introduced `suppression-debt`
+    /// findings (one per `#[allow]`/`#[expect]` occurrence, see
+    /// `judge::slop`) to touched authored LOC before the
+    /// suppression-debt gate fails.
+    #[arg(long, value_name = "RATIO")]
+    max_suppression_ratio: Option<f64>,
 }
 
 /// Output format shared by commands that emit findings (see todo.md §7).
@@ -997,6 +1004,7 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
         baseline: baseline_path,
         audit_min_sample,
         max_duplication_ratio,
+        max_suppression_ratio,
     } = options;
     let workspace = judge::ingest::load(None)?;
 
@@ -1043,7 +1051,7 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
     // (carried through `Finding.evidence` by `CloneMember::to_finding`) over
     // a raw finding count, since it's a more faithful density measure; falls
     // back to counting findings if a finding's evidence doesn't carry it.
-    let gate = match (audit_min_sample, max_duplication_ratio) {
+    let duplication_gate = match (audit_min_sample, max_duplication_ratio) {
         (Some(minimum_sample), Some(max_ratio)) => {
             let numerator: u64 = delta
                 .code_introduced
@@ -1070,7 +1078,40 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
         _ => None,
     };
 
-    let verdict = combine_verdict(delta.tri_verdict(), gate.as_ref().map(|gate| gate.verdict));
+    // Suppression-debt ratio gate (todo.md §0/§6): same opt-in shape as the
+    // duplication gate — no invented default threshold, shared
+    // `--audit-min-sample` minimum — and the same denominator, touched
+    // authored LOC (the size of the change under judgement), so both gate
+    // ratios are densities over one sample. Numerator: code-introduced
+    // `suppression-debt` findings, one per `#[allow]`/`#[expect]` occurrence
+    // (see `judge::slop`) — unlike duplication there is no token-count
+    // evidence to prefer, the attribute itself is the unit of debt.
+    let suppression_gate = match (audit_min_sample, max_suppression_ratio) {
+        (Some(minimum_sample), Some(max_ratio)) => {
+            let numerator = delta
+                .code_introduced
+                .iter()
+                .filter(|finding| finding.rule == judge::slop::SUPPRESSION_DEBT_RULE)
+                .count() as u64;
+            let sample_size = judge::health_score::authored_loc_in(&workspace, &touched) as u64;
+            Some(judge::gate::ratio_gate(
+                "suppression-debt-ratio",
+                numerator,
+                sample_size,
+                minimum_sample,
+                max_ratio,
+            ))
+        }
+        _ => None,
+    };
+
+    let verdict = combine_verdict(
+        combine_verdict(
+            delta.tri_verdict(),
+            duplication_gate.as_ref().map(|gate| gate.verdict),
+        ),
+        suppression_gate.as_ref().map(|gate| gate.verdict),
+    );
 
     match format {
         OutputFormat::Json => {
@@ -1078,11 +1119,20 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
                 "schema_version": judge::finding::SCHEMA_VERSION,
                 "verdict": verdict,
                 "delta": delta,
-                "gates": gate.iter().collect::<Vec<_>>(),
+                "gates": duplication_gate
+                    .iter()
+                    .chain(suppression_gate.iter())
+                    .collect::<Vec<_>>(),
             });
             writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
         }
-        OutputFormat::Tty => print_audit(out, &delta, verdict, gate.as_ref())?,
+        OutputFormat::Tty => print_audit(
+            out,
+            &delta,
+            verdict,
+            duplication_gate.as_ref(),
+            suppression_gate.as_ref(),
+        )?,
     }
 
     if verdict == TriVerdict::Fail {
@@ -1091,11 +1141,11 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
     Ok(CommandOutcome::Clean)
 }
 
-/// Combines the delta's tri-state verdict with the duplication ratio gate's
-/// verdict (if evaluated) into one final verdict: `Fail` wins over
-/// everything, `Warn` wins over `Pass`. A gate result of
-/// `NotEvaluatedSmallSample` is purely informational and never forces
-/// `Warn`/`Fail` on its own (see todo.md §6).
+/// Combines the delta's tri-state verdict with a ratio gate's verdict (if
+/// evaluated) into one final verdict: `Fail` wins over everything, `Warn`
+/// wins over `Pass`. With several gates, [`run_audit`] folds this over each
+/// in turn. A gate result of `NotEvaluatedSmallSample` is purely
+/// informational and never forces `Warn`/`Fail` on its own (see todo.md §6).
 fn combine_verdict(tri: TriVerdict, gate: Option<judge::gate::GateVerdict>) -> TriVerdict {
     let gate_failed = matches!(gate, Some(judge::gate::GateVerdict::Fail));
     if tri == TriVerdict::Fail || gate_failed {
@@ -1111,7 +1161,8 @@ fn print_audit(
     out: &mut dyn Write,
     delta: &judge::baseline::Delta,
     verdict: TriVerdict,
-    gate: Option<&judge::gate::RatioGate>,
+    duplication_gate: Option<&judge::gate::RatioGate>,
+    suppression_gate: Option<&judge::gate::RatioGate>,
 ) -> std::io::Result<()> {
     writeln!(
         out,
@@ -1162,6 +1213,31 @@ fn print_audit(
     }
 
     writeln!(out)?;
+    print_gate(
+        out,
+        duplication_gate,
+        "duplication-ratio",
+        "--max-duplication-ratio",
+    )?;
+    print_gate(
+        out,
+        suppression_gate,
+        "suppression-debt-ratio",
+        "--max-suppression-ratio",
+    )?;
+    Ok(())
+}
+
+/// One gate line of the audit TTY report: either the evaluated gate
+/// (including an explicit `not_evaluated_small_sample`, see todo.md §6) or
+/// the hint naming the flags that would enable it — a skipped gate stays
+/// visible either way, never a silent pass.
+fn print_gate(
+    out: &mut dyn Write,
+    gate: Option<&judge::gate::RatioGate>,
+    name: &str,
+    threshold_flag: &str,
+) -> std::io::Result<()> {
     match gate {
         Some(gate) => {
             let gate_verdict = match gate.verdict {
@@ -1173,14 +1249,13 @@ fn print_audit(
                 out,
                 "gate: {} — {}/{} ({gate_verdict}, min sample {}, max ratio {})",
                 gate.name, gate.numerator, gate.sample_size, gate.minimum_sample, gate.max_ratio
-            )?;
+            )
         }
         None => writeln!(
             out,
-            "gate: duplication-ratio not evaluated (pass --audit-min-sample and --max-duplication-ratio to enable)"
-        )?,
+            "gate: {name} not evaluated (pass --audit-min-sample and {threshold_flag} to enable)"
+        ),
     }
-    Ok(())
 }
 
 /// One `code-introduced` finding line of the audit TTY report.
@@ -2694,6 +2769,17 @@ fn dup_two(x: i32) -> i32 {
 
     fn run_in_dir(dir: &Path, cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         let _guard = lock_cwd();
+        run_in_dir_locked(dir, cli, out)
+    }
+
+    /// [`run_in_dir`] for tests that already hold the [`CWD_LOCK`] guard —
+    /// e.g. because their fixture setup itself spawns `cargo metadata` and
+    /// must not interleave with another test's cwd change.
+    fn run_in_dir_locked(
+        dir: &Path,
+        cli: Cli,
+        out: &mut dyn Write,
+    ) -> Result<CommandOutcome, CliError> {
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
         let result = run(cli, out);
@@ -3059,7 +3145,7 @@ fn dup_two(x: i32) -> i32 {
             judge::finding::Severity::Warn,
             judge::finding::Location {
                 file: PathBuf::from("src/lib.rs"),
-                line: 1,
+                line: judge::finding::OneBasedLine::FIRST,
                 item_path: "hello".to_string(),
             },
             judge::finding::EvidenceClass::DerivedFact,
@@ -3082,6 +3168,174 @@ fn dup_two(x: i32) -> i32 {
         assert_eq!(delta.rule_introduced.len(), 1);
         assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
         assert_eq!(combine_verdict(delta.tri_verdict(), None), TriVerdict::Pass);
+    }
+
+    /// A new file whose only findings are `suppression-debt` (Info severity,
+    /// derived fact): visible as gating code-introduced findings, but never
+    /// moving the tri-verdict past `pass` — so the suppression-debt ratio
+    /// gate alone decides whether the audit fails.
+    const SUPPRESSED_FILE_CONTENT: &str = r#"#[allow(dead_code)]
+pub fn quiet_one() -> u32 {
+    1
+}
+
+#[allow(unused_variables)]
+pub fn quiet_two() -> u32 {
+    2
+}
+
+#[allow(unreachable_code)]
+pub fn quiet_three() -> u32 {
+    3
+}
+"#;
+
+    /// Builds a git fixture whose saved `.judge/baseline.json` predates a
+    /// commit adding [`SUPPRESSED_FILE_CONTENT`], so `audit --since <base>`
+    /// classifies its three `suppression-debt` findings as code-introduced.
+    /// Returns the fixture dir and the baseline commit. The caller must hold
+    /// the [`CWD_LOCK`] guard — the baseline pass spawns `cargo metadata`.
+    fn suppression_audit_fixture(name: &str) -> (TempDir, String) {
+        let dir = TempDir::new(name);
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        let base_commit = commit_sha(&dir, "HEAD");
+
+        let manifest = dir.join("Cargo.toml");
+        let workspace = judge::ingest::load(Some(&manifest)).unwrap();
+        let collected = collect_findings(&workspace).unwrap();
+        assert!(collected.analysis_errors.is_empty());
+        let baseline = judge::baseline::Baseline::new(
+            &collected.findings,
+            base_commit.clone(),
+            collected.rule_revisions,
+            judge::health_score::total_authored_loc(&workspace),
+            judge::health_score::ScoreContext::from_profiles(&[]),
+        );
+        judge::baseline::save(&dir.join(DEFAULT_BASELINE_ALL), &baseline).unwrap();
+
+        std::fs::write(dir.join("src/suppressed.rs"), SUPPRESSED_FILE_CONTENT).unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add suppressions"]);
+        (dir, base_commit)
+    }
+
+    fn audit_cli(
+        since: &str,
+        audit_min_sample: Option<u64>,
+        max_suppression_ratio: Option<f64>,
+    ) -> Cli {
+        cli_with(Command::Audit(AuditOptions {
+            since: since.to_string(),
+            format: OutputFormat::Tty,
+            baseline: None,
+            audit_min_sample,
+            max_duplication_ratio: None,
+            max_suppression_ratio,
+        }))
+    }
+
+    /// Without gate flags both ratio gates are skipped but stay visible as
+    /// not evaluated, and the verdict is untouched — Info-severity
+    /// `suppression-debt` findings alone never fail an audit.
+    #[test]
+    fn audit_without_gate_flags_reports_the_suppression_gate_as_not_evaluated() {
+        let _guard = lock_cwd();
+        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-no-flags");
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir_locked(&dir, audit_cli(&base_commit, None, None), &mut out)
+            .expect("audit without gate flags must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("verdict: pass"), "unexpected output: {text}");
+        assert!(
+            text.contains("code-introduced: 3"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("gate: suppression-debt-ratio not evaluated"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("gate: duplication-ratio not evaluated"),
+            "unexpected output: {text}"
+        );
+    }
+
+    /// Over the threshold with a sufficient sample, the suppression gate
+    /// fails the audit (`CommandOutcome::FindingsFound`, exit 1), even
+    /// though the findings themselves are Info-severity.
+    #[test]
+    fn audit_fails_when_the_suppression_ratio_exceeds_the_threshold() {
+        let _guard = lock_cwd();
+        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-over-threshold");
+
+        let mut out = Vec::new();
+        let outcome =
+            run_in_dir_locked(&dir, audit_cli(&base_commit, Some(1), Some(0.0)), &mut out)
+                .expect("a failing gate is an outcome, not an error");
+        assert_eq!(outcome, CommandOutcome::FindingsFound);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("verdict: fail"), "unexpected output: {text}");
+        assert!(
+            text.contains("gate: suppression-debt-ratio — 3/"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("(fail, min sample 1, max ratio 0)"),
+            "unexpected output: {text}"
+        );
+    }
+
+    /// Below `--audit-min-sample` the gate withholds judgement — the report
+    /// must say `not_evaluated_small_sample` explicitly (todo.md §6), and
+    /// the verdict stays untouched instead of silently passing or failing.
+    #[test]
+    fn audit_reports_a_small_sample_suppression_gate_explicitly() {
+        let _guard = lock_cwd();
+        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-small-sample");
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir_locked(
+            &dir,
+            audit_cli(&base_commit, Some(1_000_000), Some(0.0)),
+            &mut out,
+        )
+        .expect("a small-sample gate must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("verdict: pass"), "unexpected output: {text}");
+        assert!(
+            text.contains("not_evaluated_small_sample"),
+            "unexpected output: {text}"
+        );
+    }
+
+    /// Below the threshold with a sufficient sample the gate passes — three
+    /// suppressions over the new file's LOC stay under a ratio of 1.
+    #[test]
+    fn audit_passes_when_the_suppression_ratio_is_within_the_threshold() {
+        let _guard = lock_cwd();
+        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-under-threshold");
+
+        let mut out = Vec::new();
+        let outcome =
+            run_in_dir_locked(&dir, audit_cli(&base_commit, Some(1), Some(1.0)), &mut out)
+                .expect("a passing gate must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("verdict: pass"), "unexpected output: {text}");
+        assert!(
+            text.contains("gate: suppression-debt-ratio — 3/"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("(pass, min sample 1, max ratio 1)"),
+            "unexpected output: {text}"
+        );
     }
 
     /// Tests todo.md §17.2/§17.5's advisory default at the wiring level: a
@@ -3136,7 +3390,7 @@ fn dup_two(x: i32) -> i32 {
                 .any(|finding| finding.rule == judge::slop_structural::CHURN_HOTSPOT_RULE),
             "fixture should provoke a churn-hotspot finding"
         );
-        let gating_rules: Vec<&String> = collected
+        let gating_rules: Vec<&judge::finding::RuleId> = collected
             .findings
             .iter()
             .filter(|finding| finding.is_gating())

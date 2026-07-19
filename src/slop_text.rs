@@ -168,16 +168,19 @@ fn build_finding(
     severity: Severity,
     evidence: Option<serde_json::Value>,
 ) -> Finding {
+    let rule = crate::finding::RuleId::from(rule);
+    let evidence_class = crate::finding::evidence_class_for_rule(&rule);
     Finding {
-        id: format!("{rule}:{}:{line}:1", file.display()),
-        rule: rule.to_string(),
+        id: format!("{rule}:{}:{line}:1", file.display()).into(),
+        rule,
         severity,
         location: Location {
             file: file.to_path_buf(),
-            line,
+            line: crate::finding::OneBasedLine::new(line)
+                .expect("text-scan line numbers are 1-based"),
             item_path: nearest_item_path(item_spans, line, file),
         },
-        evidence_class: crate::finding::evidence_class_for_rule(rule),
+        evidence_class,
         origin: Origin::Code,
         evidence,
         caused_by: Vec::new(),

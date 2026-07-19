@@ -54,7 +54,7 @@ use serde_json::json;
 
 use crate::deep::{DeepContext, DeepError, FileId};
 use crate::duplication::WorkspaceDuplication;
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::walk_functions;
 use crate::ingest::Workspace;
 use crate::reachability::has_attr_ending_in;
@@ -235,12 +235,13 @@ fn connectivity_drop_findings(records: &[FunctionFanIn]) -> Vec<Finding> {
                 "{CONNECTIVITY_DROP_RULE}:{}:{}",
                 record.file.display(),
                 record.qualified_name
-            ),
-            rule: CONNECTIVITY_DROP_RULE.to_string(),
+            )
+            .into(),
+            rule: CONNECTIVITY_DROP_RULE.into(),
             severity: Severity::Info,
             location: Location {
                 file: record.file.clone(),
-                line: record.line,
+                line: OneBasedLine::new(record.line).expect("proc-macro2 span lines are 1-based"),
                 item_path: record.qualified_name.clone(),
             },
             evidence_class: EvidenceClass::Heuristic,
@@ -319,12 +320,14 @@ fn duplicative_reinvention_findings(
                 "{DUPLICATIVE_REINVENTION_RULE}:{}:{}",
                 anchor.file.display(),
                 anchor.qualified_name
-            ),
-            rule: DUPLICATIVE_REINVENTION_RULE.to_string(),
+            )
+            .into(),
+            rule: DUPLICATIVE_REINVENTION_RULE.into(),
             severity: Severity::Info,
             location: Location {
                 file: anchor.file.clone(),
-                line: anchor.start_line,
+                line: OneBasedLine::new(anchor.start_line)
+                    .expect("proc-macro2 span lines are 1-based"),
                 item_path: anchor.qualified_name.clone(),
             },
             evidence_class: EvidenceClass::Heuristic,

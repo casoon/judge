@@ -12,7 +12,7 @@ use std::path::Path;
 use cargo_metadata::MetadataCommand;
 use serde::Deserialize;
 
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::health_score::DeductionMultiplier;
 use crate::ingest::Workspace;
 use crate::slopsquat::SlopsquatConfig;
@@ -364,12 +364,12 @@ fn evaluate_rule(rule: &BoundaryRule, graph: &CrateGraph, cargo_toml: &Path) -> 
 fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) -> Finding {
     let path_str = path.join(" -> ");
     Finding {
-        id: format!("{BOUNDARY_VIOLATION_RULE}:{}:{path_str}", rule.name),
-        rule: BOUNDARY_VIOLATION_RULE.to_string(),
+        id: format!("{BOUNDARY_VIOLATION_RULE}:{}:{path_str}", rule.name).into(),
+        rule: BOUNDARY_VIOLATION_RULE.into(),
         severity: Severity::Fail,
         location: Location {
             file: cargo_toml.to_path_buf(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: format!("{} [{}]: {path_str}", rule.name, rule.reach.label()),
         },
         evidence_class: EvidenceClass::BoundedSemantic,
@@ -385,12 +385,13 @@ fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) 
         id: format!(
             "{BOUNDARY_VIOLATION_RULE}:{}:missing-required:{from}",
             rule.name
-        ),
-        rule: BOUNDARY_VIOLATION_RULE.to_string(),
+        )
+        .into(),
+        rule: BOUNDARY_VIOLATION_RULE.into(),
         severity: Severity::Fail,
         location: Location {
             file: cargo_toml.to_path_buf(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: format!(
                 "{} [{}]: {from} does not reach any of [{}]",
                 rule.name,
@@ -409,12 +410,12 @@ fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) 
 fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
     let path_str = cycle.join(" -> ");
     Finding {
-        id: format!("{DEPENDENCY_CYCLE_RULE}:{path_str}"),
-        rule: DEPENDENCY_CYCLE_RULE.to_string(),
+        id: format!("{DEPENDENCY_CYCLE_RULE}:{path_str}").into(),
+        rule: DEPENDENCY_CYCLE_RULE.into(),
         severity: Severity::Warn,
         location: Location {
             file: cargo_toml.to_path_buf(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: path_str,
         },
         evidence_class: EvidenceClass::BoundedSemantic,

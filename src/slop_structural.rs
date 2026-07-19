@@ -27,7 +27,7 @@ use syn::{
 };
 
 use crate::complexity::FunctionInfo;
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::ingest::{SourceFile, SourceKind};
 
 /// Rule id for a file reworked often within a short window (see todo.md
@@ -78,12 +78,12 @@ pub fn churn_hotspots(churn: &HashMap<PathBuf, u32>) -> Vec<Finding> {
         .iter()
         .filter(|&(_, &count)| count >= CHURN_HOTSPOT_THRESHOLD)
         .map(|(file, &count)| Finding {
-            id: format!("{CHURN_HOTSPOT_RULE}:{}", file.display()),
-            rule: CHURN_HOTSPOT_RULE.to_string(),
+            id: format!("{CHURN_HOTSPOT_RULE}:{}", file.display()).into(),
+            rule: CHURN_HOTSPOT_RULE.into(),
             severity: Severity::Warn,
             location: Location {
                 file: file.clone(),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: file.display().to_string(),
             },
             evidence_class: EvidenceClass::Heuristic,
@@ -125,12 +125,13 @@ pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
                 "{COMPLEXITY_INFLATION_RULE}:{}:{}",
                 function.file.display(),
                 function.qualified_name
-            ),
-            rule: COMPLEXITY_INFLATION_RULE.to_string(),
+            )
+            .into(),
+            rule: COMPLEXITY_INFLATION_RULE.into(),
             severity: Severity::Warn,
             location: Location {
                 file: function.file.clone(),
-                line: function.line,
+                line: OneBasedLine::new(function.line).expect("proc-macro2 span lines are 1-based"),
                 item_path: function.qualified_name.clone(),
             },
             evidence_class: EvidenceClass::Heuristic,
@@ -180,12 +181,12 @@ pub fn legacy_freeze(churn_12mo: &HashMap<PathBuf, u32>, all_files: &[PathBuf]) 
             continue;
         }
         findings.push(Finding {
-            id: format!("{LEGACY_FREEZE_RULE}:{}", file.display()),
-            rule: LEGACY_FREEZE_RULE.to_string(),
+            id: format!("{LEGACY_FREEZE_RULE}:{}", file.display()).into(),
+            rule: LEGACY_FREEZE_RULE.into(),
             severity: Severity::Info,
             location: Location {
                 file: file.clone(),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: file.display().to_string(),
             },
             evidence_class: EvidenceClass::Heuristic,
@@ -392,12 +393,13 @@ fn abstraction_finding(
         id: format!(
             "{ABSTRACTION_INFLATION_RULE}:{}:{line}:{item_path}",
             file.display()
-        ),
-        rule: ABSTRACTION_INFLATION_RULE.to_string(),
+        )
+        .into(),
+        rule: ABSTRACTION_INFLATION_RULE.into(),
         severity: Severity::Warn,
         location: Location {
             file: file.to_path_buf(),
-            line,
+            line: OneBasedLine::new(line).expect("proc-macro2 span lines are 1-based"),
             item_path,
         },
         evidence_class: EvidenceClass::Heuristic,

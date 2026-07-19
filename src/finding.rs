@@ -44,6 +44,62 @@ impl std::fmt::Display for FindingId {
     }
 }
 
+impl PartialEq<str> for FindingId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for FindingId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+/// Stable identifier of a rule (e.g. `duplicate-code`). A newtype around the
+/// rule-id string each detector exposes as a `&'static str` constant — the
+/// ids themselves are unchanged, and `#[serde(transparent)]` keeps the JSON
+/// schema (and every baseline) byte-identical to the former plain string.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuleId(String);
+
+impl RuleId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for RuleId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for RuleId {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl std::fmt::Display for RuleId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for RuleId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for RuleId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Ordered `Info < Warn < Fail` (derive order follows declaration order) so
 /// findings can be sorted worst-first across detectors — see
 /// [`sort_by_severity_desc`].
@@ -109,8 +165,10 @@ impl EvidenceClass {
 /// migrated v1 baseline entry can't recover the mode, and baseline entries
 /// only serve identity matching. Unknown rule ids (e.g. from a v1 baseline
 /// written by a different judge) conservatively map to `Heuristic`.
-pub fn evidence_class_for_rule(rule: &str) -> EvidenceClass {
-    match rule {
+/// `pub(crate)`: only detectors and the baseline migration consult the
+/// mapping — consumers read the materialized `Finding.evidence_class`.
+pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
+    match rule.as_str() {
         "swallowed-result"
         | "empty-error-arm"
         | "catch-all-error"
@@ -147,21 +205,69 @@ pub enum Origin {
     Analyzer,
 }
 
+/// A 1-based source line number. Line 0 is unrepresentable: every producer
+/// (syn/proc-macro2 spans, git blame, manual "whole file" anchors) counts
+/// from 1, and the fallible constructor makes that invariant a type instead
+/// of a convention. Serializes as the bare number — the JSON schema is
+/// unchanged — while deserialization validates via `TryFrom` and rejects 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(into = "usize", try_from = "usize")]
+pub struct OneBasedLine(usize);
+
+impl OneBasedLine {
+    /// The first line of a file — the anchor for findings about a file (or
+    /// manifest) as a whole rather than a specific line.
+    pub const FIRST: Self = Self(1);
+
+    pub fn new(line: usize) -> Option<Self> {
+        (line != 0).then_some(Self(line))
+    }
+
+    pub fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl From<OneBasedLine> for usize {
+    fn from(value: OneBasedLine) -> Self {
+        value.0
+    }
+}
+
+impl TryFrom<usize> for OneBasedLine {
+    type Error = &'static str;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        Self::new(value).ok_or("line numbers are 1-based; 0 is not a valid line")
+    }
+}
+
+impl PartialEq<usize> for OneBasedLine {
+    fn eq(&self, other: &usize) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::fmt::Display for OneBasedLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Location {
     pub file: PathBuf,
-    pub line: usize,
+    pub line: OneBasedLine,
     pub item_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
-    /// The raw id string (wrapped as [`FindingId`] wherever findings are
-    /// indexed, e.g. in [`FindingGraph`]). Kept a plain `String` because
-    /// every detector builds it inline and several rebase it via
-    /// [`relativize_paths`].
-    pub id: String,
-    pub rule: String,
+    /// Stable identifier (e.g. `hotspot:src/lib.rs`) — the same [`FindingId`]
+    /// the causal edges reference. Detectors build the underlying string
+    /// inline; [`relativize_paths`] rebases it together with `location`.
+    pub id: FindingId,
+    pub rule: RuleId,
     pub severity: Severity,
     pub location: Location,
     pub evidence_class: EvidenceClass,
@@ -186,8 +292,8 @@ impl Finding {
     /// edges is [`FindingGraph::add_edge`], which validates ids, duplicates,
     /// and cycles.
     pub fn new(
-        id: String,
-        rule: String,
+        id: impl Into<FindingId>,
+        rule: impl Into<RuleId>,
         severity: Severity,
         location: Location,
         evidence_class: EvidenceClass,
@@ -195,8 +301,8 @@ impl Finding {
         evidence: Option<serde_json::Value>,
     ) -> Self {
         Self {
-            id,
-            rule,
+            id: id.into(),
+            rule: rule.into(),
             severity,
             location,
             evidence_class,
@@ -474,20 +580,25 @@ pub fn relativize_paths(findings: &mut [Finding], workspace_root: &Path) {
             continue;
         };
         let relative = relative.to_path_buf();
-        let absolute_text = finding.location.file.to_string_lossy();
-        let relative_text = relative.to_string_lossy();
-        let rebased_id = finding
-            .id
-            .replace(absolute_text.as_ref(), relative_text.as_ref());
-        if rebased_id != finding.id {
-            renames.insert(
-                FindingId::from(finding.id.as_str()),
-                FindingId::from(rebased_id.as_str()),
-            );
-        }
-        finding.id = rebased_id;
-        if finding.location.item_path == absolute_text {
-            finding.location.item_path = relative_text.into_owned();
+        // The id and item_path are UTF-8 strings, so the embedded path text
+        // can only be rebased when both the absolute and the stripped path
+        // render as valid UTF-8. A non-UTF-8 path can never appear verbatim
+        // in an id; substituting its lossy rendering (as this function once
+        // did) could corrupt an id that merely resembles it, so such paths
+        // keep their id/item_path untouched and only the structured
+        // location is rebased.
+        if let (Some(absolute_text), Some(relative_text)) =
+            (finding.location.file.to_str(), relative.to_str())
+        {
+            let rebased_id = finding.id.as_str().replace(absolute_text, relative_text);
+            if rebased_id != finding.id.as_str() {
+                let rebased_id = FindingId::from(rebased_id);
+                renames.insert(finding.id.clone(), rebased_id.clone());
+                finding.id = rebased_id;
+            }
+            if finding.location.item_path == absolute_text {
+                finding.location.item_path = relative_text.to_string();
+            }
         }
         finding.location.file = relative;
     }
@@ -568,7 +679,7 @@ impl FindingGraph {
             finding.caused_by.is_empty() && finding.causes.is_empty(),
             "edges are owned by the graph; add them via add_edge"
         );
-        let id = FindingId::from(finding.id.as_str());
+        let id = finding.id.clone();
         if self.index_by_id.contains_key(&id) {
             return Err(GraphError::DuplicateFinding(id));
         }
@@ -703,7 +814,7 @@ mod tests {
             Severity::Warn,
             Location {
                 file: PathBuf::from("src/lib.rs"),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: "crate::lib".to_string(),
             },
             EvidenceClass::Heuristic,
@@ -925,6 +1036,19 @@ mod tests {
 
         let ids: Vec<_> = findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(ids, ["fail", "warn", "info"]);
+    }
+
+    #[test]
+    fn one_based_line_serializes_as_the_bare_number_and_rejects_zero() {
+        assert!(OneBasedLine::new(0).is_none());
+        let line = OneBasedLine::new(42).unwrap();
+        assert_eq!(line.get(), 42);
+        assert_eq!(serde_json::to_value(line).unwrap(), serde_json::json!(42));
+        assert_eq!(
+            serde_json::from_value::<OneBasedLine>(serde_json::json!(42)).unwrap(),
+            line
+        );
+        assert!(serde_json::from_value::<OneBasedLine>(serde_json::json!(0)).is_err());
     }
 
     #[test]

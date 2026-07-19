@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gix::bstr::ByteSlice;
 
 use crate::complexity::FunctionInfo;
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 
 /// Default lookback window for churn: 12 months.
 pub const DEFAULT_WINDOW_DAYS: i64 = 365;
@@ -261,12 +261,12 @@ impl Hotspot {
     /// is an interpretation (todo.md §17.3).
     pub fn to_finding(&self) -> Finding {
         Finding {
-            id: format!("{HOTSPOT_RULE}:{}", self.file.display()),
-            rule: HOTSPOT_RULE.to_string(),
+            id: format!("{HOTSPOT_RULE}:{}", self.file.display()).into(),
+            rule: HOTSPOT_RULE.into(),
             severity: Severity::Info,
             location: Location {
                 file: self.file.clone(),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: self.file.display().to_string(),
             },
             evidence_class: EvidenceClass::Heuristic,

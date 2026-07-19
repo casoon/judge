@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use gix::bstr::{BStr, ByteSlice};
 
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::git::GitError;
 use crate::ingest::Workspace;
 
@@ -71,12 +71,12 @@ impl FileOwnership {
             Severity::Fail
         };
         Some(Finding {
-            id: format!("{LOW_BUS_FACTOR_RULE}:{}", self.file.display()),
-            rule: LOW_BUS_FACTOR_RULE.to_string(),
+            id: format!("{LOW_BUS_FACTOR_RULE}:{}", self.file.display()).into(),
+            rule: LOW_BUS_FACTOR_RULE.into(),
             severity,
             location: Location {
                 file: self.file.clone(),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: primary.email.clone(),
             },
             evidence_class: EvidenceClass::Heuristic,

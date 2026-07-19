@@ -7,12 +7,13 @@
 //! is noise. [`evaluate_ratio_gate`] withholds judgement below a configured
 //! `minimum_sample` instead of forcing a pass or fail on too little data.
 //!
-//! No concrete ratio gate (duplication %, coverage %, suppression rate) is
-//! wired to a CLI threshold yet — todo.md deliberately avoids prescribing a
-//! default (§4 "nicht optimierbar", §11 "Score-Gaming"), so picking one here
-//! would be a policy decision, not infrastructure. This module provides the
-//! primitive so a future gate only needs to supply its own numerator, sample
-//! size, and threshold.
+//! Two concrete gates are wired to opt-in CLI thresholds on `cargo judge
+//! audit --since` (`--max-duplication-ratio` and `--max-suppression-ratio`,
+//! sharing `--audit-min-sample`) — todo.md deliberately avoids prescribing a
+//! default (§4 "nicht optimierbar", §11 "Score-Gaming"), so each gate stays
+//! off until its threshold is given explicitly. This module provides the
+//! primitive; a gate only supplies its own numerator, sample size, and
+//! threshold.
 
 use serde::Serialize;
 

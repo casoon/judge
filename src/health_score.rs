@@ -556,18 +556,18 @@ pub fn trend(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finding::{Location, Origin};
+    use crate::finding::{Location, OneBasedLine, Origin};
     use crate::ingest::{CrateInfo, SourceFile, SourceKind};
     use std::path::PathBuf;
 
     fn finding(severity: Severity, file: &str) -> Finding {
         Finding {
-            id: "id".to_string(),
-            rule: "rule".to_string(),
+            id: "id".into(),
+            rule: "rule".into(),
             severity,
             location: Location {
                 file: PathBuf::from(file),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: "item".to_string(),
             },
             evidence_class: crate::finding::EvidenceClass::DerivedFact,

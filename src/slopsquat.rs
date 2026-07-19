@@ -32,7 +32,7 @@ use semver::{Version, VersionReq};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::ingest::{CrateInfo, DeclaredDependency, Workspace};
 
 pub const NAME_COLLISION_RISK_RULE: &str = "name-collision-risk";
@@ -152,12 +152,12 @@ fn name_collision_finding(
     edit_distance: usize,
 ) -> Finding {
     Finding {
-        id: format!("{NAME_COLLISION_RISK_RULE}:{}:{}", krate.name, dep.name),
-        rule: NAME_COLLISION_RISK_RULE.to_string(),
+        id: format!("{NAME_COLLISION_RISK_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: NAME_COLLISION_RISK_RULE.into(),
         severity: Severity::Warn,
         location: Location {
             file: krate.manifest_path.clone(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
         evidence_class: EvidenceClass::Heuristic,
@@ -618,12 +618,12 @@ pub fn analyze_phantom_dependencies(
 
 fn phantom_crate_finding(krate: &CrateInfo, dep: &DeclaredDependency) -> Finding {
     Finding {
-        id: format!("{PHANTOM_CRATE_RULE}:{}:{}", krate.name, dep.name),
-        rule: PHANTOM_CRATE_RULE.to_string(),
+        id: format!("{PHANTOM_CRATE_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: PHANTOM_CRATE_RULE.into(),
         severity: Severity::Fail,
         location: Location {
             file: krate.manifest_path.clone(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
         evidence_class: EvidenceClass::ExternalMeasurement,
@@ -658,12 +658,12 @@ fn phantom_version_finding(
     }
 
     Some(Finding {
-        id: format!("{PHANTOM_VERSION_RULE}:{}:{}", krate.name, dep.name),
-        rule: PHANTOM_VERSION_RULE.to_string(),
+        id: format!("{PHANTOM_VERSION_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: PHANTOM_VERSION_RULE.into(),
         severity: Severity::Fail,
         location: Location {
             file: krate.manifest_path.clone(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
         evidence_class: EvidenceClass::ExternalMeasurement,
@@ -801,12 +801,13 @@ fn fresh_low_reputation_finding(
         id: format!(
             "{FRESH_LOW_REPUTATION_DEP_RULE}:{}:{}",
             krate.name, dep.name
-        ),
-        rule: FRESH_LOW_REPUTATION_DEP_RULE.to_string(),
+        )
+        .into(),
+        rule: FRESH_LOW_REPUTATION_DEP_RULE.into(),
         severity: Severity::Warn,
         location: Location {
             file: krate.manifest_path.clone(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
         evidence_class: EvidenceClass::ExternalMeasurement,

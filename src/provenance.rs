@@ -20,7 +20,7 @@ use gix::bstr::BStr;
 
 use crate::boundaries::ProvenanceLabel;
 use crate::duplication::{CloneFamily, DupeMode, DuplicationError};
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::git::{self, CommitInfo, GitError};
 use crate::ingest::Workspace;
 use crate::slop::SlopError;
@@ -318,8 +318,8 @@ fn metric_finding(
     cargo_toml: &Path,
 ) -> Finding {
     Finding {
-        id: format!("{rule}:{class_key}"),
-        rule: rule.to_string(),
+        id: format!("{rule}:{class_key}").into(),
+        rule: rule.into(),
         // Always Info: this is a distribution trend, never a pass/fail
         // judgement (see `PROVENANCE_CAVEAT`, todo.md §3.G G6). Relies on
         // `health_score::compute`/`baseline::Delta::verdict`'s existing
@@ -327,7 +327,7 @@ fn metric_finding(
         severity: Severity::Info,
         location: Location {
             file: cargo_toml.to_path_buf(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: format!("{label} by class: {class_key}"),
         },
         // The count itself is exact, but the classification behind the
@@ -710,7 +710,7 @@ pub fn suppression_debt_by_class(
         let Ok(relative) = finding.location.file.strip_prefix(workspace_root) else {
             continue;
         };
-        let Some(commit_id) = blame.commit_for_line(relative, finding.location.line) else {
+        let Some(commit_id) = blame.commit_for_line(relative, finding.location.line.get()) else {
             continue;
         };
         let Some((class, _, _)) = classes.get(&commit_id) else {
@@ -969,7 +969,7 @@ mod tests {
         let claude_churn = breakdown
             .findings
             .iter()
-            .find(|f| f.rule == PROVENANCE_CHURN_RULE && f.id.ends_with("agent-claude"))
+            .find(|f| f.rule == PROVENANCE_CHURN_RULE && f.id.as_str().ends_with("agent-claude"))
             .expect("a Claude-trailer commit must produce a churn-by-class finding");
         assert_eq!(claude_churn.evidence_class, EvidenceClass::Heuristic);
         let evidence = claude_churn.evidence.as_ref().unwrap();
@@ -1078,12 +1078,12 @@ mod tests {
             ),
         )]);
         let finding = Finding {
-            id: "suppression-debt:dead_code".to_string(),
-            rule: crate::slop::SUPPRESSION_DEBT_RULE.to_string(),
+            id: "suppression-debt:dead_code".into(),
+            rule: crate::slop::SUPPRESSION_DEBT_RULE.into(),
             severity: Severity::Info,
             location: Location {
                 file: file.clone(),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: "dead_code".to_string(),
             },
             evidence_class: EvidenceClass::DerivedFact,

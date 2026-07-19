@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::finding::{EvidenceClass, Finding, Origin, Severity, evidence_class_for_rule};
+use crate::finding::{
+    EvidenceClass, Finding, FindingId, Origin, RuleId, Severity, evidence_class_for_rule,
+};
 use crate::health_score::ScoreContext;
 
 /// v2: findings carry `evidence_class` instead of the removed numeric
@@ -24,8 +26,8 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// deciding whether its file was touched since.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineFinding {
-    pub id: String,
-    pub rule: String,
+    pub id: FindingId,
+    pub rule: RuleId,
     pub severity: Severity,
     pub evidence_class: EvidenceClass,
     pub origin: Origin,
@@ -94,11 +96,16 @@ impl Baseline {
                 continue;
             };
             let relative = relative.to_path_buf();
-            let absolute_text = finding.file.to_string_lossy();
-            let relative_text = relative.to_string_lossy();
-            finding.id = finding
-                .id
-                .replace(absolute_text.as_ref(), relative_text.as_ref());
+            // Same UTF-8 caveat as [`crate::finding::relativize_paths`]: a
+            // non-UTF-8 path can never appear verbatim in the UTF-8 id, so
+            // instead of substituting a lossy rendering the id is left
+            // untouched and only the structured `file` is rebased.
+            if let (Some(absolute_text), Some(relative_text)) =
+                (finding.file.to_str(), relative.to_str())
+            {
+                finding.id =
+                    FindingId::from(finding.id.as_str().replace(absolute_text, relative_text));
+            }
             finding.file = relative;
         }
     }
@@ -198,7 +205,9 @@ fn migrate(path: &Path, mut value: serde_json::Value) -> Result<Baseline, Baseli
                     let class = finding
                         .get("rule")
                         .and_then(serde_json::Value::as_str)
-                        .map_or(EvidenceClass::Heuristic, evidence_class_for_rule);
+                        .map_or(EvidenceClass::Heuristic, |rule| {
+                            evidence_class_for_rule(&RuleId::from(rule))
+                        });
                     finding.insert(
                         "evidence_class".to_string(),
                         serde_json::to_value(class).map_err(BaselineError::Serialize)?,
@@ -251,8 +260,8 @@ pub fn diff(
     let mut unchanged_count = 0;
 
     for finding in current {
-        let rule_changed =
-            baseline.rule_revisions.get(&finding.rule) != current_rule_revisions.get(&finding.rule);
+        let rule_changed = baseline.rule_revisions.get(finding.rule.as_str())
+            != current_rule_revisions.get(finding.rule.as_str());
         if known_ids.contains(finding.id.as_str()) && !rule_changed {
             unchanged_count += 1;
         } else if rule_changed && !touched_files.contains(&finding.location.file) {
@@ -339,16 +348,16 @@ impl Delta {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finding::{Location, Severity};
+    use crate::finding::{Location, OneBasedLine, Severity};
 
     fn finding(id: &str, file: &str) -> Finding {
         Finding {
-            id: id.to_string(),
-            rule: "duplicate-code".to_string(),
+            id: id.into(),
+            rule: "duplicate-code".into(),
             severity: Severity::Warn,
             location: Location {
                 file: PathBuf::from(file),
-                line: 1,
+                line: OneBasedLine::FIRST,
                 item_path: "f".to_string(),
             },
             evidence_class: EvidenceClass::DerivedFact,
@@ -662,7 +671,7 @@ mod tests {
         // gate: heuristics are advisory by default (todo.md §17.2, §17.5).
         let baseline = baseline_with(&[]);
         let mut heuristic_fail = finding("hotspot:src/a.rs", "src/a.rs");
-        heuristic_fail.rule = "hotspot".to_string();
+        heuristic_fail.rule = "hotspot".into();
         heuristic_fail.severity = Severity::Fail;
         heuristic_fail.evidence_class = EvidenceClass::Heuristic;
         let touched = HashSet::from([PathBuf::from("src/a.rs")]);
@@ -680,7 +689,7 @@ mod tests {
         let mut derived_fail = finding("fail", "src/a.rs");
         derived_fail.severity = Severity::Fail;
         let mut heuristic = finding("hotspot:src/a.rs", "src/a.rs");
-        heuristic.rule = "hotspot".to_string();
+        heuristic.rule = "hotspot".into();
         heuristic.evidence_class = EvidenceClass::Heuristic;
         let touched = HashSet::from([PathBuf::from("src/a.rs")]);
 

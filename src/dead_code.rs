@@ -20,7 +20,7 @@ use proc_macro2::Span;
 use syn::visit::{self, Visit};
 
 use crate::deep::{DeepContext, DeepError, FileId};
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::{type_name, walk_functions};
 use crate::ingest::{SourceFile, Workspace};
 
@@ -228,12 +228,12 @@ fn check_item(
                 id: format!(
                     "{UNUSED_PUB_WORKSPACE_RULE}:{}:{qualified_name}",
                     file.path.display()
-                ),
-                rule: UNUSED_PUB_WORKSPACE_RULE.to_string(),
+                ).into(),
+                rule: UNUSED_PUB_WORKSPACE_RULE.into(),
                 severity: Severity::Warn,
                 location: Location {
                     file: file.path.clone(),
-                    line,
+                    line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
                     item_path: qualified_name.to_string(),
                 },
                 evidence_class: EvidenceClass::BoundedSemantic,

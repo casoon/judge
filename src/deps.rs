@@ -40,7 +40,7 @@ use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 use syn::{ItemUse, UseTree};
 
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::ingest::{CrateInfo, DependencyKind, Workspace};
 
 /// Rule id used for misplaced-dependency-kind findings (see todo.md §3.B).
@@ -187,12 +187,13 @@ fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency)
         id: format!(
             "{MISPLACED_DEPENDENCY_KIND_RULE}:{}:{}",
             krate.name, dep.name
-        ),
-        rule: MISPLACED_DEPENDENCY_KIND_RULE.to_string(),
+        )
+        .into(),
+        rule: MISPLACED_DEPENDENCY_KIND_RULE.into(),
         severity: Severity::Warn,
         location: Location {
             file: krate.manifest_path.clone(),
-            line: 1,
+            line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
         evidence_class: EvidenceClass::Heuristic,

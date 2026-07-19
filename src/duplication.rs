@@ -55,7 +55,7 @@ use quote::ToTokens;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
-use crate::finding::{EvidenceClass, Finding, Location, Origin, Severity};
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::walk_functions;
 use crate::ingest::SourceFile;
 
@@ -173,12 +173,14 @@ impl CloneMember {
                 self.qualified_name,
                 self.start_token,
                 self.end_token
-            ),
-            rule: DUPLICATE_RULE.to_string(),
+            )
+            .into(),
+            rule: DUPLICATE_RULE.into(),
             severity: Severity::Warn,
             location: Location {
                 file: self.file.clone(),
-                line: self.start_line,
+                line: OneBasedLine::new(self.start_line)
+                    .expect("proc-macro2 span lines are 1-based"),
                 item_path: self.qualified_name.clone(),
             },
             evidence_class,

@@ -256,21 +256,25 @@ impl SlopVisitor<'_> {
         evidence: Option<serde_json::Value>,
     ) {
         let start = span.start();
+        let rule = crate::finding::RuleId::from(rule);
+        let evidence_class = crate::finding::evidence_class_for_rule(&rule);
         self.findings.push(Finding {
             id: format!(
                 "{rule}:{}:{}:{}",
                 self.file.display(),
                 start.line,
                 start.column
-            ),
-            rule: rule.to_string(),
+            )
+            .into(),
+            rule,
             severity,
             location: Location {
                 file: self.file.to_path_buf(),
-                line: start.line,
+                line: crate::finding::OneBasedLine::new(start.line)
+                    .expect("proc-macro2 span lines are 1-based"),
                 item_path,
             },
-            evidence_class: crate::finding::evidence_class_for_rule(rule),
+            evidence_class,
             origin: Origin::Code,
             evidence,
             caused_by: Vec::new(),
