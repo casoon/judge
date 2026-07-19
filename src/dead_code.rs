@@ -13,9 +13,10 @@
 //! *published* crate (info-only, semver-sensitive) — this module doesn't yet
 //! check a crate's `publish` field to tell the two apart.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
+use cargo_metadata::MetadataCommand;
 use proc_macro2::Span;
 use syn::visit::{self, Visit};
 
@@ -34,6 +35,7 @@ pub enum DeadCodeError {
     Deep(DeepError),
     Io(PathBuf, std::io::Error),
     Parse(PathBuf, syn::Error),
+    Metadata(cargo_metadata::Error),
 }
 
 impl std::fmt::Display for DeadCodeError {
@@ -42,6 +44,7 @@ impl std::fmt::Display for DeadCodeError {
             Self::Deep(err) => write!(f, "{err}"),
             Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
             Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
+            Self::Metadata(err) => write!(f, "failed to read cargo metadata: {err}"),
         }
     }
 }
@@ -166,6 +169,85 @@ fn walk_type_items<'ast>(file: &'ast syn::File, on_item: impl FnMut(TypeItemSite
     walker.visit_file(file);
 }
 
+/// Workspace member crate names with at least one direct (`normal` or
+/// `build`, not `dev`) dependency whose own compiled target is a proc-macro
+/// (`cargo_metadata::Target::is_proc_macro`). Attached to
+/// `unused-pub-workspace` findings (see `check_item`) as a
+/// `proc_macro_expansion_disabled` limitation: [`crate::deep::DeepContext::load`]
+/// loads with `ProcMacroServerChoice::None`, so `find_all_refs` can never see
+/// a caller that only exists in a proc-macro's expanded output (see the
+/// `a_pub_fn_reachable_only_through_an_unexpanded_proc_macro_derive_is_falsely_flagged_dead`
+/// test below), and a crate that pulls in a proc-macro dependency is exactly
+/// where that blind spot can bite.
+///
+/// **Crate-wide, over-approximate signal — not item-level.** This answers
+/// "does this crate have a proc-macro dependency", not "is this specific
+/// item proc-macro-reachable" — the analysis has no way to narrow the signal
+/// down that far without actually expanding the macro (out of scope; see
+/// todo.md §2.1). Attaching the limitation to every `unused-pub-workspace`
+/// finding in an exposed crate, rather than trying to guess which findings
+/// are actually affected, is the same "im Zweifel nicht [fälschlich sicher]
+/// melden" stance the rest of this module takes: more disclosure than
+/// strictly necessary is safer than missing a real blind spot.
+///
+/// Needs a full (non-`--no-deps`) `cargo metadata` resolve: [`crate::ingest::load`]
+/// runs `cargo metadata --no-deps` (see its module doc), which never fetches
+/// a dependency's own package/target metadata — only the workspace members'
+/// declared dependencies are visible that way. [`crate::dep_graph`] needs the
+/// same full resolve for its own rules and documents why in its module doc;
+/// this runs its own `cargo_metadata::MetadataCommand`, once per
+/// [`analyze_workspace`] call, following that module's pattern rather than
+/// sharing its `Metadata` value — neither `dead_code` nor `ingest` currently
+/// holds one already loaded, and threading dep_graph's through would widen
+/// that module's API for a dependency this module doesn't otherwise need.
+fn proc_macro_exposed_crates(
+    workspace_root: &Path,
+) -> Result<HashSet<String>, cargo_metadata::Error> {
+    let manifest_path = workspace_root.join("Cargo.toml");
+    let metadata = MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .exec()?;
+
+    let proc_macro_packages: HashSet<&cargo_metadata::PackageId> = metadata
+        .packages
+        .iter()
+        .filter(|package| {
+            package
+                .targets
+                .iter()
+                .any(cargo_metadata::Target::is_proc_macro)
+        })
+        .map(|package| &package.id)
+        .collect();
+
+    let Some(resolve) = &metadata.resolve else {
+        return Ok(HashSet::new());
+    };
+
+    let mut exposed = HashSet::new();
+    for member_id in &metadata.workspace_members {
+        let Some(node) = resolve.nodes.iter().find(|node| &node.id == member_id) else {
+            continue;
+        };
+        let has_direct_proc_macro_dep = node.deps.iter().any(|dep| {
+            proc_macro_packages.contains(&dep.pkg)
+                && dep.dep_kinds.iter().any(|dep_kind| {
+                    matches!(
+                        dep_kind.kind,
+                        cargo_metadata::DependencyKind::Normal
+                            | cargo_metadata::DependencyKind::Build
+                    )
+                })
+        });
+        if has_direct_proc_macro_dep
+            && let Some(package) = metadata.packages.iter().find(|pkg| &pkg.id == member_id)
+        {
+            exposed.insert(package.name.clone());
+        }
+    }
+    Ok(exposed)
+}
+
 /// Checks one `pub` item for cross-crate usage and records a finding if
 /// neither that nor entry-point reachability found it live — the shared
 /// logic both [`walk_functions`]'s and [`walk_type_items`]'s callbacks
@@ -183,6 +265,7 @@ fn check_item(
     analysis: &ra_ap_ide::Analysis,
     crate_of_file: &HashMap<FileId, &str>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
+    proc_macro_exposed: &HashSet<String>,
     file: &SourceFile,
     file_id: FileId,
     krate_name: &str,
@@ -224,11 +307,23 @@ fn check_item(
         Ok(false) => {
             let searched_crates: std::collections::HashSet<&str> =
                 crate_of_file.values().copied().collect();
+            let mut evidence = serde_json::json!({
+                "tier": "deep",
+                "searched_crates": searched_crates.len(),
+                "references_found": referencing.len(),
+                "root_set_size": entry_keys.len(),
+                "reason": "no reference from another workspace crate and unreachable \
+                    from any recognized entry point (fn main in a [[bin]] or [[example]] target)",
+            });
+            if proc_macro_exposed.contains(krate_name) {
+                evidence["limitations"] = serde_json::json!(["proc_macro_expansion_disabled"]);
+            }
             report.findings.push(Finding {
                 id: format!(
                     "{UNUSED_PUB_WORKSPACE_RULE}:{}:{qualified_name}",
                     file.path.display()
-                ).into(),
+                )
+                .into(),
                 rule: UNUSED_PUB_WORKSPACE_RULE.into(),
                 severity: Severity::Warn,
                 location: Location {
@@ -238,14 +333,7 @@ fn check_item(
                 },
                 evidence_class: EvidenceClass::BoundedSemantic,
                 origin: Origin::Code,
-                evidence: Some(serde_json::json!({
-                    "tier": "deep",
-                    "searched_crates": searched_crates.len(),
-                    "references_found": referencing.len(),
-                    "root_set_size": entry_keys.len(),
-                    "reason": "no reference from another workspace crate and unreachable \
-                        from any recognized entry point (fn main in a [[bin]] or [[example]] target)",
-                })),
+                evidence: Some(evidence),
                 caused_by: Vec::new(),
                 causes: Vec::new(),
             });
@@ -308,6 +396,14 @@ pub fn analyze_workspace(
 
     let mut report = WorkspaceDeadCode::default();
 
+    let proc_macro_exposed = match proc_macro_exposed_crates(&workspace.root) {
+        Ok(exposed) => exposed,
+        Err(err) => {
+            report.errors.push(DeadCodeError::Metadata(err));
+            HashSet::new()
+        }
+    };
+
     for krate in &workspace.crates {
         for file in &krate.source_files {
             if !file.kind.is_locally_reportable() {
@@ -346,6 +442,7 @@ pub fn analyze_workspace(
                     &analysis,
                     &crate_of_file,
                     &entry_keys,
+                    &proc_macro_exposed,
                     file,
                     file_id,
                     &krate.name,
@@ -365,6 +462,7 @@ pub fn analyze_workspace(
                     &analysis,
                     &crate_of_file,
                     &entry_keys,
+                    &proc_macro_exposed,
                     file,
                     file_id,
                     &krate.name,
@@ -847,10 +945,12 @@ pub extern "C" fn exported_b() -> i32 {
         let offset = lib_source.find("    1").unwrap() as u32 + 1;
 
         let mut report = WorkspaceDeadCode::default();
+        let proc_macro_exposed = HashSet::new();
         check_item(
             &analysis,
             &crate_of_file,
             &entry_keys,
+            &proc_macro_exposed,
             file,
             file_id,
             &krate.name,
@@ -902,6 +1002,13 @@ pub extern "C" fn exported_b() -> i32 {
     /// proc-macro-usage detection across the workspace, a real feature, not
     /// a small fix — pinning down today's actual behavior here so the gap
     /// is tracked rather than silently assumed away.
+    ///
+    /// **Partial mitigation:** [`proc_macro_exposed_crates`] can't eliminate
+    /// this false positive (that needs real proc-macro expansion), but since
+    /// `core` here has a direct proc-macro dependency, the finding for
+    /// `helper` now carries `"limitations": ["proc_macro_expansion_disabled"]`
+    /// in its evidence — the uncertainty is surfaced instead of hidden behind
+    /// an unqualified `unused-pub-workspace` warning.
     #[test]
     fn a_pub_fn_reachable_only_through_an_unexpanded_proc_macro_derive_is_falsely_flagged_dead() {
         let dir = TempDir::new("dead-code-proc-macro-blind-spot");
@@ -972,6 +1079,117 @@ pub fn truly_dead() -> i32 {
         assert!(
             names.contains("truly_dead"),
             "genuinely dead regardless — control for the fixture"
+        );
+
+        let helper_finding = report
+            .findings
+            .iter()
+            .find(|f| f.location.item_path == "helper")
+            .expect("helper must be flagged, per the assertion above");
+        let evidence = helper_finding
+            .evidence
+            .as_ref()
+            .expect("evidence must be present");
+        assert_eq!(
+            evidence["limitations"],
+            serde_json::json!(["proc_macro_expansion_disabled"]),
+            "`core` has a direct proc-macro dependency (`macros`), so the finding must disclose \
+             that proc-macro expansion was disabled instead of presenting `helper` as an \
+             unqualified dead-code finding: {evidence:?}"
+        );
+    }
+
+    /// A crate whose `unused-pub-workspace` finding has nothing to do with a
+    /// proc-macro derive at all — the dead item and the proc-macro
+    /// dependency are unrelated — still gets the disclosure, because
+    /// [`proc_macro_exposed_crates`] is deliberately crate-wide, not
+    /// item-level (see that function's doc comment): the analysis can't tell
+    /// whether *this specific* finding is affected, only that the crate has
+    /// a proc-macro dependency somewhere, so it discloses on every finding in
+    /// that crate.
+    #[test]
+    fn a_pub_item_in_a_proc_macro_exposed_crate_discloses_the_limitation() {
+        let dir = TempDir::new("dead-code-proc-macro-exposed-limitation");
+        std::fs::create_dir_all(dir.join("macros/src")).unwrap();
+        std::fs::write(
+            dir.join("macros/Cargo.toml"),
+            r#"[package]
+name = "macros"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("macros/src/lib.rs"),
+            r#"use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn noop(_input: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
+"#,
+        )
+        .unwrap();
+        write_crate(
+            &dir,
+            "core",
+            &[("macros", "../macros")],
+            r#"pub fn never_called() -> i32 {
+    1
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["macros", "core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.location.item_path == "never_called")
+            .expect("never_called must be flagged dead");
+        let evidence = finding.evidence.as_ref().expect("evidence must be present");
+        assert_eq!(
+            evidence["limitations"],
+            serde_json::json!(["proc_macro_expansion_disabled"]),
+            "`core` directly depends on the proc-macro crate `macros`, so the finding must \
+             disclose that proc-macro expansion was disabled, even though this particular dead \
+             item is unrelated to the derive: {evidence:?}"
+        );
+    }
+
+    /// The negative control for the disclosure above: a workspace with no
+    /// proc-macro dependency anywhere must not carry the `limitations` field
+    /// at all — an always-present empty array would blur the signal between
+    /// "checked, no proc-macro exposure" and "checked, exposure found".
+    #[test]
+    fn a_pub_item_in_a_crate_without_any_proc_macro_dependency_has_no_limitations() {
+        let dir = TempDir::new("dead-code-no-proc-macro-dependency");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"pub fn never_called() -> i32 {
+    1
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.location.item_path == "never_called")
+            .expect("never_called must be flagged dead");
+        let evidence = finding.evidence.as_ref().expect("evidence must be present");
+        assert!(
+            evidence.get("limitations").is_none(),
+            "no proc-macro dependency anywhere in this workspace — the finding must not carry a \
+             `limitations` field: {evidence:?}"
         );
     }
 

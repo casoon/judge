@@ -2863,6 +2863,11 @@ fn run_dead_code_deep(
                         finding.location.line,
                         finding.location.item_path
                     )?;
+                    if let Some(limitations) =
+                        finding.evidence.as_ref().and_then(|e| e.get("limitations"))
+                    {
+                        writeln!(out, "    limitations: {limitations}")?;
+                    }
                 }
             }
         }

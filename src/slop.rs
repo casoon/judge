@@ -1093,6 +1093,29 @@ mod tests {
         assert!(rule_findings(&findings, SWALLOWED_RESULT_RULE).is_empty());
     }
 
+    /// `swallowed-result` — unentscheidbar (same mechanism as
+    /// `stringly-error-boundary`'s cfg-gated golden test in `pattern.rs`):
+    /// the `let _ = ...;` sits inside a `#[cfg(feature =
+    /// "not-enabled-by-default")]`-gated fn. `syn::parse_file` has no cfg
+    /// resolution and parses every `cfg` branch regardless of actual
+    /// feature activation, so a real build without that feature would never
+    /// contain this statement at all — yet it is still flagged.
+    /// `feature_gated_depth` exists in `SlopVisitor` but `visit_local`
+    /// never consults it (only `merged-stub`'s `visit_macro` does), so this
+    /// is consistent, documented Fast-Tier behavior, not a bug: making
+    /// `swallowed-result` respect cfg-gating while `catch-all-error` (see
+    /// below) doesn't would be the inconsistent choice, and todo.md's G1
+    /// entry promises nothing about cfg resolution ("rein syntaktisch").
+    #[test]
+    fn swallowed_result_inside_cfg_gated_fn_still_flagged() {
+        let findings = findings_for(
+            "#[cfg(feature = \"not-enabled-by-default\")]\nfn f() { let _ = some_call(); }\nfn some_call() -> i32 { 1 }\n",
+            "slop-swallowed-result-cfg-gated",
+        );
+        let hits = rule_findings(&findings, SWALLOWED_RESULT_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
     #[test]
     fn empty_err_arm_is_flagged() {
         let findings = findings_for(
@@ -1142,6 +1165,38 @@ fn f(r: Result<i32, ()>) {
         let findings = findings_for(
             "fn f() -> Result<(), ()> { Ok(()) }\nfn g() { if let Err(_) = f() { return; } }\n",
             "slop-if-let-non-empty",
+        );
+        assert!(rule_findings(&findings, EMPTY_ERROR_ARM_RULE).is_empty());
+    }
+
+    /// `empty-error-arm` — unentscheidbar, same class as `boolean-state-
+    /// cluster`'s `macro_rules!` golden test in `pattern.rs`: the actual
+    /// empty `Err(_) => {}` arm only exists inside a `macro_rules!` body,
+    /// never written out as source `syn` parses into an AST. `syn` treats a
+    /// macro definition's body as an opaque token stream, and the
+    /// invocation `handle_it!(r);` is an opaque `Stmt::Macro` too — neither
+    /// is expanded, so `visit_arm` never sees the `match` this rule would
+    /// otherwise flag. A real build would 100% contain the empty arm this
+    /// rule targets, but it is structurally invisible to a syntax-only
+    /// scanner: the rule stays silent rather than guessing at an
+    /// unexpanded macro body's contents.
+    #[test]
+    fn empty_error_arm_inside_macro_body_produces_no_finding() {
+        let findings = findings_for(
+            r#"
+macro_rules! handle_it {
+    ($r:expr) => {
+        match $r {
+            Err(_) => {}
+            Ok(_) => {}
+        }
+    };
+}
+fn f(r: Result<i32, ()>) {
+    handle_it!(r);
+}
+"#,
+            "slop-empty-error-arm-macro-body",
         );
         assert!(rule_findings(&findings, EMPTY_ERROR_ARM_RULE).is_empty());
     }
@@ -1206,6 +1261,25 @@ fn f(r: Result<i32, ()>) {
         assert_eq!(hits.len(), 1);
     }
 
+    /// `catch-all-error` — unentscheidbar, same mechanism as
+    /// `stringly-error-boundary`'s cfg-gated golden test in `pattern.rs`:
+    /// the `pub fn` itself sits behind `#[cfg(feature =
+    /// "not-enabled-by-default")]`, so a real build without that feature
+    /// would never expose this boundary at all. `check_catch_all_error` is
+    /// called unconditionally from `visit_item_fn` — `feature_gated_depth`
+    /// is tracked but only `merged-stub` consults it — so the finding still
+    /// fires. Documented, honest Fast-Tier limitation (`syn::parse_file`
+    /// has no cfg resolution), not a bug.
+    #[test]
+    fn catch_all_error_inside_cfg_gated_pub_fn_still_flagged() {
+        let findings = findings_for(
+            "#[cfg(feature = \"not-enabled-by-default\")]\npub fn f() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n",
+            "slop-catch-all-error-cfg-gated",
+        );
+        let hits = rule_findings(&findings, CATCH_ALL_ERROR_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
     #[test]
     fn allow_and_expect_each_produce_one_finding() {
         let findings = findings_for(
@@ -1226,6 +1300,28 @@ fn f(r: Result<i32, ()>) {
     #[test]
     fn no_suppressions_produces_zero_findings() {
         let findings = findings_for("fn f() {}\n", "slop-no-suppression-debt");
+        assert!(rule_findings(&findings, SUPPRESSION_DEBT_RULE).is_empty());
+    }
+
+    /// `suppression-debt` — unentscheidbar, but the inverse of the other
+    /// three rules' cfg/macro blind spots: here macro-blindness
+    /// *undercounts* rather than overcounts. The `#[allow(dead_code)]`
+    /// exists only inside a `macro_rules!` body, which `syn` treats as an
+    /// opaque token stream, never expanded into a real `Item::Fn` with a
+    /// visible `Attribute` — and the invocation `define_it!();` is itself
+    /// an opaque `Item::Macro`. A real build's expanded code would contain
+    /// this `#[allow(...)]` and count against the suppression-debt trend,
+    /// but `visit_attribute` never sees it, so it silently doesn't count.
+    /// Documented, honest Fast-Tier limitation (no macro expansion
+    /// available without a real compiler), not a bug: undercounting a
+    /// trend metric is a materially different (and here, unavoidable)
+    /// failure mode than misreporting a specific finding's location.
+    #[test]
+    fn suppression_debt_inside_macro_body_is_not_counted() {
+        let findings = findings_for(
+            "macro_rules! define_it {\n    () => {\n        #[allow(dead_code)]\n        fn generated() {}\n    };\n}\ndefine_it!();\n",
+            "slop-suppression-debt-macro-body",
+        );
         assert!(rule_findings(&findings, SUPPRESSION_DEBT_RULE).is_empty());
     }
 
