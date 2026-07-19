@@ -91,6 +91,16 @@ enum Command {
     /// mostly uncovered lines (see todo.md §J). judge never measures
     /// coverage itself — only an already-generated snapshot is read.
     Coverage(CoverageOptions),
+    /// Heuristic Rust design-pattern recommendations aggregated from
+    /// projectwide evidence (see todo.md §16). Advisory only — never
+    /// affects the verdict/exit code (todo.md §16.6).
+    Patterns(PatternsOptions),
+    /// Shows one pattern candidate's full evidence, preconditions,
+    /// contraindications, and migration plan (see todo.md §16.5).
+    ExplainPattern(ExplainPatternOptions),
+    /// Shows only a pattern candidate's migration plan and affected call
+    /// sites — deliberately no patch (see todo.md §16.5).
+    FixPreview(FixPreviewOptions),
 }
 
 #[derive(Debug, Args)]
@@ -290,6 +300,31 @@ struct AuditOptions {
     /// suppression-debt gate fails.
     #[arg(long, value_name = "RATIO")]
     max_suppression_ratio: Option<f64>,
+}
+
+#[derive(Debug, Args)]
+struct PatternsOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ExplainPatternOptions {
+    /// The pattern candidate id (see `cargo judge patterns`).
+    id: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct FixPreviewOptions {
+    /// The pattern candidate id (see `cargo judge patterns`).
+    id: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
 }
 
 /// Output format shared by commands that emit findings (see todo.md §7).
@@ -547,6 +582,9 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         }
         Some(Command::Inspect) => run_inspect(out),
         Some(Command::Coverage(options)) => run_coverage(options, out),
+        Some(Command::Patterns(options)) => run_patterns(options, out),
+        Some(Command::ExplainPattern(options)) => run_explain_pattern(options, out),
+        Some(Command::FixPreview(options)) => run_fix_preview(options, out),
     }
 }
 
@@ -2239,6 +2277,222 @@ fn run_provenance(
     Ok(CommandOutcome::Clean)
 }
 
+/// Loads the workspace's `catch-all-error` findings (same slop pass and
+/// `judge.toml` config `run_all`/`run_health` use) and runs the pattern
+/// aggregator (`judge::pattern`) over them. Shared by `patterns`,
+/// `explain-pattern`, and `fix-preview` — all three re-run the same
+/// analysis and then match by id, mirroring how `cargo judge explain`
+/// re-runs its own analysis rather than caching a prior run.
+fn collect_pattern_candidates(
+    workspace: &judge::ingest::Workspace,
+) -> Result<Vec<judge::pattern::PatternCandidate>, CliError> {
+    let slop_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let rules_config = load_judge_toml(&workspace.root)?.rules;
+    let slop = judge::slop::analyze_workspace(
+        slop_source_files,
+        false,
+        rules_config.catch_all_error.allow_anyhow_at_boundary,
+    );
+    Ok(judge::pattern::analyze_workspace(workspace, &slop.findings))
+}
+
+/// `cargo judge patterns` (todo.md §16.5, §16.6): heuristic Rust
+/// design-pattern recommendations aggregated from projectwide evidence.
+/// Always `CommandOutcome::Clean` — a pattern candidate never fails the
+/// verdict on its own; a real analyzer/config failure still surfaces as a
+/// `CliError` (exit 2), same as every other command.
+fn run_patterns(options: PatternsOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
+    let PatternsOptions { format } = options;
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format("`patterns`", format, "tty, json"));
+    }
+    let workspace = judge::ingest::load(None)?;
+    let candidates = collect_pattern_candidates(&workspace)?;
+
+    match format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({ "candidates": candidates });
+            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected above before loading the workspace")
+        }
+        OutputFormat::Tty => {
+            writeln!(
+                out,
+                "heuristic pattern suggestions — advisory, no verdict effect: {}",
+                candidates.len()
+            )?;
+            for candidate in &candidates {
+                writeln!(
+                    out,
+                    "  [{}] {}  crate: {}",
+                    candidate.id, candidate.pattern, candidate.scope.krate
+                )?;
+            }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// Finds the pattern candidate `id` refers to, re-running the same analysis
+/// [`collect_pattern_candidates`] does. Unknown id ⇒ [`CliError::Analyzer`]
+/// (exit 2) — a usage error, not a findings verdict (todo.md §16.6's
+/// `explain-pattern` acceptance criterion).
+fn find_pattern_candidate(
+    workspace: &judge::ingest::Workspace,
+    id: &str,
+) -> Result<judge::pattern::PatternCandidate, CliError> {
+    collect_pattern_candidates(workspace)?
+        .into_iter()
+        .find(|candidate| candidate.id.as_str() == id)
+        .ok_or_else(|| CliError::Analyzer(format!("unknown pattern candidate id: {id}")))
+}
+
+/// One [`judge::pattern::Evidence`] entry, TTY-rendered under `label`.
+fn print_evidence_tty(
+    out: &mut dyn Write,
+    label: &str,
+    evidence: &judge::pattern::Evidence,
+) -> std::io::Result<()> {
+    writeln!(out, "  evidence ({label}): {}", evidence.description)?;
+    for location in &evidence.locations {
+        match &location.item_path {
+            Some(item_path) => writeln!(out, "    - {}  {item_path}", location.file.display())?,
+            None => writeln!(out, "    - {}", location.file.display())?,
+        }
+    }
+    Ok(())
+}
+
+/// Full TTY rendering of one pattern candidate: scope, evidence,
+/// preconditions, contraindications, migration plan, and related findings
+/// (todo.md §16.6: `explain-pattern` always shows contraindications, and
+/// generic text without concrete fundstellen is unacceptable).
+fn print_pattern_candidate_tty(
+    out: &mut dyn Write,
+    candidate: &judge::pattern::PatternCandidate,
+) -> std::io::Result<()> {
+    writeln!(out, "pattern candidate: {}", candidate.id)?;
+    writeln!(out, "  pattern: {}", candidate.pattern)?;
+    writeln!(out, "  scope: crate `{}`", candidate.scope.krate)?;
+    if !candidate.scope.modules.is_empty() {
+        writeln!(out, "    modules:")?;
+        for module in &candidate.scope.modules {
+            writeln!(out, "      - {module}")?;
+        }
+    }
+    print_evidence_tty(out, "primary", &candidate.evidence.primary)?;
+    print_evidence_tty(out, "independent", &candidate.evidence.independent)?;
+    for extra in &candidate.evidence.additional {
+        print_evidence_tty(out, "additional", extra)?;
+    }
+    writeln!(out, "  preconditions:")?;
+    for precondition in &candidate.preconditions {
+        writeln!(out, "    - {}", precondition.description)?;
+    }
+    writeln!(out, "  contraindications:")?;
+    for contraindication in &candidate.contraindications {
+        writeln!(out, "    - {}", contraindication.description)?;
+    }
+    writeln!(out, "  migration plan (no patch — text only):")?;
+    for step in &candidate.migration {
+        writeln!(out, "    {}. {}", step.step, step.description)?;
+        for path in &step.affected_paths {
+            writeln!(out, "       - {}", path.display())?;
+        }
+    }
+    writeln!(out, "  related findings:")?;
+    for finding_id in &candidate.related_findings {
+        writeln!(out, "    - {finding_id}")?;
+    }
+    Ok(())
+}
+
+/// `cargo judge explain-pattern <id>` (todo.md §16.5, §16.6): the full
+/// evidence, preconditions, contraindications, and migration plan behind
+/// one pattern candidate.
+fn run_explain_pattern(
+    options: ExplainPatternOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let ExplainPatternOptions { id, format } = options;
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format("`explain-pattern`", format, "tty, json"));
+    }
+    let workspace = judge::ingest::load(None)?;
+    let candidate = find_pattern_candidate(&workspace, &id)?;
+
+    match format {
+        OutputFormat::Json => {
+            writeln!(out, "{}", serde_json::to_string_pretty(&candidate).unwrap())?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected above before loading the workspace")
+        }
+        OutputFormat::Tty => print_pattern_candidate_tty(out, &candidate)?,
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// `cargo judge fix-preview <id>` (todo.md §16.5): only the migration plan
+/// and the affected call sites (`related_findings`) — deliberately no
+/// patch is generated or applied.
+fn run_fix_preview(
+    options: FixPreviewOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let FixPreviewOptions { id, format } = options;
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format("`fix-preview`", format, "tty, json"));
+    }
+    let workspace = judge::ingest::load(None)?;
+    let candidate = find_pattern_candidate(&workspace, &id)?;
+
+    match format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "id": candidate.id,
+                "pattern": candidate.pattern,
+                "migration": candidate.migration,
+                "related_findings": candidate.related_findings,
+                "patch": serde_json::Value::Null,
+                "note": "migration plan only — no patch is generated (see todo.md §16.5)",
+            });
+            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected above before loading the workspace")
+        }
+        OutputFormat::Tty => {
+            writeln!(
+                out,
+                "fix preview for {} ({}) — no patch is generated, migration plan only:",
+                candidate.id, candidate.pattern
+            )?;
+            for step in &candidate.migration {
+                writeln!(out, "  {}. {}", step.step, step.description)?;
+                for path in &step.affected_paths {
+                    writeln!(out, "     - {}", path.display())?;
+                }
+            }
+            writeln!(out)?;
+            writeln!(
+                out,
+                "related findings (call sites): {}",
+                candidate.related_findings.len()
+            )?;
+            for finding_id in &candidate.related_findings {
+                writeln!(out, "  {finding_id}")?;
+            }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
 /// Compact TTY rendering of the analysis universe (see
 /// [`judge::finding::AnalysisUniverse`]) — the JSON report carries the same
 /// data structured; TTY gets the human-readable echo so the Deep Tier's
@@ -3296,6 +3550,25 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
     }
 
+    /// A fixture crate with two `catch-all-error` boundary functions and a
+    /// crate-local typed error — corroborated evidence for exactly one
+    /// `stringly-error-boundary` pattern candidate (see `judge::pattern`).
+    fn write_pattern_candidate_fixture_crate(dir: &Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn a() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
+             pub fn b() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
+             enum FixtureError { Bad }\n",
+        )
+        .unwrap();
+    }
+
     /// A pair of duplicated function bodies (well over
     /// `judge::duplication::DEFAULT_MIN_TOKENS`), both in one new file — a
     /// self-contained `code_introduced` duplication finding once that file
@@ -3686,6 +3959,112 @@ fn dup_two(x: i32) -> i32 {
             }
             other => panic!("expected CliError::Config, got {other:?}"),
         }
+    }
+
+    /// (d) `patterns` never fails the verdict, even with a real corroborated
+    /// candidate (todo.md §16.6: "Kein Pattern-Kandidat allein führt zu
+    /// Exitcode 1").
+    #[test]
+    fn patterns_command_is_clean_even_with_a_real_candidate() {
+        let dir = TempDir::new("patterns-clean");
+        write_pattern_candidate_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::Patterns(PatternsOptions {
+                format: OutputFormat::Json,
+            })),
+            &mut out,
+        )
+        .expect("`patterns` must not error on a valid fixture");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let candidates = json["candidates"].as_array().expect("candidates array");
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected one corroborated candidate: {json}"
+        );
+    }
+
+    /// (e) `explain-pattern` with an unknown id is a usage error (exit 2),
+    /// not a findings verdict.
+    #[test]
+    fn explain_pattern_unknown_id_is_an_analyzer_error() {
+        let dir = TempDir::new("explain-pattern-unknown");
+        write_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let err = run_in_dir(
+            &dir,
+            cli_with(Command::ExplainPattern(ExplainPatternOptions {
+                id: "pattern:domain-error:doesnotexist".to_string(),
+                format: OutputFormat::Tty,
+            })),
+            &mut out,
+        )
+        .expect_err("unknown pattern candidate id must be an error");
+        match err {
+            CliError::Analyzer(message) => {
+                assert!(
+                    message.contains("unknown pattern candidate id"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected CliError::Analyzer, got {other:?}"),
+        }
+    }
+
+    /// (f) `fix-preview` returns only the migration plan and related
+    /// findings — no patch.
+    #[test]
+    fn fix_preview_lists_migration_steps_without_a_patch() {
+        let dir = TempDir::new("fix-preview");
+        write_pattern_candidate_fixture_crate(&dir);
+
+        let mut json_out = Vec::new();
+        run_in_dir(
+            &dir,
+            cli_with(Command::Patterns(PatternsOptions {
+                format: OutputFormat::Json,
+            })),
+            &mut json_out,
+        )
+        .expect("`patterns` must not error");
+        let json: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+        let id = json["candidates"][0]["id"]
+            .as_str()
+            .expect("candidate id")
+            .to_string();
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::FixPreview(FixPreviewOptions {
+                id,
+                format: OutputFormat::Json,
+            })),
+            &mut out,
+        )
+        .expect("`fix-preview` must not error for a known id");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        let preview: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(preview["patch"].is_null(), "preview: {preview}");
+        assert!(
+            !preview["migration"]
+                .as_array()
+                .expect("migration array")
+                .is_empty()
+        );
+        assert!(
+            !preview["related_findings"]
+                .as_array()
+                .expect("related_findings array")
+                .is_empty()
+        );
     }
 
     /// `audit --format markdown` renders the PR-comment delta table,

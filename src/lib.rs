@@ -19,6 +19,7 @@ pub mod health_score;
 pub mod ingest;
 pub mod markdown;
 pub mod ownership;
+pub mod pattern;
 pub mod provenance;
 #[cfg(feature = "deep")]
 pub mod reachability;
