@@ -230,6 +230,22 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
+    RuleMetadata {
+        id: "public-invariant-bypass",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `cargo judge patterns` (or `explain-pattern`/`fix-preview`); not part of bare `cargo judge`, `audit`, or any Finding-producing report — never wired into `evidence_class_for_rule`, the health score, or a baseline verdict.",
+        exclusions: "Fast-Tier-reachable narrowing of the full todo.md §16.3 rule, deliberately without the full rule's consumer-side analysis: needs a `pub struct` with ≥2 `pub` fields and no `#[non_exhaustive]` attribute, plus at least one crate-local constructor-shaped `pub fn` (return type `Self`/the struct name, optionally `Result`-wrapped) that jointly validates ≥2 of those fields via matching parameter names. No cross-crate reasoning, no consumer call-site analysis.",
+        allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
+    RuleMetadata {
+        id: "manual-resource-lifecycle",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `cargo judge patterns` (or `explain-pattern`/`fix-preview`); not part of bare `cargo judge`, `audit`, or any Finding-producing report — never wired into `evidence_class_for_rule`, the health score, or a baseline verdict.",
+        exclusions: "Fast-Tier-reachable narrowing of the full todo.md §16.3 rule, with no ownership/lifetime analysis: needs one function calling both an acquire-shaped operation and a release-shaped counterpart by call name alone, plus a crate with no `impl Drop for ...` anywhere. Cannot show that ownership and lifetime of the resource are actually bound to a single guard — acquire/release name matches can be coincidental and couple unrelated calls.",
+        allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
     // -- provenance.rs ------------------------------------------------------
     RuleMetadata {
         id: "provenance-churn",
@@ -509,6 +525,8 @@ mod tests {
             crate::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
             crate::pattern::PRIMITIVE_DOMAIN_VALUE_RULE,
             crate::pattern::BOOLEAN_STATE_CLUSTER_RULE,
+            crate::pattern::PUBLIC_INVARIANT_BYPASS_RULE,
+            crate::pattern::MANUAL_RESOURCE_LIFECYCLE_RULE,
             crate::provenance::PROVENANCE_CHURN_RULE,
             crate::provenance::PROVENANCE_DUPLICATION_RATE_RULE,
             crate::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE,

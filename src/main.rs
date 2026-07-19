@@ -3637,11 +3637,18 @@ mod tests {
         .unwrap();
     }
 
-    /// A fixture crate combining a `stringly-error-boundary` fixture (two
-    /// `catch-all-error` boundary functions plus a crate-local typed error)
-    /// with a `boolean-state-cluster` fixture (a function with three bool
-    /// parameters, two of which are combined in one condition) — corroborated
-    /// evidence for two candidates of different patterns at once.
+    /// A fixture crate combining fixtures for all five §16.3 MVP pattern
+    /// rules at once: `stringly-error-boundary` (two `catch-all-error`
+    /// boundary functions plus a crate-local typed error),
+    /// `primitive-domain-value` (two `pub fn` signatures sharing a
+    /// `threshold: u32` parameter, one of them guarded),
+    /// `boolean-state-cluster` (a function with three bool parameters, two of
+    /// which are combined in one condition), `public-invariant-bypass` (a
+    /// `pub struct` with two `pub` fields and a constructor jointly
+    /// validating both), and `manual-resource-lifecycle` (a function calling
+    /// both an acquire- and a release-shaped operation, with no `impl Drop`
+    /// anywhere in the crate) — corroborated evidence for five candidates of
+    /// different patterns at once.
     fn write_multi_rule_pattern_candidate_fixture_crate(dir: &Path) {
         std::fs::write(
             dir.join("Cargo.toml"),
@@ -3654,13 +3661,39 @@ mod tests {
             "pub fn a() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
              pub fn b() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
              enum FixtureError { Bad }\n\
+             pub fn set_a(threshold: u32) {}\n\
+             pub fn set_b(threshold: u32) -> Result<(), String> {\n\
+             \x20   if threshold > 100 {\n\
+             \x20       return Err(\"too big\".to_string());\n\
+             \x20   }\n\
+             \x20   Ok(())\n\
+             }\n\
              pub fn configure(verbose: bool, strict: bool, dry_run: bool) {\n\
              \x20   if verbose && strict {\n\
              \x20       do_thing();\n\
              \x20   }\n\
              \x20   let _ = dry_run;\n\
              }\n\
-             fn do_thing() {}\n",
+             fn do_thing() {}\n\
+             pub struct Range {\n\
+             \x20   pub low: u32,\n\
+             \x20   pub high: u32,\n\
+             }\n\
+             impl Range {\n\
+             \x20   pub fn new(low: u32, high: u32) -> Result<Self, String> {\n\
+             \x20       if low >= high {\n\
+             \x20           return Err(\"low must be less than high\".to_string());\n\
+             \x20       }\n\
+             \x20       Ok(Self { low, high })\n\
+             \x20   }\n\
+             }\n\
+             pub fn manage(handle: u32) {\n\
+             \x20   connect();\n\
+             \x20   let _ = handle;\n\
+             \x20   disconnect();\n\
+             }\n\
+             fn connect() {}\n\
+             fn disconnect() {}\n",
         )
         .unwrap();
     }
@@ -4086,8 +4119,8 @@ fn dup_two(x: i32) -> i32 {
     }
 
     /// (d.2) Several pattern rules can produce candidates in the same run —
-    /// here `stringly-error-boundary` and `boolean-state-cluster` fire
-    /// together on one fixture — and `patterns` still stays clean (exit 0).
+    /// here all five §16.3 MVP rules fire together on one fixture — and
+    /// `patterns` still stays clean (exit 0).
     #[test]
     fn patterns_command_reports_candidates_from_multiple_rules_and_stays_clean() {
         let dir = TempDir::new("patterns-multi-rule");
@@ -4108,7 +4141,7 @@ fn dup_two(x: i32) -> i32 {
         let candidates = json["candidates"].as_array().expect("candidates array");
         assert_eq!(
             candidates.len(),
-            2,
+            5,
             "expected one candidate per rule: {json}"
         );
         let patterns: std::collections::BTreeSet<&str> = candidates
@@ -4117,8 +4150,14 @@ fn dup_two(x: i32) -> i32 {
             .collect();
         assert_eq!(
             patterns,
-            std::collections::BTreeSet::from(["domain_error", "options_struct"]),
-            "expected candidates from two different rules: {json}"
+            std::collections::BTreeSet::from([
+                "domain_error",
+                "validated_newtype",
+                "options_struct",
+                "smart_constructor",
+                "raii_guard",
+            ]),
+            "expected candidates from five different rules: {json}"
         );
     }
 
