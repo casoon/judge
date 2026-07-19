@@ -261,12 +261,64 @@ struct AuditOptions {
 }
 
 /// Output format shared by commands that emit findings (see todo.md §7).
+/// Not every command supports every format: SARIF exists for the
+/// report-producing commands, Markdown only for the audit/baseline delta
+/// (the PR-comment use case) — anything else is rejected as a config error
+/// instead of producing half-baked output.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
     /// Human-readable, reduced to root findings by default.
     Tty,
     /// Versioned JSON, always the full finding graph.
     Json,
+    /// SARIF 2.1.0 (report-producing commands only — see `judge::sarif`).
+    Sarif,
+    /// Markdown delta table (`audit --since` and `--baseline` comparison
+    /// only — see `judge::markdown`).
+    Markdown,
+}
+
+impl OutputFormat {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Tty => "tty",
+            Self::Json => "json",
+            Self::Sarif => "sarif",
+            Self::Markdown => "markdown",
+        }
+    }
+}
+
+/// The config error (exit 2) for a format a command has no meaningful
+/// rendering for (see todo.md §7: no half-baked outputs).
+fn unsupported_format(context: &str, format: OutputFormat, supported: &str) -> CliError {
+    CliError::Config(format!(
+        "--format {} is not supported for {context}; supported formats: {supported}",
+        format.label()
+    ))
+}
+
+/// Renders `findings` as a SARIF 2.1.0 log (see `judge::sarif`). Findings
+/// are relativized to the workspace root first — SARIF artifact URIs are
+/// relative, forward-slash paths.
+fn write_sarif(
+    out: &mut dyn Write,
+    workspace_root: &Path,
+    mut findings: Vec<Finding>,
+    analysis_errors: Vec<String>,
+    universe: Option<judge::finding::AnalysisUniverse>,
+) -> Result<(), CliError> {
+    judge::finding::relativize_paths(&mut findings, workspace_root);
+    let mut report = Report::with_errors(findings, analysis_errors);
+    if let Some(universe) = universe {
+        report = report.with_universe(universe);
+    }
+    writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&judge::sarif::render(&report)).unwrap()
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -738,6 +790,22 @@ fn run_all(
                 .with_universe(judge::finding::AnalysisUniverse::fast(&workspace, false));
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
+        OutputFormat::Sarif => {
+            write_sarif(
+                out,
+                &workspace.root,
+                collected.findings,
+                collected.analysis_errors,
+                Some(judge::finding::AnalysisUniverse::fast(&workspace, false)),
+            )?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format(
+                "`cargo judge`",
+                format,
+                "tty, json, sarif",
+            ));
+        }
         OutputFormat::Tty => {
             let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = collected
                 .findings
@@ -861,10 +929,12 @@ fn handle_baseline_with_trend(
                 writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
                 Err(CliError::Reported)
             }
-            OutputFormat::Tty => Err(CliError::AnalysisIncomplete {
-                context: "baseline was not evaluated",
-                errors: analysis_errors.to_vec(),
-            }),
+            OutputFormat::Tty | OutputFormat::Sarif | OutputFormat::Markdown => {
+                Err(CliError::AnalysisIncomplete {
+                    context: "baseline was not evaluated",
+                    errors: analysis_errors.to_vec(),
+                })
+            }
         };
     }
 
@@ -912,6 +982,16 @@ fn handle_baseline_with_trend(
                 envelope["trend"] = trend_json(trend);
             }
             writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
+        }
+        OutputFormat::Markdown => {
+            write!(out, "{}", judge::markdown::render_delta(&delta, verdict))?;
+        }
+        OutputFormat::Sarif => {
+            return Err(unsupported_format(
+                "baseline comparison",
+                format,
+                "tty, json, markdown",
+            ));
         }
         OutputFormat::Tty => print_delta(out, &delta, verdict)?,
     }
@@ -1126,6 +1206,28 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
             });
             writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
         }
+        OutputFormat::Markdown => {
+            let gates = [
+                judge::markdown::GateSlot {
+                    name: "duplication-ratio",
+                    threshold_flag: "--max-duplication-ratio",
+                    gate: duplication_gate.as_ref(),
+                },
+                judge::markdown::GateSlot {
+                    name: "suppression-debt-ratio",
+                    threshold_flag: "--max-suppression-ratio",
+                    gate: suppression_gate.as_ref(),
+                },
+            ];
+            write!(
+                out,
+                "{}",
+                judge::markdown::render_audit(&delta, verdict, &gates)
+            )?;
+        }
+        OutputFormat::Sarif => {
+            return Err(unsupported_format("`audit`", format, "tty, json, markdown"));
+        }
         OutputFormat::Tty => print_audit(
             out,
             &delta,
@@ -1320,6 +1422,18 @@ fn run_dupes(options: DupesOptions, out: &mut dyn Write) -> Result<CommandOutcom
             let report = Report::with_errors(report.to_findings(), analysis_errors);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
+        OutputFormat::Sarif => {
+            write_sarif(
+                out,
+                &workspace.root,
+                report.to_findings(),
+                analysis_errors,
+                None,
+            )?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format("`dupes`", format, "tty, json, sarif"));
+        }
         OutputFormat::Tty => {
             writeln!(
                 out,
@@ -1462,6 +1576,12 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
             });
             writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
         }
+        OutputFormat::Sarif => {
+            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format("`deps`", format, "tty, json, sarif"));
+        }
         OutputFormat::Tty => {
             writeln!(out, "dependency findings: {}", findings.len())?;
             if !analysis_errors.is_empty() {
@@ -1578,6 +1698,16 @@ fn run_boundaries(
             let report = Report::new(boundaries.findings);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
+        OutputFormat::Sarif => {
+            write_sarif(out, &workspace.root, boundaries.findings, Vec::new(), None)?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format(
+                "`boundaries`",
+                format,
+                "tty, json, sarif",
+            ));
+        }
         OutputFormat::Tty => {
             writeln!(out, "boundary rules: {}", config.boundaries.len())?;
             writeln!(out, "findings: {}", boundaries.findings.len())?;
@@ -1613,10 +1743,16 @@ fn run_distribution(
     let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
 
     if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([(
-            judge::ownership::LOW_BUS_FACTOR_RULE.to_string(),
-            judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
-        )]);
+        let rule_revisions = std::collections::HashMap::from([
+            (
+                judge::ownership::LOW_BUS_FACTOR_RULE.to_string(),
+                judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
+            ),
+            (
+                judge::ownership::OWNERSHIP_FRAGMENTATION_RULE.to_string(),
+                judge::ownership::OWNERSHIP_FRAGMENTATION_RULE_REVISION,
+            ),
+        ]);
         return handle_baseline(
             &workspace.root,
             &report.findings,
@@ -1638,6 +1774,16 @@ fn run_distribution(
             let report = Report::with_errors(report.findings, analysis_errors);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
+        OutputFormat::Sarif => {
+            write_sarif(out, &workspace.root, report.findings, analysis_errors, None)?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format(
+                "`distribution`",
+                format,
+                "tty, json, sarif",
+            ));
+        }
         OutputFormat::Tty => {
             writeln!(out, "files analyzed: {}", report.files.len())?;
             if !report.errors.is_empty() {
@@ -1647,15 +1793,43 @@ fn run_distribution(
                 }
             }
 
+            let (bus_factor, fragmentation): (Vec<&Finding>, Vec<&Finding>) = report
+                .findings
+                .iter()
+                .partition(|finding| finding.rule == judge::ownership::LOW_BUS_FACTOR_RULE);
+
             writeln!(out)?;
-            writeln!(out, "low-bus-factor findings: {}", report.findings.len())?;
-            for finding in &report.findings {
+            writeln!(out, "low-bus-factor findings: {}", bus_factor.len())?;
+            for finding in &bus_factor {
                 writeln!(
                     out,
                     "  [{}] {}  primary author: {}",
                     severity_label(finding.severity),
                     finding.location.file.display(),
                     finding.location.item_path
+                )?;
+            }
+
+            writeln!(out)?;
+            writeln!(
+                out,
+                "ownership-fragmentation findings (advisory, no verdict effect): {}",
+                fragmentation.len()
+            )?;
+            for finding in &fragmentation {
+                writeln!(
+                    out,
+                    "  [{}] {}  {}",
+                    severity_label(finding.severity),
+                    finding.location.file.display(),
+                    finding.location.item_path
+                )?;
+            }
+            if !fragmentation.is_empty() {
+                writeln!(
+                    out,
+                    "  note: {}",
+                    judge::ownership::OWNERSHIP_FRAGMENTATION_NOTE
                 )?;
             }
         }
@@ -1726,6 +1900,12 @@ fn run_provenance(
             envelope["caveat"] =
                 serde_json::Value::String(judge::provenance::PROVENANCE_CAVEAT.to_string());
             writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
+        }
+        // No SARIF: provenance output is inseparable from its caveat (a
+        // distribution trend, never a per-person judgement), and SARIF has
+        // no slot that CI annotators would surface it in.
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            return Err(unsupported_format("`provenance`", format, "tty, json"));
         }
         OutputFormat::Tty => {
             writeln!(out, "{}", judge::provenance::PROVENANCE_CAVEAT)?;
@@ -1913,6 +2093,22 @@ fn run_dead_code_deep(
             let report = Report::with_errors(findings, analysis_errors).with_universe(universe);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
+        OutputFormat::Sarif => {
+            write_sarif(
+                out,
+                &workspace.root,
+                findings,
+                analysis_errors,
+                Some(universe),
+            )?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format(
+                "`dead-code`",
+                format,
+                "tty, json, sarif",
+            ));
+        }
         OutputFormat::Tty => {
             print_universe_tty(out, &universe)?;
             writeln!(out, "pub items checked: {}", dead_code_report.checked)?;
@@ -1958,6 +2154,11 @@ fn run_dead_code_deep(
 /// finding id) don't exist yet.
 #[cfg_attr(not(feature = "deep"), allow(unused_variables))]
 fn run_explain(options: ExplainOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
+    // Checked before the tier/mode gates so `explain --format sarif` is the
+    // same clean config error (exit 2) in Fast and Deep Tier builds alike.
+    if matches!(options.format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format("`explain`", options.format, "tty, json"));
+    }
     if !options.why_live {
         return Err(CliError::Analyzer(
             "`judge explain` currently only supports `--why-live`".to_string(),
@@ -2022,6 +2223,9 @@ fn run_explain_deep(
                 }),
             };
             writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected in run_explain before the Deep Tier runs")
         }
         OutputFormat::Tty => match &result {
             judge::reachability::WhyLive::Path(path) => {
@@ -2285,6 +2489,28 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
                 value["score"] = serde_json::to_value(&score).unwrap();
             }
             writeln!(out, "{}", serde_json::to_string_pretty(&value).unwrap())?;
+        }
+        OutputFormat::Sarif => {
+            if show_score {
+                // SARIF has no result slot a numeric score would surface in
+                // — rejected rather than silently dropped.
+                return Err(CliError::Config(
+                    "--score is not supported with --format sarif; use --format json".to_string(),
+                ));
+            }
+            write_sarif(
+                out,
+                &workspace.root,
+                findings,
+                analysis_errors,
+                Some(judge::finding::AnalysisUniverse::fast(
+                    &workspace,
+                    include_generated,
+                )),
+            )?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format("`health`", format, "tty, json, sarif"));
         }
         OutputFormat::Tty => {
             writeln!(out, "functions analyzed: {}", functions.len())?;
@@ -2950,6 +3176,140 @@ fn dup_two(x: i32) -> i32 {
             serde_json::from_slice(&out).expect("writer must contain valid JSON");
         assert_eq!(value["schema_version"], judge::finding::SCHEMA_VERSION);
         assert!(value.get("findings").is_some());
+    }
+
+    /// `--format sarif` renders a SARIF 2.1.0 log with workspace-relative,
+    /// forward-slash artifact URIs (see `judge::sarif`).
+    #[test]
+    fn run_writes_a_sarif_log_into_the_given_writer() {
+        let dir = TempDir::new("run-sarif-writer");
+        write_fixture_crate(&dir);
+        std::fs::write(dir.join("src/dupe.rs"), DUPE_FILE_CONTENT).unwrap();
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(&dir, dupes_cli(OutputFormat::Sarif, false, None), &mut out)
+            .expect("sarif report must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let value: serde_json::Value =
+            serde_json::from_slice(&out).expect("writer must contain valid JSON");
+        assert_eq!(value["version"], "2.1.0");
+        let run = &value["runs"][0];
+        assert_eq!(run["tool"]["driver"]["name"], "judge");
+        assert_eq!(run["tool"]["driver"]["rules"][0]["id"], "duplicate-code");
+        let result = &run["results"][0];
+        assert_eq!(result["ruleId"], "duplicate-code");
+        assert_eq!(result["level"], "warning");
+        assert_eq!(
+            result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/dupe.rs"
+        );
+        assert_eq!(result["properties"]["evidence_class"], "derived_fact");
+    }
+
+    /// Markdown is delta-only (see todo.md §7): a plain report command must
+    /// reject it as a config error (exit 2) instead of printing half-baked
+    /// output.
+    #[test]
+    fn health_format_markdown_is_a_config_error() {
+        let dir = TempDir::new("health-format-markdown");
+        write_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let err = run_in_dir(
+            &dir,
+            cli_with(Command::Health(HealthOptions {
+                score: false,
+                format: OutputFormat::Markdown,
+                show_cascades: false,
+                save_baseline: false,
+                baseline: None,
+                include_generated: false,
+            })),
+            &mut out,
+        )
+        .expect_err("`health --format markdown` must be a config error");
+        match err {
+            CliError::Config(message) => {
+                assert!(
+                    message.contains("--format markdown is not supported"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected CliError::Config, got {other:?}"),
+        }
+    }
+
+    /// `explain` supports neither SARIF nor Markdown — a clean config error
+    /// (exit 2) in Fast and Deep Tier builds alike.
+    #[test]
+    fn explain_format_sarif_is_a_config_error() {
+        let mut out = Vec::new();
+        let err = run(
+            cli_with(Command::Explain(ExplainOptions {
+                item_path: "core::retry::backoff".to_string(),
+                why_live: true,
+                include_tests: false,
+                format: OutputFormat::Sarif,
+            })),
+            &mut out,
+        )
+        .expect_err("`explain --format sarif` must be a config error");
+        match err {
+            CliError::Config(message) => {
+                assert!(
+                    message.contains("--format sarif is not supported"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected CliError::Config, got {other:?}"),
+        }
+    }
+
+    /// `audit --format markdown` renders the PR-comment delta table,
+    /// including the not-evaluated gate lines (see `judge::markdown`).
+    #[test]
+    fn audit_format_markdown_renders_the_delta_table() {
+        let _guard = lock_cwd();
+        let (dir, base_commit) = suppression_audit_fixture("audit-markdown");
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir_locked(
+            &dir,
+            cli_with(Command::Audit(AuditOptions {
+                since: base_commit,
+                format: OutputFormat::Markdown,
+                baseline: None,
+                audit_min_sample: None,
+                max_duplication_ratio: None,
+                max_suppression_ratio: None,
+            })),
+            &mut out,
+        )
+        .expect("audit markdown must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("**verdict: pass**"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains(
+                "- gate `suppression-debt-ratio`: not evaluated (pass --audit-min-sample and --max-suppression-ratio to enable)"
+            ),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("### code-introduced: 3"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("| rule | severity | location | item |"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("| suppression-debt | info | src/suppressed.rs:1 |"),
+            "unexpected output: {text}"
+        );
     }
 
     /// A writer that fails like a closed pipe (`cargo judge … | head`).

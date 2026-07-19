@@ -22,10 +22,10 @@ Early stage. The Fast Tier (no build required, `syn`- and `gix`-based) and a fir
 - `cargo judge audit --since REF` — pass/warn/fail verdict scoped to findings introduced since a commit; requires a previously saved baseline
 - `cargo judge dead-code [--include-tests]` — Deep Tier, needs `--features deep` (see below)
 - `cargo judge explain <item-path> --why-live` — Deep Tier, needs `--features deep` (see below)
-- `--format json` — versioned machine-readable output
+- `--format json|sarif|markdown` — versioned JSON on every report command, SARIF 2.1.0 on the report-producing commands, Markdown for the `audit`/`--baseline` delta (PR comments)
 - `--save-baseline` / `--baseline PATH` — save or compare findings against a baseline
 
-Not yet implemented: SARIF/Markdown output, module-level boundaries (only crate-level exists), several planned maintainability and dependency-hygiene rules, and the MCP server.
+Not yet implemented: module-level boundaries (only crate-level exists), several planned maintainability and dependency-hygiene rules, and the MCP server.
 
 ## Health Score
 

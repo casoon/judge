@@ -1,5 +1,5 @@
 //! Ownership / code distribution via `git blame` (see todo.md §3.E
-//! "Ownership / Code-Verteilung"). Deliberately scoped to three of the five
+//! "Ownership / Code-Verteilung"). Deliberately scoped to four of the five
 //! metrics in that table:
 //!
 //! - `primary-author-share`: the dominant author's share of a file's lines.
@@ -9,11 +9,13 @@
 //!   *sole* author (bus-factor 1) is still active anywhere in the repo at
 //!   all — not the full "line-share of authors with no commit in N months"
 //!   from the table.
+//! - `ownership-fragmentation`: many small blame shares with no dominant
+//!   owner (advisory heuristic — see
+//!   [`FileOwnership::to_fragmentation_finding`]).
 //!
-//! `ownership-fragmentation` and `orphaned-code` are **not** implemented
-//! here: both need thresholds or evidence (fan-in, test coverage) that
-//! aren't defined or available yet, and inventing one would be policy, not
-//! analysis.
+//! `orphaned-code` is **not** implemented here: it needs evidence (fan-in,
+//! test-path coverage) from the Deep Tier that isn't available in this pass,
+//! and inventing a stand-in would be policy, not analysis.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -31,6 +33,32 @@ pub const LOW_BUS_FACTOR_RULE: &str = "low-bus-factor";
 /// Bump when the low-bus-factor rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
 pub const LOW_BUS_FACTOR_RULE_REVISION: u32 = 1;
+
+/// Rule id for files whose blame is split into many small author shares with
+/// no dominant owner (todo.md §3.E: "Verteilung vieler kleiner Blame-Anteile;
+/// 'diffuse Verantwortung' nur als Interpretation").
+pub const OWNERSHIP_FRAGMENTATION_RULE: &str = "ownership-fragmentation";
+/// Bump when the ownership-fragmentation rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const OWNERSHIP_FRAGMENTATION_RULE_REVISION: u32 = 1;
+
+/// Interpretation-limiting caption for `ownership-fragmentation` output
+/// (todo.md §16.7, §17): the blame shares are facts; the reading is not.
+pub const OWNERSHIP_FRAGMENTATION_NOTE: &str = "many small blame shares — diffuse responsibility is one possible reading, not a proven problem";
+
+/// A file counts as fragmented only with at least this many blamed authors.
+/// Three authors on one file is ordinary collaboration; the todo.md §3.E
+/// signal is "many small shares".
+const FRAGMENTATION_MIN_AUTHORS: usize = 4;
+/// ...and only if the largest single author share stays below this — a file
+/// with a dominant owner isn't fragmented no matter how many minor
+/// contributors it has.
+const FRAGMENTATION_MAX_TOP_SHARE: f64 = 0.35;
+/// Files with fewer blamed lines than this are skipped: share percentages
+/// over a handful of lines say nothing about responsibility.
+const FRAGMENTATION_MIN_LINES: u32 = 50;
+/// The evidence JSON lists at most this many top author shares.
+const FRAGMENTATION_EVIDENCE_SHARES: usize = 5;
 
 /// One author's share of a file's blamed lines.
 #[derive(Debug, Clone)]
@@ -86,6 +114,56 @@ impl FileOwnership {
             causes: Vec::new(),
         })
     }
+
+    /// Renders an `ownership-fragmentation` [`Finding`] if this file's blame
+    /// is split across at least [`FRAGMENTATION_MIN_AUTHORS`] authors, none
+    /// of whom holds [`FRAGMENTATION_MAX_TOP_SHARE`] or more of the lines,
+    /// and the file has at least [`FRAGMENTATION_MIN_LINES`] blamed lines.
+    /// Always `Severity::Info` and `EvidenceClass::Heuristic` (advisory,
+    /// never gating — [`crate::finding::EvidenceClass::is_gating`]): the
+    /// shares are exact blame facts, but "many small shares = diffuse
+    /// responsibility" is one possible reading of them, not proof (todo.md
+    /// §16.7, §17). Author emails appear in the evidence, matching how
+    /// `low-bus-factor` names its primary author; `shares` is capped at the
+    /// top [`FRAGMENTATION_EVIDENCE_SHARES`].
+    pub fn to_fragmentation_finding(&self) -> Option<Finding> {
+        if self.total_lines < FRAGMENTATION_MIN_LINES
+            || self.authors.len() < FRAGMENTATION_MIN_AUTHORS
+            || self.primary_author_share >= FRAGMENTATION_MAX_TOP_SHARE
+        {
+            return None;
+        }
+        let shares: Vec<serde_json::Value> = self
+            .authors
+            .iter()
+            .take(FRAGMENTATION_EVIDENCE_SHARES)
+            .map(|author| serde_json::json!({ "author": author.email, "lines": author.lines }))
+            .collect();
+        Some(Finding {
+            id: format!("{OWNERSHIP_FRAGMENTATION_RULE}:{}", self.file.display()).into(),
+            rule: OWNERSHIP_FRAGMENTATION_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: self.file.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: format!(
+                    "{} authors, top share {:.0}%",
+                    self.authors.len(),
+                    self.primary_author_share * 100.0
+                ),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "authors": self.authors.len(),
+                "top_share": self.primary_author_share,
+                "total_lines": self.total_lines,
+                "shares": shares,
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        })
+    }
 }
 
 /// A per-file failure to blame, kept separate from a top-level repo-open
@@ -117,14 +195,15 @@ pub struct WorkspaceOwnership {
     /// Every analyzed file's raw ownership data, not just the ones with
     /// findings.
     pub files: Vec<FileOwnership>,
-    /// Only the `low-bus-factor` findings.
+    /// The `low-bus-factor` and `ownership-fragmentation` findings.
     pub findings: Vec<Finding>,
     pub errors: Vec<OwnershipError>,
 }
 
 /// Computes per-file ownership across every source file in `workspace` by
 /// blaming each at `HEAD`, and emits `low-bus-factor` findings for files with
-/// a bus factor of 1. A repository with no commits yet (unborn `HEAD`)
+/// a bus factor of 1 plus `ownership-fragmentation` findings for files with
+/// many small blame shares. A repository with no commits yet (unborn `HEAD`)
 /// yields an empty result rather than an error, matching [`crate::git::hotspots`]'s
 /// tolerance for "no git history at all". A failure to blame a single file
 /// (e.g. it isn't tracked) is recorded in `errors` and that file is skipped,
@@ -169,6 +248,9 @@ pub fn analyze_workspace(
             match file_ownership(source_file.path.clone(), &repo, &outcome) {
                 Ok(ownership) => {
                     if let Some(finding) = ownership.to_finding(&active_authors) {
+                        result.findings.push(finding);
+                    }
+                    if let Some(finding) = ownership.to_fragmentation_finding() {
                         result.findings.push(finding);
                     }
                     result.files.push(ownership);
@@ -401,6 +483,134 @@ mod tests {
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].severity, Severity::Fail);
         assert_eq!(report.findings[0].location.item_path, "gone@example.com");
+    }
+
+    /// Grows `file` by `lines_per_author` lines per author, committing each
+    /// chunk as a different author so blame splits accordingly.
+    fn commit_chunks_as(
+        dir: &std::path::Path,
+        file: &std::path::Path,
+        authors: &[&str],
+        lines_per_author: &[usize],
+    ) {
+        let mut contents = String::new();
+        for (index, (email, lines)) in authors.iter().zip(lines_per_author).enumerate() {
+            for line in 0..*lines {
+                contents.push_str(&format!("fn f{index}_{line}() {{}}\n"));
+            }
+            std::fs::write(file, &contents).unwrap();
+            run_git_as(dir, email, &["add", "."], &[]);
+            run_git_as(dir, email, &["commit", "-q", "-m", "chunk"], &[]);
+        }
+    }
+
+    #[test]
+    fn fragmented_file_with_many_small_shares_yields_a_finding() {
+        let dir = TempDir::new("ownership-fragmented");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let file = dir.join("frag.rs");
+        commit_chunks_as(
+            &dir,
+            &file,
+            &[
+                "a@example.com",
+                "b@example.com",
+                "c@example.com",
+                "d@example.com",
+            ],
+            &[15, 15, 15, 15],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), file.clone());
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let finding = &report.findings[0];
+        assert_eq!(finding.rule, OWNERSHIP_FRAGMENTATION_RULE);
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.location.file, file);
+        let evidence = finding.evidence.as_ref().expect("evidence must be set");
+        assert_eq!(evidence["authors"], 4);
+        assert_eq!(evidence["top_share"], 0.25);
+        assert_eq!(evidence["total_lines"], 60);
+        assert_eq!(evidence["shares"].as_array().unwrap().len(), 4);
+        assert_eq!(evidence["shares"][0]["lines"], 15);
+    }
+
+    #[test]
+    fn file_with_a_dominant_author_yields_no_fragmentation_finding() {
+        let dir = TempDir::new("ownership-dominant-author");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let file = dir.join("owned.rs");
+        commit_chunks_as(
+            &dir,
+            &file,
+            &[
+                "a@example.com",
+                "b@example.com",
+                "c@example.com",
+                "d@example.com",
+            ],
+            &[30, 10, 10, 10],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), file.clone());
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn small_file_below_the_line_threshold_yields_no_fragmentation_finding() {
+        let dir = TempDir::new("ownership-small-file");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let file = dir.join("small.rs");
+        commit_chunks_as(
+            &dir,
+            &file,
+            &[
+                "a@example.com",
+                "b@example.com",
+                "c@example.com",
+                "d@example.com",
+            ],
+            &[3, 3, 3, 3],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), file.clone());
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn fragmentation_finding_is_heuristic_and_never_gating() {
+        let ownership = FileOwnership {
+            file: PathBuf::from("src/frag.rs"),
+            authors: ["a", "b", "c", "d"]
+                .map(|name| AuthorShare {
+                    email: format!("{name}@example.com"),
+                    lines: 15,
+                })
+                .to_vec(),
+            total_lines: 60,
+            primary_author_share: 0.25,
+            bus_factor: 3,
+        };
+        let finding = ownership
+            .to_fragmentation_finding()
+            .expect("all thresholds are met");
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
+        assert!(
+            !finding.is_gating(),
+            "advisory heuristic must never affect a verdict"
+        );
     }
 
     #[test]

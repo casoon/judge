@@ -15,10 +15,12 @@ pub mod gate;
 pub mod git;
 pub mod health_score;
 pub mod ingest;
+pub mod markdown;
 pub mod ownership;
 pub mod provenance;
 #[cfg(feature = "deep")]
 pub mod reachability;
+pub mod sarif;
 pub mod slop;
 pub mod slop_structural;
 #[cfg(feature = "deep")]
