@@ -169,6 +169,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
     },
+    RuleMetadata {
+        id: "unused-dependency",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Opt-in only: `cargo judge deps --check-rustc-lints` — runs a full `cargo check --workspace --all-targets` with rustc's stable `unused_crate_dependencies` lint enabled; never part of bare `cargo judge`, `audit`, or `cargo judge deps` without the flag (a full compile is a different order of cost than this module's other, instant syntactic passes).",
+        exclusions: "Restricted to `normal` dependencies (`dev`/`build` are out of scope; `dev-dependencies` has its own `unused-dev-dependency` detector). Only fires when rustc's lint reports the dependency unused in every target compiled for the package — a dependency used by only one target (e.g. only from a `[[test]]`) is a known, documented multi-target false positive of the raw lint and is deliberately not flagged (see `crate::deps` module docs). A workspace that does not currently compile produces a report error from this detector, never a finding.",
+        allowed_wording: BOUNDED_SEMANTIC_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+    },
     // -- duplication.rs -------------------------------------------------
     RuleMetadata {
         id: "duplicate-code",
@@ -518,6 +526,7 @@ mod tests {
             crate::deps::HEAVY_DEPENDENCY_RULE,
             crate::deps::UNUSED_FEATURE_FLAG_RULE,
             crate::deps::DEFAULT_FEATURES_UNUSED_RULE,
+            crate::deps::UNUSED_DEPENDENCY_RULE,
             crate::duplication::DUPLICATE_RULE,
             crate::git::HOTSPOT_RULE,
             crate::ownership::LOW_BUS_FACTOR_RULE,

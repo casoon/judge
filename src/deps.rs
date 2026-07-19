@@ -56,6 +56,32 @@
 //!   evidence as above. Deliberately does *not* cover "used, but only
 //!   non-default features": telling default from non-default items apart
 //!   needs per-dependency feature-to-symbol knowledge judge does not have.
+//!
+//! ## Importing rustc's `unused_crate_dependencies` lint
+//!
+//! [`analyze_rustc_unused_dependencies`] runs `cargo check --workspace
+//! --all-targets` with rustc's stable, allow-by-default
+//! `unused_crate_dependencies` lint turned on (`-W unused_crate_dependencies`
+//! — a stable rustc lint, not nightly-only; do not confuse it with Cargo's
+//! separate, narrower, nightly-only `unused_workspace_dependencies` lint,
+//! which only checks `[workspace.dependencies]` inheritance). It is opt-in
+//! (`cargo judge deps --check-rustc-lints`) — a full `cargo check` is a
+//! different order of cost than the rest of this module's instant syntactic
+//! passes, so it never runs as part of [`analyze_workspace`], bare `cargo
+//! judge`/`audit`, or `cargo judge deps` without the flag.
+//!
+//! The raw lint runs once per compiled unit (Cargo target: `lib`, each
+//! `[[test]]`/`[[example]]`/`[[bench]]`, ...), each with its own `--extern`
+//! set, and is documented to false-positive on multi-target packages: a
+//! dependency used only by one target (e.g. a normal dependency referenced
+//! solely from an integration test) is reported "unused" by every *other*
+//! target's compilation. judge closes that gap by only turning a dependency
+//! into a finding when it is reported unused in *every* target compiled for
+//! its package — the intersection over all target runs, never a union (see
+//! [`analyze_rustc_unused_dependencies`]). Restricted to `normal`
+//! dependencies: `dev`/`build` dependencies are out of scope here
+//! (`dev-dependencies` already has its own `unused-dev-dependency` detector
+//! above, built on judge's own usage scan rather than an imported lint).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -92,6 +118,13 @@ pub const UNUSED_FEATURE_FLAG_RULE_REVISION: u32 = 1;
 pub const DEFAULT_FEATURES_UNUSED_RULE: &str = "default-features-unused";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const DEFAULT_FEATURES_UNUSED_RULE_REVISION: u32 = 1;
+
+/// Rule id used for unused-dependency findings — imports rustc's stable
+/// `unused_crate_dependencies` lint (see module docs "Importing rustc's
+/// `unused_crate_dependencies` lint", todo.md §B).
+pub const UNUSED_DEPENDENCY_RULE: &str = "unused-dependency";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const UNUSED_DEPENDENCY_RULE_REVISION: u32 = 1;
 
 /// Above this many transitive dependencies (from a full, non `--no-deps`
 /// resolve — see `resolve_transitive_dependency_counts`), combined with
@@ -150,6 +183,14 @@ pub enum DepsError {
     /// `manifest_explicitly_enables_default_features`), which reads the raw
     /// manifest text directly rather than trusting `cargo_metadata`.
     ManifestParse(PathBuf, toml::de::Error),
+    /// The `cargo check` run behind `unused-dependency`'s rustc-lint import
+    /// (see [`analyze_rustc_unused_dependencies`]) did not complete: either
+    /// the `cargo` binary failed to spawn, or `cargo check --workspace
+    /// --all-targets` exited unsuccessfully (e.g. the workspace does not
+    /// currently compile). Collected as a report error, never a panic or a
+    /// finding — judge cannot assert anything about dependency usage from a
+    /// build it could not observe (todo.md §B "Graceful Degradation").
+    RustcCheck(String),
 }
 
 impl std::fmt::Display for DepsError {
@@ -161,6 +202,7 @@ impl std::fmt::Display for DepsError {
             Self::ManifestParse(path, err) => {
                 write!(f, "{}: failed to parse: {err}", path.display())
             }
+            Self::RustcCheck(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -172,6 +214,7 @@ impl std::error::Error for DepsError {
             Self::Parse(_, err) => Some(err),
             Self::Metadata(err) => Some(err),
             Self::ManifestParse(_, err) => Some(err),
+            Self::RustcCheck(_) => None,
         }
     }
 }
@@ -603,6 +646,259 @@ fn resolve_transitive_dependency_counts(
         }
     }
     Ok(counts)
+}
+
+/// Result of [`analyze_rustc_unused_dependencies`] — kept separate from
+/// [`WorkspaceDeps`] since this detector is opt-in and invoked by its own
+/// caller (`cargo judge deps --check-rustc-lints`), never folded into
+/// [`analyze_workspace`]'s always-on pass.
+#[derive(Debug, Default)]
+pub struct RustcLintDeps {
+    pub findings: Vec<Finding>,
+    pub errors: Vec<DepsError>,
+}
+
+/// Runs `cargo check --workspace --all-targets` with rustc's stable,
+/// allow-by-default `unused_crate_dependencies` lint turned on and turns its
+/// diagnostics into `unused-dependency` findings (see module docs "Importing
+/// rustc's `unused_crate_dependencies` lint", todo.md §B). Opt-in only
+/// (`cargo judge deps --check-rustc-lints`) — unlike every other detector in
+/// this module, this one runs a full `cargo check`, not an instant syntactic
+/// pass, so it is never part of [`analyze_workspace`] or bare `cargo judge`.
+pub fn analyze_rustc_unused_dependencies(workspace: &Workspace) -> RustcLintDeps {
+    let mut findings = Vec::new();
+    let mut errors = Vec::new();
+
+    let manifest_path = workspace.root.join("Cargo.toml");
+    let metadata = match cargo_metadata::MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .no_deps()
+        .exec()
+    {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            errors.push(DepsError::Metadata(err));
+            return RustcLintDeps { findings, errors };
+        }
+    };
+
+    let workspace_members: HashSet<cargo_metadata::PackageId> =
+        metadata.workspace_members.iter().cloned().collect();
+    let name_to_id: HashMap<&str, cargo_metadata::PackageId> = metadata
+        .packages
+        .iter()
+        .filter(|package| workspace_members.contains(&package.id))
+        .map(|package| (package.name.as_str(), package.id.clone()))
+        .collect();
+
+    let messages = match run_cargo_check_with_unused_crate_dependencies_lint(&manifest_path) {
+        Ok(messages) => messages,
+        Err(err) => {
+            errors.push(err);
+            return RustcLintDeps { findings, errors };
+        }
+    };
+
+    // Per package, every distinct target compiled (see `target_identity`) —
+    // the universe the intersection below runs over.
+    let mut targets_seen: HashMap<cargo_metadata::PackageId, HashSet<String>> = HashMap::new();
+    // Per (package, target), the dependency identifiers rustc reported
+    // unused for that one compiled unit.
+    let mut unused_per_target: HashMap<(cargo_metadata::PackageId, String), HashSet<String>> =
+        HashMap::new();
+
+    for message in messages {
+        match message {
+            cargo_metadata::Message::CompilerArtifact(artifact) => {
+                if !workspace_members.contains(&artifact.package_id) {
+                    continue;
+                }
+                targets_seen
+                    .entry(artifact.package_id)
+                    .or_default()
+                    .insert(target_identity(&artifact.target));
+            }
+            cargo_metadata::Message::CompilerMessage(compiler_message) => {
+                if !workspace_members.contains(&compiler_message.package_id) {
+                    continue;
+                }
+                let is_unused_crate_dependency = compiler_message
+                    .message
+                    .code
+                    .as_ref()
+                    .is_some_and(|code| code.code == "unused_crate_dependencies");
+                if !is_unused_crate_dependency {
+                    continue;
+                }
+                let Some(dep_identifier) =
+                    extract_unused_crate_name(&compiler_message.message.message)
+                else {
+                    continue;
+                };
+                unused_per_target
+                    .entry((
+                        compiler_message.package_id,
+                        target_identity(&compiler_message.target),
+                    ))
+                    .or_default()
+                    .insert(dep_identifier);
+            }
+            _ => {}
+        }
+    }
+
+    for krate in &workspace.crates {
+        let Some(package_id) = name_to_id.get(krate.name.as_str()) else {
+            continue;
+        };
+        let Some(all_targets) = targets_seen.get(package_id) else {
+            continue;
+        };
+        if all_targets.is_empty() {
+            continue;
+        }
+
+        // Multi-target false-positive gap (see module docs): only a
+        // dependency reported unused in *every* target run of this package
+        // is finding-worthy — the intersection, not the union.
+        let mut always_unused: Option<HashSet<String>> = None;
+        for target in all_targets {
+            let unused_here = unused_per_target
+                .get(&(package_id.clone(), target.clone()))
+                .cloned()
+                .unwrap_or_default();
+            always_unused = Some(match always_unused {
+                None => unused_here,
+                Some(acc) => acc.intersection(&unused_here).cloned().collect(),
+            });
+        }
+        let Some(always_unused) = always_unused else {
+            continue;
+        };
+
+        let mut targets_checked: Vec<&String> = all_targets.iter().collect();
+        targets_checked.sort();
+
+        for dep_identifier in &always_unused {
+            let Some(dep) = krate.dependencies.iter().find(|dep| {
+                dep.kind == DependencyKind::Normal && dep.code_identifier == *dep_identifier
+            }) else {
+                continue;
+            };
+            findings.push(unused_dependency_finding(krate, dep, &targets_checked));
+        }
+    }
+
+    RustcLintDeps { findings, errors }
+}
+
+/// A target's identity for the purposes of the multi-target intersection in
+/// [`analyze_rustc_unused_dependencies`]: its Cargo target kind(s) (`lib`,
+/// `test`, `example`, `bench`, ...) and name, e.g. `"lib:mycrate"` or
+/// `"test:it"`. Deliberately not further split by the `profile.test` build
+/// variant — the crate's own unit-test compile of `lib`/`bin` shares this
+/// same identity with its non-test compile, since both compile the same
+/// source file and "target" here means what `Cargo.toml` itself calls a
+/// target, not each individual rustc invocation.
+fn target_identity(target: &cargo_metadata::Target) -> String {
+    let kinds = target
+        .kind
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{kinds}:{}", target.name)
+}
+
+/// Extracts the unused crate's code identifier from an
+/// `unused_crate_dependencies` diagnostic's short message, e.g. "extern
+/// crate `depcrate` is unused in crate `fixture`" → `Some("depcrate")`. The
+/// message text is rustc's own and not otherwise structured in the JSON
+/// diagnostic, so this parses the one stable landmark: the first
+/// backtick-quoted name.
+fn extract_unused_crate_name(message: &str) -> Option<String> {
+    if !message.contains("is unused in crate") {
+        return None;
+    }
+    message.split('`').nth(1).map(str::to_string)
+}
+
+/// Runs `cargo check --workspace --all-targets --message-format=json` with
+/// `-W unused_crate_dependencies` added to `RUSTFLAGS` (preserving any
+/// `RUSTFLAGS` already set in the environment) and parses the resulting
+/// message stream via `cargo_metadata::Message::parse_stream`. A spawn
+/// failure or a non-zero exit status (e.g. the workspace doesn't currently
+/// compile) is returned as a [`DepsError::RustcCheck`] rather than treated
+/// as a finding source — see module docs "Importing rustc's
+/// `unused_crate_dependencies` lint".
+fn run_cargo_check_with_unused_crate_dependencies_lint(
+    manifest_path: &Path,
+) -> Result<Vec<cargo_metadata::Message>, DepsError> {
+    let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    if !rustflags.is_empty() {
+        rustflags.push(' ');
+    }
+    rustflags.push_str("-W unused_crate_dependencies");
+
+    let output = std::process::Command::new("cargo")
+        .arg("check")
+        .arg("--workspace")
+        .arg("--all-targets")
+        .arg("--message-format=json")
+        .arg("--manifest-path")
+        .arg(manifest_path)
+        .env("RUSTFLAGS", rustflags)
+        .output()
+        .map_err(|err| DepsError::RustcCheck(format!("failed to run `cargo check`: {err}")))?;
+
+    if !output.status.success() {
+        return Err(DepsError::RustcCheck(format!(
+            "`cargo check --workspace --all-targets` exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    Ok(
+        cargo_metadata::Message::parse_stream(output.stdout.as_slice())
+            .filter_map(Result::ok)
+            .collect(),
+    )
+}
+
+/// Renders an `unused-dependency` finding — rustc's own
+/// `unused_crate_dependencies` lint result, narrowed to the packages this
+/// workspace actually owns and to the multi-target intersection described in
+/// the module docs. Its evidence class is `bounded_semantic` (todo.md
+/// §17.3): the claim is scoped to "no use found across the targets this run
+/// checked", not an absolute "unused". Same `location` convention as
+/// [`misplaced_finding`].
+fn unused_dependency_finding(
+    krate: &CrateInfo,
+    dep: &crate::ingest::DeclaredDependency,
+    targets_checked: &[&String],
+) -> Finding {
+    Finding {
+        id: format!("{UNUSED_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: UNUSED_DEPENDENCY_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: krate.manifest_path.clone(),
+            line: OneBasedLine::FIRST,
+            item_path: dep.name.clone(),
+        },
+        evidence_class: EvidenceClass::BoundedSemantic,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "source": "rustc:unused_crate_dependencies",
+            "targets_checked": targets_checked,
+            "package": krate.name,
+            "reason": "no use found by rustc's unused_crate_dependencies lint \
+                across all targets of this package",
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
 }
 
 /// Distinct next-level path segments referenced under `target` (a
@@ -1460,5 +1756,137 @@ edition = "2021"
         assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
         assert!(!finding.is_gating());
         assert_eq!(finding.evidence.unwrap()["transitive_deps"], 42);
+    }
+
+    #[test]
+    fn extract_unused_crate_name_parses_the_first_backtick_quoted_name() {
+        assert_eq!(
+            extract_unused_crate_name("extern crate `depcrate` is unused in crate `fixture`"),
+            Some("depcrate".to_string())
+        );
+        assert_eq!(extract_unused_crate_name("some unrelated warning"), None);
+    }
+
+    #[test]
+    fn target_identity_joins_kind_and_name() {
+        let json = serde_json::json!({
+            "name": "it",
+            "kind": ["test"],
+            "crate_types": ["bin"],
+            "required-features": [],
+            "src_path": "tests/it.rs",
+            "edition": "2021",
+            "doc": false,
+            "doctest": false,
+            "test": true,
+        });
+        let target: cargo_metadata::Target = serde_json::from_value(json).unwrap();
+        assert_eq!(target_identity(&target), "test:it");
+    }
+
+    // The following three tests drive a real `cargo check --workspace
+    // --all-targets` subprocess (see `run_cargo_check_with_unused_crate_dependencies_lint`)
+    // against a path-dependency-only fixture — offline, but genuinely slow
+    // compared to every other test in this file (a fraction of a second per
+    // fixture, verified against a real run rather than mocked, see todo.md
+    // §B). They are the proof that `analyze_rustc_unused_dependencies`'s
+    // whole pipeline — spawn, JSON parse, multi-target intersection — works
+    // end to end, not just its pure helpers above.
+
+    #[test]
+    fn rustc_lint_import_flags_a_normal_dependency_never_referenced_anywhere() {
+        let dir = TempDir::new("deps-rustc-lint-unused");
+        let manifest = write_fixture(&dir, "[dependencies]", "depcrate", None, &[], &[]);
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_rustc_unused_dependencies(&workspace);
+
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.rule == UNUSED_DEPENDENCY_RULE)
+            .expect("expected an unused-dependency finding");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.evidence_class, EvidenceClass::BoundedSemantic);
+        assert_eq!(finding.location.item_path, "depcrate");
+        let evidence = finding.evidence.as_ref().unwrap();
+        assert_eq!(evidence["source"], "rustc:unused_crate_dependencies");
+        assert_eq!(evidence["package"], "fixture");
+        assert!(
+            evidence["reason"]
+                .as_str()
+                .unwrap()
+                .contains("unused_crate_dependencies")
+        );
+    }
+
+    #[test]
+    fn rustc_lint_import_does_not_flag_a_dependency_used_in_every_target() {
+        let dir = TempDir::new("deps-rustc-lint-used-everywhere");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[
+                ("src/lib.rs", "pub fn hello() { depcrate::noop(); }\n"),
+                ("tests/it.rs", "fn t() { depcrate::noop(); }\n"),
+            ],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_rustc_unused_dependencies(&workspace);
+
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_DEPENDENCY_RULE)
+        );
+    }
+
+    #[test]
+    fn rustc_lint_import_does_not_flag_a_dependency_used_by_only_one_target() {
+        // `depcrate` is referenced only from the integration test target,
+        // never from `lib` — rustc's raw per-target lint would report it
+        // unused for the `lib` compile alone, the documented multi-target
+        // false positive this detector's intersection logic is meant to
+        // avoid (see module docs "Importing rustc's
+        // `unused_crate_dependencies` lint").
+        let dir = TempDir::new("deps-rustc-lint-single-target");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[("tests/it.rs", "fn t() { depcrate::noop(); }\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_rustc_unused_dependencies(&workspace);
+
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_DEPENDENCY_RULE)
+        );
     }
 }

@@ -95,6 +95,12 @@ enum Command {
     /// projectwide evidence (see todo.md §16). Advisory only — never
     /// affects the verdict/exit code (todo.md §16.6).
     Patterns(PatternsOptions),
+    /// Heuristic abstract-design-principle interpretations (cohesion,
+    /// functional core/imperative shell, ...) aggregated from at least two
+    /// independent evidence classes per finding (see todo.md §16.7).
+    /// Advisory only — never affects the verdict/exit code, and a
+    /// deliberately separate assertion class from `patterns`.
+    Principles(PrinciplesOptions),
     /// Shows one pattern candidate's full evidence, preconditions,
     /// contraindications, and migration plan (see todo.md §16.5).
     ExplainPattern(ExplainPatternOptions),
@@ -174,6 +180,14 @@ struct DepsOptions {
     /// `name-collision-risk` always runs; it's fully local.
     #[arg(long)]
     check_crates_io: bool,
+    /// Opt-in: also run a full `cargo check --workspace --all-targets` with
+    /// rustc's stable `unused_crate_dependencies` lint enabled and import
+    /// its result as `unused-dependency` findings. Off by default — unlike
+    /// this command's other detectors, a full compile is a different order
+    /// of cost (see `judge::deps` module docs "Importing rustc's
+    /// `unused_crate_dependencies` lint").
+    #[arg(long)]
+    check_rustc_lints: bool,
 }
 
 #[derive(Debug, Args)]
@@ -309,6 +323,13 @@ struct AuditOptions {
 
 #[derive(Debug, Args)]
 struct PatternsOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct PrinciplesOptions {
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
     format: OutputFormat,
@@ -597,6 +618,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         Some(Command::Inspect) => run_inspect(out),
         Some(Command::Coverage(options)) => run_coverage(options, out),
         Some(Command::Patterns(options)) => run_patterns(options, out),
+        Some(Command::Principles(options)) => run_principles(options, out),
         Some(Command::ExplainPattern(options)) => run_explain_pattern(options, out),
         Some(Command::FixPreview(options)) => run_fix_preview(options, out),
         Some(Command::ExplainRule(options)) => run_explain_rule(options, out),
@@ -1668,6 +1690,7 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
         save_baseline,
         baseline,
         check_crates_io,
+        check_rustc_lints,
     } = options;
     let workspace = judge::ingest::load(None)?;
 
@@ -1748,6 +1771,16 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
         rule_revisions.insert(
             judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE.to_string(),
             judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE_REVISION,
+        );
+    }
+
+    if check_rustc_lints {
+        let rustc_lint_report = judge::deps::analyze_rustc_unused_dependencies(&workspace);
+        findings.extend(rustc_lint_report.findings);
+        analysis_errors.extend(rustc_lint_report.errors.iter().map(ToString::to_string));
+        rule_revisions.insert(
+            judge::deps::UNUSED_DEPENDENCY_RULE.to_string(),
+            judge::deps::UNUSED_DEPENDENCY_RULE_REVISION,
         );
     }
 
@@ -2351,6 +2384,61 @@ fn run_patterns(options: PatternsOptions, out: &mut dyn Write) -> Result<Command
                     "  [{}] {}  crate: {}",
                     candidate.id, candidate.pattern, candidate.scope.krate
                 )?;
+            }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// `cargo judge principles` (todo.md §16.7): heuristic abstract-design-
+/// principle interpretations aggregated from at least two independent
+/// evidence classes per finding. Always `CommandOutcome::Clean` — a
+/// principle heuristic never fails the verdict on its own; a real
+/// analyzer/config failure still surfaces as a `CliError` (exit 2), same as
+/// every other command. Deliberately a separate, standalone output block
+/// from `patterns`, even though both are advisory: todo.md §16.7 treats
+/// concrete pattern recommendations and abstract design-principle
+/// interpretations as different assertion classes.
+fn run_principles(
+    options: PrinciplesOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let PrinciplesOptions { format } = options;
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format("`principles`", format, "tty, json"));
+    }
+    let workspace = judge::ingest::load(None)?;
+    let source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let complexity = judge::complexity::analyze_workspace(source_files, false);
+    let heuristics = judge::principle::analyze_workspace(&workspace, &complexity);
+
+    match format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({ "heuristics": heuristics });
+            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected above before loading the workspace")
+        }
+        OutputFormat::Tty => {
+            writeln!(
+                out,
+                "design principle heuristics — advisory, no verdict effect, always a judgment \
+                 call: {}",
+                heuristics.len()
+            )?;
+            for heuristic in &heuristics {
+                writeln!(
+                    out,
+                    "  [{}] {}  crate: {}",
+                    heuristic.id, heuristic.principle, heuristic.scope.krate
+                )?;
+                for module in &heuristic.scope.modules {
+                    writeln!(out, "    - {module}")?;
+                }
             }
         }
     }
@@ -3698,6 +3786,37 @@ mod tests {
         .unwrap();
     }
 
+    /// A fixture crate with one function satisfying both
+    /// `functional-core-imperative-shell` signals: an `std::fs::read_to_string`
+    /// call plus nine sequential `if`s (cyclomatic complexity 10, at
+    /// [`judge::principle::FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD`]).
+    fn write_principle_heuristic_fixture_crate(dir: &Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn read_and_branch(path: &str) -> i32 {\n\
+             \x20   let contents = std::fs::read_to_string(path).unwrap();\n\
+             \x20   let mut total = contents.len() as i32;\n\
+             \x20   if total > 0 { total += 1; }\n\
+             \x20   if total > 1 { total += 1; }\n\
+             \x20   if total > 2 { total += 1; }\n\
+             \x20   if total > 3 { total += 1; }\n\
+             \x20   if total > 4 { total += 1; }\n\
+             \x20   if total > 5 { total += 1; }\n\
+             \x20   if total > 6 { total += 1; }\n\
+             \x20   if total > 7 { total += 1; }\n\
+             \x20   if total > 8 { total += 1; }\n\
+             \x20   total\n\
+             }\n",
+        )
+        .unwrap();
+    }
+
     /// A pair of duplicated function bodies (well over
     /// `judge::duplication::DEFAULT_MIN_TOKENS`), both in one new file — a
     /// self-contained `code_introduced` duplication finding once that file
@@ -4158,6 +4277,38 @@ fn dup_two(x: i32) -> i32 {
                 "raii_guard",
             ]),
             "expected candidates from five different rules: {json}"
+        );
+    }
+
+    /// (e) `principles` reports the corroborated `functional-core-
+    /// imperative-shell` heuristic and never fails the verdict (todo.md
+    /// §16.7: advisory only, same as `patterns`).
+    #[test]
+    fn principles_command_reports_a_heuristic_and_stays_clean() {
+        let dir = TempDir::new("principles-clean");
+        write_principle_heuristic_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::Principles(PrinciplesOptions {
+                format: OutputFormat::Json,
+            })),
+            &mut out,
+        )
+        .expect("`principles` must not error on a valid fixture");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let heuristics = json["heuristics"].as_array().expect("heuristics array");
+        assert_eq!(
+            heuristics.len(),
+            1,
+            "expected one corroborated heuristic: {json}"
+        );
+        assert_eq!(
+            heuristics[0]["principle"].as_str(),
+            Some("functional_core_imperative_shell")
         );
     }
 

@@ -127,6 +127,7 @@ pub enum Severity {
 /// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
 /// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::boundaries`] module docs "Module-level boundaries") |
 /// | `unused-dev-dependency` | `bounded_semantic` (no usage found in the examined view — tests/examples/benches and `#[cfg(test)]` modules of the declaring package; doctests are not scanned) |
+/// | `unused-dependency` | `bounded_semantic` (rustc's own `unused_crate_dependencies` lint result, narrowed to the intersection across every target compiled for the package — see [`crate::deps`] module docs "Importing rustc's `unused_crate_dependencies` lint") |
 /// | `phantom-crate`, `phantom-version`, `fresh-low-reputation-dep` | `external_measurement` (a crates.io lookup snapshot) |
 /// | `untested-hotspot` | `external_measurement` (complexity and churn are `derived_fact`/`heuristic` in isolation, but the imported `cargo-llvm-cov` coverage snapshot is the rarest, least locally-verifiable ingredient in the combination, so it sets the class — see `crate::coverage::untested_hotspots`) |
 /// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt` | `heuristic` (reproducible interpretation, not proof) |
@@ -199,7 +200,8 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "crate-boundary-violation"
         | "dependency-cycle"
         | "module-boundary-violation"
-        | "unused-dev-dependency" => EvidenceClass::BoundedSemantic,
+        | "unused-dev-dependency"
+        | "unused-dependency" => EvidenceClass::BoundedSemantic,
         "phantom-crate" | "phantom-version" | "fresh-low-reputation-dep" | "untested-hotspot" => {
             EvidenceClass::ExternalMeasurement
         }

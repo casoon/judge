@@ -2514,4 +2514,172 @@ mod tests {
         let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
         assert!(analyze_workspace(&workspace, &[]).is_empty());
     }
+
+    /// `stringly-error-boundary` (d) — unentscheidbar: the crate's only
+    /// typed error lives behind `#[cfg(feature = "not-enabled-by-default")]`.
+    /// A real build without that feature would never see `FooError` coexist
+    /// with the two catch-all-error boundary functions, but
+    /// `syn::parse_file` has no cfg resolution and parses every `cfg`
+    /// branch regardless of actual feature activation (a documented,
+    /// accepted Fast-Tier limitation, not a bug). This is a golden test of
+    /// that honest, limited behavior: the candidate still fires, corroborated
+    /// by evidence that might not actually coexist in any real build.
+    #[test]
+    fn stringly_error_boundary_cfg_gated_typed_error_still_corroborates() {
+        let dir = TempDir::new("pattern-stringly-cfg-gated");
+        let boundary = dir.join("boundary.rs");
+        std::fs::write(
+            &boundary,
+            "pub fn a() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
+             pub fn b() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n",
+        )
+        .unwrap();
+        let errors = dir.join("errors.rs");
+        std::fs::write(
+            &errors,
+            "#[cfg(feature = \"not-enabled-by-default\")]\n\
+             enum FooError { Bad }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![boundary.clone(), errors]);
+        let findings = vec![
+            catch_all_error_finding(&boundary, "a", 1),
+            catch_all_error_finding(&boundary, "b", 2),
+        ];
+
+        let candidates = analyze_workspace(&workspace, &findings);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::DomainError);
+    }
+
+    /// `primitive-domain-value` (d) — unentscheidbar: the guarding signature
+    /// only exists behind `#[cfg(feature = "not-enabled-by-default")]`. In a
+    /// real build without that feature, `set_b` (and its validation guard)
+    /// would not exist alongside `set_a`, but `syn::parse_file` has no cfg
+    /// resolution and parses both regardless. Golden test of that honest,
+    /// limited behavior — not a bug.
+    #[test]
+    fn primitive_domain_value_cfg_gated_guard_still_corroborates() {
+        let dir = TempDir::new("pattern-primitive-cfg-gated");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn set_a(threshold: u32) {}\n\
+             #[cfg(feature = \"not-enabled-by-default\")]\n\
+             pub fn set_b(threshold: u32) -> Result<(), String> {\n\
+             \x20   if threshold > 100 {\n\
+             \x20       return Err(\"too big\".to_string());\n\
+             \x20   }\n\
+             \x20   Ok(())\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::ValidatedNewtype);
+    }
+
+    /// `boolean-state-cluster` (d) — unentscheidbar: the three-bool-parameter
+    /// function that would trip this rule is produced entirely by a
+    /// `macro_rules!` expansion, never written out in the source. `syn` sees
+    /// the macro *definition* and the invocation `configure_impl!();` as an
+    /// opaque `Item::Macro`, never the expanded `fn configure(...)` — the
+    /// condition this rule looks for is structurally invisible to a
+    /// `syn::parse_file`-based scanner. Proves the rule stays silent rather
+    /// than guessing at what the expansion might contain.
+    #[test]
+    fn boolean_cluster_macro_generated_function_produces_no_candidate() {
+        let dir = TempDir::new("pattern-bool-macro-generated");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "macro_rules! configure_impl {\n\
+             \x20   () => {\n\
+             \x20       pub fn configure(verbose: bool, strict: bool, dry_run: bool) {\n\
+             \x20           if verbose && strict {\n\
+             \x20               do_thing();\n\
+             \x20           }\n\
+             \x20           let _ = dry_run;\n\
+             \x20       }\n\
+             \x20   };\n\
+             }\n\
+             configure_impl!();\n\
+             fn do_thing() {}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze_workspace(&workspace, &[]).is_empty());
+    }
+
+    /// `public-invariant-bypass` (d) — unentscheidbar: `Range` carries a
+    /// `#[derive(Builder)]`-shaped attribute whose expansion would generate
+    /// the real validating constructor, but that constructor is never
+    /// written out as source `syn` can see — only the derive macro
+    /// invocation is visible. No `pub fn` in this file returns `Self`/
+    /// `Range`, so `ConstructorVisitor` finds nothing to corroborate the
+    /// struct fact with. Proves the rule only acts on what is literally in
+    /// the AST, not on macro-expanded validation it cannot observe.
+    #[test]
+    fn public_invariant_bypass_derive_macro_constructor_produces_no_candidate() {
+        let dir = TempDir::new("pattern-invariant-derive-macro");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "#[derive(Builder)]\n\
+             pub struct Range {\n\
+             \x20   pub low: u32,\n\
+             \x20   pub high: u32,\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze_workspace(&workspace, &[]).is_empty());
+    }
+
+    /// `manual-resource-lifecycle` (d) — unentscheidbar: `register`/
+    /// `unregister` are called on two unrelated types (`MetricRegistry`/
+    /// `ListSubscription`) for two semantically unrelated operations that
+    /// merely happen to share the acquire/release name pattern this rule
+    /// matches on. The rule has no type resolution, so it cannot tell these
+    /// apart from a genuine acquire/release pair on one resource — it fires
+    /// anyway. This is not a bug to fix: it is the documented
+    /// false-positive vector the rule's own contraindications warn about
+    /// (see `build_manual_resource_lifecycle_candidate`'s second
+    /// contraindication), and the reason the Gegenindikationen on this rule
+    /// are mandatory.
+    #[test]
+    fn manual_resource_lifecycle_unrelated_types_sharing_call_names_still_fires() {
+        let dir = TempDir::new("pattern-resource-coincidental-names");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "struct MetricRegistry;\n\
+             impl MetricRegistry {\n\
+             \x20   fn register(&self, _id: u32) {}\n\
+             }\n\
+             struct ListSubscription;\n\
+             impl ListSubscription {\n\
+             \x20   fn unregister(&self) {}\n\
+             }\n\
+             pub fn unrelated_operations(id: u32) {\n\
+             \x20   let registry = MetricRegistry;\n\
+             \x20   let subscription = ListSubscription;\n\
+             \x20   registry.register(id);\n\
+             \x20   subscription.unregister();\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::RaiiGuard);
+    }
 }
