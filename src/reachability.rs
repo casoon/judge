@@ -1000,4 +1000,44 @@ resolver = "2"
             "crate-prefixed lookup must resolve uniquely instead of erroring"
         );
     }
+
+    /// **Documented boundary, golden test — not a bug.** The module docs are
+    /// explicit that generic registration macros (`inventory::submit!`,
+    /// `linkme::distributed_slice`, `ctor`, …) are deliberately *not*
+    /// recognized as entry points: "there's no fixed attribute or call shape
+    /// to key off generically, and guessing at specific crate names would be
+    /// arbitrary". This locks in the consequence: a `pub fn` whose only
+    /// "caller" is a `ctor`-style function that the real `ctor` crate would
+    /// run automatically at process startup (via a linker section, never via
+    /// an ordinary call from `main`) is reported `NotReachable` even though a
+    /// real build would call it. `#[ctor::ctor]` itself needs no real `ctor`
+    /// dependency here — [`has_attr_ending_in`] only ever recognizes
+    /// `test`/`bench`/`no_mangle`/`export_name`/`wasm_bindgen`, so the
+    /// unresolved attribute path is exercised the same way regardless of
+    /// whether the crate exists.
+    #[test]
+    fn a_fn_reachable_only_via_a_ctor_style_registration_attribute_is_reported_not_reachable() {
+        let dir = TempDir::new("why-live-ctor-registration");
+        let workspace = load_bin_workspace(
+            &dir,
+            r#"pub fn helper() -> i32 {
+    1
+}
+
+#[ctor::ctor]
+fn runs_at_startup() {
+    helper();
+}
+"#,
+            "fn main() {}\n",
+        );
+
+        let result = why_live(&workspace, "helper", true).unwrap();
+        assert!(
+            matches!(result, WhyLive::NotReachable),
+            "a ctor-style registration attribute is a documented blind spot, not a recognized \
+             entry point — `helper` is genuinely live at runtime but this analysis cannot see \
+             it: {result:?}"
+        );
+    }
 }

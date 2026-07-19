@@ -396,9 +396,11 @@ pub struct AnalysisUniverse {
     /// `build-script` (see `crate::ingest::EntryPointKind::label`).
     pub targets: Vec<String>,
     /// The cargo feature selection the analyzed view was resolved under.
-    /// Deep Tier: `["default"]` — the rust-analyzer loader resolves default
-    /// features. Fast Tier: empty — the syntactic pass is feature-blind and
-    /// parses every `cfg`-gated line regardless of any selection.
+    /// Deep Tier: `["all"]` — `DeepContext::load` (`crate::deep`) loads the
+    /// workspace with every feature active (`CargoFeatures::All`,
+    /// `--all-features`-equivalent), not just `default`. Fast Tier: empty —
+    /// the syntactic pass is feature-blind and parses every `cfg`-gated line
+    /// regardless of any selection.
     pub features: Vec<String>,
     /// Host platform the analysis ran on, as `<arch>-<os>` from
     /// `std::env::consts`.
@@ -438,7 +440,7 @@ pub struct AnalysisUniverse {
 
 impl AnalysisUniverse {
     /// The Deep Tier view (`dead-code`, `explain --why-live`): a semantic
-    /// workspace load under default features, deliberately without a
+    /// workspace load under every Cargo feature, deliberately without a
     /// proc-macro server and without build scripts (see `judge::deep`).
     /// `include_generated` is fixed to `false`: generated files stay in the
     /// semantic graph but are never finding targets at the Deep Tier (see
@@ -455,7 +457,7 @@ impl AnalysisUniverse {
                 .map(ToString::to_string),
         );
         Self {
-            features: vec!["default".to_string()],
+            features: vec!["all".to_string()],
             entry_points,
             include_tests,
             proc_macro_expansion: FidelityStatus::Disabled,
@@ -1154,7 +1156,7 @@ edition = "2021"
         assert_eq!(with_tests.tier, "deep");
         assert_eq!(with_tests.commit, None, "fixture is not a git repository");
         assert_eq!(with_tests.targets, ["bin", "lib"]);
-        assert_eq!(with_tests.features, ["default"]);
+        assert_eq!(with_tests.features, ["all"]);
         assert!(!with_tests.platform.is_empty());
         assert!(with_tests.include_tests);
         assert!(!with_tests.include_generated);
@@ -1229,7 +1231,7 @@ edition = "2021"
         assert_eq!(universe["tier"], "deep");
         assert_eq!(universe["commit"], serde_json::Value::Null);
         assert_eq!(universe["targets"], serde_json::json!(["bin", "lib"]));
-        assert_eq!(universe["features"], serde_json::json!(["default"]));
+        assert_eq!(universe["features"], serde_json::json!(["all"]));
         assert_eq!(universe["include_tests"], true);
         assert_eq!(universe["include_generated"], false);
         assert_eq!(universe["proc_macro_expansion"], "disabled");

@@ -1,0 +1,26 @@
+{
+  "name": "judge-mcp",
+  "version": "0.1.0",
+  "description": "MCP adapter for the cargo-judge CLI (translation layer only, computes no findings itself)",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "judge-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}

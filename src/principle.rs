@@ -25,11 +25,13 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus one real detector —
-//! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell),
-//! see [`functional_core_imperative_shell_candidates`]. The remaining
-//! `DesignPrinciple` variants are unused for now; they document the target
-//! space rather than being implemented.
+//! sixteen table entries), plus two real detectors —
+//! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
+//! (see [`functional_core_imperative_shell_candidates`]) and
+//! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
+//! [`interface_segregation_candidates`]). The remaining `DesignPrinciple`
+//! variants are unused for now; they document the target space rather than
+//! being implemented.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,6 +53,12 @@ use crate::pattern::{CodeScope, Contraindication, Evidence, EvidenceLocation};
 /// from this heuristic's (does this function already combine I/O with
 /// substantial branching).
 pub const FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD: u32 = 10;
+
+/// Minimum method count [`interface_segregation_candidates`] treats as "a
+/// large trait" (signal 1) — chosen to mean noticeably more than a small,
+/// focused interface (contrast with a two- or three-method trait, which is
+/// unremarkable on its own).
+pub const INTERFACE_SEGREGATION_METHOD_THRESHOLD: usize = 5;
 
 /// A prüffähiges Designprinzip from todo.md §16.7's table. All sixteen table
 /// entries are represented so the enum documents the full target space, even
@@ -212,14 +220,17 @@ pub struct PrincipleHeuristic {
 
 /// Runs every implemented principle-heuristic detector over `workspace`,
 /// using `complexity` (the already-computed `judge::complexity::analyze_workspace`
-/// result) as one of the independent evidence sources. Currently only
-/// [`functional_core_imperative_shell_candidates`] — this is the dispatch
-/// point future detectors from todo.md §16.7's table attach to.
+/// result) as one of the independent evidence sources for
+/// [`functional_core_imperative_shell_candidates`]. Merges its results with
+/// [`interface_segregation_candidates`] — this is the dispatch point future
+/// detectors from todo.md §16.7's table attach to.
 pub fn analyze_workspace(
     workspace: &Workspace,
     complexity: &WorkspaceComplexity,
 ) -> Vec<PrincipleHeuristic> {
-    functional_core_imperative_shell_candidates(workspace, complexity)
+    let mut heuristics = functional_core_imperative_shell_candidates(workspace, complexity);
+    heuristics.extend(interface_segregation_candidates(workspace));
+    heuristics
 }
 
 /// Functional Core, Imperative Shell (todo.md §16.7's table): "I/O,
@@ -434,6 +445,253 @@ fn build_functional_core_imperative_shell_heuristic(
     }
 }
 
+/// A trait declaration found while scanning a crate for
+/// [`interface_segregation_candidates`]: its name, its method count (signal
+/// 1), and where it lives.
+struct TraitDeclaration {
+    name: String,
+    method_count: usize,
+    location: EvidenceLocation,
+}
+
+/// An `impl TraitName for Type` block found while scanning a crate for
+/// [`interface_segregation_candidates`]: which trait it implements (matched
+/// by name only — see that function's doc comment), the `Self` type, the
+/// set of methods the block itself defines (not inherited defaults —
+/// signal 2), and where it lives.
+struct TraitImplementation {
+    trait_name: String,
+    self_type: String,
+    overridden_methods: std::collections::BTreeSet<String>,
+    location: EvidenceLocation,
+}
+
+/// Interface Segregation (todo.md §16.7's table): "großes Trait, Nutzer
+/// verwenden stabile disjunkte Methodengruppen" → "Trait könnte mehrere
+/// Consumer-Interfaces enthalten".
+///
+/// Two independent signals, both required on the same trait:
+///
+/// 1. **Structural (AST)** — the trait declares at least
+///    [`INTERFACE_SEGREGATION_METHOD_THRESHOLD`] methods (`syn::TraitItemFn`
+///    entries, counted whether or not they carry a default body).
+/// 2. **Empirical usage pattern (independent signal)** — within the same
+///    crate, at least two `impl TraitName for Type` blocks exist whose
+///    *overridden* method sets (the methods the impl block itself defines,
+///    not inherited defaults) are non-empty and pairwise disjoint — no
+///    method name shared between the two. This is structurally different
+///    from signal 1: it is empirical evidence that implementors cluster
+///    into non-overlapping capability groups, not another reading of trait
+///    size.
+///
+/// Traits are matched to their impls purely by trait name (last path
+/// segment), not full path resolution — the same accepted-limitation
+/// approach as [`path_matches_io_prefix`] uses for I/O calls. At most one
+/// heuristic per trait: the first disjoint impl pair found, in
+/// deterministic (`self_type`, file) order.
+fn interface_segregation_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    use quote::ToTokens;
+
+    struct Collector {
+        file: PathBuf,
+        traits: Vec<TraitDeclaration>,
+        impls: Vec<TraitImplementation>,
+    }
+    impl<'ast> Visit<'ast> for Collector {
+        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+            let method_count = node
+                .items
+                .iter()
+                .filter(|item| matches!(item, syn::TraitItem::Fn(_)))
+                .count();
+            self.traits.push(TraitDeclaration {
+                name: node.ident.to_string(),
+                method_count,
+                location: EvidenceLocation {
+                    file: self.file.clone(),
+                    item_path: Some(node.ident.to_string()),
+                },
+            });
+            syn::visit::visit_item_trait(self, node);
+        }
+
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            if let Some((_, path, _)) = &node.trait_
+                && let Some(segment) = path.segments.last()
+            {
+                let trait_name = segment.ident.to_string();
+                let self_type = node.self_ty.to_token_stream().to_string();
+                let overridden_methods = node
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        syn::ImplItem::Fn(method) => Some(method.sig.ident.to_string()),
+                        _ => None,
+                    })
+                    .collect();
+                self.impls.push(TraitImplementation {
+                    trait_name: trait_name.clone(),
+                    location: EvidenceLocation {
+                        file: self.file.clone(),
+                        item_path: Some(format!("<{self_type} as {trait_name}>")),
+                    },
+                    self_type,
+                    overridden_methods,
+                });
+            }
+            syn::visit::visit_item_impl(self, node);
+        }
+    }
+
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        let mut traits = Vec::new();
+        let mut impls = Vec::new();
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            let mut collector = Collector {
+                file: source.path.clone(),
+                traits: Vec::new(),
+                impls: Vec::new(),
+            };
+            collector.visit_file(&ast);
+            traits.extend(collector.traits);
+            impls.extend(collector.impls);
+        }
+
+        for trait_decl in &traits {
+            if trait_decl.method_count < INTERFACE_SEGREGATION_METHOD_THRESHOLD {
+                continue;
+            }
+            let mut candidates: Vec<&TraitImplementation> = impls
+                .iter()
+                .filter(|imp| {
+                    imp.trait_name == trait_decl.name && !imp.overridden_methods.is_empty()
+                })
+                .collect();
+            candidates.sort_by(|a, b| {
+                (&a.self_type, &a.location.file).cmp(&(&b.self_type, &b.location.file))
+            });
+
+            let disjoint_pair = candidates.iter().enumerate().find_map(|(i, first)| {
+                candidates[i + 1..]
+                    .iter()
+                    .find(|second| {
+                        first
+                            .overridden_methods
+                            .is_disjoint(&second.overridden_methods)
+                    })
+                    .map(|second| (*first, *second))
+            });
+
+            if let Some((first, second)) = disjoint_pair {
+                heuristics.push(build_interface_segregation_heuristic(
+                    krate, trait_decl, first, second,
+                ));
+            }
+        }
+    }
+    heuristics
+}
+
+fn build_interface_segregation_heuristic(
+    krate: &CrateInfo,
+    trait_decl: &TraitDeclaration,
+    first: &TraitImplementation,
+    second: &TraitImplementation,
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![trait_decl.name.clone()],
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{}` declares {} methods, at or above the {INTERFACE_SEGREGATION_METHOD_THRESHOLD} \
+             threshold this heuristic treats as a large trait.",
+            trait_decl.name, trait_decl.method_count
+        ),
+        locations: vec![trait_decl.location.clone()],
+    };
+    let usage = Evidence {
+        description: format!(
+            "In this crate, `{}` overrides {{{}}} and `{}` overrides {{{}}} of `{}` — two \
+             implementors whose overridden method sets share no method name.",
+            first.self_type,
+            sorted_joined(&first.overridden_methods),
+            second.self_type,
+            sorted_joined(&second.overridden_methods),
+            trait_decl.name
+        ),
+        locations: vec![first.location.clone(), second.location.clone()],
+    };
+
+    let evidence_identities = vec![
+        trait_decl.name.clone(),
+        first.self_type.clone(),
+        second.self_type.clone(),
+    ];
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::InterfaceSegregation,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::InterfaceSegregation,
+        scope,
+        evidence: vec![structural, usage],
+        interpretation: format!(
+            "This trait has {} methods, and its implementors in this crate split into \
+             non-overlapping groups by which methods they override. That may indicate the \
+             trait actually models more than one consumer-facing interface.",
+            trait_decl.method_count
+        ),
+        contraindications: vec![
+            Contraindication {
+                description: "A trait with many default-implemented convenience methods on top \
+                    of a small required core is a common, intentional design — not \
+                    automatically evidence of multiple interfaces."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "Only 2 implementors may be too few to establish a real usage \
+                    pattern, rather than incidental non-overlap."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether callers actually depend on the trait through the full \
+                interface or only through one of the observed subsets is not checked here \
+                (would need cross-crate consumer analysis)."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the trait as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Split into two or more smaller traits along the observed method \
+                    groups, potentially with a supertrait for shared methods if any exist."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
+/// Deterministic, comma-joined rendering of a method-name set for evidence
+/// text (sorted so the same set always renders identically).
+fn sorted_joined(methods: &std::collections::BTreeSet<String>) -> String {
+    methods.iter().cloned().collect::<Vec<_>>().join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +817,187 @@ mod tests {
         assert!(analyze(&workspace).is_empty());
     }
 
+    /// A trait with [`INTERFACE_SEGREGATION_METHOD_THRESHOLD`] methods, all
+    /// default-implemented so implementors may override any subset.
+    const WIDE_TRAIT: &str = "
+    pub trait Wide {
+        fn a(&self) { let _ = 1; }
+        fn b(&self) { let _ = 1; }
+        fn c(&self) { let _ = 1; }
+        fn d(&self) { let _ = 1; }
+        fn e(&self) { let _ = 1; }
+    }
+";
+
+    /// (a) A trait with >= threshold methods, plus two impls whose
+    /// overridden-method sets are disjoint ⇒ exactly one `PrincipleHeuristic`
+    /// for `InterfaceSegregation`, with both evidence slots populated.
+    #[test]
+    fn wide_trait_with_disjoint_impls_produces_one_heuristic() {
+        let dir = TempDir::new("principle-interface-segregation-disjoint");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            format!(
+                "{WIDE_TRAIT}\n\
+                 pub struct Left;\n\
+                 impl Wide for Left {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 }}\n\
+                 pub struct Right;\n\
+                 impl Wide for Right {{\n\
+                 \x20   fn c(&self) {{}}\n\
+                 \x20   fn d(&self) {{}}\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+
+        assert_eq!(heuristics.len(), 1);
+        let heuristic = &heuristics[0];
+        assert_eq!(heuristic.principle, DesignPrinciple::InterfaceSegregation);
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) A wide trait with only one impl ⇒ no heuristic (no pair to
+    /// compare).
+    #[test]
+    fn wide_trait_with_single_impl_produces_no_heuristic() {
+        let dir = TempDir::new("principle-interface-segregation-single-impl");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            format!(
+                "{WIDE_TRAIT}\n\
+                 pub struct Left;\n\
+                 impl Wide for Left {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze(&workspace).is_empty());
+    }
+
+    /// (b) A wide trait with two impls whose overridden-method sets overlap
+    /// ⇒ no heuristic (no disjoint pair).
+    #[test]
+    fn wide_trait_with_overlapping_impls_produces_no_heuristic() {
+        let dir = TempDir::new("principle-interface-segregation-overlap");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            format!(
+                "{WIDE_TRAIT}\n\
+                 pub struct Left;\n\
+                 impl Wide for Left {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 }}\n\
+                 pub struct Right;\n\
+                 impl Wide for Right {{\n\
+                 \x20   fn b(&self) {{}}\n\
+                 \x20   fn c(&self) {{}}\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze(&workspace).is_empty());
+    }
+
+    /// (c) A trait below the method threshold, even with disjoint impls ⇒
+    /// no heuristic.
+    #[test]
+    fn narrow_trait_with_disjoint_impls_produces_no_heuristic() {
+        let dir = TempDir::new("principle-interface-segregation-narrow");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub trait Narrow {\n\
+             \x20   fn a(&self) { let _ = 1; }\n\
+             \x20   fn b(&self) { let _ = 1; }\n\
+             \x20   fn c(&self) { let _ = 1; }\n\
+             \x20   fn d(&self) { let _ = 1; }\n\
+             }\n\
+             pub struct Left;\n\
+             impl Narrow for Left {\n\
+             \x20   fn a(&self) {}\n\
+             }\n\
+             pub struct Right;\n\
+             impl Narrow for Right {\n\
+             \x20   fn b(&self) {}\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze(&workspace).is_empty());
+    }
+
+    /// (d) Both rules run over the same workspace and can report candidates
+    /// at once: a `functional-core-imperative-shell` candidate in one file
+    /// and an `interface-segregation` candidate in another. Mirrors what
+    /// `cargo judge principles` aggregates (`judge::principle::analyze_workspace`
+    /// is exactly what that command calls).
+    #[test]
+    fn both_rules_can_report_candidates_in_the_same_workspace() {
+        let dir = TempDir::new("principle-both-rules-together");
+        let io_file = dir.join("shell.rs");
+        std::fs::write(
+            &io_file,
+            format!(
+                "pub fn read_and_branch(path: &str) -> i32 {{\n\
+                 let contents = std::fs::read_to_string(path).unwrap();\n\
+                 let mut total = contents.len() as i32;\n\
+                 {NINE_IFS}\n\
+                 total\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+        let trait_file = dir.join("wide.rs");
+        std::fs::write(
+            &trait_file,
+            format!(
+                "{WIDE_TRAIT}\n\
+                 pub struct Left;\n\
+                 impl Wide for Left {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 }}\n\
+                 pub struct Right;\n\
+                 impl Wide for Right {{\n\
+                 \x20   fn c(&self) {{}}\n\
+                 \x20   fn d(&self) {{}}\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![io_file, trait_file]);
+        let heuristics = analyze(&workspace);
+
+        let principles: Vec<DesignPrinciple> = heuristics.iter().map(|h| h.principle).collect();
+        assert!(principles.contains(&DesignPrinciple::FunctionalCoreImperativeShell));
+        assert!(principles.contains(&DesignPrinciple::InterfaceSegregation));
+        assert_eq!(heuristics.len(), 2);
+    }
+
     /// (d) Golden wording test (todo.md §16.7 "Umsetzung und Akzeptanz"):
     /// none of the generated `interpretation`/evidence texts may contain an
     /// absolute claim of violation.
@@ -576,9 +1015,9 @@ mod tests {
         ];
 
         let dir = TempDir::new("principle-golden-wording");
-        let file = dir.join("lib.rs");
+        let io_file = dir.join("shell.rs");
         std::fs::write(
-            &file,
+            &io_file,
             format!(
                 "pub fn read_and_branch(path: &str) -> i32 {{\n\
                  let contents = std::fs::read_to_string(path).unwrap();\n\
@@ -589,12 +1028,36 @@ mod tests {
             ),
         )
         .unwrap();
+        let trait_file = dir.join("wide.rs");
+        std::fs::write(
+            &trait_file,
+            format!(
+                "{WIDE_TRAIT}\n\
+                 pub struct Left;\n\
+                 impl Wide for Left {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 }}\n\
+                 pub struct Right;\n\
+                 impl Wide for Right {{\n\
+                 \x20   fn c(&self) {{}}\n\
+                 \x20   fn d(&self) {{}}\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
 
-        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![io_file, trait_file]);
         let heuristics = analyze(&workspace);
         assert!(
             !heuristics.is_empty(),
             "fixture must produce a heuristic to check"
+        );
+        let principles: Vec<DesignPrinciple> = heuristics.iter().map(|h| h.principle).collect();
+        assert!(
+            principles.contains(&DesignPrinciple::FunctionalCoreImperativeShell)
+                && principles.contains(&DesignPrinciple::InterfaceSegregation),
+            "fixture must exercise both rules' wording: {principles:?}"
         );
 
         for heuristic in &heuristics {

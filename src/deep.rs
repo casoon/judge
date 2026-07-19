@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use ra_ap_ide::{Analysis, AnalysisHost, FilePosition, FindAllRefsConfig, RaFixtureConfig};
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
-use ra_ap_project_model::CargoConfig;
+use ra_ap_project_model::{CargoConfig, CargoFeatures};
 use ra_ap_vfs::{AbsPathBuf, Vfs, VfsPath};
 
 pub use ra_ap_ide::FileId;
@@ -129,10 +129,26 @@ impl DeepContext {
     /// (`crate::reachability::why_live`'s and `is_reachable_from_entry`'s
     /// own `incoming_calls`-based BFS). `set_test: true` keeps `#[test]`
     /// code visible regardless, matching what a normal IDE session expects.
+    ///
+    /// `features: CargoFeatures::All` (`--all-features`-equivalent) is a
+    /// third, later fix for the same class of blind spot: without it, a
+    /// `pub fn` reachable only through a non-default Cargo feature resolves
+    /// fine (`Some`, not `None`) but has zero visible callers, so
+    /// `find_all_refs` legitimately reports zero references and the item is
+    /// flagged dead — a silent false positive, not an `analysis_incomplete`,
+    /// because nothing about the query itself failed. That violates todo.md
+    /// §3.A/§7's "im Zweifel nicht melden" stance just as much as the
+    /// proc-macro blind spot above. Loading with every feature active closes
+    /// this the same way a real `cargo build --all-features` (as CI commonly
+    /// runs) would see the call. Consequence for callers:
+    /// [`crate::finding::AnalysisUniverse`] must describe the Deep Tier's
+    /// feature selection as "all", not "default" — see
+    /// `AnalysisUniverse::deep`.
     pub fn load(workspace_root: &Path) -> Result<Self, DeepError> {
         let cargo_config = CargoConfig {
             sysroot: Some(ra_ap_project_model::RustLibSource::Discover),
             set_test: true,
+            features: CargoFeatures::All,
             ..CargoConfig::default()
         };
         let load_config = LoadCargoConfig {

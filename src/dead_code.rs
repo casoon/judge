@@ -875,4 +875,193 @@ pub extern "C" fn exported_b() -> i32 {
             report.errors
         );
     }
+
+    /// **Known gap, documented rather than hidden — not a regression to fix
+    /// here.** todo.md §3.A/§7 requires that proc-macro blind spots produce
+    /// `analysis_incomplete` rather than a finding ("im Zweifel nicht
+    /// melden" — a false positive costs more trust than ten false negatives
+    /// are worth; todo.md line 1696 lists "Proc-Macros und unbekannte
+    /// Consumer" explicitly among the cases that must come back
+    /// `analysis_incomplete`). [`crate::deep::DeepContext::load`] already
+    /// documents *why* this can't hold today: the Deep Tier loads with
+    /// `ProcMacroServerChoice::None`, so a proc-macro-derive's generated
+    /// code is never expanded and never enters rust-analyzer's semantic
+    /// model at all.
+    ///
+    /// This matters for `unused-pub-workspace` specifically: unlike the
+    /// unresolvable-position case above (an item whose *own* position fails
+    /// to resolve, caught by [`DeepError::UnresolvedSymbol`]), here `helper`
+    /// itself resolves perfectly fine — it's the *caller*, hidden inside
+    /// unexpanded macro output, that's invisible. `find_all_refs` therefore
+    /// legitimately answers "zero references" (`Some(empty)`, not `None`),
+    /// so the three-state error handling that protects the
+    /// unresolvable-position case doesn't fire here — there's no error to
+    /// collect. `helper` is only reachable via the derive's expansion (never
+    /// called from anywhere the analysis can see), so it is genuinely
+    /// flagged dead, contradicting the documented policy. Fixing this needs
+    /// proc-macro-usage detection across the workspace, a real feature, not
+    /// a small fix — pinning down today's actual behavior here so the gap
+    /// is tracked rather than silently assumed away.
+    #[test]
+    fn a_pub_fn_reachable_only_through_an_unexpanded_proc_macro_derive_is_falsely_flagged_dead() {
+        let dir = TempDir::new("dead-code-proc-macro-blind-spot");
+        std::fs::create_dir_all(dir.join("macros/src")).unwrap();
+        std::fs::write(
+            dir.join("macros/Cargo.toml"),
+            r#"[package]
+name = "macros"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("macros/src/lib.rs"),
+            r#"use proc_macro::TokenStream;
+
+/// Would-be expansion (never actually run — the Deep Tier loads with no
+/// proc-macro server): a call to `helper()` the analysis never sees.
+#[proc_macro_derive(CallsHelper)]
+pub fn calls_helper(_input: TokenStream) -> TokenStream {
+    "fn __generated_caller() { crate::helper(); }".parse().unwrap()
+}
+"#,
+        )
+        .unwrap();
+        write_crate(
+            &dir,
+            "core",
+            &[("macros", "../macros")],
+            r#"#[derive(macros::CallsHelper)]
+pub struct Widget;
+
+pub fn helper() -> i32 {
+    1
+}
+
+pub fn truly_dead() -> i32 {
+    2
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["macros", "core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            report.errors.is_empty(),
+            "no analyzer error is raised for this case today — `helper` resolves fine, only its \
+             caller is invisible: {:?}",
+            report.errors
+        );
+        assert!(
+            names.contains("helper"),
+            "documents today's actual (policy-violating) behavior: `helper` is only reachable \
+             through the derive's unexpanded generated code, so it is flagged dead instead of \
+             producing analysis_incomplete — see this test's doc comment"
+        );
+        assert!(
+            names.contains("truly_dead"),
+            "genuinely dead regardless — control for the fixture"
+        );
+    }
+
+    /// Regression test for a fixed false positive: [`crate::deep`]'s
+    /// `CargoConfig` used to never activate any non-default Cargo feature
+    /// (it only overrode `sysroot`/`set_test`, leaving `features` at
+    /// `ra_ap_project_model::CargoConfig::default()`'s `Selected { features:
+    /// vec![], no_default_features: false }` — default features only). A
+    /// caller reachable only through a non-default, non-enabled feature was
+    /// invisible the same way a proc-macro-only caller is: the position
+    /// resolves fine (`Some`, not `None`), so no [`DeepError::UnresolvedSymbol`]
+    /// fired — it just never showed up in `helper`'s incoming calls, and
+    /// `check_item`'s [`crate::reachability::is_reachable_from_entry`] BFS
+    /// (this rule's actual same-crate liveness test, not raw reference
+    /// counting — see `check_item`'s doc comment) never found a path to it,
+    /// even though a real `cargo build --features extra` (or
+    /// `--all-features`, as CI commonly runs) would show it reachable. That
+    /// violated todo.md §3.A/§7's "im Zweifel nicht melden" stance.
+    ///
+    /// The caller here has to itself be a recognized entry point (a
+    /// `#[test]`, gated the same way `#[cfg(test)]` test modules normally
+    /// are) rather than just any `pub fn` — [`walk_functions`] discovers
+    /// `#[test]`-attributed functions syntactically regardless of `cfg`, but
+    /// [`crate::reachability::is_reachable_from_entry`]'s BFS still needs the
+    /// feature-gated function to *semantically resolve* to reach `helper`
+    /// through it. A caller that is itself just an ordinary, uncalled `pub
+    /// fn` wouldn't do: it would stay unreachable-from-any-entry-point
+    /// regardless of the feature fix, which would make this test pass for
+    /// the wrong reason.
+    ///
+    /// [`crate::deep::DeepContext::load`] now loads the workspace with
+    /// `CargoFeatures::All` (`--all-features`-equivalent), so the `extra`
+    /// feature is active, the test function resolves as a live entry point,
+    /// and `helper` is reachable through it — no finding for `helper`
+    /// anymore.
+    #[test]
+    fn a_pub_fn_reachable_only_through_a_non_default_cargo_feature_is_not_flagged_dead() {
+        let dir = TempDir::new("dead-code-feature-gate-blind-spot");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+extra = []
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r#"pub fn helper() -> i32 {
+    1
+}
+
+#[cfg(feature = "extra")]
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calls_helper() {
+        assert_eq!(helper(), 1);
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            report.errors.is_empty(),
+            "no analyzer error is raised for this case today: {:?}",
+            report.errors
+        );
+        assert!(
+            !names.contains("helper"),
+            "`helper` is called from `calls_helper`, a #[test] fn only active with the \
+             non-default `extra` feature — now that the Deep Tier loads with all features, the \
+             test is a live entry point and `helper` must not be flagged dead"
+        );
+    }
 }

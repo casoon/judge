@@ -1,0 +1,1 @@
+{"version":3,"file":"judge.d.ts","sourceRoot":"","sources":["../src/judge.ts"],"names":[],"mappings":"AAKA,MAAM,WAAW,eAAe;IAC9B,gFAAgF;IAChF,IAAI,EAAE,MAAM,EAAE,CAAC;IACf,gFAAgF;IAChF,GAAG,CAAC,EAAE,MAAM,CAAC;CACd;AAQD;;iEAEiE;AACjE,qBAAa,mBAAoB,SAAQ,KAAK;CAAG;AA2CjD;;;;;;;;;GASG;AACH,wBAAsB,YAAY,CAAC,OAAO,EAAE,eAAe,GAAG,OAAO,CAAC,OAAO,CAAC,CA2B7E"}
