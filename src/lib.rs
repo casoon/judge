@@ -7,6 +7,7 @@ pub mod complexity;
 pub mod dead_code;
 #[cfg(feature = "deep")]
 pub mod deep;
+pub mod dep_graph;
 pub mod deps;
 pub mod duplication;
 pub mod finding;

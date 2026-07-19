@@ -541,6 +541,26 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::deps::MISPLACED_DEPENDENCY_KIND_RULE_REVISION,
         ),
         (
+            judge::deps::UNUSED_DEV_DEPENDENCY_RULE.to_string(),
+            judge::deps::UNUSED_DEV_DEPENDENCY_RULE_REVISION,
+        ),
+        (
+            judge::deps::HEAVY_DEPENDENCY_RULE.to_string(),
+            judge::deps::HEAVY_DEPENDENCY_RULE_REVISION,
+        ),
+        (
+            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
+            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE_REVISION,
+        ),
+        (
+            judge::dep_graph::MSRV_DRIFT_RULE.to_string(),
+            judge::dep_graph::MSRV_DRIFT_RULE_REVISION,
+        ),
+        (
+            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE.to_string(),
+            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE_REVISION,
+        ),
+        (
             judge::slop::SWALLOWED_RESULT_RULE.to_string(),
             judge::slop::SWALLOWED_RESULT_RULE_REVISION,
         ),
@@ -703,6 +723,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
     let deps = judge::deps::analyze_workspace(workspace);
     analysis_errors.extend(deps.errors.iter().map(ToString::to_string));
     findings.extend(deps.findings);
+
+    let dep_graph = judge::dep_graph::analyze_workspace(workspace);
+    analysis_errors.extend(dep_graph.errors.iter().map(ToString::to_string));
+    findings.extend(dep_graph.findings);
 
     // `name-collision-risk` is fully local (no network), so it runs in the
     // combined bare `cargo judge`/`audit` pass too. The other three G5
@@ -1511,11 +1535,35 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
             judge::deps::MISPLACED_DEPENDENCY_KIND_RULE_REVISION,
         ),
         (
+            judge::deps::UNUSED_DEV_DEPENDENCY_RULE.to_string(),
+            judge::deps::UNUSED_DEV_DEPENDENCY_RULE_REVISION,
+        ),
+        (
+            judge::deps::HEAVY_DEPENDENCY_RULE.to_string(),
+            judge::deps::HEAVY_DEPENDENCY_RULE_REVISION,
+        ),
+        (
+            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
+            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE_REVISION,
+        ),
+        (
+            judge::dep_graph::MSRV_DRIFT_RULE.to_string(),
+            judge::dep_graph::MSRV_DRIFT_RULE_REVISION,
+        ),
+        (
+            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE.to_string(),
+            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE_REVISION,
+        ),
+        (
             judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
             judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
         ),
     ]);
     findings.extend(judge::slopsquat::analyze_name_collision(&workspace));
+
+    let dep_graph_report = judge::dep_graph::analyze_workspace(&workspace);
+    analysis_errors.extend(dep_graph_report.errors.iter().map(ToString::to_string));
+    findings.extend(dep_graph_report.findings);
 
     if check_crates_io {
         let slopsquat_config = load_judge_toml(&workspace.root)?.slopsquat;

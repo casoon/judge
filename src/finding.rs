@@ -121,9 +121,11 @@ pub enum Severity {
 /// |---|---|
 /// | `swallowed-result`, `empty-error-arm`, `catch-all-error`, `suppression-debt`, `merged-stub`, `empty-impl`, `assertion-free-test`, `tautological-test`, `ignored-test-accumulation`, `conversational-artifact`, `restating-comment`, `step-comment-inflation`, `generic-naming`, `doc-restates-signature` | `derived_fact` (G1–G3: the reported pattern is a syntax fact) |
 /// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::duplication::CloneMember::to_finding`]) |
+/// | `duplicate-crate-versions`, `msrv-drift`, `workspace-dep-drift` | `derived_fact` (manifest/resolve-graph facts read directly from `cargo_metadata`) |
 /// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
+/// | `unused-dev-dependency` | `bounded_semantic` (no usage found in the examined view — tests/examples/benches and `#[cfg(test)]` modules of the declaring package; doctests are not scanned) |
 /// | `phantom-crate`, `phantom-version`, `fresh-low-reputation-dep` | `external_measurement` (a crates.io lookup snapshot) |
-/// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt` | `heuristic` (reproducible interpretation, not proof) |
+/// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt` | `heuristic` (reproducible interpretation, not proof) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceClass {
@@ -183,10 +185,14 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "step-comment-inflation"
         | "generic-naming"
         | "doc-restates-signature"
-        | "duplicate-code" => EvidenceClass::DerivedFact,
-        "unused-pub-workspace" | "crate-boundary-violation" | "dependency-cycle" => {
-            EvidenceClass::BoundedSemantic
-        }
+        | "duplicate-code"
+        | "duplicate-crate-versions"
+        | "msrv-drift"
+        | "workspace-dep-drift" => EvidenceClass::DerivedFact,
+        "unused-pub-workspace"
+        | "crate-boundary-violation"
+        | "dependency-cycle"
+        | "unused-dev-dependency" => EvidenceClass::BoundedSemantic,
         "phantom-crate" | "phantom-version" | "fresh-low-reputation-dep" => {
             EvidenceClass::ExternalMeasurement
         }

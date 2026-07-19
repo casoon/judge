@@ -1,8 +1,8 @@
 //! Dependency-hygiene, Fast Tier (see todo.md §3.B, §14.2 P1
 //! "Dependency-Nutzung pro Cargo-Target und `cfg` sammeln; nur eindeutige
 //! `misplaced-dependency-kind`-Vorschläge erzeugen, Feature-only-Nutzung als
-//! Evidenz erhalten"). This module deliberately implements only that one
-//! rule, and only its two unambiguous cases:
+//! Evidenz erhalten"). This module implements `misplaced-dependency-kind`'s
+//! two unambiguous cases:
 //!
 //! a. A `normal` dependency whose code identifier is referenced only from
 //!    `Dev`-domain files (`tests/`, `examples/`, `benches/`), never from
@@ -15,6 +15,13 @@
 //! needs correlating usage sites with the specific `cfg(...)` predicate
 //! guarding them, which is Deep-Tier-grade semantic analysis, not something a
 //! directory-convention heuristic can support without false positives.
+//!
+//! It also implements two usage-based rules built on top of the same
+//! per-crate usage evidence (todo.md §B): `unused-dev-dependency` (a
+//! `[dev-dependencies]` entry with no usage found in any `Dev`-domain file or
+//! `#[cfg(test)]` module) and `heavy-dependency` (a dependency whose resolved
+//! transitive footprint is large relative to how many distinct items of it
+//! the crate actually references).
 //!
 //! ## Usage-domain classification
 //!
@@ -47,6 +54,25 @@ use crate::ingest::{CrateInfo, DependencyKind, Workspace};
 pub const MISPLACED_DEPENDENCY_KIND_RULE: &str = "misplaced-dependency-kind";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const MISPLACED_DEPENDENCY_KIND_RULE_REVISION: u32 = 1;
+
+/// Rule id used for unused-dev-dependency findings (see todo.md §B).
+pub const UNUSED_DEV_DEPENDENCY_RULE: &str = "unused-dev-dependency";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const UNUSED_DEV_DEPENDENCY_RULE_REVISION: u32 = 1;
+
+/// Rule id used for heavy-dependency findings (see todo.md §B).
+pub const HEAVY_DEPENDENCY_RULE: &str = "heavy-dependency";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const HEAVY_DEPENDENCY_RULE_REVISION: u32 = 1;
+
+/// Above this many transitive dependencies (from a full, non `--no-deps`
+/// resolve — see `resolve_transitive_dependency_counts`), combined with
+/// fewer than [`HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD`] distinct items used
+/// from it, a dependency is flagged as heavy for its usage footprint (see
+/// `is_heavy_dependency`).
+const HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD: usize = 20;
+/// See [`HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD`].
+const HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD: usize = 3;
 
 /// Above this many declared features, judge doesn't assert that a `normal`
 /// dependency used only in `Dev`-domain files should move to
@@ -87,6 +113,10 @@ fn classify_domain(relative: &Path) -> UsageDomain {
 pub enum DepsError {
     Io(PathBuf, std::io::Error),
     Parse(PathBuf, syn::Error),
+    /// A full (non `--no-deps`) `cargo metadata` resolve failed — only
+    /// produced by `heavy-dependency`'s transitive-count lookup (see
+    /// `resolve_transitive_dependency_counts`).
+    Metadata(cargo_metadata::Error),
 }
 
 impl std::fmt::Display for DepsError {
@@ -94,6 +124,7 @@ impl std::fmt::Display for DepsError {
         match self {
             Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
             Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
+            Self::Metadata(err) => write!(f, "failed to resolve full dependency graph: {err}"),
         }
     }
 }
@@ -103,6 +134,7 @@ impl std::error::Error for DepsError {
         match self {
             Self::Io(_, err) => Some(err),
             Self::Parse(_, err) => Some(err),
+            Self::Metadata(err) => Some(err),
         }
     }
 }
@@ -149,6 +181,16 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
                 continue;
             }
 
+            if dep.kind == DependencyKind::Development
+                && !has_dev
+                && failed_domains.is_empty()
+                && !krate.dependencies.iter().any(|other| {
+                    other.name == dep.name && other.kind != DependencyKind::Development
+                })
+            {
+                findings.push(unused_dev_dependency_finding(krate, dep));
+            }
+
             let flagged = match dep.kind {
                 DependencyKind::Normal => {
                     has_dev
@@ -167,6 +209,10 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
             }
         }
     }
+
+    let (heavy_findings, heavy_errors) = analyze_heavy_dependencies(workspace);
+    findings.extend(heavy_findings);
+    errors.extend(heavy_errors);
 
     WorkspaceDeps {
         findings,
@@ -204,6 +250,250 @@ fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency)
     }
 }
 
+/// Renders an `unused-dev-dependency` finding. Its evidence class is
+/// `bounded_semantic` (todo.md §17.3: "no reference found ... for the
+/// searched crates/entry points") — the search is bounded to `Dev`-domain
+/// files (`tests/`, `examples/`, `benches/`) and `#[cfg(test)]` modules in
+/// `Normal`-domain files, and doctests are never scanned (a known gap). The
+/// message and severity stay honest about that bound: `Warn`, "no use found
+/// in the examined view", never an absolute "unused" claim (todo.md §17
+/// language discipline). Same `location` convention as [`misplaced_finding`].
+fn unused_dev_dependency_finding(
+    krate: &CrateInfo,
+    dep: &crate::ingest::DeclaredDependency,
+) -> Finding {
+    Finding {
+        id: format!("{UNUSED_DEV_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: UNUSED_DEV_DEPENDENCY_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: krate.manifest_path.clone(),
+            line: OneBasedLine::FIRST,
+            item_path: dep.name.clone(),
+        },
+        evidence_class: EvidenceClass::BoundedSemantic,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "searched": ["tests/", "examples/", "benches/", "#[cfg(test)] modules in src/"],
+            "reason": "no use found in the examined view (tests/examples/benches of this \
+                package, and #[cfg(test)] modules in its src files; doctests are not scanned)",
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+/// Whether a dependency counts as heavy: more than
+/// [`HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD`] transitive dependencies while
+/// fewer than [`HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD`] distinct items are
+/// used from it. Pure and side-effect free so the threshold logic is
+/// unit-testable without a `cargo metadata` resolve.
+fn is_heavy_dependency(transitive_deps: usize, used_items: usize) -> bool {
+    transitive_deps > HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD
+        && used_items < HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD
+}
+
+/// Runs the `heavy-dependency` detector (todo.md §B) over every crate in
+/// `workspace`. Always `heuristic` (todo.md §17.3, `evidence_class_for_rule`'s
+/// catch-all — no explicit arm for this rule): the transitive count depends
+/// on feature unification and platform/target resolution this Fast Tier pass
+/// doesn't fully model, and "used items" is a path-segment approximation
+/// (see [`collect_used_items`]), not resolved item usage.
+fn analyze_heavy_dependencies(workspace: &Workspace) -> (Vec<Finding>, Vec<DepsError>) {
+    let mut findings = Vec::new();
+    let mut errors = Vec::new();
+
+    let manifest_path = workspace.root.join("Cargo.toml");
+    let counts = match resolve_transitive_dependency_counts(&manifest_path) {
+        Ok(counts) => counts,
+        Err(err) => {
+            errors.push(DepsError::Metadata(err));
+            return (findings, errors);
+        }
+    };
+
+    for krate in &workspace.crates {
+        for dep in &krate.dependencies {
+            let Some(&transitive_deps) = counts.get(&dep.name) else {
+                continue;
+            };
+            let used_items = collect_used_items(krate, &dep.code_identifier);
+            if is_heavy_dependency(transitive_deps, used_items.len()) {
+                findings.push(heavy_dependency_finding(
+                    krate,
+                    dep,
+                    transitive_deps,
+                    &used_items,
+                ));
+            }
+        }
+    }
+
+    (findings, errors)
+}
+
+/// Renders a `heavy-dependency` finding. Same `location` convention as
+/// [`misplaced_finding`]; `evidence.examples` is a small, sorted sample of
+/// the distinct used-item names, for a human to sanity-check the count.
+fn heavy_dependency_finding(
+    krate: &CrateInfo,
+    dep: &crate::ingest::DeclaredDependency,
+    transitive_deps: usize,
+    used_items: &HashSet<String>,
+) -> Finding {
+    let mut examples: Vec<&String> = used_items.iter().collect();
+    examples.sort();
+    examples.truncate(5);
+
+    Finding {
+        id: format!("{HEAVY_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: HEAVY_DEPENDENCY_RULE.into(),
+        severity: Severity::Info,
+        location: Location {
+            file: krate.manifest_path.clone(),
+            line: OneBasedLine::FIRST,
+            item_path: dep.name.clone(),
+        },
+        evidence_class: EvidenceClass::Heuristic,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "transitive_deps": transitive_deps,
+            "used_items": used_items.len(),
+            "examples": examples,
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+/// Runs a full (non `--no-deps`) `cargo metadata` resolve to compute how many
+/// transitive dependencies each package in the graph pulls in — needed for
+/// `heavy-dependency`, which [`crate::ingest::load`]'s deliberately
+/// `--no-deps` ingest (todo.md §14.2 P1) cannot answer. Runs its own metadata
+/// command rather than reusing another module's resolve: a parallel
+/// `dep_graph.rs` effort resolves a full graph too, for its own manifest/graph
+/// rules; consolidating the two runs into one is left as follow-up work.
+fn resolve_transitive_dependency_counts(
+    manifest_path: &Path,
+) -> Result<HashMap<String, usize>, cargo_metadata::Error> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_path)
+        .exec()?;
+    let Some(resolve) = metadata.resolve else {
+        return Ok(HashMap::new());
+    };
+
+    let adjacency: HashMap<&cargo_metadata::PackageId, &[cargo_metadata::PackageId]> = resolve
+        .nodes
+        .iter()
+        .map(|node| (&node.id, node.dependencies.as_slice()))
+        .collect();
+    let id_to_name: HashMap<&cargo_metadata::PackageId, String> = metadata
+        .packages
+        .iter()
+        .map(|package| (&package.id, package.name.to_string()))
+        .collect();
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for node in &resolve.nodes {
+        let mut visited: HashSet<&cargo_metadata::PackageId> = HashSet::new();
+        let mut stack: Vec<&cargo_metadata::PackageId> = node.dependencies.iter().collect();
+        while let Some(dep_id) = stack.pop() {
+            if visited.insert(dep_id)
+                && let Some(children) = adjacency.get(dep_id)
+            {
+                stack.extend(children.iter());
+            }
+        }
+        if let Some(name) = id_to_name.get(&node.id) {
+            counts.entry(name.clone()).or_insert(visited.len());
+        }
+    }
+    Ok(counts)
+}
+
+/// Distinct next-level path segments referenced under `target` (a
+/// dependency's `code_identifier`) across every source file in `krate`,
+/// regardless of usage domain — `heavy-dependency` cares about total usage
+/// footprint, not where it is used. `use dep::{Foo, bar::Baz}` records `Foo`
+/// and `bar`; `dep::foo::bar()` records `foo`. An approximation of "how many
+/// distinct items of this dependency does the crate use", not exact item
+/// resolution. Files that fail to read or parse are silently skipped: this is
+/// advisory (`heuristic`) evidence, not a completeness claim like
+/// `unused-dev-dependency`'s.
+fn collect_used_items(krate: &CrateInfo, target: &str) -> HashSet<String> {
+    let mut items = HashSet::new();
+    for file in &krate.source_files {
+        let Ok(source) = std::fs::read_to_string(&file.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&source) else {
+            continue;
+        };
+        let mut collector = DepItemCollector {
+            target,
+            items: HashSet::new(),
+        };
+        collector.visit_file(&ast);
+        items.extend(collector.items);
+    }
+    items
+}
+
+struct DepItemCollector<'a> {
+    target: &'a str,
+    items: HashSet<String>,
+}
+
+impl DepItemCollector<'_> {
+    /// Mirrors [`PathIdentCollector::walk_use_tree`]'s hand-rolled walk (`use`
+    /// trees have no `syn::Path` node), but one level deeper: `matched` tracks
+    /// whether the segment just consumed was `target`, so the *next* segment
+    /// is the item to record.
+    fn walk_use_tree(&mut self, tree: &UseTree, matched: bool) {
+        match tree {
+            UseTree::Path(use_path) => {
+                let ident = use_path.ident.to_string();
+                if matched {
+                    self.items.insert(ident);
+                    self.walk_use_tree(&use_path.tree, false);
+                } else {
+                    self.walk_use_tree(&use_path.tree, ident == self.target);
+                }
+            }
+            UseTree::Name(use_name) => {
+                if matched {
+                    self.items.insert(use_name.ident.to_string());
+                }
+            }
+            UseTree::Rename(use_rename) => {
+                if matched {
+                    self.items.insert(use_rename.ident.to_string());
+                }
+            }
+            UseTree::Glob(_) => {}
+            UseTree::Group(group) => {
+                for item in &group.items {
+                    self.walk_use_tree(item, matched);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for DepItemCollector<'_> {
+    fn visit_item_use(&mut self, node: &'ast ItemUse) {
+        self.walk_use_tree(&node.tree, false);
+    }
+
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        if node.segments.len() >= 2 && node.segments[0].ident == self.target {
+            self.items.insert(node.segments[1].ident.to_string());
+        }
+        visit::visit_path(self, node);
+    }
+}
+
 /// Builds the `code_identifier -> domains observed` map for one crate, by
 /// classifying each source file's domain and parsing it for referenced path
 /// identifiers.
@@ -226,9 +516,20 @@ fn collect_crate_usage(
         let domain = classify_domain(relative);
 
         match collect_identifiers(&file.path) {
-            Ok(idents) => {
+            Ok((idents, cfg_test_idents)) => {
                 for ident in idents {
                     usage.entry(ident).or_default().insert(domain);
+                }
+                // A `#[cfg(test)]` module in an otherwise `Normal`-domain
+                // file (e.g. `mod tests` at the bottom of `src/lib.rs`) is
+                // Dev-domain usage in spirit, even though the file it lives
+                // in isn't — see `unused-dev-dependency` (todo.md §B). This
+                // is additive: identifiers found there already counted
+                // towards the file's own domain above (whole-file
+                // classification is unchanged); this just also credits
+                // `Dev`.
+                for ident in cfg_test_idents {
+                    usage.entry(ident).or_default().insert(UsageDomain::Dev);
                 }
             }
             Err(err) => {
@@ -241,19 +542,67 @@ fn collect_crate_usage(
     (usage, failed_domains, errors)
 }
 
-/// Parses `path` and collects the first-segment identifier of every
-/// referenced path — `use` trees, expression paths, type paths, and
-/// macro-invocation paths — that isn't `self`/`super`/`crate`/`Self`. Each
-/// such identifier is a candidate reference to an external crate's
-/// `code_identifier`.
-fn collect_identifiers(path: &Path) -> Result<HashSet<String>, DepsError> {
+/// Parses `path` and collects two identifier sets from a single parse: the
+/// first-segment identifier of every referenced path — `use` trees,
+/// expression paths, type paths, and macro-invocation paths — that isn't
+/// `self`/`super`/`crate`/`Self` (each such identifier is a candidate
+/// reference to an external crate's `code_identifier`); and the same, scoped
+/// to identifiers referenced only inside `#[cfg(test)]`-attributed modules
+/// (see [`CfgTestIdentCollector`]).
+fn collect_identifiers(path: &Path) -> Result<(HashSet<String>, HashSet<String>), DepsError> {
     let source =
         std::fs::read_to_string(path).map_err(|err| DepsError::Io(path.to_path_buf(), err))?;
     let ast = syn::parse_file(&source).map_err(|err| DepsError::Parse(path.to_path_buf(), err))?;
 
     let mut collector = PathIdentCollector::default();
     collector.visit_file(&ast);
-    Ok(collector.idents)
+
+    let mut cfg_test_collector = CfgTestIdentCollector::default();
+    cfg_test_collector.visit_file(&ast);
+
+    Ok((collector.idents, cfg_test_collector.idents))
+}
+
+/// Whether `attrs` contains a `#[cfg(...)]` attribute whose predicate
+/// mentions `test` as a whole word (`#[cfg(test)]`, `#[cfg(any(test, ...))]`,
+/// `#[cfg(all(test, ...))]`) — a crude but conservative parse of the
+/// attribute's raw tokens, not a full `cfg` predicate evaluator.
+fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        if !attr.path().is_ident("cfg") {
+            return false;
+        }
+        let syn::Meta::List(list) = &attr.meta else {
+            return false;
+        };
+        list.tokens
+            .to_string()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|word| word == "test")
+    })
+}
+
+/// Collects identifiers referenced inside `#[cfg(test)]`-attributed modules
+/// (see [`attrs_have_cfg_test`]) — the common `#[cfg(test)] mod tests { ... }`
+/// pattern in an otherwise non-test source file. Deliberately narrower than
+/// "any cfg(test)-gated item": individual `#[cfg(test)] fn`s outside such a
+/// module aren't recognized, matching todo.md §B's scope ("`#[cfg(test)]`-
+/// Module in normalen src-Dateien zählen als Dev-Nutzung").
+#[derive(Default)]
+struct CfgTestIdentCollector {
+    idents: HashSet<String>,
+}
+
+impl<'ast> Visit<'ast> for CfgTestIdentCollector {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if attrs_have_cfg_test(&node.attrs) {
+            let mut inner = PathIdentCollector::default();
+            inner.visit_item_mod(node);
+            self.idents.extend(inner.idents);
+        } else {
+            visit::visit_item_mod(self, node);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -571,5 +920,200 @@ edition = "2021"
         let source = std::error::Error::source(&err).expect("Io must carry a source");
         assert!(source.downcast_ref::<std::io::Error>().is_some());
         assert_eq!(err.to_string(), "src/lib.rs: failed to read file: boom");
+    }
+
+    #[test]
+    fn a_dev_dependency_used_only_from_tests_is_not_flagged_as_unused() {
+        let dir = TempDir::new("deps-dev-used-in-tests");
+        let manifest = write_fixture(
+            &dir,
+            "[dev-dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[("tests/it.rs", "fn t() { depcrate::noop(); }\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_DEV_DEPENDENCY_RULE)
+        );
+    }
+
+    #[test]
+    fn a_dev_dependency_never_used_is_flagged_with_a_hedged_message() {
+        let dir = TempDir::new("deps-dev-unused");
+        let manifest = write_fixture(&dir, "[dev-dependencies]", "depcrate", None, &[], &[]);
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.rule == UNUSED_DEV_DEPENDENCY_RULE)
+            .expect("expected an unused-dev-dependency finding");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.evidence_class, EvidenceClass::BoundedSemantic);
+        assert_eq!(finding.location.item_path, "depcrate");
+        let reason = finding.evidence.as_ref().unwrap()["reason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("no use found in the examined view"));
+        assert!(!reason.contains("is unused"));
+    }
+
+    #[test]
+    fn a_dev_dependency_used_only_in_a_cfg_test_module_in_src_is_not_flagged() {
+        let dir = TempDir::new("deps-dev-cfg-test");
+        let manifest = write_fixture(
+            &dir,
+            "[dev-dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[(
+                "src/lib.rs",
+                "pub fn hello() {}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() { depcrate::noop(); }\n}\n",
+            )],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_DEV_DEPENDENCY_RULE)
+        );
+    }
+
+    #[test]
+    fn a_dev_dependency_also_declared_as_a_normal_dependency_is_not_flagged() {
+        let dir = TempDir::new("deps-dev-also-normal");
+        std::fs::create_dir_all(dir.join("main/src")).unwrap();
+        std::fs::create_dir_all(dir.join("dep_crate/src")).unwrap();
+        std::fs::write(
+            dir.join("main/Cargo.toml"),
+            r#"
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+depcrate = { path = "../dep_crate" }
+
+[dev-dependencies]
+depcrate = { path = "../dep_crate" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("main/src/lib.rs"),
+            "pub fn hello() { depcrate::noop(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("dep_crate/Cargo.toml"),
+            r#"
+[package]
+name = "depcrate"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep_crate/src/lib.rs"), "pub fn noop() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("main/Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_DEV_DEPENDENCY_RULE)
+        );
+    }
+
+    #[test]
+    fn collect_used_items_records_next_level_path_segments() {
+        let dir = TempDir::new("deps-used-items");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let file_path = dir.join("src/lib.rs");
+        std::fs::write(
+            &file_path,
+            "use depcrate::{Foo, bar::Baz};\nfn use_it() { depcrate::other::thing(); }\n",
+        )
+        .unwrap();
+
+        let krate = CrateInfo {
+            name: "fixture".to_string(),
+            version: "0.1.0".to_string(),
+            manifest_path: dir.join("Cargo.toml"),
+            root: dir.to_path_buf(),
+            source_files: vec![crate::ingest::SourceFile {
+                path: file_path,
+                kind: crate::ingest::SourceKind::Authored,
+            }],
+            entry_points: Vec::new(),
+            dependencies: Vec::new(),
+        };
+
+        let mut items: Vec<String> = collect_used_items(&krate, "depcrate").into_iter().collect();
+        items.sort();
+        assert_eq!(items, vec!["Foo", "bar", "other"]);
+    }
+
+    #[test]
+    fn is_heavy_dependency_requires_both_thresholds_to_be_crossed() {
+        assert!(!is_heavy_dependency(
+            HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD,
+            0
+        ));
+        assert!(!is_heavy_dependency(
+            HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD + 1,
+            HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD
+        ));
+        assert!(is_heavy_dependency(
+            HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD + 1,
+            HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD - 1
+        ));
+    }
+
+    #[test]
+    fn heavy_dependency_finding_is_advisory_only() {
+        let krate = CrateInfo {
+            name: "fixture".to_string(),
+            version: "0.1.0".to_string(),
+            manifest_path: PathBuf::from("fixture/Cargo.toml"),
+            root: PathBuf::from("fixture"),
+            source_files: Vec::new(),
+            entry_points: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        let dep = crate::ingest::DeclaredDependency {
+            name: "heavy_crate".to_string(),
+            kind: DependencyKind::Normal,
+            code_identifier: "heavy_crate".to_string(),
+            target: None,
+            features: Vec::new(),
+            version_req: "*".to_string(),
+        };
+        let used_items: HashSet<String> = HashSet::new();
+        let finding = heavy_dependency_finding(&krate, &dep, 42, &used_items);
+
+        assert_eq!(finding.rule, HEAVY_DEPENDENCY_RULE);
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
+        assert!(!finding.is_gating());
+        assert_eq!(finding.evidence.unwrap()["transitive_deps"], 42);
     }
 }
