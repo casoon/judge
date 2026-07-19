@@ -101,6 +101,11 @@ enum Command {
     /// Shows only a pattern candidate's migration plan and affected call
     /// sites — deliberately no patch (see todo.md §16.5).
     FixPreview(FixPreviewOptions),
+    /// Shows one rule's evidence class, preconditions, exclusions, allowed
+    /// wording, and verdict effect from the static rule registry (see
+    /// todo.md §17.5). A pure documentation lookup — never runs analysis and
+    /// never produces exit code 1.
+    ExplainRule(ExplainRuleOptions),
 }
 
 #[derive(Debug, Args)]
@@ -321,6 +326,15 @@ struct ExplainPatternOptions {
 #[derive(Debug, Args)]
 struct FixPreviewOptions {
     /// The pattern candidate id (see `cargo judge patterns`).
+    id: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ExplainRuleOptions {
+    /// The rule id (e.g. `catch-all-error`) — see `judge::rule_registry`.
     id: String,
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
@@ -585,6 +599,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         Some(Command::Patterns(options)) => run_patterns(options, out),
         Some(Command::ExplainPattern(options)) => run_explain_pattern(options, out),
         Some(Command::FixPreview(options)) => run_fix_preview(options, out),
+        Some(Command::ExplainRule(options)) => run_explain_rule(options, out),
     }
 }
 
@@ -2004,6 +2019,10 @@ fn run_boundaries(
                 judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
                 judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
             ),
+            (
+                judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE.to_string(),
+                judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
+            ),
         ]);
         return handle_baseline(
             &workspace.root,
@@ -2488,6 +2507,55 @@ fn run_fix_preview(
             for finding_id in &candidate.related_findings {
                 writeln!(out, "  {finding_id}")?;
             }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// `cargo judge explain-rule <id>` (todo.md §17.5): a rule's fixed
+/// documentation from [`judge::rule_registry`] — evidence class,
+/// preconditions, exclusions, allowed wording, and verdict effect. A pure
+/// static lookup: unlike `explain-pattern`/`fix-preview` it never loads the
+/// workspace or runs analysis, so it never fails for an analyzer reason and
+/// never produces `CommandOutcome::FindingsFound`.
+fn run_explain_rule(
+    options: ExplainRuleOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let ExplainRuleOptions { id, format } = options;
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format("`explain-rule`", format, "tty, json"));
+    }
+    let entry = judge::rule_registry::lookup(&id)
+        .ok_or_else(|| CliError::Analyzer(format!("unknown rule id: {id}")))?;
+
+    match format {
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "id": entry.id,
+                "evidence_class": entry.evidence_class,
+                "verdict_effect": entry.verdict_effect.label(),
+                "preconditions": entry.preconditions,
+                "exclusions": entry.exclusions,
+                "allowed_wording": entry.allowed_wording,
+            });
+            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected above before looking up the rule")
+        }
+        OutputFormat::Tty => {
+            let evidence_class = serde_json::to_value(entry.evidence_class).unwrap();
+            writeln!(out, "rule: {}", entry.id)?;
+            writeln!(
+                out,
+                "  evidence class: {}",
+                evidence_class.as_str().unwrap_or_default()
+            )?;
+            writeln!(out, "  verdict effect: {}", entry.verdict_effect.label())?;
+            writeln!(out, "  preconditions: {}", entry.preconditions)?;
+            writeln!(out, "  exclusions: {}", entry.exclusions)?;
+            writeln!(out, "  allowed wording: {}", entry.allowed_wording)?;
         }
     }
     Ok(CommandOutcome::Clean)
@@ -4080,6 +4148,88 @@ fn dup_two(x: i32) -> i32 {
             }
             other => panic!("expected CliError::Analyzer, got {other:?}"),
         }
+    }
+
+    /// `explain-rule` is a pure static lookup — no workspace/cwd needed, so
+    /// these tests call `run` directly instead of `run_in_dir`.
+    ///
+    /// (a) A known rule id resolves with every field rendered in TTY output.
+    #[test]
+    fn explain_rule_known_id_renders_all_fields_in_tty() {
+        let mut out = Vec::new();
+        let outcome = run(
+            cli_with(Command::ExplainRule(ExplainRuleOptions {
+                id: "catch-all-error".to_string(),
+                format: OutputFormat::Tty,
+            })),
+            &mut out,
+        )
+        .expect("known rule id must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("rule: catch-all-error"), "{text}");
+        assert!(text.contains("evidence class: derived_fact"), "{text}");
+        assert!(text.contains("verdict effect: gating"), "{text}");
+        assert!(text.contains("preconditions:"), "{text}");
+        assert!(text.contains("exclusions:"), "{text}");
+        assert!(text.contains("allowed wording:"), "{text}");
+    }
+
+    /// (a) Same known rule id, rendered as JSON — same field values, an
+    /// unambiguous shape.
+    #[test]
+    fn explain_rule_known_id_renders_all_fields_in_json() {
+        let mut out = Vec::new();
+        let outcome = run(
+            cli_with(Command::ExplainRule(ExplainRuleOptions {
+                id: "catch-all-error".to_string(),
+                format: OutputFormat::Json,
+            })),
+            &mut out,
+        )
+        .expect("known rule id must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["id"], "catch-all-error");
+        assert_eq!(json["evidence_class"], "derived_fact");
+        assert_eq!(json["verdict_effect"], "gating");
+        assert!(
+            !json["preconditions"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(!json["exclusions"].as_str().unwrap_or_default().is_empty());
+        assert!(
+            !json["allowed_wording"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+
+    /// (b) An unknown rule id is a usage error (exit 2), not a findings
+    /// verdict — same convention as `explain-pattern`.
+    #[test]
+    fn explain_rule_unknown_id_is_an_analyzer_error() {
+        let mut out = Vec::new();
+        let err = run(
+            cli_with(Command::ExplainRule(ExplainRuleOptions {
+                id: "not-a-real-rule".to_string(),
+                format: OutputFormat::Tty,
+            })),
+            &mut out,
+        )
+        .expect_err("unknown rule id must be an error");
+        match &err {
+            CliError::Analyzer(message) => {
+                assert!(message.contains("unknown rule id"), "message: {message}");
+            }
+            other => panic!("expected CliError::Analyzer, got {other:?}"),
+        }
+        assert_eq!(exit_code(&Err(err)), 2);
     }
 
     /// (f) `fix-preview` returns only the migration plan and related

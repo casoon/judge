@@ -1,23 +1,49 @@
-//! Architecture boundaries: crate-level dependency rules and cycle detection
-//! (see todo.md §3.H "Architektur & Boundaries", §14.2 P1/P2 bullets 1-2).
+//! Architecture boundaries: crate-level dependency rules and cycle
+//! detection, plus a second, independent module-level boundary layer within
+//! a single crate (see todo.md §3.H "Architektur & Boundaries", §14.2 P1/P2
+//! bullets 1-2, §9 "Modul-Boundaries").
 //!
-//! This is deliberately scoped to *crate-level* dependency edges, fully
-//! knowable from `cargo_metadata` without a build. `[layers]` (see todo.md
-//! §9) is a crate-level convenience on top of the same model — it expands a
-//! compact layer/role/group assignment into the same [`BoundaryRule`] edges
-//! a hand-written `[[boundary]]` entry produces. Module-level boundaries
-//! still need semantic module resolution the Fast Tier doesn't have yet (see
-//! todo.md §0).
+//! ## Crate-level boundaries
+//!
+//! [`BoundaryRule`]/[`evaluate`] are deliberately scoped to *crate-level*
+//! dependency edges, fully knowable from `cargo_metadata` without a build.
+//! `[layers]` (see todo.md §9) is a crate-level convenience on top of the
+//! same model — it expands a compact layer/role/group assignment into the
+//! same [`BoundaryRule`] edges a hand-written `[[boundary]]` entry produces.
+//!
+//! ## Module-level boundaries (`[[module_boundary]]`)
+//!
+//! [`ModuleBoundaryRule`] checks a second, independent boundary layer
+//! *within* one crate — e.g. "the `domain` module must not reach
+//! `io`/`cli`". Two Fast-Tier limitations, by design rather than oversight:
+//!
+//! - **Module path resolution is a directory-convention heuristic, not
+//!   `mod`-graph resolution** — the same trade-off `deps.rs`'s
+//!   `UsageDomain` classification documents. A `.rs` file's module path is
+//!   derived purely from its position under `src/` (see
+//!   [`module_path_for_file`]). A file wired into the build in an
+//!   unconventional way — e.g. via a `#[path = "..."]` attribute — is
+//!   missed.
+//! - **Only `direct` reach is supported**, unlike crate-level
+//!   [`BoundaryRule`]'s `direct`/`transitive` choice: `transitive` would
+//!   need a real module call graph, which needs a Deep Tier judge doesn't
+//!   have yet. Requesting it in `[[module_boundary]]` is a config error.
+//!
+//! `required` (crate-level boundaries' other half) is also not part of this
+//! first slice — only `forbidden` is supported.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use cargo_metadata::MetadataCommand;
 use serde::Deserialize;
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
+use syn::{ItemUse, UseTree};
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::health_score::DeductionMultiplier;
-use crate::ingest::Workspace;
+use crate::ingest::{CrateInfo, Workspace};
 use crate::slopsquat::SlopsquatConfig;
 
 /// One user-configured `[[provenance_label]]` rule (see `crate::provenance`,
@@ -53,6 +79,15 @@ pub const DEPENDENCY_CYCLE_RULE: &str = "dependency-cycle";
 /// "Regelversions-Schutz").
 pub const DEPENDENCY_CYCLE_RULE_REVISION: u32 = 1;
 
+/// Rule id used for `[[module_boundary]]` violations — deliberately distinct
+/// from [`BOUNDARY_VIOLATION_RULE`]: a module-boundary finding makes a claim
+/// on a heuristically-derived module view within one crate, a different
+/// statement than a crate-to-crate dependency edge (see module docs
+/// "Module-level boundaries").
+pub const MODULE_BOUNDARY_VIOLATION_RULE: &str = "module-boundary-violation";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const MODULE_BOUNDARY_VIOLATION_RULE_REVISION: u32 = 1;
+
 /// Whether a boundary is checked against direct neighbors only, or against
 /// anything reachable via any number of hops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -87,6 +122,35 @@ pub struct BoundaryRule {
     /// workspace doesn't have (see todo.md §14.2 P1/P2 bullet 2).
     #[serde(default)]
     pub allow_empty: bool,
+}
+
+/// One named `[[module_boundary]]` rule from `judge.toml` (see todo.md §9,
+/// module docs "Module-level boundaries"): a boundary within a single
+/// crate's module tree, scoped by directory-convention module paths rather
+/// than crate names. Unlike [`BoundaryRule`], `from` is a single module path
+/// prefix (not a list) and there is no `required`/`reach` choice — see the
+/// module docs for why.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModuleBoundaryRule {
+    pub name: String,
+    /// The workspace crate this rule scopes to. Validated to exist, same as
+    /// [`BoundaryRule::from`]/`forbidden`/`required`.
+    #[serde(rename = "crate")]
+    pub krate: String,
+    /// A module path prefix relative to the crate root, e.g. `"domain"`
+    /// matches `crate::domain` and any of its descendants.
+    pub from: String,
+    /// Module path prefixes `from` must not reference. Must be non-empty —
+    /// a rule with no forbidden targets is vacuous.
+    #[serde(default)]
+    pub forbidden: Vec<String>,
+    /// Only present so a `reach = "transitive"` entry (a field that exists
+    /// on the crate-level `[[boundary]]` table) produces a clear config
+    /// error instead of being silently accepted or rejected by serde as an
+    /// unknown field. `None`/`Some(Reach::Direct)` are the only valid
+    /// values — see module docs "Module-level boundaries".
+    #[serde(default)]
+    pub reach: Option<Reach>,
 }
 
 /// One named crate-type profile from `judge.toml` (see todo.md §4 "Health
@@ -160,6 +224,8 @@ pub struct LayersConfig {
 pub struct BoundaryConfig {
     #[serde(rename = "boundary", default)]
     pub boundaries: Vec<BoundaryRule>,
+    #[serde(rename = "module_boundary", default)]
+    pub module_boundaries: Vec<ModuleBoundaryRule>,
     #[serde(default)]
     pub layers: Option<LayersConfig>,
     #[serde(rename = "crate_profile", default)]
@@ -213,6 +279,10 @@ pub enum BoundaryConfigError {
     /// its `assign`/`order`/`shared` values are inconsistent (see todo.md
     /// §9).
     InvalidLayers(String),
+    /// A `[[module_boundary]]` rule has an empty `forbidden` list, or
+    /// requests `reach = "transitive"` (see [`ModuleBoundaryRule::reach`],
+    /// module docs "Module-level boundaries").
+    InvalidModuleBoundary(String),
 }
 
 impl std::fmt::Display for BoundaryConfigError {
@@ -224,6 +294,9 @@ impl std::fmt::Display for BoundaryConfigError {
                 "boundary rule `{rule}` references unknown crate `{crate_name}` (set allow_empty = true to permit this)"
             ),
             Self::InvalidLayers(message) => write!(f, "invalid [layers] config: {message}"),
+            Self::InvalidModuleBoundary(message) => {
+                write!(f, "invalid [[module_boundary]] config: {message}")
+            }
         }
     }
 }
@@ -232,7 +305,9 @@ impl std::error::Error for BoundaryConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Metadata(err) => Some(err),
-            Self::UnknownCrate { .. } | Self::InvalidLayers(_) => None,
+            Self::UnknownCrate { .. } | Self::InvalidLayers(_) | Self::InvalidModuleBoundary(_) => {
+                None
+            }
         }
     }
 }
@@ -314,6 +389,37 @@ fn validate_config(
                     crate_name: name.clone(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Validates every `[[module_boundary]]` rule: its `crate` must name a
+/// workspace crate, `forbidden` must be non-empty (an empty-scope rule is
+/// vacuous — see todo.md §14.1), and `reach` must not request
+/// `"transitive"` (see [`ModuleBoundaryRule::reach`]).
+fn validate_module_boundary_config(
+    config: &BoundaryConfig,
+    crate_names: &HashSet<&str>,
+) -> Result<(), BoundaryConfigError> {
+    for rule in &config.module_boundaries {
+        if !crate_names.contains(rule.krate.as_str()) {
+            return Err(BoundaryConfigError::UnknownCrate {
+                rule: rule.name.clone(),
+                crate_name: rule.krate.clone(),
+            });
+        }
+        if rule.forbidden.is_empty() {
+            return Err(BoundaryConfigError::InvalidModuleBoundary(format!(
+                "module boundary rule `{}` has no forbidden targets — a rule with no forbidden targets is vacuous",
+                rule.name
+            )));
+        }
+        if rule.reach == Some(Reach::Transitive) {
+            return Err(BoundaryConfigError::InvalidModuleBoundary(format!(
+                "module boundary rule `{}`: module boundaries only support direct reach in the Fast Tier",
+                rule.name
+            )));
         }
     }
     Ok(())
@@ -523,6 +629,7 @@ pub fn evaluate(
         .map(|krate| krate.name.as_str())
         .collect();
     validate_config(config, &crate_names)?;
+    validate_module_boundary_config(config, &crate_names)?;
     let layer_rules = match &config.layers {
         Some(layers) => generate_layer_rules(layers, &crate_names)?,
         None => Vec::new(),
@@ -547,6 +654,15 @@ pub fn evaluate(
     }
     for cycle in find_cycles(&graph) {
         findings.push(cycle_finding(&cycle, &cargo_toml));
+    }
+    for rule in &config.module_boundaries {
+        if let Some(krate) = workspace
+            .crates
+            .iter()
+            .find(|krate| krate.name == rule.krate)
+        {
+            findings.extend(evaluate_module_boundary_rule(rule, krate));
+        }
     }
 
     Ok(WorkspaceBoundaries { findings })
@@ -703,6 +819,271 @@ fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: None,
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+// --- Module-level boundaries (`[[module_boundary]]`) --------------------
+//
+// See module docs "Module-level boundaries" for the two Fast-Tier
+// limitations this section implements: directory-convention module path
+// resolution, and direct-reach-only checking.
+
+/// Derives a source file's module path purely from its position under
+/// `crate_root/src/` — a directory-convention heuristic, not `mod`-graph
+/// resolution (see module docs "Module-level boundaries"). Rust 2018+
+/// convention: `src/foo/bar.rs` -> `Some("foo::bar")`, `src/foo.rs` ->
+/// `Some("foo")`, `src/foo/mod.rs` -> `Some("foo")` (the older but still
+/// valid `mod.rs` convention), `src/lib.rs`/`src/main.rs`/`src/bin/*.rs` ->
+/// `Some("")` (the crate root module). Anything not under `src/` (e.g.
+/// `build.rs`) returns `None` — it has no place in a module tree
+/// `[[module_boundary]]` can reason about.
+fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Option<String> {
+    let relative = file_path.strip_prefix(crate_root).ok()?;
+    let mut components: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if components.first().map(String::as_str) != Some("src") {
+        return None;
+    }
+    components.remove(0);
+    if components.is_empty() {
+        return None;
+    }
+    if components.len() == 1 && matches!(components[0].as_str(), "lib.rs" | "main.rs") {
+        return Some(String::new());
+    }
+    if components.first().map(String::as_str) == Some("bin") {
+        return Some(String::new());
+    }
+
+    let last = components.last().cloned()?;
+    if last == "mod.rs" {
+        components.pop();
+    } else if let Some(stem) = last.strip_suffix(".rs") {
+        let stem = stem.to_string();
+        *components.last_mut().expect("just checked non-empty") = stem;
+    } else {
+        return None;
+    }
+    Some(components.join("::"))
+}
+
+/// Whether `module_path` is `prefix` itself, or a descendant of it — a
+/// `::`-segment prefix match, not a raw string prefix match (`"io"` must not
+/// match `"ioutils"`).
+fn module_path_under(module_path: &str, prefix: &str) -> bool {
+    module_path == prefix || module_path.starts_with(&format!("{prefix}::"))
+}
+
+/// Whether `segments` (a fully crate-root-relative path, see
+/// [`resolve_leading_segments`]) references something under `forbidden` — a
+/// `::`-segment prefix match against `forbidden`'s own segments.
+fn segments_match_forbidden(segments: &[String], forbidden: &str) -> bool {
+    let forbidden_segments: Vec<&str> = forbidden.split("::").collect();
+    if segments.len() < forbidden_segments.len() {
+        return false;
+    }
+    segments
+        .iter()
+        .zip(forbidden_segments.iter())
+        .all(|(segment, forbidden_segment)| segment == forbidden_segment)
+}
+
+/// Resolves a raw identifier-segment chain (from a `use` tree leaf or a
+/// `syn::Path`) to a crate-root-relative module path, if and only if its
+/// leading segment is `crate` or (one or more) `super` — see module docs
+/// "Module-level boundaries": these are the only two forms judge resolves
+/// without full `mod`-graph resolution. Any other leading segment (a local,
+/// unqualified reference relative to the *current* module, an external
+/// crate name, or `self`) returns `None` — not a violation judge can prove
+/// without guessing.
+fn resolve_leading_segments(
+    current_module: &str,
+    mut segments: Vec<String>,
+) -> Option<Vec<String>> {
+    if segments.is_empty() {
+        return None;
+    }
+    let head = segments.remove(0);
+    let mut resolved: Vec<String> = match head.as_str() {
+        "crate" => Vec::new(),
+        "super" => {
+            let mut parts = current_module_segments(current_module);
+            parts.pop()?;
+            parts
+        }
+        _ => return None,
+    };
+    while segments.first().map(String::as_str) == Some("super") {
+        segments.remove(0);
+        resolved.pop()?;
+    }
+    resolved.extend(segments);
+    Some(resolved)
+}
+
+fn current_module_segments(current_module: &str) -> Vec<String> {
+    if current_module.is_empty() {
+        Vec::new()
+    } else {
+        current_module.split("::").map(str::to_string).collect()
+    }
+}
+
+/// Collects every leaf path of a `use` tree as a flat segment chain,
+/// including its leading identifier (`crate`, `super`, an external crate
+/// name, ...) — mirrors `deps.rs`'s `DepItemCollector::walk_use_tree`, one
+/// level shallower (it records the whole chain, not just one segment past a
+/// target). A `use a::{b, c::d}` yields `[["a", "b"], ["a", "c", "d"]]`; a
+/// glob `use a::*` yields `[["a"]]` (no synthetic wildcard segment).
+fn use_tree_leaf_segments(tree: &UseTree, acc: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    match tree {
+        UseTree::Path(use_path) => {
+            acc.push(use_path.ident.to_string());
+            use_tree_leaf_segments(&use_path.tree, acc, out);
+            acc.pop();
+        }
+        UseTree::Name(use_name) => {
+            let mut leaf = acc.clone();
+            leaf.push(use_name.ident.to_string());
+            out.push(leaf);
+        }
+        UseTree::Rename(use_rename) => {
+            let mut leaf = acc.clone();
+            leaf.push(use_rename.ident.to_string());
+            out.push(leaf);
+        }
+        UseTree::Glob(_) => out.push(acc.clone()),
+        UseTree::Group(group) => {
+            for item in &group.items {
+                use_tree_leaf_segments(item, acc, out);
+            }
+        }
+    }
+}
+
+/// Collects every `(line, forbidden target matched)` hit in one parsed file,
+/// scanning `use` statements and `crate::`/`super::`-qualified path
+/// expressions (see [`resolve_leading_segments`]).
+struct ModuleBoundaryCollector<'a> {
+    current_module: &'a str,
+    forbidden: &'a [String],
+    hits: Vec<(usize, String)>,
+}
+
+impl ModuleBoundaryCollector<'_> {
+    fn record_if_forbidden(&mut self, segments: &[String], line: usize) {
+        if let Some(forbidden) = self
+            .forbidden
+            .iter()
+            .find(|forbidden| segments_match_forbidden(segments, forbidden))
+        {
+            self.hits.push((line, forbidden.clone()));
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ModuleBoundaryCollector<'_> {
+    fn visit_item_use(&mut self, node: &'ast ItemUse) {
+        let mut leaves = Vec::new();
+        use_tree_leaf_segments(&node.tree, &mut Vec::new(), &mut leaves);
+        let line = node.span().start().line;
+        for leaf in leaves {
+            if let Some(resolved) = resolve_leading_segments(self.current_module, leaf) {
+                self.record_if_forbidden(&resolved, line);
+            }
+        }
+    }
+
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        let segments: Vec<String> = node.segments.iter().map(|s| s.ident.to_string()).collect();
+        if let Some(resolved) = resolve_leading_segments(self.current_module, segments) {
+            self.record_if_forbidden(&resolved, node.span().start().line);
+        }
+        visit::visit_path(self, node);
+    }
+}
+
+/// Evaluates one `[[module_boundary]]` rule against every source file of
+/// `krate` whose derived module path (see [`module_path_for_file`]) falls
+/// under `rule.from`. Files that fail to read or parse are silently skipped
+/// — this is advisory (`bounded_semantic`, not a completeness proof)
+/// evidence within the examined view, matching how `deps.rs`'s
+/// `collect_used_items` treats the same failure mode. One finding per
+/// violating file, at its earliest offending line — "a violation" is a file
+/// referencing a forbidden module, not each individual reference.
+fn evaluate_module_boundary_rule(rule: &ModuleBoundaryRule, krate: &CrateInfo) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for file in &krate.source_files {
+        let Some(module_path) = module_path_for_file(&krate.root, &file.path) else {
+            continue;
+        };
+        if !module_path_under(&module_path, &rule.from) {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&file.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&source) else {
+            continue;
+        };
+        let mut collector = ModuleBoundaryCollector {
+            current_module: &module_path,
+            forbidden: &rule.forbidden,
+            hits: Vec::new(),
+        };
+        collector.visit_file(&ast);
+        if let Some((line, forbidden)) = collector.hits.into_iter().min_by_key(|(line, _)| *line) {
+            findings.push(module_boundary_finding(
+                rule,
+                &file.path,
+                line,
+                &module_path,
+                &forbidden,
+            ));
+        }
+    }
+    findings
+}
+
+/// Renders a `module-boundary-violation` finding. `evidence_class` is
+/// `bounded_semantic` — an explicitly configured edge over a heuristically
+/// derived module view (see module docs "Module-level boundaries"), the
+/// same class as `crate-boundary-violation` but with that extra unsureness
+/// named honestly in `evidence`.
+fn module_boundary_finding(
+    rule: &ModuleBoundaryRule,
+    file: &Path,
+    line: usize,
+    module_path: &str,
+    forbidden: &str,
+) -> Finding {
+    let line = OneBasedLine::new(line).unwrap_or(OneBasedLine::FIRST);
+    Finding {
+        id: format!(
+            "{MODULE_BOUNDARY_VIOLATION_RULE}:{}:{}:{line}",
+            rule.name,
+            file.display()
+        )
+        .into(),
+        rule: MODULE_BOUNDARY_VIOLATION_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: file.to_path_buf(),
+            line,
+            item_path: format!("{} [direct]: {module_path} -> {forbidden}", rule.name),
+        },
+        evidence_class: EvidenceClass::BoundedSemantic,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "module_path_resolution": "directory-convention heuristic, not module-graph resolution — e.g. #[path = \"...\"] attributes are not recognized"
+        })),
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1421,6 +1802,295 @@ order = ["domain", "application", "infrastructure"]
         assert_eq!(
             preset_finding.evidence,
             Some(serde_json::json!({ "source": "preset:layered" }))
+        );
+    }
+
+    // --- [[module_boundary]] -------------------------------------------
+
+    fn module_boundary_rule(
+        name: &str,
+        krate: &str,
+        from: &str,
+        forbidden: &[&str],
+    ) -> ModuleBoundaryRule {
+        ModuleBoundaryRule {
+            name: name.to_string(),
+            krate: krate.to_string(),
+            from: from.to_string(),
+            forbidden: forbidden.iter().map(|s| s.to_string()).collect(),
+            reach: None,
+        }
+    }
+
+    #[test]
+    fn module_boundary_flags_a_forbidden_qualified_path_reference() {
+        let dir = TempDir::new("module-boundary-violation");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+        std::fs::write(
+            dir.join("my-core/src/lib.rs"),
+            "pub mod domain;\npub mod io;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("my-core/src/domain")).unwrap();
+        std::fs::write(
+            dir.join("my-core/src/domain/mod.rs"),
+            "pub fn run() {\n    crate::io::read_file();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("my-core/src/io.rs"), "pub fn read_file() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "my-core",
+                "domain",
+                &["io"],
+            )],
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        let findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule == MODULE_BOUNDARY_VIOLATION_RULE)
+            .collect();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Warn);
+        assert_eq!(findings[0].evidence_class, EvidenceClass::BoundedSemantic);
+        assert!(findings[0].location.item_path.contains("domain -> io"));
+        assert!(findings[0].location.file.ends_with("src/domain/mod.rs"));
+    }
+
+    #[test]
+    fn module_boundary_does_not_flag_a_domain_module_with_no_io_reference() {
+        let dir = TempDir::new("module-boundary-clean");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+        std::fs::write(
+            dir.join("my-core/src/lib.rs"),
+            "pub mod domain;\npub mod io;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("my-core/src/domain")).unwrap();
+        std::fs::write(
+            dir.join("my-core/src/domain/mod.rs"),
+            "pub fn run() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("my-core/src/io.rs"), "pub fn read_file() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "my-core",
+                "domain",
+                &["io"],
+            )],
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .all(|f| f.rule != MODULE_BOUNDARY_VIOLATION_RULE)
+        );
+    }
+
+    #[test]
+    fn module_boundary_does_not_flag_a_reference_from_outside_the_from_module() {
+        let dir = TempDir::new("module-boundary-out-of-scope");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+        std::fs::write(
+            dir.join("my-core/src/lib.rs"),
+            "pub mod application;\npub mod io;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("my-core/src/application")).unwrap();
+        std::fs::write(
+            dir.join("my-core/src/application/mod.rs"),
+            "pub fn run() {\n    crate::io::read_file();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("my-core/src/io.rs"), "pub fn read_file() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "my-core",
+                "domain",
+                &["io"],
+            )],
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .all(|f| f.rule != MODULE_BOUNDARY_VIOLATION_RULE)
+        );
+    }
+
+    #[test]
+    fn module_boundary_rule_naming_an_unknown_crate_is_a_config_error() {
+        let dir = TempDir::new("module-boundary-unknown-crate");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "does-not-exist",
+                "domain",
+                &["io"],
+            )],
+            ..Default::default()
+        };
+
+        let err = evaluate(&workspace, &config).unwrap_err();
+        assert!(matches!(err, BoundaryConfigError::UnknownCrate { .. }));
+    }
+
+    #[test]
+    fn module_boundary_rule_with_empty_forbidden_is_a_config_error() {
+        let dir = TempDir::new("module-boundary-empty-forbidden");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "my-core",
+                "domain",
+                &[],
+            )],
+            ..Default::default()
+        };
+
+        let err = evaluate(&workspace, &config).unwrap_err();
+        assert!(matches!(err, BoundaryConfigError::InvalidModuleBoundary(_)));
+    }
+
+    #[test]
+    fn module_boundary_rule_with_transitive_reach_is_a_config_error() {
+        let dir = TempDir::new("module-boundary-transitive-reach");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let mut rule = module_boundary_rule("domain-no-io", "my-core", "domain", &["io"]);
+        rule.reach = Some(Reach::Transitive);
+        let config = BoundaryConfig {
+            module_boundaries: vec![rule],
+            ..Default::default()
+        };
+
+        let err = evaluate(&workspace, &config).unwrap_err();
+        match err {
+            BoundaryConfigError::InvalidModuleBoundary(message) => {
+                assert!(message.contains("direct reach"));
+            }
+            other => panic!("expected InvalidModuleBoundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn module_boundary_matches_nested_modules_under_from_by_prefix() {
+        let dir = TempDir::new("module-boundary-nested");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+        std::fs::write(
+            dir.join("my-core/src/lib.rs"),
+            "pub mod domain;\npub mod io;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("my-core/src/domain/inner")).unwrap();
+        std::fs::write(dir.join("my-core/src/domain/mod.rs"), "pub mod inner;\n").unwrap();
+        std::fs::write(
+            dir.join("my-core/src/domain/inner/thing.rs"),
+            "pub fn run() {\n    crate::io::read_file();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("my-core/src/io.rs"), "pub fn read_file() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "my-core",
+                "domain",
+                &["io"],
+            )],
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        let findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule == MODULE_BOUNDARY_VIOLATION_RULE)
+            .collect();
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .location
+                .file
+                .ends_with("src/domain/inner/thing.rs")
+        );
+    }
+
+    #[test]
+    fn module_path_for_file_resolves_directory_convention() {
+        let root = Path::new("/ws/my-core");
+        assert_eq!(
+            module_path_for_file(root, Path::new("/ws/my-core/src/lib.rs")),
+            Some(String::new())
+        );
+        assert_eq!(
+            module_path_for_file(root, Path::new("/ws/my-core/src/main.rs")),
+            Some(String::new())
+        );
+        assert_eq!(
+            module_path_for_file(root, Path::new("/ws/my-core/src/bin/tool.rs")),
+            Some(String::new())
+        );
+        assert_eq!(
+            module_path_for_file(root, Path::new("/ws/my-core/src/domain.rs")),
+            Some("domain".to_string())
+        );
+        assert_eq!(
+            module_path_for_file(root, Path::new("/ws/my-core/src/domain/mod.rs")),
+            Some("domain".to_string())
+        );
+        assert_eq!(
+            module_path_for_file(root, Path::new("/ws/my-core/src/domain/inner/thing.rs")),
+            Some("domain::inner::thing".to_string())
+        );
+        assert_eq!(
+            module_path_for_file(root, Path::new("/ws/my-core/build.rs")),
+            None
         );
     }
 }
