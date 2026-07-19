@@ -3569,6 +3569,34 @@ mod tests {
         .unwrap();
     }
 
+    /// A fixture crate combining a `stringly-error-boundary` fixture (two
+    /// `catch-all-error` boundary functions plus a crate-local typed error)
+    /// with a `boolean-state-cluster` fixture (a function with three bool
+    /// parameters, two of which are combined in one condition) — corroborated
+    /// evidence for two candidates of different patterns at once.
+    fn write_multi_rule_pattern_candidate_fixture_crate(dir: &Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn a() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
+             pub fn b() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
+             enum FixtureError { Bad }\n\
+             pub fn configure(verbose: bool, strict: bool, dry_run: bool) {\n\
+             \x20   if verbose && strict {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             \x20   let _ = dry_run;\n\
+             }\n\
+             fn do_thing() {}\n",
+        )
+        .unwrap();
+    }
+
     /// A pair of duplicated function bodies (well over
     /// `judge::duplication::DEFAULT_MIN_TOKENS`), both in one new file — a
     /// self-contained `code_introduced` duplication finding once that file
@@ -3986,6 +4014,43 @@ fn dup_two(x: i32) -> i32 {
             candidates.len(),
             1,
             "expected one corroborated candidate: {json}"
+        );
+    }
+
+    /// (d.2) Several pattern rules can produce candidates in the same run —
+    /// here `stringly-error-boundary` and `boolean-state-cluster` fire
+    /// together on one fixture — and `patterns` still stays clean (exit 0).
+    #[test]
+    fn patterns_command_reports_candidates_from_multiple_rules_and_stays_clean() {
+        let dir = TempDir::new("patterns-multi-rule");
+        write_multi_rule_pattern_candidate_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::Patterns(PatternsOptions {
+                format: OutputFormat::Json,
+            })),
+            &mut out,
+        )
+        .expect("`patterns` must not error on a valid fixture");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let candidates = json["candidates"].as_array().expect("candidates array");
+        assert_eq!(
+            candidates.len(),
+            2,
+            "expected one candidate per rule: {json}"
+        );
+        let patterns: std::collections::BTreeSet<&str> = candidates
+            .iter()
+            .map(|candidate| candidate["pattern"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            patterns,
+            std::collections::BTreeSet::from(["domain_error", "options_struct"]),
+            "expected candidates from two different rules: {json}"
         );
     }
 

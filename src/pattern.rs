@@ -7,14 +7,18 @@
 //! the health score, or a baseline verdict (todo.md §16.1 "Pattern-
 //! Empfehlungen sind keine normalen Findings").
 //!
-//! Scope of this module (first MVP slice, todo.md §16.6): only
-//! [`PatternCandidate`]/[`CorroboratedEvidence`] and exactly one aggregation
-//! rule, `stringly-error-boundary` (see [`analyze_workspace`]). The broader
-//! `PrincipleHeuristic` type from todo.md §16.7 (abstract design-principle
-//! heuristics like SRP/KISS/YAGNI) is a deliberately separate, later slice
-//! and is not implemented here.
+//! Scope of this module (MVP slice, todo.md §16.6):
+//! [`PatternCandidate`]/[`CorroboratedEvidence`] plus three aggregation
+//! rules — `stringly-error-boundary`, `primitive-domain-value`, and
+//! `boolean-state-cluster` (see [`analyze_workspace`]). The latter two are
+//! listed as "Deep" tier in todo.md §16.3's rule table; the versions
+//! implemented here are deliberately narrower, Fast-Tier-reachable subsets
+//! of their full definitions (see each rule function's doc comment for the
+//! exact narrowing). The broader `PrincipleHeuristic` type from todo.md
+//! §16.7 (abstract design-principle heuristics like SRP/KISS/YAGNI) is a
+//! deliberately separate, later slice and is not implemented here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -28,6 +32,14 @@ use crate::ingest::{CrateInfo, Workspace};
 /// [`RustPattern`] — the rule is the *evidence pattern* judge looks for, the
 /// pattern is the *recommendation* it emits.
 pub const STRINGLY_ERROR_BOUNDARY_RULE: &str = "stringly-error-boundary";
+
+/// The rule id for the `primitive-domain-value` aggregation implemented in
+/// this module (see [`primitive_domain_value_candidates`]).
+pub const PRIMITIVE_DOMAIN_VALUE_RULE: &str = "primitive-domain-value";
+
+/// The rule id for the `boolean-state-cluster` aggregation implemented in
+/// this module (see [`boolean_state_cluster_candidates`]).
+pub const BOOLEAN_STATE_CLUSTER_RULE: &str = "boolean-state-cluster";
 
 /// A recommended Rust design pattern (todo.md §16.2, §16.3). Exactly the enum
 /// from the todo.md sketch — no additional variants.
@@ -235,10 +247,14 @@ pub struct PatternCandidate {
 
 /// Runs every implemented pattern-aggregation rule over `workspace` and
 /// `findings` (the combined output of `judge::slop::analyze_workspace`, or
-/// any superset of it). Currently just `stringly-error-boundary` — this is
-/// the dispatch point future rules from todo.md §16.3 attach to.
+/// any superset of it): `stringly-error-boundary`, `primitive-domain-value`,
+/// and `boolean-state-cluster` — this is the dispatch point future rules
+/// from todo.md §16.3 attach to.
 pub fn analyze_workspace(workspace: &Workspace, findings: &[Finding]) -> Vec<PatternCandidate> {
-    stringly_error_boundary_candidates(workspace, findings)
+    let mut candidates = stringly_error_boundary_candidates(workspace, findings);
+    candidates.extend(primitive_domain_value_candidates(workspace));
+    candidates.extend(boolean_state_cluster_candidates(workspace));
+    candidates
 }
 
 /// `stringly-error-boundary` (todo.md §16.3): concrete errors are converted
@@ -541,6 +557,711 @@ fn has_derive_ending_in(attrs: &[syn::Attribute], ident: &str) -> bool {
     })
 }
 
+/// `primitive-domain-value` (todo.md §16.3): the same primitive value is
+/// validated identically at several boundaries, or only ever used within a
+/// restricted range.
+///
+/// **This is a deliberately narrower, Fast-Tier-reachable subset of the full
+/// rule from todo.md §16.3** (which is listed there as "Deep" tier). The
+/// full rule can reason about validation performed anywhere a value flows,
+/// across crates, and via non-syntactic evidence (e.g. Deep-Tier semantic
+/// analysis of call sites). This implementation only looks at:
+///
+/// 1. **Primary** — the same (parameter name, type) pair appears as a
+///    parameter in at least two *different* `pub fn` signatures within the
+///    *same crate*. Types are restricted to `u8`/`u16`/`u32`/`u64`/`usize`/
+///    `i8`/`i16`/`i32`/`i64`/`isize`/`f32`/`f64`/`String`/`&str` (`bool` is
+///    deliberately excluded — that is [`boolean_state_cluster_candidates`]'s
+///    domain, not this rule's).
+/// 2. **Independent** — at least one of those signatures has a validation
+///    guard referencing the parameter within the function body: an `if`
+///    whose condition references the parameter and whose then-branch
+///    returns `Err(...)` or calls `panic!(...)`, or an `assert!(...)` whose
+///    arguments reference the parameter.
+///
+/// Only (crate, parameter name, type) tuples satisfying both produce a
+/// candidate — exactly one per tuple, referencing every contributing
+/// signature.
+fn primitive_domain_value_candidates(workspace: &Workspace) -> Vec<PatternCandidate> {
+    let mut candidates = Vec::new();
+    for krate in &workspace.crates {
+        let mut facts: Vec<SignatureParamFact> = Vec::new();
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            let mut visitor = PrimitiveDomainValueVisitor {
+                file: &source.path,
+                self_type: None,
+                facts: Vec::new(),
+            };
+            visitor.visit_file(&ast);
+            facts.append(&mut visitor.facts);
+        }
+
+        let mut by_param: BTreeMap<(String, String), Vec<SignatureParamFact>> = BTreeMap::new();
+        for fact in facts {
+            by_param
+                .entry((fact.param.clone(), fact.type_name.clone()))
+                .or_default()
+                .push(fact);
+        }
+
+        for ((param, type_name), group) in by_param {
+            if group.len() < 2 {
+                continue;
+            }
+            if !group.iter().any(|fact| fact.has_guard) {
+                continue;
+            }
+            candidates.push(build_primitive_domain_value_candidate(
+                krate, &param, &type_name, &group,
+            ));
+        }
+    }
+    candidates
+}
+
+/// One `pub fn` parameter matching [`primitive_domain_value_candidates`]'s
+/// type restriction, plus whether the function body guards it.
+struct SignatureParamFact {
+    file: PathBuf,
+    item_path: String,
+    param: String,
+    type_name: String,
+    has_guard: bool,
+}
+
+fn build_primitive_domain_value_candidate(
+    krate: &CrateInfo,
+    param: &str,
+    type_name: &str,
+    group: &[SignatureParamFact],
+) -> PatternCandidate {
+    let mut modules: Vec<String> = group.iter().map(|fact| fact.item_path.clone()).collect();
+    modules.sort();
+    modules.dedup();
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules,
+    };
+
+    let mut primary_locations: Vec<EvidenceLocation> = group
+        .iter()
+        .map(|fact| EvidenceLocation {
+            file: fact.file.clone(),
+            item_path: Some(fact.item_path.clone()),
+        })
+        .collect();
+    primary_locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+
+    let mut guard_locations: Vec<EvidenceLocation> = group
+        .iter()
+        .filter(|fact| fact.has_guard)
+        .map(|fact| EvidenceLocation {
+            file: fact.file.clone(),
+            item_path: Some(fact.item_path.clone()),
+        })
+        .collect();
+    guard_locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+
+    let primary = Evidence {
+        description: format!(
+            "Parameter `{param}: {type_name}` appears with the same name and type in {} `pub \
+             fn` signature(s) in crate `{}`.",
+            group.len(),
+            krate.name
+        ),
+        locations: primary_locations,
+    };
+    let independent = Evidence {
+        description: format!(
+            "At least one of these signatures guards `{param}` with an early error/panic path \
+             referencing the parameter (`if` + `return Err(...)`, `if` + `panic!(...)`, or \
+             `assert!(...)`)."
+        ),
+        locations: guard_locations,
+    };
+
+    let evidence_identities: Vec<String> = primary
+        .locations
+        .iter()
+        .map(|location| {
+            format!(
+                "{}:{}",
+                location.file.display(),
+                location.item_path.as_deref().unwrap_or("")
+            )
+        })
+        .collect();
+    let id =
+        PatternCandidateId::compute(RustPattern::ValidatedNewtype, &scope, &evidence_identities);
+
+    let mut affected_paths: Vec<PathBuf> = group.iter().map(|fact| fact.file.clone()).collect();
+    affected_paths.sort();
+    affected_paths.dedup();
+
+    PatternCandidate {
+        id,
+        pattern: RustPattern::ValidatedNewtype,
+        scope,
+        evidence: CorroboratedEvidence {
+            primary,
+            independent,
+            additional: Vec::new(),
+        },
+        preconditions: vec![Precondition {
+            description: format!(
+                "Crate `{}` verwendet `{param}: {type_name}` wiederholt als Parametername/-typ, \
+                 und mindestens eine Fundstelle validiert den Wertebereich explizit.",
+                krate.name
+            ),
+        }],
+        contraindications: vec![
+            Contraindication {
+                description: "Der Parametername kann in verschiedenen Funktionen tatsächlich \
+                    unterschiedliche Bedeutungen haben, auch wenn Name und Typ übereinstimmen."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "Bei nur einer Validierungsstelle könnte ein Newtype mehr \
+                    Boilerplate als Nutzen erzeugen, falls die übrigen Aufrufstellen den Wert nie \
+                    direkt validieren müssen."
+                    .to_string(),
+            },
+        ],
+        migration: vec![
+            MigrationStep {
+                step: 1,
+                description: "Newtype für den Wertebereich definieren.".to_string(),
+                affected_paths: Vec::new(),
+            },
+            MigrationStep {
+                step: 2,
+                description: "`TryFrom<...>` mit der gefundenen Validierungslogik implementieren."
+                    .to_string(),
+                affected_paths: Vec::new(),
+            },
+            MigrationStep {
+                step: 3,
+                description: "Betroffene Signaturen schrittweise auf den Newtype umstellen."
+                    .to_string(),
+                affected_paths: affected_paths.clone(),
+            },
+            MigrationStep {
+                step: 4,
+                description: "Call-Sites anpassen.".to_string(),
+                affected_paths,
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
+/// Whether `ty` is one of [`primitive_domain_value_candidates`]'s allowed
+/// primitive types (`u8`.."f64"`, `String`, `&str`), matched structurally by
+/// the type path's last segment — no type resolution, so a local type alias
+/// named e.g. `type String = Foo;` would produce a false positive. This is
+/// an accepted Fast-Tier limitation, same in spirit as `crate_for_file`'s
+/// path-based crate matching above.
+fn primitive_type_name(ty: &syn::Type) -> Option<String> {
+    const NUMERIC: &[&str] = &[
+        "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64",
+    ];
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => {
+            let segment = type_path.path.segments.last()?;
+            if !matches!(segment.arguments, syn::PathArguments::None) {
+                return None;
+            }
+            let name = segment.ident.to_string();
+            if NUMERIC.contains(&name.as_str()) || name == "String" {
+                Some(name)
+            } else {
+                None
+            }
+        }
+        syn::Type::Reference(type_ref) => match &*type_ref.elem {
+            syn::Type::Path(type_path) if type_path.qself.is_none() => {
+                let segment = type_path.path.segments.last()?;
+                if matches!(segment.arguments, syn::PathArguments::None) && segment.ident == "str" {
+                    Some("&str".to_string())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Collects [`SignatureParamFact`]s from `pub fn` items (free functions and
+/// `impl` methods) in one source file.
+struct PrimitiveDomainValueVisitor<'a> {
+    file: &'a Path,
+    self_type: Option<String>,
+    facts: Vec<SignatureParamFact>,
+}
+
+impl PrimitiveDomainValueVisitor<'_> {
+    fn record_fn(&mut self, name: &str, sig: &syn::Signature, block: &syn::Block) {
+        let item_path = match &self.self_type {
+            Some(self_type) => format!("{self_type}::{name}"),
+            None => name.to_string(),
+        };
+        for input in &sig.inputs {
+            let syn::FnArg::Typed(pat_type) = input else {
+                continue;
+            };
+            let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                continue;
+            };
+            let Some(type_name) = primitive_type_name(&pat_type.ty) else {
+                continue;
+            };
+            let param = pat_ident.ident.to_string();
+            let has_guard = body_has_validation_guard_for(block, &param);
+            self.facts.push(SignatureParamFact {
+                file: self.file.to_path_buf(),
+                item_path: item_path.clone(),
+                param,
+                type_name,
+                has_guard,
+            });
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for PrimitiveDomainValueVisitor<'_> {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+        }
+        syn::visit::visit_item_fn(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        use quote::ToTokens;
+        let previous = self
+            .self_type
+            .replace(node.self_ty.to_token_stream().to_string());
+        syn::visit::visit_item_impl(self, node);
+        self.self_type = previous;
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+        }
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+}
+
+/// Whether `expr` references identifier `ident` anywhere within it (used to
+/// check that a validation guard's condition actually mentions the
+/// parameter in question, not just any `if`/`assert!`).
+fn expr_references_ident(expr: &syn::Expr, ident: &str) -> bool {
+    struct Finder<'a> {
+        ident: &'a str,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if node.path.is_ident(self.ident) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+    let mut finder = Finder {
+        ident,
+        found: false,
+    };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+/// Whether `tokens` contains identifier `ident` as a token anywhere,
+/// including inside nested groups (used for `assert!(...)` macro arguments,
+/// which `syn` only exposes as an opaque `TokenStream`).
+fn tokens_reference_ident(tokens: &proc_macro2::TokenStream, ident: &str) -> bool {
+    tokens.clone().into_iter().any(|tree| match tree {
+        proc_macro2::TokenTree::Ident(node) => node == ident,
+        proc_macro2::TokenTree::Group(group) => tokens_reference_ident(&group.stream(), ident),
+        _ => false,
+    })
+}
+
+/// Whether `block` contains a `return Err(...)` or a `panic!(...)` call
+/// anywhere within it (used as the then-branch check for an `if`-shaped
+/// validation guard).
+fn block_leads_to_error_path(block: &syn::Block) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if node.expr.as_deref().is_some_and(is_err_call) {
+                self.found = true;
+            }
+            syn::visit::visit_expr_return(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if node.path.is_ident("panic") {
+                self.found = true;
+            }
+            syn::visit::visit_macro(self, node);
+        }
+    }
+    let mut finder = Finder { found: false };
+    finder.visit_block(block);
+    finder.found
+}
+
+/// Whether `expr` is a call whose callee path ends in the segment `Err`
+/// (covers both bare `Err(...)` and a qualified `Result::Err(...)`).
+fn is_err_call(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Call(call) => matches!(
+            call.func.as_ref(),
+            syn::Expr::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Err")
+        ),
+        _ => false,
+    }
+}
+
+/// Whether `block` (a function body) contains a validation guard for
+/// `param` — see [`primitive_domain_value_candidates`]'s signal 2.
+fn body_has_validation_guard_for(block: &syn::Block, param: &str) -> bool {
+    struct GuardVisitor<'a> {
+        param: &'a str,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for GuardVisitor<'_> {
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            if expr_references_ident(&node.cond, self.param)
+                && block_leads_to_error_path(&node.then_branch)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_if(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if node.path.is_ident("assert") && tokens_reference_ident(&node.tokens, self.param) {
+                self.found = true;
+            }
+            syn::visit::visit_macro(self, node);
+        }
+    }
+    let mut visitor = GuardVisitor {
+        param,
+        found: false,
+    };
+    visitor.visit_block(block);
+    visitor.found
+}
+
+/// `boolean-state-cluster` (todo.md §16.3): several bool values are passed
+/// around together; combinations of them are checked or guarded against
+/// repeatedly.
+///
+/// **This is a deliberately narrower, Fast-Tier-reachable subset of the full
+/// rule from todo.md §16.3** (which is listed there as "Deep" tier), and it
+/// is scoped to a single function rather than cross-call-site — the full
+/// rule can aggregate evidence about how bool parameters are combined
+/// *across* call sites; this implementation only looks within one function
+/// body:
+///
+/// 1. **Primary** — a `fn`/`pub fn` (including a `pub fn new` constructor)
+///    has at least three `bool`-typed parameters.
+/// 2. **Independent** — the function body contains a condition or `match`
+///    that combines at least two of those bool parameters together in one
+///    condition (e.g. `if a && b`, `if a && !b`, `match (a, b) { ... }`,
+///    `if a || b`) — evidence that combinations are actually checked, not
+///    just that several bools happen to be parameters.
+///
+/// Only functions satisfying both produce a candidate — exactly one per
+/// function, scoped to that function rather than the whole crate (unlike
+/// `primitive-domain-value`, since the finding here is local to one
+/// function).
+fn boolean_state_cluster_candidates(workspace: &Workspace) -> Vec<PatternCandidate> {
+    let mut candidates = Vec::new();
+    for krate in &workspace.crates {
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            let mut visitor = BooleanStateClusterVisitor {
+                file: &source.path,
+                self_type: None,
+                facts: Vec::new(),
+            };
+            visitor.visit_file(&ast);
+            for fact in visitor.facts {
+                candidates.push(build_boolean_state_cluster_candidate(krate, &fact));
+            }
+        }
+    }
+    candidates
+}
+
+/// One function whose signature/body satisfy both
+/// [`boolean_state_cluster_candidates`] signals.
+struct BoolClusterFact {
+    file: PathBuf,
+    item_path: String,
+    bool_params: BTreeSet<String>,
+    combo_hits: Vec<String>,
+}
+
+fn build_boolean_state_cluster_candidate(
+    krate: &CrateInfo,
+    fact: &BoolClusterFact,
+) -> PatternCandidate {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![fact.item_path.clone()],
+    };
+
+    let location = EvidenceLocation {
+        file: fact.file.clone(),
+        item_path: Some(fact.item_path.clone()),
+    };
+
+    let bool_params: Vec<&String> = fact.bool_params.iter().collect();
+    let primary = Evidence {
+        description: format!(
+            "`{}` has {} `bool`-typed parameters: {}.",
+            fact.item_path,
+            fact.bool_params.len(),
+            bool_params
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        locations: vec![location.clone()],
+    };
+    let independent = Evidence {
+        description: format!(
+            "The function body combines at least two of these bool parameters together in a \
+             condition, e.g. `{}`.",
+            fact.combo_hits.join("`, `")
+        ),
+        locations: vec![location],
+    };
+
+    let evidence_identities: Vec<String> = std::iter::once(fact.item_path.clone())
+        .chain(fact.bool_params.iter().cloned())
+        .chain(fact.combo_hits.iter().cloned())
+        .collect();
+    let id = PatternCandidateId::compute(RustPattern::OptionsStruct, &scope, &evidence_identities);
+
+    PatternCandidate {
+        id,
+        pattern: RustPattern::OptionsStruct,
+        scope,
+        evidence: CorroboratedEvidence {
+            primary,
+            independent,
+            additional: Vec::new(),
+        },
+        preconditions: vec![Precondition {
+            description: format!(
+                "`{}` nimmt mehrere Bool-Parameter entgegen und prüft mindestens eine \
+                 Kombination davon gemeinsam im Funktionskörper.",
+                fact.item_path
+            ),
+        }],
+        contraindications: vec![
+            Contraindication {
+                description: "Wenige, klar benannte, unabhängig verwendete Bool-Flags können \
+                    lesbarer sein als ein zusätzlicher Enum-/Options-Typ."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "Wenn die Kombinationsprüfung nur eine einmalige \
+                    Eingabevalidierung ist (kein wiederholtes Muster), kann ein zusätzlicher Typ \
+                    Overkill sein."
+                    .to_string(),
+            },
+        ],
+        migration: vec![
+            MigrationStep {
+                step: 1,
+                description: "Gültige Optionen/Zustände benennen (Options-Struct vs. \
+                    Zustands-Enum, je nach Anzahl gültiger Kombinationen)."
+                    .to_string(),
+                affected_paths: Vec::new(),
+            },
+            MigrationStep {
+                step: 2,
+                description: "Den gewählten Typ definieren.".to_string(),
+                affected_paths: Vec::new(),
+            },
+            MigrationStep {
+                step: 3,
+                description: "Konstruktor-/Funktionsparameterliste ersetzen.".to_string(),
+                affected_paths: vec![fact.file.clone()],
+            },
+            MigrationStep {
+                step: 4,
+                description: "Call-Sites aktualisieren.".to_string(),
+                affected_paths: vec![fact.file.clone()],
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
+/// Whether `ty` is `bool`, matched structurally (same caveat as
+/// [`primitive_type_name`]: no type resolution).
+fn is_bool_type(ty: &syn::Type) -> bool {
+    matches!(
+        ty,
+        syn::Type::Path(type_path)
+            if type_path.qself.is_none()
+                && type_path.path.segments.last().is_some_and(|segment| {
+                    segment.ident == "bool" && matches!(segment.arguments, syn::PathArguments::None)
+                })
+    )
+}
+
+/// Collects [`BoolClusterFact`]s from `fn` items (free functions and `impl`
+/// methods, any visibility) in one source file.
+struct BooleanStateClusterVisitor<'a> {
+    file: &'a Path,
+    self_type: Option<String>,
+    facts: Vec<BoolClusterFact>,
+}
+
+impl BooleanStateClusterVisitor<'_> {
+    fn record_fn(&mut self, name: &str, sig: &syn::Signature, block: &syn::Block) {
+        let item_path = match &self.self_type {
+            Some(self_type) => format!("{self_type}::{name}"),
+            None => name.to_string(),
+        };
+        let bool_params: BTreeSet<String> = sig
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                let syn::FnArg::Typed(pat_type) = input else {
+                    return None;
+                };
+                if !is_bool_type(&pat_type.ty) {
+                    return None;
+                }
+                let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+                    return None;
+                };
+                Some(pat_ident.ident.to_string())
+            })
+            .collect();
+        if bool_params.len() < 3 {
+            return;
+        }
+        let combo_hits = body_boolean_combo_hits(block, &bool_params);
+        if combo_hits.is_empty() {
+            return;
+        }
+        self.facts.push(BoolClusterFact {
+            file: self.file.to_path_buf(),
+            item_path,
+            bool_params,
+            combo_hits,
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for BooleanStateClusterVisitor<'_> {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+        syn::visit::visit_item_fn(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        use quote::ToTokens;
+        let previous = self
+            .self_type
+            .replace(node.self_ty.to_token_stream().to_string());
+        syn::visit::visit_item_impl(self, node);
+        self.self_type = previous;
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+}
+
+/// The subset of `params` referenced anywhere within `expr` (used to check
+/// how many distinct bool parameters a condition/match-scrutinee combines).
+fn referenced_params_in_expr(expr: &syn::Expr, params: &BTreeSet<String>) -> BTreeSet<String> {
+    struct Collector<'a> {
+        params: &'a BTreeSet<String>,
+        found: BTreeSet<String>,
+    }
+    impl<'ast> Visit<'ast> for Collector<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if let Some(ident) = node.path.get_ident() {
+                let name = ident.to_string();
+                if self.params.contains(&name) {
+                    self.found.insert(name);
+                }
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+    let mut collector = Collector {
+        params,
+        found: BTreeSet::new(),
+    };
+    collector.visit_expr(expr);
+    collector.found
+}
+
+/// Rendered source text of every `if`/`match` in `block` whose
+/// condition/scrutinee combines at least two of `bool_params` — see
+/// [`boolean_state_cluster_candidates`]'s signal 2.
+fn body_boolean_combo_hits(block: &syn::Block, bool_params: &BTreeSet<String>) -> Vec<String> {
+    use quote::ToTokens;
+
+    struct ComboVisitor<'a> {
+        bool_params: &'a BTreeSet<String>,
+        hits: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for ComboVisitor<'_> {
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            if referenced_params_in_expr(&node.cond, self.bool_params).len() >= 2 {
+                self.hits.push(node.cond.to_token_stream().to_string());
+            }
+            syn::visit::visit_expr_if(self, node);
+        }
+
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            if referenced_params_in_expr(&node.expr, self.bool_params).len() >= 2 {
+                self.hits.push(node.expr.to_token_stream().to_string());
+            }
+            syn::visit::visit_expr_match(self, node);
+        }
+    }
+    let mut visitor = ComboVisitor {
+        bool_params,
+        hits: Vec::new(),
+    };
+    visitor.visit_block(block);
+    visitor.hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +1437,159 @@ mod tests {
         let first = analyze_workspace(&workspace, &findings);
         let second = analyze_workspace(&workspace, &findings);
         assert_eq!(first[0].id, second[0].id);
+    }
+
+    /// `primitive-domain-value` (a): two `pub fn` signatures sharing a
+    /// (parameter name, type) pair, one of them guarding the parameter with
+    /// an early `return Err(...)` ⇒ one candidate with both evidence slots
+    /// populated by the correct fundstellen.
+    #[test]
+    fn primitive_domain_value_two_signatures_plus_a_guard_produce_one_candidate() {
+        let dir = TempDir::new("pattern-primitive-corroborated");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn set_a(threshold: u32) {}\n\
+             pub fn set_b(threshold: u32) -> Result<(), String> {\n\
+             \x20   if threshold > 100 {\n\
+             \x20       return Err(\"too big\".to_string());\n\
+             \x20   }\n\
+             \x20   Ok(())\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.pattern, RustPattern::ValidatedNewtype);
+        assert_eq!(candidate.scope.krate, "fixture");
+        assert_eq!(candidate.evidence.primary.locations.len(), 2);
+        assert_eq!(candidate.evidence.independent.locations.len(), 1);
+        assert_eq!(
+            candidate.evidence.independent.locations[0]
+                .item_path
+                .as_deref(),
+            Some("set_b")
+        );
+        assert!(!candidate.contraindications.is_empty());
+        assert!(candidate.migration.len() >= 2);
+    }
+
+    /// `primitive-domain-value` (b): only one signature, even with a guard
+    /// ⇒ no candidate (a single occurrence is not a pattern).
+    #[test]
+    fn primitive_domain_value_single_signature_is_below_threshold() {
+        let dir = TempDir::new("pattern-primitive-single");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn set_a(threshold: u32) -> Result<(), String> {\n\
+             \x20   if threshold > 100 {\n\
+             \x20       return Err(\"too big\".to_string());\n\
+             \x20   }\n\
+             \x20   Ok(())\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze_workspace(&workspace, &[]).is_empty());
+    }
+
+    /// `primitive-domain-value` (c): two signatures sharing the pair, but no
+    /// validation guard anywhere ⇒ no candidate (only one signal).
+    #[test]
+    fn primitive_domain_value_without_any_guard_is_not_corroborated() {
+        let dir = TempDir::new("pattern-primitive-unguarded");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn set_a(threshold: u32) {}\n\
+             pub fn set_b(threshold: u32) {}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze_workspace(&workspace, &[]).is_empty());
+    }
+
+    /// `boolean-state-cluster` (a): a function with three bool parameters
+    /// and a condition combining two of them ⇒ one candidate.
+    #[test]
+    fn boolean_cluster_three_bools_plus_a_combined_condition_produce_one_candidate() {
+        let dir = TempDir::new("pattern-bool-corroborated");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn configure(verbose: bool, strict: bool, dry_run: bool) {\n\
+             \x20   if verbose && strict {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             \x20   let _ = dry_run;\n\
+             }\n\
+             fn do_thing() {}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.pattern, RustPattern::OptionsStruct);
+        assert_eq!(candidate.scope.krate, "fixture");
+        assert_eq!(candidate.scope.modules, vec!["configure".to_string()]);
+        assert!(!candidate.contraindications.is_empty());
+    }
+
+    /// `boolean-state-cluster` (b): three bool parameters, but only
+    /// independent single-flag checks, never combined ⇒ no candidate.
+    #[test]
+    fn boolean_cluster_without_a_combined_condition_is_not_corroborated() {
+        let dir = TempDir::new("pattern-bool-independent-checks");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn configure(verbose: bool, strict: bool, dry_run: bool) {\n\
+             \x20   if verbose {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             \x20   if strict {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             \x20   if dry_run {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             }\n\
+             fn do_thing() {}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze_workspace(&workspace, &[]).is_empty());
+    }
+
+    /// `boolean-state-cluster` (c): only two bool parameters, even with a
+    /// combined condition ⇒ no candidate (threshold of three not reached).
+    #[test]
+    fn boolean_cluster_with_only_two_bools_is_below_threshold() {
+        let dir = TempDir::new("pattern-bool-below-threshold");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn configure(verbose: bool, strict: bool) {\n\
+             \x20   if verbose && strict {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             }\n\
+             fn do_thing() {}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze_workspace(&workspace, &[]).is_empty());
     }
 }
