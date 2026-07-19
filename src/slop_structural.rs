@@ -205,6 +205,35 @@ pub fn legacy_freeze(churn_12mo: &HashMap<PathBuf, u32>, all_files: &[PathBuf]) 
     findings
 }
 
+/// Traits conventionally derived (`#[derive(...)]`) rather than
+/// hand-implemented, plus `FromStr` — see below. Excluded wholesale from the
+/// `single-impl-trait` sub-check: derive macros never appear as `ItemImpl`
+/// nodes in the unexpanded AST this module parses (see [`FileCollector`]), so
+/// a trait derived hundreds of times across the workspace looks identical,
+/// to this counter, to a trait implemented exactly once, whenever exactly
+/// one file *also* hand-writes it — e.g. `impl Debug for BrowserManager`
+/// alongside hundreds of `#[derive(Debug)]` elsewhere. `FromStr` isn't
+/// std-derivable, but is common enough as a deliberate, rarely-repeated
+/// manual impl (parsing) that counting its impls doesn't help either; a
+/// derive-count fix (counting `#[derive(...)]` attributes to offset the
+/// impl count) wouldn't cover it, so it joins this exclusion list instead
+/// (see GitHub issue #3).
+const KNOWN_DERIVABLE_TRAITS: &[&str] = &[
+    "Debug",
+    "Clone",
+    "Copy",
+    "Default",
+    "PartialEq",
+    "Eq",
+    "Hash",
+    "PartialOrd",
+    "Ord",
+    "Display",
+    "Serialize",
+    "Deserialize",
+    "FromStr",
+];
+
 /// Builders targeting a struct with at most this many fields are considered
 /// "small enough that a builder is unnecessary ceremony" (todo.md §3.G:
 /// "Builder für Struct mit ≤2 Feldern").
@@ -522,6 +551,9 @@ pub fn analyze_workspace_structural<'a>(
 
     // Sub-check 1: trait with exactly one impl.
     for (trait_name, impls) in &trait_impls {
+        if KNOWN_DERIVABLE_TRAITS.contains(&trait_name.as_str()) {
+            continue;
+        }
         let [(file, self_type, line)] = impls.as_slice() else {
             continue;
         };
@@ -715,6 +747,55 @@ impl Greet for B {
         .unwrap();
 
         let files = authored([two_impls]);
+        let findings = analyze_workspace_structural(files.iter());
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "single-impl-trait")
+            .collect();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn single_impl_trait_excludes_known_derivable_traits() {
+        let dir = TempDir::new("abstraction-single-impl-debug");
+        let debug_impl = dir.join("debug_impl.rs");
+        std::fs::write(
+            &debug_impl,
+            r#"
+struct A;
+impl std::fmt::Debug for A {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "A")
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([debug_impl]);
+        let findings = analyze_workspace_structural(files.iter());
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "single-impl-trait")
+            .collect();
+        assert!(hits.is_empty());
+
+        let dir = TempDir::new("abstraction-single-impl-serialize");
+        let serialize_impl = dir.join("serialize_impl.rs");
+        std::fs::write(
+            &serialize_impl,
+            r#"
+struct A;
+impl Serialize for A {
+    fn serialize(&self) -> String {
+        String::new()
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([serialize_impl]);
         let findings = analyze_workspace_structural(files.iter());
         let hits: Vec<_> = findings
             .iter()

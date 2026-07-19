@@ -209,7 +209,7 @@ pub fn analyze_workspace(
         .crates
         .iter()
         .flat_map(|krate| krate.source_files.iter());
-    let slop_report = crate::slop::analyze_workspace(slop_source_files, false);
+    let slop_report = crate::slop::analyze_workspace(slop_source_files, false, false);
     errors.extend(slop_report.errors.into_iter().map(ProvenanceError::Slop));
     let suppression_findings: Vec<Finding> = slop_report
         .findings

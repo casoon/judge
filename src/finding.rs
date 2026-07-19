@@ -532,6 +532,18 @@ pub struct Report {
     /// Analyzer failures that made the report incomplete. An empty list means
     /// every requested detector completed successfully.
     pub errors: Vec<String>,
+    /// Findings dropped by an inline `// judge-ignore: <rule> — <reason>`
+    /// comment before this report was built (see
+    /// [`crate::suppression::apply_inline_suppressions`], todo.md §5) — the
+    /// only trace a suppression leaves, since the findings themselves are
+    /// gone as if they never fired. Additive in schema v2 — no version bump;
+    /// omitted from JSON when zero, matching `analysis_universe`'s pattern.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub suppressed_inline: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 impl Report {
@@ -550,6 +562,7 @@ impl Report {
             },
             findings,
             errors,
+            suppressed_inline: 0,
         }
     }
 
@@ -558,6 +571,16 @@ impl Report {
     /// only the commands that describe their universe opt in.
     pub fn with_universe(mut self, universe: AnalysisUniverse) -> Self {
         self.analysis_universe = Some(universe);
+        self
+    }
+
+    /// Records how many findings an inline `judge-ignore` comment dropped
+    /// before this report was built — builder-style like [`with_universe`],
+    /// so only commands that actually run the filter opt in.
+    ///
+    /// [`with_universe`]: Report::with_universe
+    pub fn with_suppressed_inline(mut self, count: usize) -> Self {
+        self.suppressed_inline = count;
         self
     }
 }

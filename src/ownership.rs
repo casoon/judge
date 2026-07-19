@@ -32,7 +32,18 @@ use crate::ingest::Workspace;
 pub const LOW_BUS_FACTOR_RULE: &str = "low-bus-factor";
 /// Bump when the low-bus-factor rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
-pub const LOW_BUS_FACTOR_RULE_REVISION: u32 = 1;
+pub const LOW_BUS_FACTOR_RULE_REVISION: u32 = 2;
+
+/// `low-bus-factor` only fires if the repository has at least this many
+/// distinct authors active within the window also used for the per-file
+/// active/inactive check (see [`analyze_workspace`]'s use of
+/// `active_authors_since`). With a single repo-wide author, every file is
+/// bus-factor 1 by construction — there is no "knowledge concentration" to
+/// compare against, so the metric is categorially inapplicable, not merely
+/// statistically weak (see GitHub issue #2: 586 commits, 1 author, 333
+/// `low-bus-factor` findings — practically every file). Two is the minimum
+/// author count at which the comparison becomes meaningful at all.
+const LOW_BUS_FACTOR_MIN_REPO_AUTHORS: usize = 2;
 
 /// Rule id for files whose blame is split into many small author shares with
 /// no dominant owner (todo.md §3.E: "Verteilung vieler kleiner Blame-Anteile;
@@ -87,7 +98,10 @@ impl FileOwnership {
     /// if they still are. The evidence class is `heuristic`: the blame
     /// counts are exact historical facts, but "bus factor 1 = knowledge
     /// risk" is an interpretation of them — blame measures line authorship,
-    /// not knowledge (todo.md §17.3).
+    /// not knowledge (todo.md §17.3). Callers must additionally gate this on
+    /// [`LOW_BUS_FACTOR_MIN_REPO_AUTHORS`] at the repo level (see
+    /// [`analyze_workspace`]) — this method has no visibility into how many
+    /// authors the repository has overall.
     pub fn to_finding(&self, active_authors: &HashSet<String>) -> Option<Finding> {
         if self.bus_factor != 1 {
             return None;
@@ -203,11 +217,16 @@ pub struct WorkspaceOwnership {
 /// Computes per-file ownership across every source file in `workspace` by
 /// blaming each at `HEAD`, and emits `low-bus-factor` findings for files with
 /// a bus factor of 1 plus `ownership-fragmentation` findings for files with
-/// many small blame shares. A repository with no commits yet (unborn `HEAD`)
-/// yields an empty result rather than an error, matching [`crate::git::hotspots`]'s
-/// tolerance for "no git history at all". A failure to blame a single file
-/// (e.g. it isn't tracked) is recorded in `errors` and that file is skipped,
-/// not treated as a fatal error for the whole run.
+/// many small blame shares. `low-bus-factor` is skipped for the whole
+/// workspace if the repository has fewer than [`LOW_BUS_FACTOR_MIN_REPO_AUTHORS`]
+/// distinct authors active in `window_days` (see that constant's docs and
+/// GitHub issue #2) — the repo-wide author count is computed once via
+/// `active_authors_since`, not per file. A repository with no commits yet
+/// (unborn `HEAD`) yields an empty result rather than an error, matching
+/// [`crate::git::hotspots`]'s tolerance for "no git history at all". A
+/// failure to blame a single file (e.g. it isn't tracked) is recorded in
+/// `errors` and that file is skipped, not treated as a fatal error for the
+/// whole run.
 pub fn analyze_workspace(
     workspace: &Workspace,
     window_days: i64,
@@ -219,6 +238,8 @@ pub fn analyze_workspace(
     };
 
     let active_authors = crate::git::active_authors_since(&workspace.root, window_days)?;
+    let repo_has_enough_authors_for_bus_factor =
+        active_authors.len() >= LOW_BUS_FACTOR_MIN_REPO_AUTHORS;
 
     let mut result = WorkspaceOwnership::default();
 
@@ -247,7 +268,9 @@ pub fn analyze_workspace(
 
             match file_ownership(source_file.path.clone(), &repo, &outcome) {
                 Ok(ownership) => {
-                    if let Some(finding) = ownership.to_finding(&active_authors) {
+                    if repo_has_enough_authors_for_bus_factor
+                        && let Some(finding) = ownership.to_finding(&active_authors)
+                    {
                         result.findings.push(finding);
                     }
                     if let Some(finding) = ownership.to_fragmentation_finding() {
@@ -363,6 +386,10 @@ mod tests {
     }
 
     fn workspace_of(root: PathBuf, file: PathBuf) -> Workspace {
+        workspace_of_files(root, vec![file])
+    }
+
+    fn workspace_of_files(root: PathBuf, files: Vec<PathBuf>) -> Workspace {
         Workspace {
             root: root.clone(),
             crates: vec![CrateInfo {
@@ -370,10 +397,13 @@ mod tests {
                 version: "0.1.0".to_string(),
                 manifest_path: root.join("Cargo.toml"),
                 root,
-                source_files: vec![SourceFile {
-                    path: file,
-                    kind: SourceKind::Authored,
-                }],
+                source_files: files
+                    .into_iter()
+                    .map(|path| SourceFile {
+                        path,
+                        kind: SourceKind::Authored,
+                    })
+                    .collect(),
                 entry_points: Vec::new(),
                 dependencies: Vec::new(),
             }],
@@ -449,6 +479,19 @@ mod tests {
             &[],
         );
 
+        // A second, unrelated file/author so the repo has the
+        // LOW_BUS_FACTOR_MIN_REPO_AUTHORS distinct authors the low-bus-factor
+        // guard requires; the analyzed file's ownership is unaffected.
+        let other_file = dir.join("other.rs");
+        std::fs::write(&other_file, "fn z() {}\n").unwrap();
+        run_git_as(&dir, "other@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "other@example.com",
+            &["commit", "-q", "-m", "unrelated"],
+            &[],
+        );
+
         let workspace = workspace_of(dir.to_path_buf(), file.clone());
         let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
 
@@ -477,12 +520,79 @@ mod tests {
             &old_date,
         );
 
+        // Two recent, unrelated authors so the repo has the
+        // LOW_BUS_FACTOR_MIN_REPO_AUTHORS distinct authors the low-bus-factor
+        // guard requires within the 30-day window, without either of them
+        // being the analyzed file's (inactive) author.
+        let other_file = dir.join("other.rs");
+        std::fs::write(&other_file, "fn y() {}\n").unwrap();
+        run_git_as(&dir, "recent-a@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "recent-a@example.com",
+            &["commit", "-q", "-m", "unrelated a"],
+            &[],
+        );
+        std::fs::write(&other_file, "fn y() {}\nfn z() {}\n").unwrap();
+        run_git_as(&dir, "recent-b@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "recent-b@example.com",
+            &["commit", "-q", "-m", "unrelated b"],
+            &[],
+        );
+
         let workspace = workspace_of(dir.to_path_buf(), file.clone());
         let report = analyze_workspace(&workspace, 30).unwrap();
 
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].severity, Severity::Fail);
         assert_eq!(report.findings[0].location.item_path, "gone@example.com");
+    }
+
+    /// Regression test for GitHub issue #2: on a repo with a single overall
+    /// author, every file is bus-factor 1 by construction (there's no
+    /// "concentration" to compare against), so `low-bus-factor` must not
+    /// fire at all — even though each file's own bus factor is still 1.
+    #[test]
+    fn solo_author_repo_yields_no_low_bus_factor_findings_despite_bus_factor_one_everywhere() {
+        let dir = TempDir::new("ownership-solo-repo");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let small = dir.join("small.rs");
+        std::fs::write(&small, "fn a() {}\n").unwrap();
+        let large = dir.join("large.rs");
+        std::fs::write(
+            &large,
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n",
+        )
+        .unwrap();
+        run_git_as(&dir, "solo@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "solo@example.com",
+            &["commit", "-q", "-m", "initial"],
+            &[],
+        );
+
+        let workspace = workspace_of_files(dir.to_path_buf(), vec![small, large]);
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files.len(), 2);
+        assert!(
+            report.files.iter().all(|f| f.bus_factor == 1),
+            "{:?}",
+            report.files
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.rule != LOW_BUS_FACTOR_RULE),
+            "{:?}",
+            report.findings
+        );
     }
 
     /// Grows `file` by `lines_per_author` lines per author, committing each

@@ -171,6 +171,29 @@ pub struct BoundaryConfig {
     /// than nested under a `[provenance]` table.
     #[serde(flatten)]
     pub provenance: ProvenanceConfig,
+    #[serde(default)]
+    pub rules: RulesConfig,
+}
+
+/// The `judge.toml` `[rules.*]` tables — per-rule configuration, keyed by
+/// rule id (see GitHub issue #5). A precedent for future per-rule config
+/// beyond `catch-all-error`, not a one-off.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RulesConfig {
+    #[serde(rename = "catch-all-error", default)]
+    pub catch_all_error: CatchAllErrorConfig,
+}
+
+/// `[rules.catch-all-error]`: opts a codebase following the "thiserror for
+/// error types, anyhow for propagation at public boundaries" convention out
+/// of `catch-all-error` findings on `anyhow::Result`/`anyhow::Error` — but
+/// not on `Box<dyn Error>`, which has no comparable convention argument (see
+/// GitHub issue #5).
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct CatchAllErrorConfig {
+    #[serde(default)]
+    pub allow_anyhow_at_boundary: bool,
 }
 
 /// A configuration error, distinct from a [`Finding`] — this means the rule
@@ -1102,6 +1125,24 @@ trailer_contains = ["internal-ci-bot"]
         );
         assert_eq!(config.provenance.labels[1].name, "internal-bot");
         assert!(config.provenance.labels[1].author_email_contains.is_empty());
+    }
+
+    #[test]
+    fn toml_from_str_round_trips_catch_all_error_rule_config() {
+        let source = r#"
+[rules.catch-all-error]
+allow-anyhow-at-boundary = true
+"#;
+        let config: BoundaryConfig = toml::from_str(source).unwrap();
+
+        assert!(config.rules.catch_all_error.allow_anyhow_at_boundary);
+    }
+
+    #[test]
+    fn missing_rules_table_defaults_to_false() {
+        let config: BoundaryConfig = toml::from_str("").unwrap();
+
+        assert!(!config.rules.catch_all_error.allow_anyhow_at_boundary);
     }
 
     #[test]

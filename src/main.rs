@@ -19,6 +19,15 @@ const DEFAULT_BASELINE_COVERAGE: &str = ".judge/baseline-coverage.json";
 #[cfg(feature = "deep")]
 const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
+/// Top-N cap on git hotspot findings — shared by the dedicated `health`
+/// hotspot print path and every combined findings list `git::hotspots`
+/// feeds into. `git::hotspots` already sorts by score (complexity × changes)
+/// descending, so `.take(HOTSPOT_LIMIT)` keeps the highest-score files, not
+/// an arbitrary prefix. Without this cap a repo where every file crosses
+/// both complexity and churn thresholds floods the findings list with one
+/// hotspot per file instead of surfacing genuine outliers.
+const HOTSPOT_LIMIT: usize = 15;
+
 #[derive(Debug, Parser)]
 #[command(name = "cargo judge", version, about)]
 struct Cli {
@@ -440,6 +449,12 @@ impl From<judge::coverage::LcovError> for CliError {
     }
 }
 
+impl From<judge::suppression::SuppressionError> for CliError {
+    fn from(err: judge::suppression::SuppressionError) -> Self {
+        Self::Config(err.to_string())
+    }
+}
+
 #[cfg(feature = "deep")]
 impl From<judge::dead_code::DeadCodeError> for CliError {
     fn from(err: judge::dead_code::DeadCodeError) -> Self {
@@ -545,6 +560,9 @@ struct CollectedFindings {
     rule_revisions: std::collections::HashMap<String, u32>,
     boundary_rules_checked: usize,
     boundaries_config_path: PathBuf,
+    /// How many findings an inline `// judge-ignore: <rule> — <reason>`
+    /// comment dropped (see [`judge::suppression::apply_inline_suppressions`]).
+    suppressed_inline: usize,
 }
 
 /// Runs every detector that doesn't need extra opt-in config (complexity +
@@ -691,7 +709,12 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         &complexity.functions,
         judge::git::DEFAULT_WINDOW_DAYS,
     ) {
-        Ok(hotspots) => findings.extend(hotspots.iter().map(judge::git::Hotspot::to_finding)),
+        Ok(hotspots) => findings.extend(
+            hotspots
+                .iter()
+                .take(HOTSPOT_LIMIT)
+                .map(judge::git::Hotspot::to_finding),
+        ),
         Err(err) => analysis_errors.push(err.to_string()),
     }
     findings.extend(judge::slop_structural::complexity_inflation(
@@ -733,7 +756,12 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         .crates
         .iter()
         .flat_map(|krate| krate.source_files.iter());
-    let slop = judge::slop::analyze_workspace(slop_source_files, false);
+    let rules_config = load_judge_toml(&workspace.root)?.rules;
+    let slop = judge::slop::analyze_workspace(
+        slop_source_files,
+        false,
+        rules_config.catch_all_error.allow_anyhow_at_boundary,
+    );
     analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
     findings.extend(slop.findings);
 
@@ -804,12 +832,21 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         );
     }
 
+    // Inline `judge-ignore` suppression (todo.md §5): a generic, per-rule
+    // post-filter applied after every detector above has merged its
+    // findings in, so a suppressed finding never reaches baseline diff,
+    // verdict, or score computation for either of this function's callers
+    // (bare `cargo judge` and `audit`).
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+
     Ok(CollectedFindings {
         findings,
         analysis_errors,
         rule_revisions,
         boundary_rules_checked,
         boundaries_config_path,
+        suppressed_inline,
     })
 }
 
@@ -849,7 +886,8 @@ fn run_all(
             // Bare `cargo judge` analyzes with the generated-code default
             // (excluded — see `collect_findings`), so the universe says so.
             let report = Report::with_errors(collected.findings, collected.analysis_errors)
-                .with_universe(judge::finding::AnalysisUniverse::fast(&workspace, false));
+                .with_universe(judge::finding::AnalysisUniverse::fast(&workspace, false))
+                .with_suppressed_inline(collected.suppressed_inline);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
         OutputFormat::Sarif => {
@@ -895,6 +933,13 @@ fn run_all(
                     " (no judge.toml — boundaries skipped)"
                 }
             )?;
+            if collected.suppressed_inline > 0 {
+                writeln!(
+                    out,
+                    "suppressed (inline judge-ignore): {}",
+                    collected.suppressed_inline
+                )?;
+            }
             writeln!(out)?;
             for finding in &gating {
                 write_combined_finding(out, finding)?;
@@ -1265,6 +1310,7 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
                     .iter()
                     .chain(suppression_gate.iter())
                     .collect::<Vec<_>>(),
+                "suppressed_inline": collected.suppressed_inline,
             });
             writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
         }
@@ -1296,6 +1342,7 @@ fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcom
             verdict,
             duplication_gate.as_ref(),
             suppression_gate.as_ref(),
+            collected.suppressed_inline,
         )?,
     }
 
@@ -1327,6 +1374,7 @@ fn print_audit(
     verdict: TriVerdict,
     duplication_gate: Option<&judge::gate::RatioGate>,
     suppression_gate: Option<&judge::gate::RatioGate>,
+    suppressed_inline: usize,
 ) -> std::io::Result<()> {
     writeln!(
         out,
@@ -1337,6 +1385,9 @@ fn print_audit(
             TriVerdict::Fail => "fail",
         }
     )?;
+    if suppressed_inline > 0 {
+        writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
+    }
     writeln!(out, "unchanged: {}", delta.unchanged_count)?;
     writeln!(out, "resolved: {}", delta.resolved.len())?;
     for finding in &delta.resolved {
@@ -1457,8 +1508,14 @@ fn run_dupes(options: DupesOptions, out: &mut dyn Write) -> Result<CommandOutcom
     );
     let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
 
+    // Inline `judge-ignore` suppression (todo.md §5): dropped here, before
+    // baseline diff/verdict or JSON/SARIF output — the TTY clone-family
+    // preview below still lists every family member (see `run_dupes`'s own
+    // scope note at its `Tty` arm), but nothing suppressed reaches a verdict.
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(report.to_findings(), &workspace.root)?;
+
     if save_baseline || baseline.is_some() {
-        let findings = report.to_findings();
         let rule_revisions = std::collections::HashMap::from([(
             judge::duplication::DUPLICATE_RULE.to_string(),
             judge::duplication::DUPLICATE_RULE_REVISION,
@@ -1481,17 +1538,12 @@ fn run_dupes(options: DupesOptions, out: &mut dyn Write) -> Result<CommandOutcom
 
     match format {
         OutputFormat::Json => {
-            let report = Report::with_errors(report.to_findings(), analysis_errors);
+            let report = Report::with_errors(findings, analysis_errors)
+                .with_suppressed_inline(suppressed_inline);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
         OutputFormat::Sarif => {
-            write_sarif(
-                out,
-                &workspace.root,
-                report.to_findings(),
-                analysis_errors,
-                None,
-            )?;
+            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
         }
         OutputFormat::Markdown => {
             return Err(unsupported_format("`dupes`", format, "tty, json, sarif"));
@@ -1521,6 +1573,9 @@ fn run_dupes(options: DupesOptions, out: &mut dyn Write) -> Result<CommandOutcom
                     "excluded (generated): {} (see --include-generated)",
                     report.excluded_generated
                 )?;
+            }
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
 
             for (index, family) in report.families.iter().take(15).enumerate() {
@@ -1643,6 +1698,11 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
         );
     }
 
+    // Inline `judge-ignore` suppression (todo.md §5), applied after every
+    // detector above has merged its findings in.
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+
     if save_baseline || baseline.is_some() {
         return handle_baseline(
             &workspace.root,
@@ -1667,6 +1727,7 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
                 "findings": findings,
                 "feature_only_candidates": report.feature_only_candidates,
                 "errors": analysis_errors,
+                "suppressed_inline": suppressed_inline,
             });
             writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
         }
@@ -1683,6 +1744,9 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
                 for err in &analysis_errors {
                     writeln!(out, "  {err}")?;
                 }
+            }
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
 
             for finding in &findings {
@@ -1888,6 +1952,10 @@ fn run_boundaries(
 
     let boundaries = judge::boundaries::evaluate(&workspace, &config)?;
 
+    // Inline `judge-ignore` suppression (todo.md §5).
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(boundaries.findings, &workspace.root)?;
+
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([
             (
@@ -1901,7 +1969,7 @@ fn run_boundaries(
         ]);
         return handle_baseline(
             &workspace.root,
-            &boundaries.findings,
+            &findings,
             &[],
             BaselineOptions {
                 rule_revisions,
@@ -1917,11 +1985,11 @@ fn run_boundaries(
 
     match format {
         OutputFormat::Json => {
-            let report = Report::new(boundaries.findings);
+            let report = Report::new(findings).with_suppressed_inline(suppressed_inline);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
         OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, boundaries.findings, Vec::new(), None)?;
+            write_sarif(out, &workspace.root, findings, Vec::new(), None)?;
         }
         OutputFormat::Markdown => {
             return Err(unsupported_format(
@@ -1932,8 +2000,11 @@ fn run_boundaries(
         }
         OutputFormat::Tty => {
             writeln!(out, "boundary rules: {}", config.boundaries.len())?;
-            writeln!(out, "findings: {}", boundaries.findings.len())?;
-            for finding in &boundaries.findings {
+            writeln!(out, "findings: {}", findings.len())?;
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
+            }
+            for finding in &findings {
                 writeln!(
                     out,
                     "  [{}] {} — {}",
@@ -1963,6 +2034,12 @@ fn run_distribution(
 
     let report = judge::ownership::analyze_workspace(&workspace, judge::git::DEFAULT_WINDOW_DAYS)?;
     let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
+    let files_analyzed = report.files.len();
+    let blame_errors = report.errors.len();
+
+    // Inline `judge-ignore` suppression (todo.md §5).
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
 
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([
@@ -1977,7 +2054,7 @@ fn run_distribution(
         ]);
         return handle_baseline(
             &workspace.root,
-            &report.findings,
+            &findings,
             &analysis_errors,
             BaselineOptions {
                 rule_revisions,
@@ -1993,11 +2070,12 @@ fn run_distribution(
 
     match format {
         OutputFormat::Json => {
-            let report = Report::with_errors(report.findings, analysis_errors);
+            let report = Report::with_errors(findings, analysis_errors)
+                .with_suppressed_inline(suppressed_inline);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
         OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, report.findings, analysis_errors, None)?;
+            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
         }
         OutputFormat::Markdown => {
             return Err(unsupported_format(
@@ -2007,16 +2085,18 @@ fn run_distribution(
             ));
         }
         OutputFormat::Tty => {
-            writeln!(out, "files analyzed: {}", report.files.len())?;
-            if !report.errors.is_empty() {
-                writeln!(out, "files skipped (blame errors): {}", report.errors.len())?;
-                for err in &report.errors {
+            writeln!(out, "files analyzed: {files_analyzed}")?;
+            if blame_errors > 0 {
+                writeln!(out, "files skipped (blame errors): {blame_errors}")?;
+                for err in &analysis_errors {
                     writeln!(out, "  {err}")?;
                 }
             }
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
+            }
 
-            let (bus_factor, fragmentation): (Vec<&Finding>, Vec<&Finding>) = report
-                .findings
+            let (bus_factor, fragmentation): (Vec<&Finding>, Vec<&Finding>) = findings
                 .iter()
                 .partition(|finding| finding.rule == judge::ownership::LOW_BUS_FACTOR_RULE);
 
@@ -2276,6 +2356,10 @@ fn run_dead_code_deep(
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     analysis_errors.extend(structural_report.errors.iter().map(ToString::to_string));
 
+    // Inline `judge-ignore` suppression (todo.md §5).
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([
             (
@@ -2312,7 +2396,9 @@ fn run_dead_code_deep(
     let universe = judge::finding::AnalysisUniverse::deep(&workspace, include_tests);
     match format {
         OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors).with_universe(universe);
+            let report = Report::with_errors(findings, analysis_errors)
+                .with_universe(universe)
+                .with_suppressed_inline(suppressed_inline);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
         OutputFormat::Sarif => {
@@ -2344,6 +2430,9 @@ fn run_dead_code_deep(
                 for error in &analysis_errors {
                     writeln!(out, "  {error}")?;
                 }
+            }
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
             for rule in [
                 judge::dead_code::UNUSED_PUB_WORKSPACE_RULE,
@@ -2506,6 +2595,7 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
         };
     let mut findings: Vec<_> = hotspots
         .iter()
+        .take(HOTSPOT_LIMIT)
         .map(judge::git::Hotspot::to_finding)
         .collect();
 
@@ -2517,7 +2607,12 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
         .crates
         .iter()
         .flat_map(|krate| krate.source_files.iter());
-    let slop = judge::slop::analyze_workspace(slop_source_files, include_generated);
+    let rules_config = load_judge_toml(&workspace.root)?.rules;
+    let slop = judge::slop::analyze_workspace(
+        slop_source_files,
+        include_generated,
+        rules_config.catch_all_error.allow_anyhow_at_boundary,
+    );
     analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
     findings.extend(slop.findings);
 
@@ -2558,6 +2653,12 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
     findings.extend(judge::slop_structural::analyze_workspace_structural(
         abstraction_source_files,
     ));
+
+    // Inline `judge-ignore` suppression (todo.md §5): applied after every
+    // detector above has merged its findings in, so a suppressed finding
+    // never reaches score, baseline diff, or verdict below.
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
 
     let excluded_generated = report.excluded_generated + slop.excluded_generated;
 
@@ -2703,9 +2804,12 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
             } else {
                 None
             };
-            let report = Report::with_errors(findings, analysis_errors).with_universe(
-                judge::finding::AnalysisUniverse::fast(&workspace, include_generated),
-            );
+            let report = Report::with_errors(findings, analysis_errors)
+                .with_universe(judge::finding::AnalysisUniverse::fast(
+                    &workspace,
+                    include_generated,
+                ))
+                .with_suppressed_inline(suppressed_inline);
             let mut value = serde_json::to_value(&report).unwrap();
             if let Some(score) = score {
                 value["score"] = serde_json::to_value(&score).unwrap();
@@ -2747,6 +2851,9 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
                     out,
                     "excluded (generated): {excluded_generated} (see --include-generated)"
                 )?;
+            }
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
 
             writeln!(out)?;
@@ -2940,7 +3047,7 @@ fn print_hotspots(
         "hotspots (complexity × changes in the last {} days — advisory, no verdict effect):",
         judge::git::DEFAULT_WINDOW_DAYS
     )?;
-    for hotspot in hotspots.iter().take(15) {
+    for hotspot in hotspots.iter().take(HOTSPOT_LIMIT) {
         let id = format!("{}:{}", judge::git::HOTSPOT_RULE, hotspot.file.display());
         if !shown_ids.contains(id.as_str()) {
             continue;
@@ -3159,6 +3266,16 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    /// The `judge-ignore` marker text, assembled at runtime rather than
+    /// written as one literal in this file — a fixture string containing it
+    /// verbatim (especially the deliberately-malformed, missing-reason
+    /// cases below) would itself read as a real directive when `judge`
+    /// analyzes its own `main.rs`, wherever a `duplicate-code`/
+    /// `legacy-freeze`/etc. finding happens to land on or next to that line.
+    fn ignore_marker() -> String {
+        ["judge", "-ignore:"].concat()
+    }
+
     fn commit_sha(dir: &Path, rev: &str) -> String {
         let output = std::process::Command::new("git")
             .args(["rev-parse", rev])
@@ -3255,6 +3372,16 @@ fn dup_two(x: i32) -> i32 {
         }))
     }
 
+    /// Bare `cargo judge` (no subcommand — `Cli::command` is `None`).
+    fn all_cli(save_baseline: bool, baseline: Option<PathBuf>) -> Cli {
+        Cli {
+            command: None,
+            format: OutputFormat::Tty,
+            save_baseline,
+            baseline,
+        }
+    }
+
     /// Success path: a clean fixture workspace runs through `run` to
     /// `CommandOutcome::Clean`, with the TTY report in the writer.
     #[test]
@@ -3311,6 +3438,80 @@ fn dup_two(x: i32) -> i32 {
         assert_eq!(outcome, CommandOutcome::FindingsFound);
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("verdict: fail"), "unexpected output: {text}");
+    }
+
+    /// (f) End-to-end (todo.md §5): a `// judge-ignore: <rule> — <reason>`
+    /// comment on an otherwise-`Fail`-triggering finding (`swallowed-result`
+    /// — `slop.rs`'s own tests cover that it fires without suppression)
+    /// removes it before the baseline diff, so the verdict is
+    /// `CommandOutcome::Clean`/`pass` instead of `FindingsFound`/`fail`.
+    #[test]
+    fn judge_ignore_suppresses_a_finding_so_it_does_not_fail_the_verdict() {
+        let dir = TempDir::new("judge-ignore-verdict");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(&dir, all_cli(true, None), &mut out)
+            .expect("saving a baseline must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        std::fs::write(
+            dir.join("src/risky.rs"),
+            format!(
+                "pub fn call_it() {{\n    let _ = std::fs::remove_file(\"x\"); // {} swallowed-result — best-effort cleanup\n}}\n",
+                ignore_marker()
+            ),
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(
+            &dir,
+            &["commit", "-q", "-m", "add suppressed swallowed-result"],
+        );
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            all_cli(false, Some(PathBuf::from(DEFAULT_BASELINE_ALL))),
+            &mut out,
+        )
+        .expect("a suppressed finding must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("verdict: pass"), "unexpected output: {text}");
+    }
+
+    /// (d) End-to-end (todo.md §5): a `judge-ignore` comment with no reason
+    /// is a hard config error (exit 2), analogous to `judge-dupe-off`
+    /// without a reason (`duplication::tests::judge_dupe_off_without_a_reason_is_a_hard_error`).
+    #[test]
+    fn judge_ignore_without_a_reason_is_a_config_error_end_to_end() {
+        let dir = TempDir::new("judge-ignore-missing-reason");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        std::fs::write(
+            dir.join("src/risky.rs"),
+            format!(
+                "pub fn call_it() {{\n    let _ = std::fs::remove_file(\"x\"); // {} swallowed-result\n}}\n",
+                ignore_marker()
+            ),
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let mut out = Vec::new();
+        let err = run_in_dir(&dir, all_cli(false, None), &mut out)
+            .expect_err("a judge-ignore comment with no reason must be a config error");
+        match err {
+            CliError::Config(message) => {
+                assert!(message.contains("requires a reason"), "message: {message}");
+            }
+            other => panic!("expected CliError::Config, got {other:?}"),
+        }
     }
 
     /// Config-error path: an unparseable `judge.toml` is a `CliError::Config`
@@ -4014,6 +4215,77 @@ pub fn quiet_three() -> u32 {
         let report = Report::new(collected.findings);
         assert_eq!(report.counts.gating, 0);
         assert!(report.counts.advisory > 0);
+    }
+
+    /// A repo where every file crosses both the complexity and churn
+    /// thresholds must not flood the combined findings list with one
+    /// `hotspot` finding per file (see `HOTSPOT_LIMIT`'s doc comment: 317/317
+    /// files flagged in a real repo, no "outlier" signal left). `collect_findings`
+    /// caps at `HOTSPOT_LIMIT`, and — since `git::hotspots` already sorts by
+    /// score (complexity × changes) descending — keeps the *highest*-score
+    /// files, not an arbitrary prefix.
+    #[test]
+    fn collect_findings_caps_hotspots_at_the_shared_limit_keeping_the_highest_scores() {
+        let _guard = lock_cwd();
+        let dir = TempDir::new("hotspot-limit");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+
+        // 20 more files, each with a distinct, strictly increasing cyclomatic
+        // complexity (one more `if` branch than the last) — together with
+        // `write_fixture_crate`'s `src/lib.rs` (complexity 1, the unambiguous
+        // minimum), that's 21 hotspot candidates once all are committed
+        // together (one commit = one churn count each), well past
+        // `HOTSPOT_LIMIT`, with a strict score ranking so "top N by score"
+        // has one unambiguous answer.
+        const FILE_COUNT: usize = 20;
+        for branches in 1..=FILE_COUNT {
+            let mut body = String::from("pub fn f(x: i32) -> i32 {\n    let mut total = x;\n");
+            for i in 0..branches {
+                body.push_str(&format!("    if x > {i} {{ total += {i}; }}\n"));
+            }
+            body.push_str("    total\n}\n");
+            std::fs::write(dir.join(format!("src/hotspot_{branches:02}.rs")), body).unwrap();
+        }
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let manifest = dir.join("Cargo.toml");
+        let workspace = judge::ingest::load(Some(&manifest)).unwrap();
+        let mut collected = collect_findings(&workspace).unwrap();
+        assert!(collected.analysis_errors.is_empty());
+        judge::finding::relativize_paths(&mut collected.findings, &workspace.root);
+
+        let hotspot_files: std::collections::HashSet<&Path> = collected
+            .findings
+            .iter()
+            .filter(|finding| finding.rule == judge::git::HOTSPOT_RULE)
+            .map(|finding| finding.location.file.as_path())
+            .collect();
+        assert_eq!(
+            hotspot_files.len(),
+            HOTSPOT_LIMIT,
+            "expected exactly {HOTSPOT_LIMIT} hotspot findings out of 21 candidates, got {}",
+            hotspot_files.len()
+        );
+
+        // Bottom 6 by score (`src/lib.rs` at complexity 1, then branches
+        // 1..=5) must be dropped; top 15 (branches 6..=20) must survive.
+        assert!(!hotspot_files.contains(Path::new("src/lib.rs")));
+        for branches in 1..=5 {
+            let file = PathBuf::from(format!("src/hotspot_{branches:02}.rs"));
+            assert!(
+                !hotspot_files.contains(file.as_path()),
+                "expected the lower-complexity {file:?} to be dropped by the cap"
+            );
+        }
+        for branches in 6..=FILE_COUNT {
+            let file = PathBuf::from(format!("src/hotspot_{branches:02}.rs"));
+            assert!(
+                hotspot_files.contains(file.as_path()),
+                "expected the higher-complexity {file:?} to survive the cap"
+            );
+        }
     }
 
     #[test]

@@ -152,7 +152,11 @@ pub struct WorkspaceSlop {
 }
 
 /// Parses a single Rust source file and returns every slop finding in it.
-pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SlopError> {
+/// See [`contains_catch_all_error`] for `allow_anyhow_at_boundary`.
+pub fn analyze_file(
+    path: &Path,
+    allow_anyhow_at_boundary: bool,
+) -> Result<Vec<Finding>, SlopError> {
     let source =
         std::fs::read_to_string(path).map_err(|err| SlopError::Io(path.to_path_buf(), err))?;
     let ast = syn::parse_file(&source).map_err(|err| SlopError::Parse(path.to_path_buf(), err))?;
@@ -163,6 +167,7 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SlopError> {
         findings: Vec::new(),
         feature_gated_depth: 0,
         item_spans: Vec::new(),
+        allow_anyhow_at_boundary,
     };
     visitor.visit_file(&ast);
     let mut findings = visitor.findings;
@@ -177,10 +182,12 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SlopError> {
 /// Runs [`analyze_file`] over every file in `source_files` and aggregates the
 /// results. Generated files are skipped unless `include_generated` is set
 /// (see todo.md §3.A) — slop signals on generated code aren't actionable the
-/// way they are on authored code.
+/// way they are on authored code. See [`contains_catch_all_error`] for
+/// `allow_anyhow_at_boundary`.
 pub fn analyze_workspace<'a>(
     source_files: impl IntoIterator<Item = &'a SourceFile>,
     include_generated: bool,
+    allow_anyhow_at_boundary: bool,
 ) -> WorkspaceSlop {
     let mut report = WorkspaceSlop::default();
     for file in source_files {
@@ -188,7 +195,7 @@ pub fn analyze_workspace<'a>(
             report.excluded_generated += 1;
             continue;
         }
-        match analyze_file(&file.path) {
+        match analyze_file(&file.path, allow_anyhow_at_boundary) {
             Ok(mut findings) => report.findings.append(&mut findings),
             Err(err) => report.errors.push(err),
         }
@@ -224,6 +231,9 @@ struct SlopVisitor<'a> {
     /// walking — feeds [`crate::slop_text::scan_comments`]'s attribution of
     /// raw-text findings (see [`ItemSpan`]).
     pub(crate) item_spans: Vec<ItemSpan>,
+    /// Whether `catch-all-error` exempts `anyhow::Result`/`anyhow::Error`
+    /// return types (see [`contains_catch_all_error`], GitHub issue #5).
+    allow_anyhow_at_boundary: bool,
 }
 
 impl SlopVisitor<'_> {
@@ -294,7 +304,7 @@ impl SlopVisitor<'_> {
         let syn::ReturnType::Type(_, ty) = &sig.output else {
             return;
         };
-        if !contains_catch_all_error(ty) {
+        if !contains_catch_all_error(ty, self.allow_anyhow_at_boundary) {
             return;
         }
         let item_path = self.current_item_path();
@@ -761,13 +771,17 @@ fn is_empty_block_expr(expr: &Expr) -> bool {
 /// Whether `ty`, written syntactically, is or contains `Box<dyn ... Error
 /// ...>` or a path ending in `anyhow::Error`/`anyhow::Result` (see todo.md
 /// §G1 `catch-all-error`). Recurses into generic arguments so both a bare
-/// `Box<dyn Error>` return type and `Result<_, Box<dyn Error>>` match.
-fn contains_catch_all_error(ty: &Type) -> bool {
+/// `Box<dyn Error>` return type and `Result<_, Box<dyn Error>>` match. When
+/// `allow_anyhow_at_boundary` is set, `anyhow::Error`/`anyhow::Result` no
+/// longer match — but `Box<dyn Error>` still does (see GitHub issue #5:
+/// anyhow is the documented propagation convention, `Box<dyn Error>` has no
+/// comparable exemption).
+fn contains_catch_all_error(ty: &Type, allow_anyhow_at_boundary: bool) -> bool {
     match ty {
         Type::TraitObject(trait_object) => is_error_trait_object(trait_object),
         Type::Path(type_path) => {
             let segments = &type_path.path.segments;
-            if segments.len() >= 2 {
+            if !allow_anyhow_at_boundary && segments.len() >= 2 {
                 let last = segments.last().unwrap();
                 let prev = &segments[segments.len() - 2];
                 if prev.ident == "anyhow" && (last.ident == "Error" || last.ident == "Result") {
@@ -779,7 +793,9 @@ fn contains_catch_all_error(ty: &Type) -> bool {
                     return false;
                 };
                 args.args.iter().any(|arg| match arg {
-                    GenericArgument::Type(inner) => contains_catch_all_error(inner),
+                    GenericArgument::Type(inner) => {
+                        contains_catch_all_error(inner, allow_anyhow_at_boundary)
+                    }
                     _ => false,
                 })
             })
@@ -951,7 +967,7 @@ struct AssertionScanner {
 
 impl<'ast> Visit<'ast> for AssertionScanner {
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        const ASSERT_MACROS: [&str; 8] = [
+        const ASSERT_MACROS: [&str; 16] = [
             "assert",
             "assert_eq",
             "assert_ne",
@@ -960,8 +976,25 @@ impl<'ast> Visit<'ast> for AssertionScanner {
             "debug_assert_ne",
             "panic",
             "unreachable",
+            "assert_snapshot",
+            "assert_json_snapshot",
+            "assert_debug_snapshot",
+            "assert_display_snapshot",
+            "assert_yaml_snapshot",
+            "assert_ron_snapshot",
+            "assert_csv_snapshot",
+            "assert_toml_snapshot",
         ];
-        if ASSERT_MACROS.iter().any(|name| mac.path.is_ident(name)) {
+        // Matches the last path segment, not just single-segment paths via
+        // `is_ident` — otherwise a qualified call like
+        // `insta::assert_snapshot!(...)` or `pretty_assertions::assert_eq!`
+        // is invisible to this scanner (see GitHub issue #6).
+        if mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| ASSERT_MACROS.contains(&segment.ident.to_string().as_str()))
+        {
             self.found = true;
         }
         visit::visit_macro(self, mac);
@@ -1002,10 +1035,18 @@ mod tests {
     }
 
     fn findings_for(source: &str, name: &str) -> Vec<Finding> {
+        findings_for_with_config(source, name, false)
+    }
+
+    fn findings_for_with_config(
+        source: &str,
+        name: &str,
+        allow_anyhow_at_boundary: bool,
+    ) -> Vec<Finding> {
         let dir = TempDir::new(name);
         let file = dir.join("lib.rs");
         std::fs::write(&file, source).unwrap();
-        analyze_file(&file).unwrap()
+        analyze_file(&file, allow_anyhow_at_boundary).unwrap()
     }
 
     fn rule_findings<'a>(findings: &'a [Finding], rule: &str) -> Vec<&'a Finding> {
@@ -1145,6 +1186,27 @@ fn f(r: Result<i32, ()>) {
     }
 
     #[test]
+    fn anyhow_result_is_not_flagged_when_allowed_at_boundary() {
+        let findings = findings_for_with_config(
+            "pub fn f() -> anyhow::Result<()> { Ok(()) }\n",
+            "slop-catch-all-anyhow-allowed",
+            true,
+        );
+        assert!(rule_findings(&findings, CATCH_ALL_ERROR_RULE).is_empty());
+    }
+
+    #[test]
+    fn boxed_dyn_error_is_still_flagged_when_anyhow_allowed_at_boundary() {
+        let findings = findings_for_with_config(
+            "pub fn f() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n",
+            "slop-catch-all-boxed-allowed",
+            true,
+        );
+        let hits = rule_findings(&findings, CATCH_ALL_ERROR_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
     fn allow_and_expect_each_produce_one_finding() {
         let findings = findings_for(
             "#[allow(dead_code)]\nfn f() {}\n\n#[expect(clippy::foo)]\nfn g() {}\n",
@@ -1182,11 +1244,11 @@ fn f(r: Result<i32, ()>) {
             kind: SourceKind::Generated,
         }];
 
-        let excluded = analyze_workspace(files.iter(), false);
+        let excluded = analyze_workspace(files.iter(), false, false);
         assert!(excluded.findings.is_empty());
         assert_eq!(excluded.excluded_generated, 1);
 
-        let included = analyze_workspace(files.iter(), true);
+        let included = analyze_workspace(files.iter(), true, false);
         assert_eq!(included.findings.len(), 1);
         assert_eq!(included.excluded_generated, 0);
     }
@@ -1198,7 +1260,7 @@ fn f(r: Result<i32, ()>) {
         std::fs::write(&file, "fn broken( {").unwrap();
 
         let files = [authored(file)];
-        let report = analyze_workspace(files.iter(), false);
+        let report = analyze_workspace(files.iter(), false, false);
 
         assert_eq!(report.errors.len(), 1);
         assert!(report.findings.is_empty());
@@ -1410,6 +1472,33 @@ fn f(r: Result<i32, ()>) {
             "slop-assertion-free-closure",
         );
         assert_eq!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).len(), 1);
+    }
+
+    #[test]
+    fn test_with_qualified_insta_snapshot_macro_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { insta::assert_snapshot!(\"value\"); }\n",
+            "slop-assertion-free-insta-snapshot",
+        );
+        assert!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn test_with_qualified_insta_json_snapshot_macro_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { insta::assert_json_snapshot!(value); }\n",
+            "slop-assertion-free-insta-json-snapshot",
+        );
+        assert!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).is_empty());
+    }
+
+    #[test]
+    fn test_with_qualified_pretty_assertions_assert_eq_is_not_flagged() {
+        let findings = findings_for(
+            "#[test]\nfn f() { pretty_assertions::assert_eq!(1 + 1, 2); }\n",
+            "slop-assertion-free-pretty-assertions",
+        );
+        assert!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).is_empty());
     }
 
     #[test]

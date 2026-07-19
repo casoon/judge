@@ -29,6 +29,7 @@ pub mod slop_structural;
 pub mod slop_structural_deep;
 mod slop_text;
 pub mod slopsquat;
+pub mod suppression;
 #[cfg(test)]
 mod test_util;
 
