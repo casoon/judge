@@ -15,6 +15,7 @@ const DEFAULT_BASELINE_BOUNDARIES: &str = ".judge/baseline-boundaries.json";
 const DEFAULT_BASELINE_ALL: &str = ".judge/baseline.json";
 const DEFAULT_BASELINE_DISTRIBUTION: &str = ".judge/baseline-distribution.json";
 const DEFAULT_BASELINE_PROVENANCE: &str = ".judge/baseline-provenance.json";
+const DEFAULT_BASELINE_COVERAGE: &str = ".judge/baseline-coverage.json";
 #[cfg(feature = "deep")]
 const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
@@ -76,6 +77,11 @@ enum Command {
     Init,
     /// Show detected entry points, tiers, and cache status.
     Inspect,
+    /// Imports an externally generated `cargo-llvm-cov` LCOV report and
+    /// flags `untested-hotspot` functions: high complexity, high churn, and
+    /// mostly uncovered lines (see todo.md §J). judge never measures
+    /// coverage itself — only an already-generated snapshot is read.
+    Coverage(CoverageOptions),
 }
 
 #[derive(Debug, Args)]
@@ -196,6 +202,23 @@ struct DeadCodeOptions {
     /// (see todo.md §3.A "Reachability-Modi").
     #[arg(long)]
     include_tests: bool,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+    /// Save the current findings as the baseline (see todo.md §5).
+    #[arg(long)]
+    save_baseline: bool,
+    /// Compare findings against a previously saved baseline.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CoverageOptions {
+    /// Path to a `cargo-llvm-cov` LCOV report (see todo.md §J). judge never
+    /// measures coverage itself, only imports an already-generated snapshot.
+    #[arg(long, value_name = "PATH")]
+    lcov: PathBuf,
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
     format: OutputFormat,
@@ -411,6 +434,12 @@ impl From<judge::boundaries::BoundaryConfigError> for CliError {
     }
 }
 
+impl From<judge::coverage::LcovError> for CliError {
+    fn from(err: judge::coverage::LcovError) -> Self {
+        Self::Config(err.to_string())
+    }
+}
+
 #[cfg(feature = "deep")]
 impl From<judge::dead_code::DeadCodeError> for CliError {
     fn from(err: judge::dead_code::DeadCodeError) -> Self {
@@ -502,6 +531,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
             Ok(CommandOutcome::Clean)
         }
         Some(Command::Inspect) => run_inspect(out),
+        Some(Command::Coverage(options)) => run_coverage(options, out),
     }
 }
 
@@ -547,6 +577,14 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         (
             judge::deps::HEAVY_DEPENDENCY_RULE.to_string(),
             judge::deps::HEAVY_DEPENDENCY_RULE_REVISION,
+        ),
+        (
+            judge::deps::UNUSED_FEATURE_FLAG_RULE.to_string(),
+            judge::deps::UNUSED_FEATURE_FLAG_RULE_REVISION,
+        ),
+        (
+            judge::deps::DEFAULT_FEATURES_UNUSED_RULE.to_string(),
+            judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
         ),
         (
             judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
@@ -1543,6 +1581,14 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
             judge::deps::HEAVY_DEPENDENCY_RULE_REVISION,
         ),
         (
+            judge::deps::UNUSED_FEATURE_FLAG_RULE.to_string(),
+            judge::deps::UNUSED_FEATURE_FLAG_RULE_REVISION,
+        ),
+        (
+            judge::deps::DEFAULT_FEATURES_UNUSED_RULE.to_string(),
+            judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
+        ),
+        (
             judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
             judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE_REVISION,
         ),
@@ -1675,9 +1721,137 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
                 writeln!(out)?;
                 writeln!(
                     out,
-                    "feature-only candidates (no code usage found, kept as evidence, not asserted): {}",
+                    "feature-only candidates (no code usage found; see unused-feature-flag findings above for detail): {}",
                     report.feature_only_candidates.join(", ")
                 )?;
+            }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
+    let CoverageOptions {
+        lcov,
+        format,
+        save_baseline,
+        baseline,
+    } = options;
+    let workspace = judge::ingest::load(None)?;
+
+    let coverage = judge::coverage::read_lcov(&lcov, &workspace.root)?;
+
+    let complexity_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let complexity_report = judge::complexity::analyze_workspace(complexity_source_files, false);
+    let mut analysis_errors: Vec<String> = complexity_report
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    for missing in &coverage.missing_files {
+        analysis_errors.push(format!(
+            "{}: coverage data references this file, but it no longer exists in the workspace",
+            missing.display()
+        ));
+    }
+
+    let churn = match judge::git::churn(
+        &workspace.root,
+        judge::coverage::UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS,
+    ) {
+        Ok(churn) => churn,
+        Err(err) => {
+            analysis_errors.push(err.to_string());
+            std::collections::HashMap::new()
+        }
+    };
+
+    let findings = judge::coverage::untested_hotspots(
+        &complexity_report.functions,
+        &churn,
+        &coverage,
+        &workspace.root,
+    );
+
+    let no_coverage_data_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let no_coverage_data = coverage.files_without_coverage_data(
+        &workspace.root,
+        no_coverage_data_source_files.map(|file| file.path.as_path()),
+    );
+
+    if save_baseline || baseline.is_some() {
+        let rule_revisions = std::collections::HashMap::from([(
+            judge::coverage::UNTESTED_HOTSPOT_RULE.to_string(),
+            judge::coverage::UNTESTED_HOTSPOT_RULE_REVISION,
+        )]);
+        return handle_baseline(
+            &workspace.root,
+            &findings,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_COVERAGE),
+                format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
+            },
+            out,
+        );
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let report = Report::with_errors(findings, analysis_errors);
+            let mut value = serde_json::to_value(&report).unwrap();
+            value["files_without_coverage_data"] = serde_json::to_value(
+                no_coverage_data
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            writeln!(out, "{}", serde_json::to_string_pretty(&value).unwrap())?;
+        }
+        OutputFormat::Sarif => {
+            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format("`coverage`", format, "tty, json, sarif"));
+        }
+        OutputFormat::Tty => {
+            writeln!(out, "untested hotspots: {}", findings.len())?;
+            if !analysis_errors.is_empty() {
+                writeln!(out, "errors: {}", analysis_errors.len())?;
+                for err in &analysis_errors {
+                    writeln!(out, "  {err}")?;
+                }
+            }
+            for finding in &findings {
+                writeln!(
+                    out,
+                    "  {}:{}  {}",
+                    finding.location.file.display(),
+                    finding.location.line,
+                    finding.location.item_path
+                )?;
+            }
+            if !no_coverage_data.is_empty() {
+                writeln!(out)?;
+                writeln!(
+                    out,
+                    "no coverage data (not asserted as 0%): {}",
+                    no_coverage_data.len()
+                )?;
+                for file in &no_coverage_data {
+                    writeln!(out, "  {}", file.display())?;
+                }
             }
         }
     }

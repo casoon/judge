@@ -38,8 +38,24 @@
 //! declares a non-empty `features` list is deliberately **not** turned into a
 //! misplaced-kind finding — judge cannot see which code path a feature
 //! enables, so asserting a kind mismatch there would be an unbacked claim.
-//! Such dependencies are instead recorded as `feature_only_candidates`, kept
-//! as evidence for a future detector or a human to look at.
+//! Such dependencies are still recorded in `feature_only_candidates`, and
+//! also drive two further findings built on that same zero-usage evidence
+//! (todo.md §B) — never on knowledge of a specific dependency's feature
+//! vocabulary:
+//!
+//! - **`unused-feature-flag`**: one finding per declared feature name, for a
+//!   dependency with zero usage found anywhere (the case above). Deliberately
+//!   does *not* cover prominent "bundle" features with a well-known naming
+//!   convention (e.g. `tokio = { features = ["full"] }`), even when the
+//!   dependency itself *is* used — recognizing those needs a hardcoded
+//!   feature vocabulary per dependency, which judge does not maintain.
+//! - **`default-features-unused`**: a dependency whose manifest entry
+//!   explicitly sets `default-features = true` — the raw TOML text says so
+//!   (see [`manifest_explicitly_enables_default_features`]), not just
+//!   Cargo's own implicit default — and that has the same zero-usage
+//!   evidence as above. Deliberately does *not* cover "used, but only
+//!   non-default features": telling default from non-default items apart
+//!   needs per-dependency feature-to-symbol knowledge judge does not have.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -64,6 +80,18 @@ pub const UNUSED_DEV_DEPENDENCY_RULE_REVISION: u32 = 1;
 pub const HEAVY_DEPENDENCY_RULE: &str = "heavy-dependency";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const HEAVY_DEPENDENCY_RULE_REVISION: u32 = 1;
+
+/// Rule id used for unused-feature-flag findings (see todo.md §B, module
+/// docs "Feature-only evidence").
+pub const UNUSED_FEATURE_FLAG_RULE: &str = "unused-feature-flag";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const UNUSED_FEATURE_FLAG_RULE_REVISION: u32 = 1;
+
+/// Rule id used for default-features-unused findings (see todo.md §B, module
+/// docs "Feature-only evidence").
+pub const DEFAULT_FEATURES_UNUSED_RULE: &str = "default-features-unused";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const DEFAULT_FEATURES_UNUSED_RULE_REVISION: u32 = 1;
 
 /// Above this many transitive dependencies (from a full, non `--no-deps`
 /// resolve — see `resolve_transitive_dependency_counts`), combined with
@@ -117,6 +145,11 @@ pub enum DepsError {
     /// produced by `heavy-dependency`'s transitive-count lookup (see
     /// `resolve_transitive_dependency_counts`).
     Metadata(cargo_metadata::Error),
+    /// A crate's manifest failed to parse as TOML — only produced by
+    /// `default-features-unused`'s manifest lookup (see
+    /// `manifest_explicitly_enables_default_features`), which reads the raw
+    /// manifest text directly rather than trusting `cargo_metadata`.
+    ManifestParse(PathBuf, toml::de::Error),
 }
 
 impl std::fmt::Display for DepsError {
@@ -125,6 +158,9 @@ impl std::fmt::Display for DepsError {
             Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
             Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
             Self::Metadata(err) => write!(f, "failed to resolve full dependency graph: {err}"),
+            Self::ManifestParse(path, err) => {
+                write!(f, "{}: failed to parse: {err}", path.display())
+            }
         }
     }
 }
@@ -135,6 +171,7 @@ impl std::error::Error for DepsError {
             Self::Io(_, err) => Some(err),
             Self::Parse(_, err) => Some(err),
             Self::Metadata(err) => Some(err),
+            Self::ManifestParse(_, err) => Some(err),
         }
     }
 }
@@ -144,8 +181,10 @@ impl std::error::Error for DepsError {
 pub struct WorkspaceDeps {
     pub findings: Vec<Finding>,
     /// Dependencies with zero identifier usages found anywhere, but a
-    /// non-empty `features` list — kept as evidence rather than asserted as
-    /// findings (see module docs "Feature-only evidence").
+    /// non-empty `features` list (see module docs "Feature-only evidence").
+    /// Kept alongside the `unused-feature-flag` findings derived from the
+    /// same evidence, for a human to skim the affected dependency names at a
+    /// glance.
     pub feature_only_candidates: Vec<String>,
     pub errors: Vec<DepsError>,
 }
@@ -168,6 +207,7 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
     for krate in &workspace.crates {
         let (usage, failed_domains, crate_errors) = collect_crate_usage(krate);
         errors.extend(crate_errors);
+        let manifest = read_manifest_toml(&krate.manifest_path, &mut errors);
 
         for dep in &krate.dependencies {
             let domains = usage.get(&dep.code_identifier);
@@ -175,9 +215,22 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
             let has_dev = domains.is_some_and(|d| d.contains(&UsageDomain::Dev));
             let has_build = domains.is_some_and(|d| d.contains(&UsageDomain::Build));
             let used_anywhere = domains.is_some_and(|d| !d.is_empty());
+            let zero_usage = !used_anywhere && failed_domains.is_empty();
 
-            if !used_anywhere && !dep.features.is_empty() && failed_domains.is_empty() {
+            if zero_usage && !dep.features.is_empty() {
                 feature_only_candidates.push(dep.name.clone());
+                findings.extend(unused_feature_flag_findings(krate, dep));
+            }
+
+            if zero_usage
+                && manifest.as_ref().is_some_and(|manifest| {
+                    manifest_explicitly_enables_default_features(manifest, &dep.name)
+                })
+            {
+                findings.push(default_features_unused_finding(krate, dep));
+            }
+
+            if zero_usage && !dep.features.is_empty() {
                 continue;
             }
 
@@ -219,6 +272,75 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
         feature_only_candidates,
         errors,
     }
+}
+
+/// Reads and parses `manifest_path` as TOML, once per crate — needed only by
+/// `default-features-unused`'s manifest lookup (see
+/// [`manifest_explicitly_enables_default_features`]): `cargo_metadata`'s
+/// resolved `Dependency` doesn't distinguish an explicit `default-features =
+/// true` from Cargo's own implicit default, so that rule reads the manifest
+/// text directly instead. A read or parse failure is pushed to `errors` and
+/// `None` is returned — the rule is then silently skipped for this crate
+/// rather than asserting an unbacked claim.
+fn read_manifest_toml(manifest_path: &Path, errors: &mut Vec<DepsError>) -> Option<toml::Value> {
+    let text = match std::fs::read_to_string(manifest_path) {
+        Ok(text) => text,
+        Err(err) => {
+            errors.push(DepsError::Io(manifest_path.to_path_buf(), err));
+            return None;
+        }
+    };
+    match toml::from_str(&text) {
+        Ok(manifest) => Some(manifest),
+        Err(err) => {
+            errors.push(DepsError::ManifestParse(manifest_path.to_path_buf(), err));
+            None
+        }
+    }
+}
+
+/// Whether `manifest`'s raw TOML text explicitly sets `default-features =
+/// true` for the dependency named `dep_name`, in `[dependencies]`,
+/// `[dev-dependencies]`, `[build-dependencies]`, or their per-platform
+/// `[target.'cfg(...)'.*]` equivalents. Deliberately reads the manifest text
+/// rather than `cargo_metadata::Dependency::uses_default_features`: that
+/// field is `true` both when the manifest says so explicitly and when the
+/// key is simply absent (Cargo's own default), and only the manifest text
+/// itself can tell those two apart (see module docs "Feature-only
+/// evidence").
+fn manifest_explicitly_enables_default_features(manifest: &toml::Value, dep_name: &str) -> bool {
+    const DEPENDENCY_TABLE_KEYS: [&str; 3] =
+        ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    fn table_sets_default_features_true(table: &toml::Value, dep_name: &str) -> bool {
+        table
+            .get(dep_name)
+            .and_then(|dep| dep.get("default-features"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    }
+
+    let found_at_top_level = DEPENDENCY_TABLE_KEYS.iter().any(|key| {
+        manifest
+            .get(key)
+            .is_some_and(|table| table_sets_default_features_true(table, dep_name))
+    });
+    if found_at_top_level {
+        return true;
+    }
+
+    manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|platforms| {
+            platforms.values().any(|platform| {
+                DEPENDENCY_TABLE_KEYS.iter().any(|key| {
+                    platform
+                        .get(key)
+                        .is_some_and(|table| table_sets_default_features_true(table, dep_name))
+                })
+            })
+        })
 }
 
 /// Renders a misplaced-dependency-kind finding. Its evidence class is
@@ -277,6 +399,77 @@ fn unused_dev_dependency_finding(
             "searched": ["tests/", "examples/", "benches/", "#[cfg(test)] modules in src/"],
             "reason": "no use found in the examined view (tests/examples/benches of this \
                 package, and #[cfg(test)] modules in its src files; doctests are not scanned)",
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+/// Renders one `unused-feature-flag` finding per feature name declared by
+/// `dep`, for a dependency with zero identifier usages found anywhere (see
+/// module docs "Feature-only evidence") — the only feature-related claim
+/// judge can back without knowing what a feature enables: that the feature
+/// is turned on for a dependency nothing in the examined view references at
+/// all. Its evidence class is `derived_fact`: both halves of the claim (the
+/// feature is declared; no usage was found) are read directly from the
+/// declared inputs. Same `location` convention as [`misplaced_finding`].
+fn unused_feature_flag_findings(
+    krate: &CrateInfo,
+    dep: &crate::ingest::DeclaredDependency,
+) -> Vec<Finding> {
+    dep.features
+        .iter()
+        .map(|feature| Finding {
+            id: format!(
+                "{UNUSED_FEATURE_FLAG_RULE}:{}:{}:{feature}",
+                krate.name, dep.name
+            )
+            .into(),
+            rule: UNUSED_FEATURE_FLAG_RULE.into(),
+            severity: Severity::Warn,
+            location: Location {
+                file: krate.manifest_path.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: dep.name.clone(),
+            },
+            evidence_class: EvidenceClass::DerivedFact,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "feature": feature,
+                "reason": "no other usage of this dependency was found in the examined view",
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        })
+        .collect()
+}
+
+/// Renders a `default-features-unused` finding: `dep`'s manifest entry
+/// explicitly sets `default-features = true` (see
+/// [`manifest_explicitly_enables_default_features`]) and has zero identifier
+/// usages found anywhere (see module docs "Feature-only evidence"). Its
+/// evidence class is `derived_fact` for the same reason as
+/// [`unused_feature_flag_findings`]: both halves are read directly from the
+/// declared inputs, not interpreted. Same `location` convention as
+/// [`misplaced_finding`].
+fn default_features_unused_finding(
+    krate: &CrateInfo,
+    dep: &crate::ingest::DeclaredDependency,
+) -> Finding {
+    Finding {
+        id: format!("{DEFAULT_FEATURES_UNUSED_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: DEFAULT_FEATURES_UNUSED_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: krate.manifest_path.clone(),
+            line: OneBasedLine::FIRST,
+            item_path: dep.name.clone(),
+        },
+        evidence_class: EvidenceClass::DerivedFact,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "reason": "no other usage of this dependency was found in the examined view, and \
+                the manifest explicitly sets default-features = true",
         })),
         caused_by: Vec::new(),
         causes: Vec::new(),
@@ -833,22 +1026,174 @@ edition = "2021"
     }
 
     #[test]
-    fn a_dependency_with_zero_usage_and_features_is_a_feature_only_candidate() {
+    fn a_dependency_with_zero_usage_and_features_is_flagged_per_feature() {
         let dir = TempDir::new("deps-feature-only");
         let manifest = write_fixture(
             &dir,
             "[dependencies]",
             "depcrate",
             None,
-            &["some-feature"],
+            &["some-feature", "other-feature"],
             &[],
         );
 
         let workspace = crate::ingest::load(Some(&manifest)).unwrap();
         let report = analyze_workspace(&workspace);
 
-        assert!(report.findings.is_empty());
         assert_eq!(report.feature_only_candidates, vec!["depcrate".to_string()]);
+
+        let flagged: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == UNUSED_FEATURE_FLAG_RULE)
+            .collect();
+        assert_eq!(flagged.len(), 2);
+        for finding in &flagged {
+            assert_eq!(finding.severity, Severity::Warn);
+            assert_eq!(finding.evidence_class, EvidenceClass::DerivedFact);
+            assert_eq!(finding.location.item_path, "depcrate");
+        }
+        let features: Vec<&str> = flagged
+            .iter()
+            .map(|f| f.evidence.as_ref().unwrap()["feature"].as_str().unwrap())
+            .collect();
+        assert!(features.contains(&"some-feature"));
+        assert!(features.contains(&"other-feature"));
+    }
+
+    #[test]
+    fn a_dependency_used_anywhere_has_no_unused_feature_flag_finding_despite_many_features() {
+        let dir = TempDir::new("deps-feature-used");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &["some-feature", "other-feature"],
+            &[("src/lib.rs", "pub fn hello() { depcrate::noop(); }\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_FEATURE_FLAG_RULE)
+        );
+        assert!(report.feature_only_candidates.is_empty());
+    }
+
+    /// Writes a fixture like [`write_fixture`], but with a caller-supplied
+    /// dependency line — needed for `default-features-unused` tests, which
+    /// must control whether `default-features = true` is present in the
+    /// manifest text verbatim (something [`write_fixture`]'s `features`-only
+    /// knobs can't express).
+    fn write_fixture_with_dep_line(
+        dir: &TempDir,
+        dep_line: &str,
+        main_files: &[(&str, &str)],
+    ) -> PathBuf {
+        std::fs::create_dir_all(dir.join("main/src")).unwrap();
+        std::fs::create_dir_all(dir.join("dep_crate/src")).unwrap();
+
+        std::fs::write(
+            dir.join("main/Cargo.toml"),
+            format!(
+                r#"
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+{dep_line}
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main/src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        for (relative, content) in main_files {
+            let file_path = dir.join("main").join(relative);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(file_path, content).unwrap();
+        }
+
+        std::fs::write(
+            dir.join("dep_crate/Cargo.toml"),
+            r#"
+[package]
+name = "depcrate"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep_crate/src/lib.rs"), "pub fn noop() {}\n").unwrap();
+
+        dir.join("main/Cargo.toml")
+    }
+
+    #[test]
+    fn explicit_default_features_true_and_zero_usage_is_flagged() {
+        let dir = TempDir::new("deps-default-features-unused");
+        let manifest = write_fixture_with_dep_line(
+            &dir,
+            r#"depcrate = { path = "../dep_crate", default-features = true }"#,
+            &[],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.rule == DEFAULT_FEATURES_UNUSED_RULE)
+            .expect("expected a default-features-unused finding");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.evidence_class, EvidenceClass::DerivedFact);
+        assert_eq!(finding.location.item_path, "depcrate");
+    }
+
+    #[test]
+    fn explicit_default_features_true_but_used_is_not_flagged() {
+        let dir = TempDir::new("deps-default-features-used");
+        let manifest = write_fixture_with_dep_line(
+            &dir,
+            r#"depcrate = { path = "../dep_crate", default-features = true }"#,
+            &[("src/lib.rs", "pub fn hello() { depcrate::noop(); }\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == DEFAULT_FEATURES_UNUSED_RULE)
+        );
+    }
+
+    #[test]
+    fn no_explicit_default_features_and_zero_usage_is_not_flagged() {
+        let dir = TempDir::new("deps-default-features-implicit");
+        let manifest =
+            write_fixture_with_dep_line(&dir, r#"depcrate = { path = "../dep_crate" }"#, &[]);
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == DEFAULT_FEATURES_UNUSED_RULE)
+        );
     }
 
     #[test]

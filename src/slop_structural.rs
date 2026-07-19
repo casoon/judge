@@ -62,9 +62,12 @@ pub const ABSTRACTION_INFLATION_RULE_REVISION: u32 = 1;
 /// normal churn for a healthy file (mirrors
 /// [`crate::duplication::DEFAULT_MIN_TOKENS`]'s arbitrary-but-documented
 /// style).
-const CHURN_HOTSPOT_THRESHOLD: u32 = 5;
+/// `pub(crate)`: also reused by `crate::coverage::untested_hotspots`, so the
+/// two rules agree on what "high churn" means for the same workspace.
+pub(crate) const CHURN_HOTSPOT_THRESHOLD: u32 = 5;
 /// The churn window this rule assumes its caller used — see [`churn_hotspots`].
-const CHURN_HOTSPOT_WINDOW_DAYS: i64 = 14;
+/// `pub(crate)`: see [`CHURN_HOTSPOT_THRESHOLD`].
+pub(crate) const CHURN_HOTSPOT_WINDOW_DAYS: i64 = 14;
 
 /// Renders churn counts (see [`crate::git::churn`], called by the caller
 /// with a 14-day window) at or above [`CHURN_HOTSPOT_THRESHOLD`] as

@@ -3,6 +3,7 @@
 pub mod baseline;
 pub mod boundaries;
 pub mod complexity;
+pub mod coverage;
 #[cfg(feature = "deep")]
 pub mod dead_code;
 #[cfg(feature = "deep")]

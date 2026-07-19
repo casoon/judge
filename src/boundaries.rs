@@ -2,9 +2,12 @@
 //! (see todo.md §3.H "Architektur & Boundaries", §14.2 P1/P2 bullets 1-2).
 //!
 //! This is deliberately scoped to *crate-level* dependency edges, fully
-//! knowable from `cargo_metadata` without a build — layer presets
-//! (`layered`/`hexagonal`/`feature-sliced`) and module-level boundaries need
-//! semantic module resolution the Fast Tier doesn't have yet (see todo.md §0).
+//! knowable from `cargo_metadata` without a build. `[layers]` (see todo.md
+//! §9) is a crate-level convenience on top of the same model — it expands a
+//! compact layer/role/group assignment into the same [`BoundaryRule`] edges
+//! a hand-written `[[boundary]]` entry produces. Module-level boundaries
+//! still need semantic module resolution the Fast Tier doesn't have yet (see
+//! todo.md §0).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -103,14 +106,62 @@ pub struct CrateProfile {
     pub deduction_multiplier: DeductionMultiplier,
 }
 
-/// The `judge.toml` `[[boundary]]`, `[[crate_profile]]`, and `[slopsquat]`
-/// tables (see todo.md §8). `[slopsquat]` lives here rather than in its own
-/// top-level config struct because this is already the one struct every
-/// `judge.toml` table deserializes into (see `main.rs`'s `load_judge_toml`).
+/// A named preset for `[layers]` (see todo.md §9 "Layer-Presets/Modul-
+/// Boundaries"). Each preset expands a compact crate-to-layer/role/group
+/// assignment into the same [`BoundaryRule`] edges a hand-written
+/// `[[boundary]]` entry produces, via [`generate_layer_rules`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LayerPreset {
+    Layered,
+    Hexagonal,
+    FeatureSliced,
+}
+
+impl LayerPreset {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Layered => "layered",
+            Self::Hexagonal => "hexagonal",
+            Self::FeatureSliced => "feature-sliced",
+        }
+    }
+}
+
+/// The `judge.toml` `[layers]` table (see todo.md §9). Crates not named in
+/// `assign` are ignored — never auto-assigned to a layer, since guessing
+/// project intent is exactly what todo.md §17 forbids.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LayersConfig {
+    pub preset: LayerPreset,
+    /// `layered` only: layer names from innermost (index 0, e.g. `"domain"`)
+    /// to outermost (e.g. `"infrastructure"`). Inner layers may not reach
+    /// outer layers; outer layers may freely reach inner ones.
+    #[serde(default)]
+    pub order: Vec<String>,
+    /// `feature-sliced` only: the group name (a value used in `assign`)
+    /// every other group may reference without being flagged.
+    #[serde(default)]
+    pub shared: Option<String>,
+    /// Crate name -> layer/role/group name. For `layered`, values must be
+    /// entries of `order`. For `hexagonal`, values must be `"core"`,
+    /// `"ports"`, or `"adapters"`. For `feature-sliced`, values are
+    /// free-form group names.
+    #[serde(default)]
+    pub assign: HashMap<String, String>,
+}
+
+/// The `judge.toml` `[[boundary]]`, `[layers]`, `[[crate_profile]]`, and
+/// `[slopsquat]` tables (see todo.md §8, §9). `[slopsquat]` lives here rather
+/// than in its own top-level config struct because this is already the one
+/// struct every `judge.toml` table deserializes into (see `main.rs`'s
+/// `load_judge_toml`).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct BoundaryConfig {
     #[serde(rename = "boundary", default)]
     pub boundaries: Vec<BoundaryRule>,
+    #[serde(default)]
+    pub layers: Option<LayersConfig>,
     #[serde(rename = "crate_profile", default)]
     pub crate_profiles: Vec<CrateProfile>,
     #[serde(default)]
@@ -135,6 +186,10 @@ pub enum BoundaryConfigError {
         rule: String,
         crate_name: String,
     },
+    /// A `[layers]` preset is missing a required role/order assignment, or
+    /// its `assign`/`order`/`shared` values are inconsistent (see todo.md
+    /// §9).
+    InvalidLayers(String),
 }
 
 impl std::fmt::Display for BoundaryConfigError {
@@ -145,6 +200,7 @@ impl std::fmt::Display for BoundaryConfigError {
                 f,
                 "boundary rule `{rule}` references unknown crate `{crate_name}` (set allow_empty = true to permit this)"
             ),
+            Self::InvalidLayers(message) => write!(f, "invalid [layers] config: {message}"),
         }
     }
 }
@@ -153,7 +209,7 @@ impl std::error::Error for BoundaryConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Metadata(err) => Some(err),
-            Self::UnknownCrate { .. } => None,
+            Self::UnknownCrate { .. } | Self::InvalidLayers(_) => None,
         }
     }
 }
@@ -240,6 +296,196 @@ fn validate_config(
     Ok(())
 }
 
+/// Every crate assigned to `group_name` in `assign`, in ascending crate-name
+/// order (`assign` is pre-sorted by [`generate_layer_rules`], so this is
+/// just a filter — deterministic without a re-sort).
+fn group_crates(assigned: &[(&str, &str)], group_name: &str) -> Vec<String> {
+    assigned
+        .iter()
+        .filter(|(_, group)| *group == group_name)
+        .map(|(krate, _)| (*krate).to_string())
+        .collect()
+}
+
+const HEXAGONAL_ROLES: [&str; 3] = ["core", "ports", "adapters"];
+
+/// `layered`: for each layer, forbids that layer's crates from reaching
+/// (directly or transitively) any crate assigned to a layer later in
+/// `order` (i.e. further out). A layer with no crates assigned, or with no
+/// outer layers to forbid, generates nothing.
+fn generate_layered_rules(
+    layers: &LayersConfig,
+    assigned: &[(&str, &str)],
+) -> Result<Vec<BoundaryRule>, BoundaryConfigError> {
+    if layers.order.len() < 2 {
+        return Err(BoundaryConfigError::InvalidLayers(
+            "preset \"layered\" needs at least 2 entries in `order`".to_string(),
+        ));
+    }
+    let known_layers: HashSet<&str> = layers.order.iter().map(String::as_str).collect();
+    for (krate, group) in assigned {
+        if !known_layers.contains(group) {
+            return Err(BoundaryConfigError::InvalidLayers(format!(
+                "`layers.assign` names crate `{krate}` as layer `{group}`, which is not in `order`"
+            )));
+        }
+    }
+
+    let mut rules = Vec::new();
+    for (i, inner) in layers.order.iter().enumerate() {
+        let from = group_crates(assigned, inner);
+        if from.is_empty() {
+            continue;
+        }
+        let forbidden: Vec<String> = layers.order[i + 1..]
+            .iter()
+            .flat_map(|outer| group_crates(assigned, outer))
+            .collect();
+        if forbidden.is_empty() {
+            continue;
+        }
+        rules.push(BoundaryRule {
+            name: format!("preset:layered:{inner}"),
+            from,
+            forbidden,
+            required: Vec::new(),
+            reach: Reach::Transitive,
+            allow_empty: false,
+        });
+    }
+    Ok(rules)
+}
+
+/// `hexagonal`: a minimal 3-role model (`core`, `ports`, `adapters`). `core`
+/// must not reach `adapters`; `adapters` must not reach `core` directly, and
+/// must reach `ports` directly (adapters reach the domain only through a
+/// port). All three roles need at least one assigned crate.
+fn generate_hexagonal_rules(
+    assigned: &[(&str, &str)],
+) -> Result<Vec<BoundaryRule>, BoundaryConfigError> {
+    for (krate, role) in assigned {
+        if !HEXAGONAL_ROLES.contains(role) {
+            return Err(BoundaryConfigError::InvalidLayers(format!(
+                "`layers.assign` names crate `{krate}` as role `{role}`, but preset \"hexagonal\" only knows {HEXAGONAL_ROLES:?}"
+            )));
+        }
+    }
+    let core = group_crates(assigned, "core");
+    let ports = group_crates(assigned, "ports");
+    let adapters = group_crates(assigned, "adapters");
+    if core.is_empty() || ports.is_empty() || adapters.is_empty() {
+        return Err(BoundaryConfigError::InvalidLayers(
+            "preset \"hexagonal\" needs at least one crate assigned to each of \"core\", \"ports\", \"adapters\"".to_string(),
+        ));
+    }
+
+    Ok(vec![
+        BoundaryRule {
+            name: "preset:hexagonal:core".to_string(),
+            from: core.clone(),
+            forbidden: adapters.clone(),
+            required: Vec::new(),
+            reach: Reach::Direct,
+            allow_empty: false,
+        },
+        BoundaryRule {
+            name: "preset:hexagonal:adapters".to_string(),
+            from: adapters,
+            forbidden: core,
+            required: ports,
+            reach: Reach::Direct,
+            allow_empty: false,
+        },
+    ])
+}
+
+/// `feature-sliced`: every non-`shared` group is mutually isolated from
+/// every other non-`shared` group (forbidden, both directions); `shared`
+/// crates aren't restricted, and any group may reach them.
+fn generate_feature_sliced_rules(
+    layers: &LayersConfig,
+    assigned: &[(&str, &str)],
+) -> Result<Vec<BoundaryRule>, BoundaryConfigError> {
+    if assigned.is_empty() {
+        return Err(BoundaryConfigError::InvalidLayers(
+            "preset \"feature-sliced\" needs at least one crate in `layers.assign`".to_string(),
+        ));
+    }
+    let mut groups: Vec<&str> = assigned.iter().map(|(_, group)| *group).collect();
+    groups.sort();
+    groups.dedup();
+
+    if let Some(shared) = &layers.shared
+        && !groups.contains(&shared.as_str())
+    {
+        return Err(BoundaryConfigError::InvalidLayers(format!(
+            "`layers.shared = \"{shared}\"` does not match any group in `layers.assign`"
+        )));
+    }
+
+    let non_shared: Vec<&str> = groups
+        .into_iter()
+        .filter(|group| Some(*group) != layers.shared.as_deref())
+        .collect();
+    if non_shared.len() < 2 {
+        return Err(BoundaryConfigError::InvalidLayers(
+            "preset \"feature-sliced\" needs at least 2 non-shared groups in `layers.assign`"
+                .to_string(),
+        ));
+    }
+
+    let mut rules = Vec::new();
+    for &from_group in &non_shared {
+        let from = group_crates(assigned, from_group);
+        let forbidden: Vec<String> = non_shared
+            .iter()
+            .filter(|&&group| group != from_group)
+            .flat_map(|group| group_crates(assigned, group))
+            .collect();
+        rules.push(BoundaryRule {
+            name: format!("preset:feature-sliced:{from_group}"),
+            from,
+            forbidden,
+            required: Vec::new(),
+            reach: Reach::Transitive,
+            allow_empty: false,
+        });
+    }
+    Ok(rules)
+}
+
+/// Expands `[layers]` into the [`BoundaryRule`]s its preset implies (see
+/// todo.md §9). Validates that every crate named in `assign` exists in the
+/// workspace and that the preset's required roles/order are satisfied,
+/// before generating anything — an invalid `[layers]` config is an exit-2
+/// condition, same as an invalid `[[boundary]]` rule.
+fn generate_layer_rules(
+    layers: &LayersConfig,
+    crate_names: &HashSet<&str>,
+) -> Result<Vec<BoundaryRule>, BoundaryConfigError> {
+    let mut assigned: Vec<(&str, &str)> = layers
+        .assign
+        .iter()
+        .map(|(krate, group)| (krate.as_str(), group.as_str()))
+        .collect();
+    assigned.sort();
+
+    for (krate, _) in &assigned {
+        if !crate_names.contains(krate) {
+            return Err(BoundaryConfigError::UnknownCrate {
+                rule: "layers".to_string(),
+                crate_name: (*krate).to_string(),
+            });
+        }
+    }
+
+    match layers.preset {
+        LayerPreset::Layered => generate_layered_rules(layers, &assigned),
+        LayerPreset::Hexagonal => generate_hexagonal_rules(&assigned),
+        LayerPreset::FeatureSliced => generate_feature_sliced_rules(layers, &assigned),
+    }
+}
+
 /// Evaluates every rule in `config` against `workspace`'s crate dependency
 /// graph, plus a whole-graph cycle scan, and returns the resulting findings.
 /// Fails with [`BoundaryConfigError`] if a rule's config is invalid — that is
@@ -254,6 +500,10 @@ pub fn evaluate(
         .map(|krate| krate.name.as_str())
         .collect();
     validate_config(config, &crate_names)?;
+    let layer_rules = match &config.layers {
+        Some(layers) => generate_layer_rules(layers, &crate_names)?,
+        None => Vec::new(),
+    };
 
     let manifest = workspace.root.join("Cargo.toml");
     let graph = build_crate_graph(Some(&manifest))?;
@@ -262,6 +512,15 @@ pub fn evaluate(
     let mut findings = Vec::new();
     for rule in &config.boundaries {
         findings.extend(evaluate_rule(rule, &graph, &cargo_toml));
+    }
+    if let Some(layers) = &config.layers {
+        let preset_source = format!("preset:{}", layers.preset.label());
+        for rule in &layer_rules {
+            for mut finding in evaluate_rule(rule, &graph, &cargo_toml) {
+                finding.evidence = Some(serde_json::json!({ "source": preset_source }));
+                findings.push(finding);
+            }
+        }
     }
     for cycle in find_cycles(&graph) {
         findings.push(cycle_finding(&cycle, &cargo_toml));
@@ -851,5 +1110,276 @@ trailer_contains = ["internal-ci-bot"]
             build_crate_graph(Some(Path::new("/nonexistent/judge-test/Cargo.toml"))).unwrap_err();
         let source = std::error::Error::source(&err).expect("Metadata must carry a source");
         assert!(source.downcast_ref::<cargo_metadata::Error>().is_some());
+    }
+
+    #[test]
+    fn toml_from_str_round_trips_a_layers_preset_fixture() {
+        let source = r#"
+[layers]
+preset = "layered"
+order = ["domain", "application", "infrastructure"]
+
+[layers.assign]
+"core-domain" = "domain"
+"app-service" = "application"
+"infra-io" = "infrastructure"
+"#;
+        let config: BoundaryConfig = toml::from_str(source).unwrap();
+
+        let layers = config.layers.expect("layers table must be present");
+        assert_eq!(layers.preset, LayerPreset::Layered);
+        assert_eq!(
+            layers.order,
+            vec![
+                "domain".to_string(),
+                "application".to_string(),
+                "infrastructure".to_string()
+            ]
+        );
+        assert_eq!(
+            layers.assign.get("core-domain").map(String::as_str),
+            Some("domain")
+        );
+        assert!(layers.shared.is_none());
+    }
+
+    fn layers_config(
+        preset: LayerPreset,
+        order: &[&str],
+        shared: Option<&str>,
+        assign: &[(&str, &str)],
+    ) -> LayersConfig {
+        LayersConfig {
+            preset,
+            order: order.iter().map(|s| s.to_string()).collect(),
+            shared: shared.map(str::to_string),
+            assign: assign
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn layered_preset_flags_inner_layer_reaching_outer_layer() {
+        let dir = TempDir::new("layers-layered-violation");
+        write_crate(&dir, "core-domain", &[("app-service", "../app-service")]);
+        write_crate(&dir, "app-service", &[]);
+        write_crate(&dir, "infra-io", &[]);
+        write_workspace_manifest(&dir, &["core-domain", "app-service", "infra-io"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Layered,
+                &["domain", "application", "infrastructure"],
+                None,
+                &[
+                    ("core-domain", "domain"),
+                    ("app-service", "application"),
+                    ("infra-io", "infrastructure"),
+                ],
+            )),
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert_eq!(result.findings.len(), 1);
+        let finding = &result.findings[0];
+        assert_eq!(finding.rule, BOUNDARY_VIOLATION_RULE);
+        assert!(
+            finding
+                .location
+                .item_path
+                .contains("core-domain -> app-service")
+        );
+        assert_eq!(
+            finding.evidence,
+            Some(serde_json::json!({ "source": "preset:layered" }))
+        );
+    }
+
+    #[test]
+    fn layered_preset_allows_outer_layer_reaching_inner_layer() {
+        let dir = TempDir::new("layers-layered-allowed");
+        write_crate(&dir, "core-domain", &[]);
+        write_crate(&dir, "app-service", &[("core-domain", "../core-domain")]);
+        write_crate(&dir, "infra-io", &[]);
+        write_workspace_manifest(&dir, &["core-domain", "app-service", "infra-io"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Layered,
+                &["domain", "application", "infrastructure"],
+                None,
+                &[
+                    ("core-domain", "domain"),
+                    ("app-service", "application"),
+                    ("infra-io", "infrastructure"),
+                ],
+            )),
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert!(result.findings.is_empty());
+    }
+
+    #[test]
+    fn feature_sliced_preset_flags_cross_group_reference_but_allows_shared() {
+        let dir = TempDir::new("layers-feature-sliced");
+        write_crate(
+            &dir,
+            "feature-a",
+            &[("feature-b", "../feature-b"), ("common", "../common")],
+        );
+        write_crate(&dir, "feature-b", &[("common", "../common")]);
+        write_crate(&dir, "common", &[]);
+        write_workspace_manifest(&dir, &["feature-a", "feature-b", "common"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::FeatureSliced,
+                &[],
+                Some("shared"),
+                &[
+                    ("feature-a", "group-a"),
+                    ("feature-b", "group-b"),
+                    ("common", "shared"),
+                ],
+            )),
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert_eq!(result.findings.len(), 1);
+        let finding = &result.findings[0];
+        assert_eq!(finding.rule, BOUNDARY_VIOLATION_RULE);
+        assert!(
+            finding
+                .location
+                .item_path
+                .contains("feature-a -> feature-b")
+        );
+        assert_eq!(
+            finding.evidence,
+            Some(serde_json::json!({ "source": "preset:feature-sliced" }))
+        );
+    }
+
+    #[test]
+    fn hexagonal_preset_flags_core_reaching_adapters() {
+        let dir = TempDir::new("layers-hexagonal");
+        write_crate(&dir, "core-crate", &[("adapter-crate", "../adapter-crate")]);
+        write_crate(&dir, "adapter-crate", &[("port-crate", "../port-crate")]);
+        write_crate(&dir, "port-crate", &[]);
+        write_workspace_manifest(&dir, &["core-crate", "adapter-crate", "port-crate"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Hexagonal,
+                &[],
+                None,
+                &[
+                    ("core-crate", "core"),
+                    ("adapter-crate", "adapters"),
+                    ("port-crate", "ports"),
+                ],
+            )),
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert_eq!(result.findings.len(), 1);
+        let finding = &result.findings[0];
+        assert_eq!(finding.rule, BOUNDARY_VIOLATION_RULE);
+        assert!(
+            finding
+                .location
+                .item_path
+                .contains("core-crate -> adapter-crate")
+        );
+        assert_eq!(
+            finding.evidence,
+            Some(serde_json::json!({ "source": "preset:hexagonal" }))
+        );
+    }
+
+    #[test]
+    fn unknown_crate_in_layers_assign_is_a_config_error() {
+        let dir = TempDir::new("layers-unknown-crate");
+        write_crate(&dir, "ui", &[]);
+        write_workspace_manifest(&dir, &["ui"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Layered,
+                &["domain", "application"],
+                None,
+                &[("does-not-exist", "domain")],
+            )),
+            ..Default::default()
+        };
+
+        let err = evaluate(&workspace, &config).unwrap_err();
+        assert!(matches!(err, BoundaryConfigError::UnknownCrate { .. }));
+    }
+
+    #[test]
+    fn handwritten_boundary_rule_and_layers_preset_both_fire() {
+        let dir = TempDir::new("layers-and-handwritten-boundary");
+        write_crate(&dir, "ui", &[("db", "../db")]);
+        write_crate(&dir, "db", &[]);
+        write_crate(&dir, "core-domain", &[("app-service", "../app-service")]);
+        write_crate(&dir, "app-service", &[]);
+        write_workspace_manifest(&dir, &["ui", "db", "core-domain", "app-service"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let mut handwritten = rule("ui-must-not-touch-db", &["ui"], Reach::Direct);
+        handwritten.forbidden = vec!["db".to_string()];
+        let config = BoundaryConfig {
+            boundaries: vec![handwritten],
+            layers: Some(layers_config(
+                LayerPreset::Layered,
+                &["domain", "application"],
+                None,
+                &[("core-domain", "domain"), ("app-service", "application")],
+            )),
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert_eq!(result.findings.len(), 2);
+        let handwritten_finding = result
+            .findings
+            .iter()
+            .find(|f| f.location.item_path.contains("ui -> db"))
+            .expect("handwritten rule must still fire");
+        assert!(handwritten_finding.evidence.is_none());
+
+        let preset_finding = result
+            .findings
+            .iter()
+            .find(|f| f.location.item_path.contains("core-domain -> app-service"))
+            .expect("preset rule must also fire");
+        assert_eq!(
+            preset_finding.evidence,
+            Some(serde_json::json!({ "source": "preset:layered" }))
+        );
     }
 }
