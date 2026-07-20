@@ -29,6 +29,17 @@ const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 /// hotspot per file instead of surfacing genuine outliers.
 const HOTSPOT_LIMIT: usize = 15;
 
+/// `cargo judge dupes`'s TTY view prints at most this many clone families
+/// (GitHub issue #7: on a large workspace the unindicated truncation reads
+/// as a complete list — grepping the TTY output for a just-touched file and
+/// finding nothing looked like "no duplication" when the full graph, only
+/// visible via `--format json`, told a different story). The header's
+/// `clone families: N` line already gives the true total; the loop below
+/// additionally prints an explicit "... and N more" trailer whenever the
+/// list is actually truncated, so the TTY view can't be mistaken for the
+/// full picture on its own.
+const DUPE_FAMILY_TTY_LIMIT: usize = 15;
+
 #[derive(Debug, Parser)]
 #[command(name = "cargo judge", version, about)]
 struct Cli {
@@ -1692,7 +1703,12 @@ fn run_dupes(options: DupesOptions, out: &mut dyn Write) -> Result<CommandOutcom
                 writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
 
-            for (index, family) in report.families.iter().take(15).enumerate() {
+            for (index, family) in report
+                .families
+                .iter()
+                .take(DUPE_FAMILY_TTY_LIMIT)
+                .enumerate()
+            {
                 writeln!(out)?;
                 writeln!(
                     out,
@@ -1711,6 +1727,13 @@ fn run_dupes(options: DupesOptions, out: &mut dyn Write) -> Result<CommandOutcom
                         member.qualified_name
                     )?;
                 }
+            }
+            if report.families.len() > DUPE_FAMILY_TTY_LIMIT {
+                writeln!(
+                    out,
+                    "\n... and {} more families (see --format json for the full list)",
+                    report.families.len() - DUPE_FAMILY_TTY_LIMIT
+                )?;
             }
         }
     }
@@ -4352,6 +4375,50 @@ fn dup_two(x: i32) -> i32 {
         assert!(
             text.contains("clone families: 0"),
             "unexpected output: {text}"
+        );
+    }
+
+    /// GitHub issue #7: with more than [`DUPE_FAMILY_TTY_LIMIT`] clone
+    /// families, the TTY view must say so explicitly instead of silently
+    /// stopping after the cap — the header count alone isn't enough,
+    /// grepping the (apparently complete) family list for a touched file
+    /// and finding nothing must not read as "no duplication".
+    #[test]
+    fn run_dupes_tty_reports_a_trailer_when_families_exceed_the_cap() {
+        let dir = TempDir::new("dupes-truncation-trailer");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        // 16 distinct clone families (one over the 15-family TTY cap) — each
+        // pair has unique literals so Mild mode doesn't merge them into one
+        // family, and each body is well over `DEFAULT_MIN_TOKENS` (20).
+        let mut source = String::new();
+        for i in 0..16 {
+            for suffix in ["a", "b"] {
+                source.push_str(&format!(
+                    "pub fn dup_{i}_{suffix}() -> i32 {{ let v0 = {i}; let v1 = {i}; \
+                     let v2 = {i}; let v3 = {i}; let v4 = {i}; let v5 = {i}; \
+                     let v6 = {i}; v0 + v1 + v2 + v3 + v4 + v5 + v6 }}\n"
+                ));
+            }
+        }
+        std::fs::write(dir.join("src/lib.rs"), source).unwrap();
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(&dir, dupes_cli(OutputFormat::Tty, false, None), &mut out)
+            .expect("fixture must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("clone families: 16"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            text.contains("... and 1 more families (see --format json for the full list)"),
+            "missing truncation trailer: {text}"
         );
     }
 
