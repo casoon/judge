@@ -550,4 +550,68 @@ mod tests {
         assert!(spans[0].text.contains("line one"));
         assert!(spans[0].text.contains("line two"));
     }
+
+    fn findings_for(source: &str, name: &str) -> Vec<Finding> {
+        let dir = crate::test_util::TempDir::new(name);
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, source).unwrap();
+        crate::slop::analyze_file(&file, false).unwrap()
+    }
+
+    fn rule_findings<'a>(findings: &'a [Finding], rule: &str) -> Vec<&'a Finding> {
+        findings.iter().filter(|f| f.rule == rule).collect()
+    }
+
+    /// Documented v1 limitation #1 (see module doc): [`extract_comments`]
+    /// does not handle nested `/* /* */ */` block comments the way Rust's
+    /// own lexer does — it closes at the *first* `*/` it finds, not the one
+    /// matching the true nesting depth. Real Rust nests this comment one
+    /// level deep (open, open, close-inner, close-outer), so the whole
+    /// thing — including the "in a real implementation" sentence — is one
+    /// comment invisible to `rustc`. This scanner instead closes after
+    /// `/* inner note */`, leaving the rest of the (still, to `rustc`,
+    /// commented-out) text to fall through as unrecognized, un-scanned
+    /// content: no `CommentSpan` at all is produced for it, so a trigger
+    /// phrase sitting there is never even considered — not "not matched",
+    /// but silently never looked at.
+    #[test]
+    fn nested_block_comment_swallows_trailing_text_in_extract_comments() {
+        let spans = extract_comments(
+            "/* outer doc\n/* inner note */\nin a real implementation, this text sits inside the outer comment but the scanner already closed it\nstill more hidden text */\n",
+        );
+        assert_eq!(spans.len(), 1);
+        assert!(!spans[0].text.contains("in a real implementation"));
+    }
+
+    /// Same limitation as above, followed through the full pipeline: the
+    /// file parses fine (Rust really does nest block comments, so `syn`
+    /// sees one big comment followed by `fn f() {}`), but
+    /// `conversational-artifact` never fires on the Tier-2 trigger phrase
+    /// "in a real implementation" because [`extract_comments`] never
+    /// produced a `CommentSpan` covering it.
+    #[test]
+    fn nested_block_comment_hides_trigger_from_conversational_artifact() {
+        let findings = findings_for(
+            "/* outer doc\n/* inner note */\nin a real implementation, this text sits inside the outer comment but the scanner already closed it\nstill more hidden text */\nfn f() {}\n",
+            "slop-text-nested-block-comment",
+        );
+        assert!(rule_findings(&findings, crate::slop::CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    /// Documented v1 limitation #2 (see module doc): consecutive `//` lines
+    /// are never joined into one logical comment block — each line becomes
+    /// its own [`CommentSpan`], scanned independently. Here a Tier-1
+    /// `conversational-artifact` phrase ("i'm an ai") is split across two
+    /// consecutive `//` lines: `// I'm an` / `// AI assistant explaining
+    /// this limitation in detail here.`. Read together, the phrase is
+    /// obviously present; scanned line-by-line, neither line's text alone
+    /// contains it, so the rule produces zero findings.
+    #[test]
+    fn consecutive_line_comments_are_never_joined_into_one_block() {
+        let findings = findings_for(
+            "fn f() {\n    // I'm an\n    // AI assistant explaining this limitation in detail here.\n    let _ = 1;\n}\n",
+            "slop-text-consecutive-line-comments",
+        );
+        assert!(rule_findings(&findings, crate::slop::CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
 }

@@ -120,6 +120,7 @@ pub enum Severity {
 /// | Rule | Class |
 /// |---|---|
 /// | `swallowed-result`, `empty-error-arm`, `catch-all-error`, `suppression-debt`, `merged-stub`, `empty-impl`, `assertion-free-test`, `tautological-test`, `ignored-test-accumulation`, `conversational-artifact`, `restating-comment`, `step-comment-inflation`, `generic-naming`, `doc-restates-signature` | `derived_fact` (G1–G3: the reported pattern is a syntax fact) |
+/// | `undocumented-public-item` | `derived_fact` (the absence of a `#[doc = ...]` attribute on a `pub` item is an exact syntax fact — see `crate::api_surface`) |
 /// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::duplication::CloneMember::to_finding`]) |
 /// | `duplicate-crate-versions`, `msrv-drift`, `workspace-dep-drift` | `derived_fact` (manifest/resolve-graph facts read directly from `cargo_metadata`) |
 /// | `unused-feature-flag` | `derived_fact` (the feature is declared in the manifest, and zero usage of the dependency was found anywhere in the examined view — both read directly from the declared inputs, see [`crate::deps`] module docs "Feature-only evidence") |
@@ -190,6 +191,7 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "step-comment-inflation"
         | "generic-naming"
         | "doc-restates-signature"
+        | "undocumented-public-item"
         | "duplicate-code"
         | "duplicate-crate-versions"
         | "msrv-drift"

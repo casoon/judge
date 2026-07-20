@@ -25,11 +25,13 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus two real detectors —
+//! sixteen table entries), plus three real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
-//! (see [`functional_core_imperative_shell_candidates`]) and
+//! (see [`functional_core_imperative_shell_candidates`]),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
-//! [`interface_segregation_candidates`]). The remaining `DesignPrinciple`
+//! [`interface_segregation_candidates`]), and
+//! [`DependencyInversion`](DesignPrinciple::DependencyInversion) (see
+//! [`dependency_inversion_candidates`]). The remaining `DesignPrinciple`
 //! variants are unused for now; they document the target space rather than
 //! being implemented.
 
@@ -39,8 +41,11 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use syn::visit::Visit;
 
+use crate::boundaries::{
+    self, BoundaryConfig, BoundaryConfigError, MODULE_BOUNDARY_VIOLATION_RULE, ModuleBoundaryRule,
+};
 use crate::complexity::WorkspaceComplexity;
-use crate::finding::FindingId;
+use crate::finding::{Finding, FindingId};
 use crate::functions::walk_functions;
 use crate::ingest::{CrateInfo, Workspace};
 use crate::pattern::{CodeScope, Contraindication, Evidence, EvidenceLocation};
@@ -221,16 +226,28 @@ pub struct PrincipleHeuristic {
 /// Runs every implemented principle-heuristic detector over `workspace`,
 /// using `complexity` (the already-computed `judge::complexity::analyze_workspace`
 /// result) as one of the independent evidence sources for
-/// [`functional_core_imperative_shell_candidates`]. Merges its results with
-/// [`interface_segregation_candidates`] — this is the dispatch point future
+/// [`functional_core_imperative_shell_candidates`], and `boundary_config`
+/// (the already-loaded `judge.toml` `[[boundary]]`/`[[module_boundary]]`
+/// config, if any) as [`dependency_inversion_candidates`]' precondition —
+/// that detector produces nothing when `boundary_config` is `None` or has no
+/// `[[module_boundary]]` entries (todo.md §17: never guess project intent).
+/// Merges results from [`interface_segregation_candidates`] and
+/// [`dependency_inversion_candidates`] — this is the dispatch point future
 /// detectors from todo.md §16.7's table attach to.
+///
+/// Returns [`BoundaryConfigError`] only via [`dependency_inversion_candidates`]
+/// (an invalid `[[module_boundary]]`/`[[boundary]]` rule in `boundary_config`
+/// is a config error, not a finding) — the same exit-2 treatment
+/// `judge::boundaries::evaluate` gets everywhere else it's called.
 pub fn analyze_workspace(
     workspace: &Workspace,
     complexity: &WorkspaceComplexity,
-) -> Vec<PrincipleHeuristic> {
+    boundary_config: Option<&BoundaryConfig>,
+) -> Result<Vec<PrincipleHeuristic>, BoundaryConfigError> {
     let mut heuristics = functional_core_imperative_shell_candidates(workspace, complexity);
     heuristics.extend(interface_segregation_candidates(workspace));
-    heuristics
+    heuristics.extend(dependency_inversion_candidates(workspace, boundary_config)?);
+    Ok(heuristics)
 }
 
 /// Functional Core, Imperative Shell (todo.md §16.7's table): "I/O,
@@ -692,6 +709,404 @@ fn sorted_joined(methods: &std::collections::BTreeSet<String>) -> String {
     methods.iter().cloned().collect::<Vec<_>>().join(", ")
 }
 
+/// Derives a source file's module path purely from its position under
+/// `crate_root/src/` — identical directory-convention logic to
+/// `crate::boundaries::module_path_for_file`, duplicated rather than shared
+/// because that function is private to `boundaries.rs` (same trade-off as
+/// this module's own `fnv1a_hex`, duplicated from `pattern.rs` for the same
+/// reason). See that function's doc comment for the exact convention.
+fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Option<String> {
+    let relative = file_path.strip_prefix(crate_root).ok()?;
+    let mut components: Vec<String> = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if components.first().map(String::as_str) != Some("src") {
+        return None;
+    }
+    components.remove(0);
+    if components.is_empty() {
+        return None;
+    }
+    if components.len() == 1 && matches!(components[0].as_str(), "lib.rs" | "main.rs") {
+        return Some(String::new());
+    }
+    if components.first().map(String::as_str) == Some("bin") {
+        return Some(String::new());
+    }
+
+    let last = components.last().cloned()?;
+    if last == "mod.rs" {
+        components.pop();
+    } else if let Some(stem) = last.strip_suffix(".rs") {
+        let stem = stem.to_string();
+        *components.last_mut().expect("just checked non-empty") = stem;
+    } else {
+        return None;
+    }
+    Some(components.join("::"))
+}
+
+/// Whether `module_path` is `prefix` itself, or a descendant of it — a
+/// `::`-segment prefix match, not a raw string prefix match. Identical logic
+/// to `crate::boundaries::module_path_under`, duplicated for the same reason
+/// as [`module_path_for_file`].
+fn module_path_under(module_path: &str, prefix: &str) -> bool {
+    module_path == prefix || module_path.starts_with(&format!("{prefix}::"))
+}
+
+/// One `pub fn` (free function or impl method) whose parameter or return
+/// type's path textually begins with `crate::<forbidden>` — signal 2 for
+/// [`dependency_inversion_candidates`].
+struct LeakedSignature {
+    item_path: String,
+    leaked_type: String,
+    forbidden: String,
+    location: EvidenceLocation,
+}
+
+/// Whether `ty` (after unwrapping a `&`/`&mut` reference) is a path type
+/// whose segments are `crate::<one of `forbidden`>::...` — pure
+/// `syn::Path`-segment prefix matching, no type resolution, mirroring
+/// `boundaries::segments_match_forbidden`'s own accepted-limitation approach
+/// but restricted to signature types. Returns the rendered type text and the
+/// matched `forbidden` entry on a hit.
+fn leaked_type_in(ty: &syn::Type, forbidden: &[String]) -> Option<(String, String)> {
+    use quote::ToTokens;
+
+    let inner = match ty {
+        syn::Type::Reference(reference) => reference.elem.as_ref(),
+        other => other,
+    };
+    let syn::Type::Path(type_path) = inner else {
+        return None;
+    };
+    let segments: Vec<String> = type_path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect();
+    if segments.first().map(String::as_str) != Some("crate") {
+        return None;
+    }
+    let rest = &segments[1..];
+    forbidden.iter().find_map(|target| {
+        let target_segments: Vec<&str> = target.split("::").collect();
+        let is_match = rest.len() >= target_segments.len()
+            && rest
+                .iter()
+                .zip(target_segments.iter())
+                .all(|(segment, target_segment)| segment == target_segment);
+        is_match.then(|| (ty.to_token_stream().to_string(), target.clone()))
+    })
+}
+
+/// Collects every `pub fn`/`pub` impl-method signature in one parsed file
+/// whose parameter or return type matches [`leaked_type_in`], tracking the
+/// enclosing `mod`/`impl` path for a qualified item name (same path-tracking
+/// shape as `crate::functions::walk_functions`' `Walker`, reimplemented here
+/// because that helper doesn't expose parameter/return types).
+struct SignatureCollector<'a> {
+    path: Vec<String>,
+    file: PathBuf,
+    forbidden: &'a [String],
+    hits: Vec<LeakedSignature>,
+}
+
+impl SignatureCollector<'_> {
+    fn qualified(&self, name: &str) -> String {
+        if self.path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{name}", self.path.join("::"))
+        }
+    }
+
+    fn check_signature(&mut self, item_path: &str, sig: &syn::Signature) {
+        let mut types: Vec<&syn::Type> = sig
+            .inputs
+            .iter()
+            .filter_map(|arg| match arg {
+                syn::FnArg::Typed(pat_type) => Some(pat_type.ty.as_ref()),
+                syn::FnArg::Receiver(_) => None,
+            })
+            .collect();
+        if let syn::ReturnType::Type(_, ty) = &sig.output {
+            types.push(ty.as_ref());
+        }
+        for ty in types {
+            if let Some((leaked_type, forbidden)) = leaked_type_in(ty, self.forbidden) {
+                self.hits.push(LeakedSignature {
+                    item_path: item_path.to_string(),
+                    leaked_type,
+                    forbidden,
+                    location: EvidenceLocation {
+                        file: self.file.clone(),
+                        item_path: Some(item_path.to_string()),
+                    },
+                });
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for SignatureCollector<'_> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if node.content.is_some() {
+            self.path.push(node.ident.to_string());
+            syn::visit::visit_item_mod(self, node);
+            self.path.pop();
+        } else {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        self.path.push(crate::functions::type_name(&node.self_ty));
+        syn::visit::visit_item_impl(self, node);
+        self.path.pop();
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            let item_path = self.qualified(&node.sig.ident.to_string());
+            self.check_signature(&item_path, &node.sig);
+        }
+        syn::visit::visit_item_fn(self, node);
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            let item_path = self.qualified(&node.sig.ident.to_string());
+            self.check_signature(&item_path, &node.sig);
+        }
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+}
+
+/// Every [`LeakedSignature`] found in `krate`'s source files whose derived
+/// module path (see [`module_path_for_file`]) falls under `from_module` —
+/// the same file-scoping [`dependency_inversion_candidates`]' signal 1 uses
+/// via `boundaries::evaluate_module_boundary_rule` (private to that module,
+/// so scoped independently here with the duplicated helpers above). Files
+/// that fail to read or parse are silently skipped, the same accepted
+/// limitation `boundaries.rs` documents for its own scan.
+fn leaked_signatures(
+    krate: &CrateInfo,
+    from_module: &str,
+    forbidden: &[String],
+) -> Vec<LeakedSignature> {
+    let mut leaks = Vec::new();
+    for source in &krate.source_files {
+        let Some(module_path) = module_path_for_file(&krate.root, &source.path) else {
+            continue;
+        };
+        if !module_path_under(&module_path, from_module) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&source.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&text) else {
+            continue;
+        };
+        let mut collector = SignatureCollector {
+            path: Vec::new(),
+            file: source.path.clone(),
+            forbidden,
+            hits: Vec::new(),
+        };
+        collector.visit_file(&ast);
+        leaks.extend(collector.hits);
+    }
+    leaks
+}
+
+/// Dependency Inversion (todo.md §16.7's table): "konfigurierte Domain-
+/// Schicht hängt direkt von konkreter Infrastruktur ab; Infrastrukturtypen
+/// leaken in öffentliche Domain-Signaturen" → "Port-/Adapter-Grenze prüfen".
+///
+/// Requires a user-configured `[[module_boundary]]` in `judge.toml`
+/// (`boundary_config`) — todo.md §17 forbids guessing project intent, so
+/// without a configured `from`/`forbidden` module pairing this detector
+/// produces nothing: not "no violation found", but "not applicable". When
+/// `boundary_config` is `None`, or has no `[[module_boundary]]` entries,
+/// this returns an empty `Vec` without doing any further work.
+///
+/// Two independent signals, both required for the same configured
+/// `[[module_boundary]]` rule:
+///
+/// 1. **Corroborating finding (call-level, already computed elsewhere)** —
+///    [`boundaries::evaluate`] reports at least one `module-boundary-
+///    violation` finding for this rule (matched by `rule.name`, since a
+///    finding's `item_path` is rendered as `"{rule.name} [direct]: ..."` —
+///    see `boundaries::module_boundary_finding`). This shows the crate
+///    already crosses this boundary somewhere at the reference level.
+/// 2. **API-signature leak (independent, `pub fn` signature level)** — at
+///    least one `pub fn` in a file under the rule's `from` module has a
+///    parameter or return type whose path textually begins with
+///    `crate::<forbidden>` for one of the rule's `forbidden` targets (see
+///    [`leaked_signatures`]). Qualitatively different from signal 1: a
+///    call-level finding says the module *references* forbidden code
+///    somewhere; this says a forbidden type is *exposed in the public API*
+///    of the domain-tagged module.
+///
+/// Only rules satisfying both produce a heuristic — at most one per
+/// `[[module_boundary]]` rule, with `related_findings` pointing at the
+/// `module-boundary-violation` finding ids from signal 1.
+fn dependency_inversion_candidates(
+    workspace: &Workspace,
+    boundary_config: Option<&BoundaryConfig>,
+) -> Result<Vec<PrincipleHeuristic>, BoundaryConfigError> {
+    let Some(config) = boundary_config else {
+        return Ok(Vec::new());
+    };
+    if config.module_boundaries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let boundaries = boundaries::evaluate(workspace, config)?;
+
+    let mut heuristics = Vec::new();
+    for rule in &config.module_boundaries {
+        let Some(krate) = workspace.crates.iter().find(|k| k.name == rule.krate) else {
+            continue;
+        };
+
+        let prefix = format!("{} [direct]:", rule.name);
+        let related_findings: Vec<&Finding> = boundaries
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.rule == MODULE_BOUNDARY_VIOLATION_RULE
+                    && finding.location.item_path.starts_with(&prefix)
+            })
+            .collect();
+        if related_findings.is_empty() {
+            continue;
+        }
+
+        let leaks = leaked_signatures(krate, &rule.from, &rule.forbidden);
+        if leaks.is_empty() {
+            continue;
+        }
+
+        heuristics.push(build_dependency_inversion_heuristic(
+            krate,
+            rule,
+            &related_findings,
+            &leaks,
+        ));
+    }
+    Ok(heuristics)
+}
+
+fn build_dependency_inversion_heuristic(
+    krate: &CrateInfo,
+    rule: &ModuleBoundaryRule,
+    related_findings: &[&Finding],
+    leaks: &[LeakedSignature],
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![rule.from.clone()],
+    };
+
+    let call_level = Evidence {
+        description: format!(
+            "`{}` already has {} `module-boundary-violation` finding(s) for `{}` -> {{{}}}, \
+             recorded independently by `judge::boundaries::evaluate`.",
+            rule.name,
+            related_findings.len(),
+            rule.from,
+            rule.forbidden.join(", "),
+        ),
+        locations: related_findings
+            .iter()
+            .map(|finding| EvidenceLocation {
+                file: finding.location.file.clone(),
+                item_path: Some(finding.location.item_path.clone()),
+            })
+            .collect(),
+    };
+
+    let leak_descriptions: Vec<String> = leaks
+        .iter()
+        .map(|leak| {
+            format!(
+                "`{}` in `{}` names `{}` (matches forbidden module `{}`)",
+                leak.item_path, rule.from, leak.leaked_type, leak.forbidden
+            )
+        })
+        .collect();
+    let signature_leak = Evidence {
+        description: format!(
+            "In `{}`, {} public function signature(s) name a type whose path begins with \
+             `crate::<forbidden module>`: {}.",
+            rule.from,
+            leaks.len(),
+            leak_descriptions.join("; "),
+        ),
+        locations: leaks.iter().map(|leak| leak.location.clone()).collect(),
+    };
+
+    let mut evidence_identities = vec![rule.name.clone()];
+    evidence_identities.extend(leaks.iter().map(|leak| leak.item_path.clone()));
+    evidence_identities.extend(related_findings.iter().map(|f| f.id.as_str().to_string()));
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::DependencyInversion,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::DependencyInversion,
+        scope,
+        evidence: vec![call_level, signature_leak],
+        interpretation: "This module boundary is both crossed at the call level and has \
+            infrastructure types leaking into public signatures of the domain-tagged module. \
+            Introducing a port/trait at the boundary could decouple the domain module from the \
+            concrete infrastructure type."
+            .to_string(),
+        contraindications: vec![
+            Contraindication {
+                description: "A small, stable, unlikely-to-change infrastructure type (e.g. a \
+                    newtype wrapper) may not justify the indirection of a port/trait."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "If the module boundary itself is new/experimental configuration, \
+                    the violations may reflect an intentional transition period rather than a \
+                    design flaw."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether the leaked type is actually varied/swapped in practice (the \
+                core justification for dependency inversion) is not checked — only that a \
+                public signature names it."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the module boundary as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Introduce a trait/port owned by the domain module, implement it \
+                    for the infrastructure type, and change the public signature to use the \
+                    trait object/generic instead."
+                    .to_string(),
+            },
+        ],
+        related_findings: related_findings.iter().map(|f| f.id.clone()).collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,12 +1135,19 @@ mod tests {
     }
 
     fn analyze(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+        analyze_with_boundary_config(workspace, None)
+    }
+
+    fn analyze_with_boundary_config(
+        workspace: &Workspace,
+        boundary_config: Option<&BoundaryConfig>,
+    ) -> Vec<PrincipleHeuristic> {
         let source_files = workspace
             .crates
             .iter()
             .flat_map(|krate| krate.source_files.iter());
         let complexity = crate::complexity::analyze_workspace(source_files, false);
-        analyze_workspace(workspace, &complexity)
+        analyze_workspace(workspace, &complexity, boundary_config).unwrap()
     }
 
     /// Nine sequential `if` statements plus the base of 1 reaches exactly
@@ -1015,9 +1437,19 @@ mod tests {
         ];
 
         let dir = TempDir::new("principle-golden-wording");
-        let io_file = dir.join("shell.rs");
+        std::fs::create_dir_all(dir.join("fixture/src/domain")).unwrap();
         std::fs::write(
-            &io_file,
+            dir.join("fixture/Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("fixture/src/lib.rs"),
+            "pub mod domain;\npub mod infra;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("fixture/src/shell.rs"),
             format!(
                 "pub fn read_and_branch(path: &str) -> i32 {{\n\
                  let contents = std::fs::read_to_string(path).unwrap();\n\
@@ -1028,9 +1460,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let trait_file = dir.join("wide.rs");
         std::fs::write(
-            &trait_file,
+            dir.join("fixture/src/wide.rs"),
             format!(
                 "{WIDE_TRAIT}\n\
                  pub struct Left;\n\
@@ -1046,9 +1477,34 @@ mod tests {
             ),
         )
         .unwrap();
+        std::fs::write(
+            dir.join("fixture/src/domain/mod.rs"),
+            "pub fn run() {\n    crate::infra::read_file();\n}\n\n\
+             pub fn build() -> crate::infra::Client {\n    todo!()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("fixture/src/infra.rs"),
+            "pub fn read_file() {}\npub struct Client;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"fixture\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
 
-        let workspace = workspace_with_crate(dir.to_path_buf(), vec![io_file, trait_file]);
-        let heuristics = analyze(&workspace);
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-infra",
+                "fixture",
+                "domain",
+                &["infra"],
+            )],
+            ..Default::default()
+        };
+        let heuristics = analyze_with_boundary_config(&workspace, Some(&config));
         assert!(
             !heuristics.is_empty(),
             "fixture must produce a heuristic to check"
@@ -1056,8 +1512,9 @@ mod tests {
         let principles: Vec<DesignPrinciple> = heuristics.iter().map(|h| h.principle).collect();
         assert!(
             principles.contains(&DesignPrinciple::FunctionalCoreImperativeShell)
-                && principles.contains(&DesignPrinciple::InterfaceSegregation),
-            "fixture must exercise both rules' wording: {principles:?}"
+                && principles.contains(&DesignPrinciple::InterfaceSegregation)
+                && principles.contains(&DesignPrinciple::DependencyInversion),
+            "fixture must exercise all three rules' wording: {principles:?}"
         );
 
         for heuristic in &heuristics {
@@ -1087,5 +1544,185 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- DependencyInversion ---------------------------------------------
+
+    fn module_boundary_rule(
+        name: &str,
+        krate: &str,
+        from: &str,
+        forbidden: &[&str],
+    ) -> ModuleBoundaryRule {
+        ModuleBoundaryRule {
+            name: name.to_string(),
+            krate: krate.to_string(),
+            from: from.to_string(),
+            forbidden: forbidden.iter().map(|s| s.to_string()).collect(),
+            reach: None,
+        }
+    }
+
+    /// A single-crate workspace named `fixture`, with `domain`/`infra`
+    /// modules (plus an optional `other` module) whose bodies are supplied
+    /// by the caller — mirrors `boundaries.rs`'s own `write_crate`/
+    /// `write_workspace_manifest` test fixtures, since `dependency_inversion_candidates`
+    /// goes through `boundaries::evaluate`, which needs a real `cargo
+    /// metadata`-readable workspace.
+    fn dependency_inversion_workspace(
+        dir: &TempDir,
+        domain_body: &str,
+        infra_body: &str,
+        other_body: Option<&str>,
+    ) -> Workspace {
+        std::fs::create_dir_all(dir.join("fixture/src/domain")).unwrap();
+        std::fs::write(
+            dir.join("fixture/Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let mut lib_rs = "pub mod domain;\npub mod infra;\n".to_string();
+        if other_body.is_some() {
+            lib_rs.push_str("pub mod other;\n");
+        }
+        std::fs::write(dir.join("fixture/src/lib.rs"), lib_rs).unwrap();
+        std::fs::write(dir.join("fixture/src/domain/mod.rs"), domain_body).unwrap();
+        std::fs::write(dir.join("fixture/src/infra.rs"), infra_body).unwrap();
+        if let Some(other_body) = other_body {
+            std::fs::write(dir.join("fixture/src/other.rs"), other_body).unwrap();
+        }
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"fixture\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap()
+    }
+
+    fn dependency_inversion_heuristics(
+        heuristics: &[PrincipleHeuristic],
+    ) -> Vec<&PrincipleHeuristic> {
+        heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::DependencyInversion)
+            .collect()
+    }
+
+    /// (a) `domain` both calls into `infra` (call-level violation) and has a
+    /// `pub fn` whose return type leaks a `crate::infra` type ⇒ exactly one
+    /// `DependencyInversion` heuristic, with `related_findings` populated
+    /// from the corroborating `module-boundary-violation` finding(s).
+    #[test]
+    fn call_violation_plus_signature_leak_produces_one_heuristic() {
+        let dir = TempDir::new("principle-dependency-inversion-both-signals");
+        let workspace = dependency_inversion_workspace(
+            &dir,
+            "pub fn run() {\n    crate::infra::read_file();\n}\n\n\
+             pub fn build() -> crate::infra::Client {\n    todo!()\n}\n",
+            "pub fn read_file() {}\npub struct Client;\n",
+            None,
+        );
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-infra",
+                "fixture",
+                "domain",
+                &["infra"],
+            )],
+            ..Default::default()
+        };
+
+        let heuristics = analyze_with_boundary_config(&workspace, Some(&config));
+        let dependency_inversion = dependency_inversion_heuristics(&heuristics);
+
+        assert_eq!(dependency_inversion.len(), 1);
+        let heuristic = dependency_inversion[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(!heuristic.related_findings.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) `domain` calls into `infra` (call-level violation) but has no
+    /// `pub fn` leaking an `infra` type in its signature ⇒ no
+    /// `DependencyInversion` heuristic.
+    #[test]
+    fn call_violation_without_signature_leak_produces_no_heuristic() {
+        let dir = TempDir::new("principle-dependency-inversion-call-only");
+        let workspace = dependency_inversion_workspace(
+            &dir,
+            "pub fn run() {\n    crate::infra::read_file();\n}\n",
+            "pub fn read_file() {}\npub struct Client;\n",
+            None,
+        );
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-infra",
+                "fixture",
+                "domain",
+                &["infra"],
+            )],
+            ..Default::default()
+        };
+
+        let heuristics = analyze_with_boundary_config(&workspace, Some(&config));
+        assert!(dependency_inversion_heuristics(&heuristics).is_empty());
+    }
+
+    /// (c) A `pub fn` genuinely leaks a `crate::infra` type in its return
+    /// type, but it lives in an `other` module the configured
+    /// `[[module_boundary]]` rule doesn't cover (`from = "domain"`) — so
+    /// neither `boundaries::evaluate` nor this rule's own signature scan
+    /// (both scoped to `from`) ever look at it. No `module-boundary-
+    /// violation` finding exists for this rule either ⇒ no heuristic (not
+    /// applicable, not a guess about `other`'s intent).
+    #[test]
+    fn signature_leak_outside_the_configured_module_boundary_produces_no_heuristic() {
+        let dir = TempDir::new("principle-dependency-inversion-out-of-scope");
+        let workspace = dependency_inversion_workspace(
+            &dir,
+            "pub fn run() -> i32 {\n    42\n}\n",
+            "pub fn read_file() {}\npub struct Client;\n",
+            Some("pub fn leaked() -> crate::infra::Client {\n    todo!()\n}\n"),
+        );
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-infra",
+                "fixture",
+                "domain",
+                &["infra"],
+            )],
+            ..Default::default()
+        };
+
+        let heuristics = analyze_with_boundary_config(&workspace, Some(&config));
+        assert!(dependency_inversion_heuristics(&heuristics).is_empty());
+    }
+
+    /// (d) No `[[module_boundary]]` configured at all — even with both
+    /// signals present in the source, the rule runs empty rather than
+    /// guessing a boundary the user never configured (todo.md §17). No
+    /// crash either.
+    #[test]
+    fn no_module_boundary_config_produces_no_heuristic() {
+        let dir = TempDir::new("principle-dependency-inversion-no-config");
+        let workspace = dependency_inversion_workspace(
+            &dir,
+            "pub fn run() {\n    crate::infra::read_file();\n}\n\n\
+             pub fn build() -> crate::infra::Client {\n    todo!()\n}\n",
+            "pub fn read_file() {}\npub struct Client;\n",
+            None,
+        );
+
+        let heuristics = analyze_with_boundary_config(&workspace, None);
+        assert!(dependency_inversion_heuristics(&heuristics).is_empty());
+
+        let empty_config = BoundaryConfig::default();
+        let heuristics = analyze_with_boundary_config(&workspace, Some(&empty_config));
+        assert!(dependency_inversion_heuristics(&heuristics).is_empty());
     }
 }

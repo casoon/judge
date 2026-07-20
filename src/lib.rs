@@ -1,5 +1,6 @@
 //! Codebase intelligence for Rust workspaces.
 
+pub mod api_surface;
 pub mod baseline;
 pub mod boundaries;
 pub mod complexity;

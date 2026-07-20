@@ -1744,4 +1744,128 @@ fn f(r: Result<i32, ()>) {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
+
+    /// `merged-stub` — unentscheidbar, macro-blindness (companion to the
+    /// existing `feature_gated_fn_todo_is_not_flagged` cfg-blindness tests
+    /// above, which already confirm `feature_gated_depth` suppresses a
+    /// cfg-gated `todo!()`): here the `todo!()` exists only inside a
+    /// `macro_rules!` body. `syn` treats a macro definition's body as an
+    /// opaque token stream — `visit_macro` never sees the inner `todo!()`
+    /// as a real `Macro` node — and the invocation `define_it!();` is
+    /// itself an opaque `Item::Macro`, never expanded. A real build's
+    /// expanded code would contain this `todo!()`, but it's structurally
+    /// invisible to a syntax-only scanner: an undercount, not a bug.
+    #[test]
+    fn merged_stub_inside_macro_body_produces_no_finding() {
+        let findings = findings_for(
+            "macro_rules! define_it {\n    () => {\n        fn generated() { todo!() }\n    };\n}\ndefine_it!();\n",
+            "slop-merged-stub-macro-body",
+        );
+        assert!(rule_findings(&findings, MERGED_STUB_RULE).is_empty());
+    }
+
+    /// `empty-impl` — unentscheidbar, macro-blindness: the doc-commented,
+    /// literally-empty fn only exists inside a `macro_rules!` body. `syn`
+    /// parses the macro definition's body as an opaque token stream, never
+    /// as a real `ItemFn` — `check_empty_impl` is never called on it — and
+    /// the invocation `define_stub!();` is itself an opaque `Item::Macro`,
+    /// never expanded into the real stub it produces. Same undercount class
+    /// as `merged_stub_inside_macro_body_produces_no_finding` above.
+    #[test]
+    fn empty_impl_inside_macro_body_produces_no_finding() {
+        let findings = findings_for(
+            "macro_rules! define_stub {\n    () => {\n        /// Does nothing yet.\n        fn generated() {}\n    };\n}\ndefine_stub!();\n",
+            "slop-empty-impl-macro-body",
+        );
+        assert!(rule_findings(&findings, EMPTY_IMPL_RULE).is_empty());
+    }
+
+    /// `assertion-free-test` — unentscheidbar: the test's only assertion
+    /// goes through a local `macro_rules! check { ... }` wrapper that
+    /// itself calls `assert!` internally. `AssertionScanner::visit_macro`
+    /// only recognizes a fixed list of assertion-macro names (plus
+    /// qualified paths ending in one of them, per the `insta`/
+    /// `pretty_assertions` fix) — `check` isn't on that list, and `syn`
+    /// never expands the wrapper to see the `assert!` inside it, so the
+    /// scanner finds nothing and flags a test that does, in fact, assert.
+    /// Documented false positive, not a bug: recognizing arbitrary
+    /// user-defined wrapper macros isn't solvable without macro expansion.
+    #[test]
+    fn test_using_custom_assertion_wrapper_macro_is_still_flagged() {
+        let findings = findings_for(
+            "macro_rules! check {\n    ($cond:expr) => {\n        assert!($cond);\n    };\n}\n#[test]\nfn f() { check!(1 + 1 == 2); }\n",
+            "slop-assertion-free-custom-wrapper",
+        );
+        let hits = rule_findings(&findings, ASSERTION_FREE_TEST_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// `tautological-test` — confirms the rule is purely syntactic (token
+    /// comparison), not semantic: `VALUE` is a `const` whose value is
+    /// produced by a `macro_rules!` invocation, not written out literally,
+    /// yet `assert_eq!(VALUE, VALUE)` is flagged exactly the same as
+    /// `assert_eq!(x, x)` would be. The rule never looks at how `VALUE` was
+    /// defined — it only compares the two macro arguments' token strings —
+    /// so a macro-generated definition changes nothing about detectability
+    /// here (unlike the other rules in this block, this one has no blind
+    /// spot to demonstrate; the golden test documents that fact).
+    #[test]
+    fn assert_eq_macro_generated_const_is_flagged_syntactically() {
+        let findings = findings_for(
+            "macro_rules! define_const {\n    ($name:ident, $val:expr) => {\n        const $name: i32 = $val;\n    };\n}\ndefine_const!(VALUE, 42);\nfn f() { assert_eq!(VALUE, VALUE); }\n",
+            "slop-tautological-macro-const",
+        );
+        let hits = rule_findings(&findings, TAUTOLOGICAL_TEST_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// `ignored-test-accumulation` — unentscheidbar, macro-blindness
+    /// (undercount, same class as `suppression_debt_inside_macro_body_is_
+    /// not_counted` above): the `#[ignore]` attribute exists only inside a
+    /// `macro_rules!` body. `visit_attribute` never sees it — the macro
+    /// definition's body is an opaque token stream, and the invocation
+    /// `define_ignored_test!();` is itself an opaque `Item::Macro`, never
+    /// expanded — so a real build's ignored test doesn't count toward this
+    /// rule's total.
+    #[test]
+    fn ignored_test_inside_macro_body_is_not_counted() {
+        let findings = findings_for(
+            "macro_rules! define_ignored_test {\n    () => {\n        #[test]\n        #[ignore]\n        fn generated() { assert!(true); }\n    };\n}\ndefine_ignored_test!();\n",
+            "slop-ignored-test-macro-body",
+        );
+        assert!(rule_findings(&findings, IGNORED_TEST_ACCUMULATION_RULE).is_empty());
+    }
+
+    /// `generic-naming` — unentscheidbar, cfg-blindness: `check_generic_
+    /// naming_item_fn` is called unconditionally from `visit_item_fn`, the
+    /// same as `check_catch_all_error` — `feature_gated_depth` is tracked
+    /// but this check never consults it. A `pub fn` named `manager` behind
+    /// `#[cfg(feature = "wip")]` is still flagged even though a build
+    /// without that feature would never compile it in. Same class as
+    /// `catch_all_error_inside_cfg_gated_pub_fn_still_flagged` above.
+    #[test]
+    fn generic_naming_pub_fn_inside_cfg_gated_mod_still_flagged() {
+        let findings = findings_for(
+            "#[cfg(feature = \"wip\")]\nmod m {\n    pub fn manager() {}\n}\n",
+            "slop-generic-naming-cfg-gated",
+        );
+        let hits = rule_findings(&findings, GENERIC_NAMING_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// `doc-restates-signature` — unentscheidbar, macro-blindness
+    /// (undercount): the pure-echo doc comment and its fn signature exist
+    /// only inside a `macro_rules!` body. `check_doc_restates_signature` is
+    /// never called on it — the macro definition's body is an opaque token
+    /// stream, and the invocation `define_getter!();` is itself an opaque
+    /// `Item::Macro`, never expanded into the real, matching fn it
+    /// produces.
+    #[test]
+    fn doc_restates_signature_inside_macro_body_produces_no_finding() {
+        let findings = findings_for(
+            "macro_rules! define_getter {\n    () => {\n        /// Returns the result.\n        pub fn f() -> Result<(), String> { Ok(()) }\n    };\n}\ndefine_getter!();\n",
+            "slop-doc-restates-signature-macro-body",
+        );
+        assert!(rule_findings(&findings, DOC_RESTATES_SIGNATURE_RULE).is_empty());
+    }
 }

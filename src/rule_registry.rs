@@ -68,6 +68,15 @@ const HEURISTIC_WORDING: &str = "State as a hint or possible reading, never as p
 /// completeness guarantee and the consistency test below for the
 /// evidence-class/verdict-effect invariant.
 pub const RULE_REGISTRY: &[RuleMetadata] = &[
+    // -- api_surface.rs ---------------------------------------------------
+    RuleMetadata {
+        id: "undocumented-public-item",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; `cargo judge api-surface`, subcommand-only).",
+        exclusions: "Checks only whether the item itself is written `pub`, not the full visibility chain up through enclosing modules — a `pub fn` inside a private `mod` is not actually reachable from outside the crate but is still checked (see `crate::api_surface` module docs). Scoped to free `fn`/`struct`/`enum`/`trait`/`const`/`static`/`type` at module level plus inherent-impl methods; methods inside `impl Trait for Type` are exempt (typically inherit the trait's own documentation), as are `#[test]`-attributed functions and anything gated by `#[cfg(test)]`.",
+        allowed_wording: "State only that no doc comment was found on this `pub` item — never that its documentation is 'bad' or 'incomplete' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
     // -- boundaries.rs --------------------------------------------------
     RuleMetadata {
         id: "crate-boundary-violation",
@@ -515,6 +524,7 @@ mod tests {
     #[test]
     fn every_fast_tier_rule_id_has_a_registry_entry() {
         let ids: &[&str] = &[
+            crate::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE,
             crate::boundaries::BOUNDARY_VIOLATION_RULE,
             crate::boundaries::DEPENDENCY_CYCLE_RULE,
             crate::coverage::UNTESTED_HOTSPOT_RULE,

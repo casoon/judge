@@ -16,6 +16,7 @@ const DEFAULT_BASELINE_ALL: &str = ".judge/baseline.json";
 const DEFAULT_BASELINE_DISTRIBUTION: &str = ".judge/baseline-distribution.json";
 const DEFAULT_BASELINE_PROVENANCE: &str = ".judge/baseline-provenance.json";
 const DEFAULT_BASELINE_COVERAGE: &str = ".judge/baseline-coverage.json";
+const DEFAULT_BASELINE_API_SURFACE: &str = ".judge/baseline-api-surface.json";
 #[cfg(feature = "deep")]
 const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
@@ -112,6 +113,11 @@ enum Command {
     /// todo.md §17.5). A pure documentation lookup — never runs analysis and
     /// never produces exit code 1.
     ExplainRule(ExplainRuleOptions),
+    /// Shows public-API-surface findings (`undocumented-public-item` — see
+    /// todo.md §I). Subcommand-only: not part of bare `cargo judge`,
+    /// `audit`, or `health`, matching `Distribution`/`Provenance`/
+    /// `DeadCode`'s own opt-in precedent.
+    ApiSurface(ApiSurfaceOptions),
 }
 
 #[derive(Debug, Args)]
@@ -360,6 +366,24 @@ struct ExplainRuleOptions {
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
     format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ApiSurfaceOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+    /// Save the current findings as the baseline (see todo.md §5).
+    #[arg(long)]
+    save_baseline: bool,
+    /// Compare findings against a previously saved baseline.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<PathBuf>,
+    /// Analyze generated files too (see todo.md §3.A). Off by default —
+    /// documentation completeness on generated code isn't actionable the way
+    /// it is on authored code.
+    #[arg(long)]
+    include_generated: bool,
 }
 
 /// Output format shared by commands that emit findings (see todo.md §7).
@@ -622,6 +646,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         Some(Command::ExplainPattern(options)) => run_explain_pattern(options, out),
         Some(Command::FixPreview(options)) => run_fix_preview(options, out),
         Some(Command::ExplainRule(options)) => run_explain_rule(options, out),
+        Some(Command::ApiSurface(options)) => run_api_surface(options, out),
     }
 }
 
@@ -2229,6 +2254,103 @@ fn run_distribution(
     Ok(CommandOutcome::Clean)
 }
 
+/// Public-API-surface findings (`undocumented-public-item` — see todo.md
+/// §I). Subcommand-only: deliberately not wired into `collect_findings`/
+/// `run_all`/`SLOP_RULES`, matching `Distribution`/`Provenance`/`DeadCode`'s
+/// own opt-in precedent.
+fn run_api_surface(
+    options: ApiSurfaceOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let ApiSurfaceOptions {
+        format,
+        save_baseline,
+        baseline,
+        include_generated,
+    } = options;
+    let workspace = judge::ingest::load(None)?;
+
+    let source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let report = judge::api_surface::analyze_workspace(source_files, include_generated);
+    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
+
+    // Inline `judge-ignore` suppression (todo.md §5).
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
+
+    if save_baseline || baseline.is_some() {
+        let rule_revisions = std::collections::HashMap::from([(
+            judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE.to_string(),
+            judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION,
+        )]);
+        return handle_baseline(
+            &workspace.root,
+            &findings,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_API_SURFACE),
+                format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
+            },
+            out,
+        );
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let report = Report::with_errors(findings, analysis_errors)
+                .with_suppressed_inline(suppressed_inline);
+            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
+        }
+        OutputFormat::Sarif => {
+            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format(
+                "`api-surface`",
+                format,
+                "tty, json, sarif",
+            ));
+        }
+        OutputFormat::Tty => {
+            writeln!(out, "undocumented public items: {}", findings.len())?;
+            if !report.errors.is_empty() {
+                writeln!(out, "files skipped (parse errors): {}", report.errors.len())?;
+                for err in &analysis_errors {
+                    writeln!(out, "  {err}")?;
+                }
+            }
+            if report.excluded_generated > 0 {
+                writeln!(
+                    out,
+                    "excluded (generated): {} (see --include-generated)",
+                    report.excluded_generated
+                )?;
+            }
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
+            }
+            for finding in &findings {
+                writeln!(
+                    out,
+                    "  [{}] {}:{}  {}",
+                    severity_label(finding.severity),
+                    finding.location.file.display(),
+                    finding.location.line,
+                    finding.location.item_path
+                )?;
+            }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
 /// Heuristic author-class breakdowns of churn, duplication, and suppression
 /// debt (see todo.md §3.G G6). Subcommand-only: deliberately not wired into
 /// `collect_findings`/`run_all`/`SLOP_RULES`, matching `Distribution`/
@@ -2408,12 +2530,14 @@ fn run_principles(
         return Err(unsupported_format("`principles`", format, "tty, json"));
     }
     let workspace = judge::ingest::load(None)?;
+    let boundary_config = load_judge_toml(&workspace.root)?;
     let source_files = workspace
         .crates
         .iter()
         .flat_map(|krate| krate.source_files.iter());
     let complexity = judge::complexity::analyze_workspace(source_files, false);
-    let heuristics = judge::principle::analyze_workspace(&workspace, &complexity);
+    let heuristics =
+        judge::principle::analyze_workspace(&workspace, &complexity, Some(&boundary_config))?;
 
     match format {
         OutputFormat::Json => {
@@ -3711,6 +3835,62 @@ mod tests {
         std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
     }
 
+    /// `cargo judge api-surface` end-to-end: a `pub fn` with a `///` doc
+    /// comment produces no finding.
+    #[test]
+    fn run_api_surface_reports_clean_on_a_documented_fixture() {
+        let dir = TempDir::new("api-surface-clean");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "/// Says hello.\npub fn hello() {}\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            api_surface_cli(OutputFormat::Tty, false, None),
+            &mut out,
+        )
+        .expect("clean fixture must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("undocumented public items: 0"),
+            "unexpected output: {text}"
+        );
+    }
+
+    /// `cargo judge api-surface` end-to-end: an undocumented `pub fn`
+    /// produces one `undocumented-public-item` finding, listed in the TTY
+    /// output.
+    #[test]
+    fn run_api_surface_reports_undocumented_public_items() {
+        let dir = TempDir::new("api-surface-findings");
+        write_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            api_surface_cli(OutputFormat::Tty, false, None),
+            &mut out,
+        )
+        .expect("fixture must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("undocumented public items: 1"),
+            "unexpected output: {text}"
+        );
+        assert!(text.contains("hello"), "unexpected output: {text}");
+    }
+
     /// A fixture crate with two `catch-all-error` boundary functions and a
     /// crate-local typed error — corroborated evidence for exactly one
     /// `stringly-error-boundary` pattern candidate (see `judge::pattern`).
@@ -3891,6 +4071,19 @@ fn dup_two(x: i32) -> i32 {
         cli_with(Command::Dupes(DupesOptions {
             mode: DupeModeArg::Mild,
             min_tokens: judge::duplication::DEFAULT_MIN_TOKENS,
+            format,
+            save_baseline,
+            baseline,
+            include_generated: false,
+        }))
+    }
+
+    fn api_surface_cli(
+        format: OutputFormat,
+        save_baseline: bool,
+        baseline: Option<PathBuf>,
+    ) -> Cli {
+        cli_with(Command::ApiSurface(ApiSurfaceOptions {
             format,
             save_baseline,
             baseline,
