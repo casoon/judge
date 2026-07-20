@@ -784,4 +784,291 @@ resolver = "2"
              reliable signal for test functions"
         );
     }
+
+    /// Undecidable fixture (todo.md §17.5): a function whose only cross-file
+    /// caller is a `#[test]` fn in another file. `include_tests: true` is the
+    /// same "count every usage" mode [`crate::deep::find_refs`] documents —
+    /// this proves a test-only cross-file reference counts exactly like a
+    /// production one for `connectivity-drop` in that mode, not a weaker
+    /// signal. See the companion test below for the `include_tests: false`
+    /// side of this same fixture.
+    #[test]
+    fn connectivity_drop_counts_a_test_only_cross_file_caller_when_include_tests_is_true() {
+        let dir = TempDir::new("connectivity-drop-test-only-caller-included");
+        write_crate(
+            &dir,
+            "core",
+            &[],
+            r#"pub fn used_only_in_test() -> i32 {
+    1
+}
+"#,
+        );
+        write_crate(
+            &dir,
+            "consumer",
+            &[("core", "../core")],
+            r#"#[test]
+fn calls_it() {
+    assert_eq!(core::used_only_in_test(), 1);
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["core", "consumer"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let duplication = WorkspaceDuplication::default();
+        let report = analyze_workspace(&workspace, &duplication, true).unwrap();
+
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == CONNECTIVITY_DROP_RULE)
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            !names.contains("used_only_in_test"),
+            "called from a #[test] fn in another file — with include_tests: true this counts as \
+             a cross-file reference, the same as production usage, so it must not be flagged"
+        );
+    }
+
+    /// Same fixture as
+    /// [`connectivity_drop_counts_a_test_only_cross_file_caller_when_include_tests_is_true`],
+    /// with `include_tests: false`: documents that mode's actual, intended
+    /// behavior — a cross-file caller that only exists inside a `#[test]` fn
+    /// is filtered out just like any other test-only usage, so a function
+    /// with no production callers looks structurally unwired even though a
+    /// real (test-only) caller exists. This is the "getrennte Graphen für
+    /// production, tests und all" design (todo.md §3.A) working as intended,
+    /// not a bug — `include_tests` is a caller-selected mode, not an
+    /// accident.
+    #[test]
+    fn connectivity_drop_does_not_count_a_test_only_cross_file_caller_when_include_tests_is_false()
+    {
+        let dir = TempDir::new("connectivity-drop-test-only-caller-excluded");
+        write_crate(
+            &dir,
+            "core",
+            &[],
+            r#"pub fn used_only_in_test() -> i32 {
+    1
+}
+"#,
+        );
+        write_crate(
+            &dir,
+            "consumer",
+            &[("core", "../core")],
+            r#"#[test]
+fn calls_it() {
+    assert_eq!(core::used_only_in_test(), 1);
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["core", "consumer"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let duplication = WorkspaceDuplication::default();
+        let report = analyze_workspace(&workspace, &duplication, false).unwrap();
+
+        let names: HashSet<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == CONNECTIVITY_DROP_RULE)
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            names.contains("used_only_in_test"),
+            "its only cross-file caller lives inside a #[test] fn — with include_tests: false \
+             that reference is filtered out same as any other test-only usage, so the function \
+             looks structurally unwired even though a real (test-only) caller exists"
+        );
+    }
+
+    /// Undecidable fixture (todo.md §17.5): a clone family with one member
+    /// in a header-marked generated file (`// @generated` — the same marker
+    /// [`crate::ingest`] already recognizes). Real duplication detection run
+    /// with `--include-generated` (Fast Tier, `syn`-based) finds and pairs it
+    /// just fine — a generated file is still ordinary, parseable Rust source.
+    /// [`collect_function_fan_in`] is different: it skips every file whose
+    /// `file.kind.is_locally_reportable()` is `false`, unconditionally, with
+    /// no `include_generated` override, so `clone_generated` never enters
+    /// `records` at all. Per the documented contract on
+    /// [`duplicative_reinvention_findings`] ("a member whose function isn't
+    /// in records at all ... is treated as *not* isolated"), the whole
+    /// family must stay unflagged even though its other, authored member
+    /// genuinely has zero cross-file references on its own — "im Zweifel
+    /// nicht melden" wins over a signal built on an admittedly incomplete
+    /// fan-in table. This confirms the already-documented behavior rather
+    /// than uncovering a new one.
+    #[test]
+    fn duplicative_reinvention_does_not_flag_a_family_with_a_generated_file_member() {
+        let dir = TempDir::new("duplicative-reinvention-generated-member");
+        std::fs::create_dir_all(dir.join("core/src")).unwrap();
+        std::fs::write(
+            dir.join("core/Cargo.toml"),
+            "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("core/src/lib.rs"),
+            "mod authored;\nmod generated;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("core/src/authored.rs"),
+            "fn clone_authored() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("core/src/generated.rs"),
+            "// @generated by codegen. DO NOT EDIT.\nfn clone_generated() -> i32 {\n    42\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"core\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let source_files = workspace
+            .crates
+            .iter()
+            .flat_map(|krate| krate.source_files.iter());
+        let duplication =
+            crate::duplication::analyze_workspace(source_files, DupeMode::Strict, 1, true);
+        assert_eq!(
+            duplication.families.len(),
+            1,
+            "clone_authored and clone_generated must form one real clone family: {:?}",
+            duplication.families
+        );
+
+        let report = analyze_workspace(&workspace, &duplication, true).unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == DUPLICATIVE_REINVENTION_RULE),
+            "clone_generated's file is skipped by the fan-in scan (generated code, \
+             unconditionally excluded there), so it never enters `records` — the family must be \
+             treated as not-all-isolated rather than flagged on an incomplete signal"
+        );
+    }
+
+    /// Undecidable fixture (todo.md §17.5): a clone family whose only real
+    /// caller is invisible proc-macro-generated code — the same blind spot
+    /// [`crate::dead_code`] already documents for `unused-pub-workspace`
+    /// (see that module's `proc_macro_exposed_crates` and its
+    /// `a_pub_fn_reachable_only_through_an_unexpanded_proc_macro_derive_is_falsely_flagged_dead`
+    /// test). `duplicative-reinvention` shares [`cross_file_reference_count`]
+    /// with `connectivity-drop`, so it inherits the same gap: the Deep Tier
+    /// loads with no proc-macro server ([`crate::deep::DeepContext::load`]),
+    /// so a call that exists only inside a derive macro's expanded output is
+    /// invisible to `find_all_refs`. Here `clone_two`'s only real caller is
+    /// such a call — genuinely used, but from generated code the analysis
+    /// can never see — so its cross-file reference count comes back `0`,
+    /// indistinguishable from `clone_one`, which really is unused, and the
+    /// family gets flagged as though neither member had a caller.
+    ///
+    /// **Known gap, documented rather than hidden — not fixed here.** A full
+    /// fix needs real proc-macro expansion across the workspace (todo.md
+    /// §2.1, out of scope). Unlike `unused-pub-workspace`, this module
+    /// doesn't attach a `proc_macro_expansion_disabled` limitation
+    /// disclosure — `duplicative-reinvention` and `connectivity-drop` are
+    /// already `Info`-severity, advisory-only findings with no score/verdict
+    /// effect (see module docs), so the false positive's cost is lower than
+    /// an equivalent gating one; wiring the same crate-wide disclosure this
+    /// module doesn't yet have is separate follow-up work, not a "clearly
+    /// fixable" bug within this fixture task's scope.
+    #[test]
+    fn duplicative_reinvention_flags_a_family_whose_only_caller_is_invisible_proc_macro_generated_code()
+     {
+        let dir = TempDir::new("duplicative-reinvention-proc-macro-blind-spot");
+        std::fs::create_dir_all(dir.join("macros/src")).unwrap();
+        std::fs::write(
+            dir.join("macros/Cargo.toml"),
+            r#"[package]
+name = "macros"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("macros/src/lib.rs"),
+            r#"use proc_macro::TokenStream;
+
+/// Would-be expansion (never actually run — the Deep Tier loads with no
+/// proc-macro server): a call to `clone_two()` the analysis never sees.
+#[proc_macro_derive(CallsCloneTwo)]
+pub fn calls_clone_two(_input: TokenStream) -> TokenStream {
+    "fn __generated_caller() { crate::clone_two(); }".parse().unwrap()
+}
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("core/src")).unwrap();
+        std::fs::write(
+            dir.join("core/Cargo.toml"),
+            r#"[package]
+name = "core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macros = { path = "../macros" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("core/src/lib.rs"), "mod a;\nmod b;\nmod widget;\n").unwrap();
+        std::fs::write(
+            dir.join("core/src/a.rs"),
+            "pub fn clone_one() -> i32 {\n    7\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("core/src/b.rs"),
+            "pub fn clone_two() -> i32 {\n    7\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("core/src/widget.rs"),
+            "#[derive(macros::CallsCloneTwo)]\npub struct Widget;\n",
+        )
+        .unwrap();
+        write_workspace_manifest(&dir, &["macros", "core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let source_files = workspace
+            .crates
+            .iter()
+            .flat_map(|krate| krate.source_files.iter());
+        let duplication =
+            crate::duplication::analyze_workspace(source_files, DupeMode::Strict, 1, false);
+        assert_eq!(
+            duplication.families.len(),
+            1,
+            "clone_one and clone_two must form one real clone family: {:?}",
+            duplication.families
+        );
+
+        let report = analyze_workspace(&workspace, &duplication, true).unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == DUPLICATIVE_REINVENTION_RULE),
+            "documents today's actual (policy-violating) behavior: clone_two's only real caller \
+             is invisible generated code, so it looks just as isolated as the genuinely-unused \
+             clone_one and the family is flagged — see this test's doc comment"
+        );
+    }
 }

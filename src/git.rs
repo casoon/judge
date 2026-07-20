@@ -707,6 +707,179 @@ mod tests {
         assert!(found.is_empty());
     }
 
+    /// `hotspots()` calls the same [`churn`] that `churn-hotspot`
+    /// (`slop_structural::churn_hotspot`) reads, and `churn` has no rename
+    /// tracking configured on its tree diff. A `git mv` with no content
+    /// change is therefore split into a `Deletion` under the old path and an
+    /// `Addition` under the new one, rather than fused into one history —
+    /// already confirmed as a real, non-fixed undercounting limit for
+    /// `churn-hotspot` (todo.md §17.5, 2026-07-19 entry). Since `hotspots()`
+    /// looks up churn by the file's *current* path only (the path
+    /// `FunctionInfo` carries, from parsing the checkout as it exists now),
+    /// the same split applies to the `hotspot` score itself: the 3 commits
+    /// that touched `old.rs` before the rename are invisible to the score,
+    /// even though the file (under its new name) really has 6 real touches.
+    #[test]
+    fn hotspots_score_only_counts_churn_after_an_untracked_rename() {
+        let dir = TempDir::new("git-hotspots-rename-split");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("old.rs"), "fn f() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(dir.join("old.rs"), "fn f() { 1 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch old 1"]);
+
+        std::fs::write(dir.join("old.rs"), "fn f() { 2 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch old 2"]);
+
+        git(&dir, &["mv", "old.rs", "new.rs"]);
+        git(&dir, &["commit", "-q", "-m", "rename old to new"]);
+
+        std::fs::write(dir.join("new.rs"), "fn f() { 3 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch new 1"]);
+
+        std::fs::write(dir.join("new.rs"), "fn f() { 4 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch new 2"]);
+
+        // The file (as it exists today) really was touched 6 times, but the
+        // rename splits that into 3 commits under `old.rs` and 3 under
+        // `new.rs` — see `churn`'s direct count below.
+        let churn_counts = churn(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+        assert_eq!(churn_counts.get(&PathBuf::from("old.rs")), Some(&3));
+        assert_eq!(churn_counts.get(&PathBuf::from("new.rs")), Some(&3));
+
+        let functions = vec![function_info(dir.join("new.rs"), 5)];
+        let found = hotspots(&dir, &functions, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file, dir.join("new.rs"));
+        // Only the post-rename half of the file's real history is visible
+        // to the hotspot score.
+        assert_eq!(found[0].changes, 3);
+        assert_eq!(found[0].score(), 15);
+    }
+
+    /// A file that had heavy churn but no longer exists in the checkout is
+    /// correctly left out of hotspots — not shown as a spurious
+    /// complexity-0 entry. This falls out of how `hotspots()` is driven: the
+    /// candidate set is `file_complexity`, built purely from the caller's
+    /// `functions` (parsed from files that exist on disk today), and
+    /// `churn` is only ever used to look values up for keys already in that
+    /// set. A file with churn but no matching `FunctionInfo` (because a real
+    /// caller can't parse a file that no longer exists) never enters the
+    /// candidate set in the first place.
+    #[test]
+    fn hotspots_excludes_a_deleted_file_even_though_it_had_heavy_churn() {
+        let dir = TempDir::new("git-hotspots-deleted-file");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("deleted.rs"), "fn f() {}\n").unwrap();
+        std::fs::write(dir.join("kept.rs"), "fn g() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(dir.join("deleted.rs"), "fn f() { 1 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch deleted 1"]);
+
+        std::fs::write(dir.join("deleted.rs"), "fn f() { 2 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch deleted 2"]);
+
+        git(&dir, &["rm", "-q", "deleted.rs"]);
+        git(&dir, &["commit", "-q", "-m", "remove deleted.rs"]);
+
+        // `deleted.rs` really has 4 recorded churn touches (3 edits + the
+        // removal), more than `kept.rs` — but no `FunctionInfo` for it,
+        // matching what a real caller would produce.
+        let churn_counts = churn(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+        assert_eq!(churn_counts.get(&PathBuf::from("deleted.rs")), Some(&4));
+
+        let functions = vec![function_info(dir.join("kept.rs"), 5)];
+        let found = hotspots(&dir, &functions, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file, dir.join("kept.rs"));
+    }
+
+    /// todo.md §3.E describes the hotspot formula as `Komplexität ×
+    /// Änderungsfrequenz (... exponentielle Gewichtung neuerer Commits)`,
+    /// but `Hotspot::score` is a flat `complexity * changes` and `changes`
+    /// is `churn`'s raw commit count inside the window — no recency
+    /// weighting is implemented. This test documents that gap: a file
+    /// touched only near the far edge of the window scores identically to
+    /// one touched the same number of times, but only very recently.
+    #[test]
+    fn hotspots_score_has_no_recency_weighting_despite_the_docs() {
+        let dir = TempDir::new("git-hotspots-no-recency-weight");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["commit", "-q", "--allow-empty", "-m", "root"]);
+
+        // Just inside the default 365-day window, but as old as it gets
+        // without falling out of it.
+        let far_edge_date = unix_date_env(300);
+        let far_edge = [
+            ("GIT_AUTHOR_DATE", far_edge_date.as_str()),
+            ("GIT_COMMITTER_DATE", far_edge_date.as_str()),
+        ];
+        std::fs::write(dir.join("old_edge.rs"), "fn f() {}\n").unwrap();
+        run_git(&dir, &["add", "."], &[]);
+        run_git(&dir, &["commit", "-q", "-m", "old edge 1"], &far_edge);
+        std::fs::write(dir.join("old_edge.rs"), "fn f() { 1 }\n").unwrap();
+        run_git(&dir, &["add", "."], &[]);
+        run_git(&dir, &["commit", "-q", "-m", "old edge 2"], &far_edge);
+        std::fs::write(dir.join("old_edge.rs"), "fn f() { 2 }\n").unwrap();
+        run_git(&dir, &["add", "."], &[]);
+        run_git(&dir, &["commit", "-q", "-m", "old edge 3"], &far_edge);
+
+        std::fs::write(dir.join("recent.rs"), "fn g() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "recent 1"]);
+        std::fs::write(dir.join("recent.rs"), "fn g() { 1 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "recent 2"]);
+        std::fs::write(dir.join("recent.rs"), "fn g() { 2 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "recent 3"]);
+
+        let functions = vec![
+            function_info(dir.join("old_edge.rs"), 5),
+            function_info(dir.join("recent.rs"), 5),
+        ];
+        let found = hotspots(&dir, &functions, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(found.len(), 2);
+        let old_edge = found
+            .iter()
+            .find(|hotspot| hotspot.file == dir.join("old_edge.rs"))
+            .unwrap();
+        let recent = found
+            .iter()
+            .find(|hotspot| hotspot.file == dir.join("recent.rs"))
+            .unwrap();
+        assert_eq!(old_edge.changes, 3);
+        assert_eq!(recent.changes, 3);
+        // Same complexity, same raw commit count, wildly different recency
+        // — yet identical score, because no exponential weighting exists.
+        assert_eq!(old_edge.score(), recent.score());
+    }
+
+    /// Formats a Unix timestamp `days_ago` days before "now" the way `git`
+    /// accepts for `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` (`@<seconds>
+    /// <tz-offset>`), for tests that need a commit date near, but still
+    /// inside, a lookback window's far edge (unlike the fixed year-2000
+    /// dates other tests use for dates meant to fall *outside* the window).
+    fn unix_date_env(days_ago: i64) -> String {
+        let seconds = now_unix_seconds() - days_ago * 24 * 3600;
+        format!("@{seconds} +0000")
+    }
+
     #[test]
     fn hotspot_to_finding_is_informational_and_stable() {
         let hotspot = Hotspot {

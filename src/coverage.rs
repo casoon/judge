@@ -157,11 +157,17 @@ pub fn read_lcov(path: &Path, workspace_root: &Path) -> Result<CoverageReport, L
 /// discard an otherwise-usable snapshot.
 ///
 /// `SF:` paths are normalized relative to `workspace_root` when they are
-/// absolute and resolve under it; already-relative paths are kept as given
-/// (LCOV from `cargo-llvm-cov` run at the workspace root emits both forms
-/// depending on invocation). After parsing, every resulting path is checked
-/// for existence and recorded in [`CoverageReport::missing_files`] if it
-/// isn't found — see todo.md §J point 2.
+/// absolute and resolve under it; already-relative paths have any `.`
+/// (current-dir) components stripped — e.g. `./src/lib.rs` and `src/lib.rs`
+/// resolve to the same key — since [`CoverageReport::for_file`] strips
+/// `function.file` (always an absolute, `.`-free path) the same way and a
+/// stray leading `./` would otherwise silently miss an existing entry (see
+/// [`resolve_lcov_path`]). Case (on case-insensitive filesystems) is *not*
+/// normalized — a `SF:` path differing only in case from the workspace path
+/// still misses, since judge cannot know a given filesystem's case
+/// sensitivity from its inputs alone. After parsing, every resulting path is
+/// checked for existence and recorded in [`CoverageReport::missing_files`] if
+/// it isn't found — see todo.md §J point 2.
 pub fn parse_lcov(text: &str, workspace_root: &Path) -> CoverageReport {
     let mut per_file: HashMap<PathBuf, FileCoverage> = HashMap::new();
     let mut current: Option<(PathBuf, HashMap<usize, u64>)> = None;
@@ -220,7 +226,14 @@ fn resolve_lcov_path(raw_path: &str, workspace_root: &Path) -> PathBuf {
             .map(Path::to_path_buf)
             .unwrap_or(path)
     } else {
-        path
+        // Strip `.` components (e.g. a leading `./`) so `./src/lib.rs` keys
+        // the same entry as `src/lib.rs` — `for_file` never produces a `.`
+        // component when it strips an absolute `function.file`, so leaving
+        // one in here would make an otherwise-matching file look like it has
+        // no coverage data at all.
+        path.components()
+            .filter(|component| !matches!(component, std::path::Component::CurDir))
+            .collect()
     }
 }
 
@@ -266,6 +279,19 @@ fn finalize_file(lines: HashMap<usize, u64>) -> FileCoverage {
 /// is the rarest and least locally-verifiable ingredient in the
 /// combination, so it sets the class for the combined claim (todo.md
 /// §17.3).
+///
+/// Known, undecidable time skew: `churn` and `coverage` are read as of two
+/// independent snapshots — `churn` from the workspace's current git history,
+/// `coverage` from whenever the LCOV report was generated (a CI run that can
+/// be days or weeks old). Both use the *current* function line ranges from
+/// `functions`. If a hotspot was reworked after the LCOV snapshot was taken,
+/// the reported `lines_covered_pct`/`uncovered_line_count` describe lines
+/// that may no longer exist in their current form — judge has no way to
+/// detect this from the LCOV file alone (it carries no commit/timestamp
+/// judge could compare against `AnalysisUniverse`'s commit). This is a
+/// structural limitation of importing an external snapshot, not a bug: it
+/// cannot be fixed by adjusting `UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS` or any
+/// other local threshold.
 pub fn untested_hotspots(
     functions: &[FunctionInfo],
     churn: &HashMap<PathBuf, u32>,
@@ -405,6 +431,43 @@ end_of_record
     }
 
     #[test]
+    fn parse_lcov_strips_a_leading_curdir_so_the_path_matches_the_workspace_relative_form() {
+        // `cargo-llvm-cov`/`grcov` invocations can emit `SF:./src/lib.rs`
+        // instead of `SF:src/lib.rs` depending on how they're run. Without
+        // stripping the `./`, this key would never match `for_file`'s
+        // lookup (which strips an absolute `function.file` down to
+        // `src/lib.rs`, no `./`) — a real, silent false negative fixed
+        // alongside this fixture (see `resolve_lcov_path`).
+        let dir = TempDir::new("coverage-parse-leading-curdir");
+        std::fs::write(dir.join("lib.rs"), "fn a() {}\n").unwrap();
+
+        let lcov = "SF:./lib.rs\nDA:1,1\nend_of_record\n";
+        let report = parse_lcov(lcov, &dir);
+
+        assert!(report.per_file.contains_key(&PathBuf::from("lib.rs")));
+        assert!(report.for_file(&dir, &dir.join("lib.rs")).is_some());
+    }
+
+    #[test]
+    fn coverage_report_for_file_misses_when_lcov_case_differs_from_the_workspace_path() {
+        // Same file, different case in the LCOV report — plausible when a
+        // report is generated on one OS/tool invocation and consumed
+        // locally, or the workspace filesystem is case-insensitive (macOS,
+        // Windows) so `SRC/HOT.RS` and `src/hot.rs` name the same file on
+        // disk. Documented, not fixed: judge cannot know a given
+        // filesystem's case sensitivity from its inputs alone (see
+        // `parse_lcov`'s doc comment), so this is expected to miss.
+        let dir = TempDir::new("coverage-case-mismatch");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/hot.rs"), "fn hot() {}\n").unwrap();
+
+        let lcov = "SF:SRC/HOT.RS\nDA:1,1\nend_of_record\n";
+        let report = parse_lcov(lcov, &dir);
+
+        assert!(report.for_file(&dir, &dir.join("src/hot.rs")).is_none());
+    }
+
+    #[test]
     fn read_lcov_errors_clearly_for_a_missing_report_file() {
         let dir = TempDir::new("coverage-read-missing-report");
         let err = read_lcov(&dir.join("nope.info"), &dir).unwrap_err();
@@ -539,6 +602,97 @@ end_of_record
                 "lines_covered_pct": coverage.per_file[&PathBuf::from("src/hot.rs")].covered_pct(),
                 "uncovered_line_count": 8,
             }))
+        );
+    }
+
+    /// Same fixture as
+    /// `untested_hotspot_fires_when_complexity_churn_and_uncovered_lines_all_coincide`,
+    /// but with a leading `./` in the LCOV `SF:` path — regression coverage
+    /// for the `resolve_lcov_path` fix: before it, this LCOV entry was keyed
+    /// under `./src/hot.rs` while `for_file` looked up `src/hot.rs`, so the
+    /// mismatch made a genuinely uncovered, high-complexity, high-churn
+    /// function silently look like "no coverage data" and skip the rule
+    /// entirely.
+    #[test]
+    fn untested_hotspot_fires_despite_a_leading_curdir_in_the_lcov_path() {
+        let dir = TempDir::new("coverage-untested-hotspot-leading-curdir");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/hot.rs"), "fn hot() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        for i in 0..5 {
+            std::fs::write(dir.join("src/hot.rs"), format!("fn hot() {{ {i} }}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", "rework"]);
+        }
+
+        let churn = crate::git::churn(&dir, UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS).unwrap();
+        let functions = vec![function_info(dir.join("src/hot.rs"), 10, 12, 11)];
+
+        let lcov = "\
+SF:./src/hot.rs
+DA:10,1
+DA:11,1
+DA:12,1
+DA:13,0
+DA:14,0
+DA:15,0
+DA:16,0
+DA:17,0
+DA:18,0
+DA:19,0
+DA:20,0
+end_of_record
+";
+        let coverage = parse_lcov(lcov, &dir);
+
+        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+
+        assert_eq!(findings.len(), 1);
+    }
+
+    /// Simulates a function whose `lines_of_code` (as `crate::complexity`
+    /// computes it, over the full `syn` AST) spans an inactive
+    /// `#[cfg(feature = "x")]` branch, while the LCOV report — generated
+    /// from a real build with the feature off — never instruments those
+    /// cfg-gated lines at all (not "uncovered": simply never compiled, so
+    /// they never appear as `DA:` records). Those phantom lines inflate
+    /// `uncovered_ratio`'s denominator (`function.lines_of_code`) without
+    /// ever being able to inflate its numerator (`uncovered_in_function`
+    /// only counts lines LCOV actually reported as zero-hit). The result is
+    /// the opposite of a false positive: a function whose truly-compiled
+    /// lines are 100% uncovered can still be diluted below
+    /// `UNCOVERED_MAJORITY_RATIO` and silently escape `untested-hotspot`.
+    /// Not fixed — doing so would mean sizing the denominator from LCOV's
+    /// own instrumented-line set instead of `lines_of_code`, a bigger change
+    /// than this test-only task's scope allows; documented here instead.
+    #[test]
+    fn untested_hotspot_misses_a_real_hotspot_when_cfg_gated_lines_inflate_the_span() {
+        let dir = TempDir::new("coverage-untested-hotspot-cfg-blind-loc");
+        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
+        // `lines_of_code` (14) spans lines 1..=14 as `syn` sees them
+        // (cfg-blind); only lines 1..=4 are actually compiled and
+        // instrumented — lines 5..=14 belong to an inactive
+        // `#[cfg(feature = "x")]` branch and never appear in the LCOV file.
+        let functions = vec![function_info(dir.join("src/hot.rs"), 1, 12, 14)];
+        let mut coverage = CoverageReport::default();
+        coverage.per_file.insert(
+            PathBuf::from("src/hot.rs"),
+            FileCoverage {
+                lines_total: 4,
+                lines_covered: 0,
+                uncovered_lines: vec![1, 2, 3, 4],
+            },
+        );
+
+        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+
+        assert!(
+            findings.is_empty(),
+            "cfg-blind lines_of_code dilutes uncovered_ratio (4/14 ≈ 29%) below the \
+             50% threshold, even though the truly-compiled 4 lines are 100% uncovered"
         );
     }
 
