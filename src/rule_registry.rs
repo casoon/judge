@@ -212,6 +212,23 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
+    // -- module_graph.rs ------------------------------------------------
+    RuleMetadata {
+        id: "unlinked-file",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Always evaluated (Fast Tier; `cargo judge module-graph`, subcommand-only).",
+        exclusions: "Resolves `mod` declarations (including `#[path = \"...\"]`) from every recognized Cargo target root (`lib`, `bin`, `test`, `example`, `bench`, `build.rs`); a file spliced in only via `include!(...)` has no `mod` declaration and is invisible to this scan, so it is misreported as unlinked (see module docs 'Known blind spot: include!'). Generated files are excluded by default (see `crate::ingest::SourceKind`).",
+        allowed_wording: BOUNDED_SEMANTIC_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "orphan-module",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Always evaluated (Fast Tier; `cargo judge module-graph`, subcommand-only).",
+        exclusions: "Only resolves `crate::`/`super::`/`<crate-name>::`-qualified references, plus the narrow same-file `mod foo; use foo::...;` bare-reference exception (see module docs); any other bare/self-relative reference is not resolved, so a module referenced only that way can be misreported as orphaned. Modules containing a recognized entry point (`fn main`, a `#[test]`-like function) are exempt. Scoped to file-backed (`mod foo;`) module nodes; inline `mod foo { .. }` blocks have no file of their own and are not checked.",
+        allowed_wording: BOUNDED_SEMANTIC_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+    },
     // -- ownership.rs -------------------------------------------------------
     RuleMetadata {
         id: "low-bus-factor",
@@ -548,6 +565,8 @@ mod tests {
             crate::deps::UNUSED_DEPENDENCY_RULE,
             crate::duplication::DUPLICATE_RULE,
             crate::git::HOTSPOT_RULE,
+            crate::module_graph::UNLINKED_FILE_RULE,
+            crate::module_graph::ORPHAN_MODULE_RULE,
             crate::ownership::LOW_BUS_FACTOR_RULE,
             crate::ownership::OWNERSHIP_FRAGMENTATION_RULE,
             crate::pattern::STRINGLY_ERROR_BOUNDARY_RULE,

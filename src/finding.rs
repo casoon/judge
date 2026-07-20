@@ -127,6 +127,7 @@ pub enum Severity {
 /// | `unused-feature-flag` | `derived_fact` (the feature is declared in the manifest, and zero usage of the dependency was found anywhere in the examined view — both read directly from the declared inputs, see [`crate::deps`] module docs "Feature-only evidence") |
 /// | `default-features-unused` | `derived_fact` (the manifest text explicitly sets `default-features = true`, and zero usage of the dependency was found anywhere in the examined view — see [`crate::deps`] module docs "Feature-only evidence") |
 /// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
+/// | `unlinked-file`, `orphan-module` | `bounded_semantic` (proven only within the crate's own resolved `mod` tree / the loaded workspace's cross-file reference scan — see `crate::module_graph`) |
 /// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::boundaries`] module docs "Module-level boundaries") |
 /// | `unused-dev-dependency` | `bounded_semantic` (no usage found in the examined view — tests/examples/benches and `#[cfg(test)]` modules of the declaring package; doctests are not scanned) |
 /// | `unused-dependency` | `bounded_semantic` (rustc's own `unused_crate_dependencies` lint result, narrowed to the intersection across every target compiled for the package — see [`crate::deps`] module docs "Importing rustc's `unused_crate_dependencies` lint") |
@@ -205,7 +206,9 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "dependency-cycle"
         | "module-boundary-violation"
         | "unused-dev-dependency"
-        | "unused-dependency" => EvidenceClass::BoundedSemantic,
+        | "unused-dependency"
+        | "unlinked-file"
+        | "orphan-module" => EvidenceClass::BoundedSemantic,
         "phantom-crate" | "phantom-version" | "fresh-low-reputation-dep" | "untested-hotspot" => {
             EvidenceClass::ExternalMeasurement
         }

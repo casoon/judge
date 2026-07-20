@@ -21,6 +21,7 @@ pub mod git;
 pub mod health_score;
 pub mod ingest;
 pub mod markdown;
+pub mod module_graph;
 pub mod ownership;
 pub mod pattern;
 pub mod principle;

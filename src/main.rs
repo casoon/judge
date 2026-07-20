@@ -17,6 +17,7 @@ const DEFAULT_BASELINE_DISTRIBUTION: &str = ".judge/baseline-distribution.json";
 const DEFAULT_BASELINE_PROVENANCE: &str = ".judge/baseline-provenance.json";
 const DEFAULT_BASELINE_COVERAGE: &str = ".judge/baseline-coverage.json";
 const DEFAULT_BASELINE_API_SURFACE: &str = ".judge/baseline-api-surface.json";
+const DEFAULT_BASELINE_MODULE_GRAPH: &str = ".judge/baseline-module-graph.json";
 #[cfg(feature = "deep")]
 const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
@@ -131,6 +132,11 @@ enum Command {
     /// build compiled with `--features deep` additionally checks
     /// `semver-hazard`'s `leaked_dependency_type` sub-case.
     ApiSurface(ApiSurfaceOptions),
+    /// Shows `unlinked-file`/`orphan-module` findings from resolving each
+    /// crate's real `mod` tree (see `judge::module_graph`). Subcommand-only:
+    /// not part of bare `cargo judge`, `audit`, or `health`, matching
+    /// `Distribution`/`Provenance`/`ApiSurface`'s own opt-in precedent.
+    ModuleGraph(ModuleGraphOptions),
 }
 
 #[derive(Debug, Args)]
@@ -399,6 +405,24 @@ struct ApiSurfaceOptions {
     include_generated: bool,
 }
 
+#[derive(Debug, Args)]
+struct ModuleGraphOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+    /// Save the current findings as the baseline (see todo.md §5).
+    #[arg(long)]
+    save_baseline: bool,
+    /// Compare findings against a previously saved baseline.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<PathBuf>,
+    /// Analyze generated files too (see todo.md §3.A). Off by default — an
+    /// unlinked/orphaned generated file isn't actionable the way it is in
+    /// authored code.
+    #[arg(long)]
+    include_generated: bool,
+}
+
 /// Output format shared by commands that emit findings (see todo.md §7).
 /// Not every command supports every format: SARIF exists for the
 /// report-producing commands, Markdown only for the audit/baseline delta
@@ -660,6 +684,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         Some(Command::FixPreview(options)) => run_fix_preview(options, out),
         Some(Command::ExplainRule(options)) => run_explain_rule(options, out),
         Some(Command::ApiSurface(options)) => run_api_surface(options, out),
+        Some(Command::ModuleGraph(options)) => run_module_graph(options, out),
     }
 }
 
@@ -2284,6 +2309,120 @@ fn run_distribution(
                     out,
                     "  note: {}",
                     judge::ownership::OWNERSHIP_FRAGMENTATION_NOTE
+                )?;
+            }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// `unlinked-file`/`orphan-module` findings from resolving each crate's real
+/// `mod` tree (see `judge::module_graph`). Subcommand-only, matching
+/// `Distribution`/`Provenance`/`ApiSurface`'s own opt-in precedent — no
+/// config needed, but not part of bare `cargo judge`/`audit`/`health`.
+fn run_module_graph(
+    options: ModuleGraphOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let ModuleGraphOptions {
+        format,
+        save_baseline,
+        baseline,
+        include_generated,
+    } = options;
+    let workspace = judge::ingest::load(None)?;
+
+    let report = judge::module_graph::analyze_workspace(&workspace, include_generated);
+    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
+    let excluded_generated = report.excluded_generated;
+
+    // Inline `judge-ignore` suppression (todo.md §5).
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
+
+    if save_baseline || baseline.is_some() {
+        let rule_revisions = std::collections::HashMap::from([
+            (
+                judge::module_graph::UNLINKED_FILE_RULE.to_string(),
+                judge::module_graph::UNLINKED_FILE_RULE_REVISION,
+            ),
+            (
+                judge::module_graph::ORPHAN_MODULE_RULE.to_string(),
+                judge::module_graph::ORPHAN_MODULE_RULE_REVISION,
+            ),
+        ]);
+        return handle_baseline(
+            &workspace.root,
+            &findings,
+            &analysis_errors,
+            BaselineOptions {
+                rule_revisions,
+                save: save_baseline,
+                compare_path: baseline.as_deref(),
+                default_save_path: Path::new(DEFAULT_BASELINE_MODULE_GRAPH),
+                format,
+                total_loc: judge::health_score::total_authored_loc(&workspace),
+            },
+            out,
+        );
+    }
+
+    match format {
+        OutputFormat::Json => {
+            let report = Report::with_errors(findings, analysis_errors)
+                .with_suppressed_inline(suppressed_inline);
+            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
+        }
+        OutputFormat::Sarif => {
+            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
+        }
+        OutputFormat::Markdown => {
+            return Err(unsupported_format(
+                "`module-graph`",
+                format,
+                "tty, json, sarif",
+            ));
+        }
+        OutputFormat::Tty => {
+            let (unlinked, orphaned): (Vec<&Finding>, Vec<&Finding>) = findings
+                .iter()
+                .partition(|finding| finding.rule == judge::module_graph::UNLINKED_FILE_RULE);
+            if !analysis_errors.is_empty() {
+                writeln!(
+                    out,
+                    "files skipped (parse errors): {}",
+                    analysis_errors.len()
+                )?;
+                for err in &analysis_errors {
+                    writeln!(out, "  {err}")?;
+                }
+            }
+            if excluded_generated > 0 {
+                writeln!(
+                    out,
+                    "excluded (generated): {excluded_generated} (see --include-generated)"
+                )?;
+            }
+            if suppressed_inline > 0 {
+                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
+            }
+            writeln!(out, "unlinked-file findings: {}", unlinked.len())?;
+            for finding in &unlinked {
+                writeln!(
+                    out,
+                    "  [{}] {}",
+                    severity_label(finding.severity),
+                    finding.location.item_path
+                )?;
+            }
+            writeln!(out)?;
+            writeln!(out, "orphan-module findings: {}", orphaned.len())?;
+            for finding in &orphaned {
+                writeln!(
+                    out,
+                    "  [{}] {}",
+                    severity_label(finding.severity),
+                    finding.location.item_path
                 )?;
             }
         }
