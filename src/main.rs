@@ -113,10 +113,12 @@ enum Command {
     /// todo.md §17.5). A pure documentation lookup — never runs analysis and
     /// never produces exit code 1.
     ExplainRule(ExplainRuleOptions),
-    /// Shows public-API-surface findings (`undocumented-public-item` — see
-    /// todo.md §I). Subcommand-only: not part of bare `cargo judge`,
-    /// `audit`, or `health`, matching `Distribution`/`Provenance`/
-    /// `DeadCode`'s own opt-in precedent.
+    /// Shows public-API-surface findings (`undocumented-public-item` and
+    /// `semver-hazard` — see todo.md §I). Subcommand-only: not part of bare
+    /// `cargo judge`, `audit`, or `health`, matching
+    /// `Distribution`/`Provenance`/`DeadCode`'s own opt-in precedent. A
+    /// build compiled with `--features deep` additionally checks
+    /// `semver-hazard`'s `leaked_dependency_type` sub-case.
     ApiSurface(ApiSurfaceOptions),
 }
 
@@ -2266,10 +2268,15 @@ fn run_distribution(
     Ok(CommandOutcome::Clean)
 }
 
-/// Public-API-surface findings (`undocumented-public-item` — see todo.md
-/// §I). Subcommand-only: deliberately not wired into `collect_findings`/
-/// `run_all`/`SLOP_RULES`, matching `Distribution`/`Provenance`/`DeadCode`'s
-/// own opt-in precedent.
+/// Public-API-surface findings (`undocumented-public-item` and
+/// `semver-hazard` — see todo.md §I). Subcommand-only: deliberately not
+/// wired into `collect_findings`/`run_all`/`SLOP_RULES`, matching
+/// `Distribution`/`Provenance`/`DeadCode`'s own opt-in precedent. In a build
+/// compiled with `--features deep`, also runs `semver-hazard`'s
+/// `leaked_dependency_type` sub-case (see `judge::api_surface_deep`) on top
+/// of the two Fast-Tier sub-cases — unlike `dead-code`, this command still
+/// produces useful output without the Deep Tier, so it degrades rather than
+/// erroring when built without it.
 fn run_api_surface(
     options: ApiSurfaceOptions,
     out: &mut dyn Write,
@@ -2283,11 +2290,43 @@ fn run_api_surface(
     let workspace = judge::ingest::load(None)?;
 
     let report = judge::api_surface::analyze_workspace(workspace.crates.iter(), include_generated);
-    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut findings = report.findings;
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
+
+    // The third `semver-hazard` sub-case (`leaked_dependency_type`) needs
+    // the Deep Tier's type resolution — see `judge::api_surface_deep`'s
+    // module docs. Only available in a build compiled with `--features
+    // deep`; a Fast Tier build silently skips it rather than erroring,
+    // unlike `dead-code` (whose *entire* subcommand needs the Deep Tier),
+    // because the other two `semver-hazard` sub-cases and
+    // `undocumented-public-item` are useful on their own.
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut deep_errors: Vec<String> = Vec::new();
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut deep_checked: Option<usize> = None;
+    if judge::AnalysisTier::Deep.is_available() {
+        #[cfg(feature = "deep")]
+        {
+            let deep_report = judge::api_surface_deep::analyze_workspace(&workspace)
+                .map_err(|err| CliError::Analyzer(err.to_string()))?;
+            deep_checked = Some(deep_report.checked);
+            findings.extend(deep_report.findings);
+            deep_errors = deep_report.errors.iter().map(ToString::to_string).collect();
+            analysis_errors.extend(deep_errors.iter().cloned());
+        }
+        #[cfg(not(feature = "deep"))]
+        {
+            unreachable!(
+                "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
+            );
+        }
+    }
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
 
     // API-surface-size trend against a saved baseline (see todo.md §I
     // "API-Surface-Größe pro Crate, Trend gegen Baseline") — computed before
@@ -2366,9 +2405,22 @@ fn run_api_surface(
         }
         OutputFormat::Tty => {
             writeln!(out, "undocumented public items: {}", findings.len())?;
+            if let Some(checked) = deep_checked {
+                writeln!(out, "pub fns checked (leaked_dependency_type): {checked}")?;
+            }
             if !report.errors.is_empty() {
                 writeln!(out, "files skipped (parse errors): {}", report.errors.len())?;
-                for err in &analysis_errors {
+                for err in report.errors.iter().map(ToString::to_string) {
+                    writeln!(out, "  {err}")?;
+                }
+            }
+            if !deep_errors.is_empty() {
+                writeln!(
+                    out,
+                    "leaked-dependency-type analysis errors: {}",
+                    deep_errors.len()
+                )?;
+                for err in &deep_errors {
                     writeln!(out, "  {err}")?;
                 }
             }

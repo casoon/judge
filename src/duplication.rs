@@ -1750,6 +1750,166 @@ fn calls_helper_two(x: i32) -> i32 {
         }
     }
 
+    /// Undecidable fixture (todo.md §17.5): one of two identical spans sits
+    /// behind an inactive `#[cfg(feature = "off")]` — a feature this crate
+    /// build never enables. `collect_function_tokens` runs `syn::parse_file`
+    /// on the raw source and [`crate::functions::walk_functions`] does no
+    /// `cfg` evaluation at all (attributes are only inspected for `#[test]`/
+    /// visibility elsewhere in the codebase, never for `cfg` gating), so the
+    /// cfg-gated function is parsed and tokenized exactly like a normal one.
+    /// Confirmed cfg-blind, matching every other Fast Tier rule's documented
+    /// limitation — not a bug to fix here (cfg evaluation needs a real
+    /// feature-resolution pass, out of scope for a token scanner).
+    #[test]
+    fn duplicate_behind_an_inactive_cfg_is_still_reported() {
+        let dir = TempDir::new("dup-cfg-blind");
+        let file = dir.join("cfg.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn dup_active(x: i32) -> i32 {
+    let mut total = 0;
+    for i in 0..x {
+        total += i;
+    }
+    total
+}
+
+#[cfg(feature = "off")]
+fn dup_inactive(x: i32) -> i32 {
+    let mut total = 0;
+    for i in 0..x {
+        total += i;
+    }
+    total
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+
+        assert_eq!(report.families.len(), 1, "{:?}", report.families);
+        let names: Vec<_> = report.families[0]
+            .members
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(names, ["dup_active", "dup_inactive"]);
+    }
+
+    /// Undecidable fixture (todo.md §17.5): two call sites of the same macro
+    /// name, with different arguments, that happen to have identical
+    /// call-site *syntax* (`ident ! ( ident , ident )`). Under
+    /// [`DupeMode::Semantic`], bare local-variable-shaped identifiers are
+    /// positionally normalized (see [`assign_semantic_text`]) — and macro
+    /// arguments look exactly like bare locals at the token layer, since the
+    /// scanner never expands the macro and has no idea what the arguments
+    /// mean inside it. So two calls with different but same-shaped
+    /// arguments collapse into one placeholder pattern and get reported as
+    /// duplicates, even though the two calls could expand to completely
+    /// different code — this is macro-blindness compounding with `Semantic`
+    /// mode's identifier normalization. `Mild`/`Weak` do not have this
+    /// problem here: they compare the literal argument tokens, which
+    /// differ, so no match. Documented, not fixed — expanding macros before
+    /// scanning is out of scope for a token-level Fast Tier detector.
+    #[test]
+    fn semantic_mode_matches_different_macro_call_arguments_with_identical_shape() {
+        let dir = TempDir::new("dup-macro-blind");
+        let file = dir.join("macro_calls.rs");
+        std::fs::write(
+            &file,
+            r#"
+macro_rules! foo {
+    ($a:expr, $b:expr) => { $a + $b };
+}
+
+fn calls_foo_one(a: i32, b: i32) -> i32 {
+    foo!(a, b) + a + b + a + b + a + b
+}
+
+fn calls_foo_two(c: i32, d: i32) -> i32 {
+    foo!(c, d) + c + d + c + d + c + d
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+
+        // Mild sees the literal argument tokens (`a`/`b` vs. `c`/`d`)
+        // repeated throughout the body, so every min-length window contains
+        // at least one differing token and no match is found.
+        let mild = analyze_workspace(files.iter(), DupeMode::Mild, 10, false);
+        assert!(mild.families.is_empty(), "{:?}", mild.families);
+
+        // Semantic normalizes the bare-looking macro arguments to the same
+        // positional placeholders and matches — despite never seeing what
+        // the macro actually does with them.
+        let semantic = analyze_workspace(files.iter(), DupeMode::Semantic, 10, false);
+        assert_eq!(semantic.families.len(), 1, "{:?}", semantic.families);
+        let names: Vec<_> = semantic.families[0]
+            .members
+            .iter()
+            .map(|m| m.qualified_name.as_str())
+            .collect();
+        assert_eq!(names, ["calls_foo_one", "calls_foo_two"]);
+    }
+
+    /// Undecidable fixture (todo.md §17.5): `judge-dupe-off`/`-on` markers
+    /// that sit inside an inactive `#[cfg(feature = "off")]` function, while
+    /// the *duplicated* code the comment brackets also lives entirely
+    /// inside that same inactive function. [`suppressed_ranges`] is a pure
+    /// line-number text scan over the raw source — it never consults `syn`
+    /// or evaluates `cfg` attributes at all — so it works identically
+    /// whether the bracketed lines are cfg-active or not. Confirms
+    /// suppression is exactly as cfg-blind as detection itself: the
+    /// off/on markers behave the same regardless of the enclosing cfg
+    /// attribute, so an inactive cfg block's suppression comment still
+    /// suppresses that block's (cfg-blindly detected) duplicate. Documented
+    /// behavior, not a bug.
+    #[test]
+    fn suppression_markers_inside_an_inactive_cfg_block_still_apply() {
+        let dir = TempDir::new("dup-suppress-cfg");
+        let file_a = dir.join("a.rs");
+        let file_b = dir.join("b.rs");
+        std::fs::write(
+            &file_a,
+            r#"
+#[cfg(feature = "off")]
+// judge-dupe-off: intentional protocol table duplication
+fn dup_one(x: i32) -> i32 {
+    let mut total = 0;
+    for i in 0..x {
+        total += i;
+    }
+    total
+}
+// judge-dupe-on
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &file_b,
+            r#"
+fn dup_two(x: i32) -> i32 {
+    let mut total = 0;
+    for i in 0..x {
+        total += i;
+    }
+    total
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file_a, file_b]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+
+        assert!(report.families.is_empty(), "{:?}", report.families);
+    }
+
     #[test]
     fn duplication_error_source_preserves_the_underlying_error() {
         let err = DuplicationError::Io(PathBuf::from("src/lib.rs"), std::io::Error::other("boom"));

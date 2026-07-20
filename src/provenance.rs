@@ -629,7 +629,22 @@ impl<'repo> BlameCache<'repo> {
                 repo.blame_file(
                     file_path,
                     head_id,
-                    gix::repository::blame_file::Options::default(),
+                    gix::repository::blame_file::Options {
+                        // Without this, gix does not follow a `git mv` rename
+                        // at all (see `gix_blame`'s
+                        // `tree_diff_without_rewrites_at_file_path`): a pure
+                        // rename with no content change is treated as an
+                        // `Addition`, so blame stops at the rename commit and
+                        // misattributes every pre-rename line to whoever ran
+                        // `git mv`, instead of the line's actual author.
+                        // Plain `git blame` follows renames of the blamed
+                        // file by default (no `--follow` needed — that flag
+                        // is for `git log`), so this matches that default
+                        // rather than introducing new behavior. Same fix as
+                        // `ownership.rs`'s `blame_file` call.
+                        rewrites: Some(gix::diff::Rewrites::default()),
+                        ..Default::default()
+                    },
                 )
                 .ok()
             });
@@ -910,6 +925,141 @@ mod tests {
         let (class, confidence, _) = &classes["c1"];
         assert_eq!(*class, AuthorClass::Labeled("contractor-x".to_string()));
         assert_eq!(*confidence, 0.95);
+    }
+
+    #[test]
+    fn trailer_wins_outright_over_conflicting_heuristic_signals() {
+        // `classify_commits` chains `match_label(...).or_else(classify_trailer_or_marker)
+        // .or_else(classify_heuristic)` — `Option::or_else` never evaluates a
+        // later closure once an earlier one returned `Some`. So a commit
+        // with BOTH a `Co-authored-by: Claude` trailer AND heuristic signals
+        // that would independently qualify it as an outlier (a large
+        // files-changed count, a Tier-1 "AI language model" phrase) is
+        // classified purely from the trailer: `classify_heuristic` is never
+        // even invoked for it, so the conflicting evidence is not merged,
+        // averaged, or recorded anywhere — the trailer wins outright and the
+        // heuristic signals leave no trace in the evidence.
+        let mut commits: Vec<CommitInfo> = (0..11)
+            .map(|i| commit_info(&format!("normal-{i}"), "author@example.com", 1_000 + i))
+            .collect();
+
+        let mut conflicted = commit_info("conflicted", "author@example.com", 2_000);
+        conflicted.trailers = vec![(
+            "Co-authored-by".to_string(),
+            "Claude <noreply@anthropic.com>".to_string(),
+        )];
+        conflicted.files_changed = (0..20).map(|i| PathBuf::from(format!("f{i}.rs"))).collect();
+        conflicted.message_body = "As an AI language model, I did this.".to_string();
+        commits.push(conflicted);
+
+        let classes = classify_commits(&commits, &[]);
+        let (class, confidence, evidence) = &classes["conflicted"];
+
+        assert_eq!(*class, AuthorClass::Agent("claude".to_string()));
+        assert_eq!(*confidence, TRAILER_CONFIDENCE);
+        assert_eq!(evidence["basis"], "trailer_or_marker");
+        assert!(
+            evidence.get("signals").is_none(),
+            "heuristic signals must not appear in the evidence once a trailer matched: {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn configured_label_wins_over_a_contradicting_trailer_in_the_full_pipeline() {
+        // Complements `configured_label_overrides_trailer_heuristic` (which
+        // exercises `classify_commits` directly with a synthetic
+        // `CommitInfo`) with a real git fixture through the full
+        // `analyze_workspace` pipeline: a commit carries a real
+        // `Co-authored-by: Claude` trailer (parsed by `git::walk_commits`,
+        // not hand-constructed), but a `[[provenance_label]]` also matches
+        // it via `author_email_contains`. The label wins outright — the
+        // commit's churn is attributed to `labeled-trusted-human`, not
+        // `agent-claude`.
+        let dir = TempDir::new("provenance-label-vs-trailer");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        let file = dir.join("a.rs");
+        std::fs::write(&file, "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        run_git(
+            &dir,
+            &[
+                "-c",
+                "user.email=trusted-human@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "add a\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+            ],
+            &[],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), file);
+        let label = ProvenanceLabel {
+            name: "trusted-human".to_string(),
+            trailer_contains: Vec::new(),
+            author_email_contains: vec!["trusted-human@example.com".to_string()],
+        };
+        let breakdown = analyze_workspace(&workspace, 30, &[label]);
+
+        assert!(breakdown.errors.is_empty(), "{:?}", breakdown.errors);
+        assert!(
+            breakdown
+                .findings
+                .iter()
+                .any(|f| f.id.as_str().ends_with("labeled-trusted-human")),
+            "the labeled class must win: {:?}",
+            breakdown.findings
+        );
+        assert!(
+            breakdown
+                .findings
+                .iter()
+                .all(|f| !f.id.as_str().ends_with("agent-claude")),
+            "the contradicting Claude trailer must not surface as a class despite \
+             being present in the commit: {:?}",
+            breakdown.findings
+        );
+    }
+
+    #[test]
+    fn a_repos_first_commit_with_no_history_is_unknown_not_misclassified() {
+        // The size-outlier and interval-CV heuristics both require a
+        // baseline sample (`MIN_COMMITS_FOR_SIZE_OUTLIER` = 10,
+        // `MIN_COMMITS_FOR_INTERVAL_CV` = 5) before they run at all — a
+        // repo's very first commit has no comparison basis for "unusual"
+        // file count or cadence. This documents that a first commit
+        // touching many files, with an ordinary message and no trailer, is
+        // NOT flagged as an outlier just because there's no history to
+        // compare it against: it lands in `Unknown`, not in any `agent-*`
+        // bucket.
+        let dir = TempDir::new("provenance-first-commit-no-history");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        for i in 0..15 {
+            std::fs::write(dir.join(format!("f{i}.rs")), format!("fn f{i}() {{}}\n")).unwrap();
+        }
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial import"]);
+
+        let workspace = workspace_of(dir.to_path_buf(), dir.join("f0.rs"));
+        let breakdown = analyze_workspace(&workspace, 30, &[]);
+
+        assert!(breakdown.errors.is_empty(), "{:?}", breakdown.errors);
+        assert!(
+            breakdown
+                .findings
+                .iter()
+                .any(|f| f.rule == PROVENANCE_CHURN_RULE && f.id.as_str().ends_with("unknown")),
+            "the first commit must classify as unknown: {:?}",
+            breakdown.findings
+        );
+        assert!(
+            breakdown
+                .findings
+                .iter()
+                .all(|f| !f.id.as_str().contains("agent-")),
+            "no agent-* class may appear without any evidence: {:?}",
+            breakdown.findings
+        );
     }
 
     #[test]

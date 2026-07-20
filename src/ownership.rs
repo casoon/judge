@@ -254,7 +254,20 @@ pub fn analyze_workspace(
             let outcome = repo.blame_file(
                 file_path,
                 head_id.detach(),
-                gix::repository::blame_file::Options::default(),
+                gix::repository::blame_file::Options {
+                    // Without this, gix does not follow a `git mv` rename at
+                    // all (see `gix_blame`'s `tree_diff_without_rewrites_at_file_path`):
+                    // a pure rename with no content change is treated as an
+                    // `Addition`, so blame stops at the rename commit and
+                    // misattributes every pre-rename line to whoever ran
+                    // `git mv`, instead of the line's actual author. Plain
+                    // `git blame` follows renames of the blamed file by
+                    // default (no `--follow` needed — that flag is for `git
+                    // log`), so this matches that default rather than
+                    // introducing new behavior.
+                    rewrites: Some(gix::diff::Rewrites::default()),
+                    ..Default::default()
+                },
             );
             let outcome = match outcome {
                 Ok(outcome) => outcome,
@@ -737,6 +750,224 @@ mod tests {
         assert!(report.files.is_empty());
         assert!(report.findings.is_empty());
         assert!(report.errors.is_empty());
+    }
+
+    /// Regression test for a bug found while probing `low-bus-factor`/
+    /// `ownership-fragmentation` for undecidable fixtures (todo.md §17.5):
+    /// `gix::repository::blame_file::Options::default()` leaves `rewrites:
+    /// None`, so `gix_blame` never tries rename detection for the blamed
+    /// file (see `gix_blame::file::function::tree_diff_at_file_path`, which
+    /// only retries with rewrite detection — and only for the current
+    /// commit's diff, not by walking further back — when `rewrites` is
+    /// `Some`). A pure `git mv` with no content change was, before the fix
+    /// in [`analyze_workspace`], treated as an `Addition` at the rename
+    /// commit, so blame stopped there and misattributed every pre-rename
+    /// line to whoever ran `git mv` instead of that line's actual author.
+    /// Plain `git blame <file>` (verified against the real CLI, no flags)
+    /// follows a rename of the blamed file by default — `--follow` is a
+    /// `git log`-only flag, irrelevant to `git blame` — so this was a
+    /// genuine divergence from git's own behavior, not just an
+    /// interpretation question.
+    #[test]
+    fn blame_follows_a_pure_rename_and_credits_the_original_author() {
+        let dir = TempDir::new("ownership-rename");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let old = dir.join("old.rs");
+        std::fs::write(&old, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        run_git_as(&dir, "a@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "a@example.com",
+            &["commit", "-q", "-m", "author a initial"],
+            &[],
+        );
+
+        // Renamed by a third author who never touches the content — a pure
+        // `git mv`. If blame doesn't follow the rename, these three lines
+        // get misattributed to this rename author instead of `a`.
+        let new = dir.join("new.rs");
+        run_git_as(&dir, "c@example.com", &["mv", "old.rs", "new.rs"], &[]);
+        run_git_as(
+            &dir,
+            "c@example.com",
+            &["commit", "-q", "-m", "rename"],
+            &[],
+        );
+
+        std::fs::write(
+            &new,
+            "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\nfn e() {}\n",
+        )
+        .unwrap();
+        run_git_as(&dir, "b@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "b@example.com",
+            &["commit", "-q", "-m", "author b adds"],
+            &[],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), new.clone());
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files.len(), 1);
+        let ownership = &report.files[0];
+        let by_email: std::collections::HashMap<_, _> = ownership
+            .authors
+            .iter()
+            .map(|author| (author.email.as_str(), author.lines))
+            .collect();
+        assert_eq!(by_email.get("a@example.com"), Some(&3));
+        assert_eq!(by_email.get("b@example.com"), Some(&2));
+        assert_eq!(
+            by_email.get("c@example.com"),
+            None,
+            "the rename-only commit must not be credited with any lines"
+        );
+    }
+
+    /// Undecidable fixture (todo.md §17.5): two branches independently edit
+    /// the same base line to the *same* resulting text, then merge. Since
+    /// both parents' trees are byte-identical at the merge point, `git
+    /// blame` — and, verified here, `gix`'s blame — never even looks at the
+    /// second parent's history for that line: it credits whichever parent
+    /// is checked first (`git merge`'s current-branch parent), not the
+    /// "real" independent author of the identical text on the other
+    /// branch. This isn't a bug: attributing a line that two people wrote
+    /// identically, independently, to a single "true" author is genuinely
+    /// undecidable from blame alone — `git blame` itself makes the same
+    /// first-parent-wins choice (verified against the real CLI). Documented
+    /// as a known ownership-data limitation, not fixed.
+    #[test]
+    fn merge_of_identical_independent_edits_credits_only_the_first_parents_author() {
+        let dir = TempDir::new("ownership-merge-ambiguous");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let file = dir.join("f.rs");
+        std::fs::write(&file, "line1\nline2\nline3\n").unwrap();
+        run_git_as(&dir, "base@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "base@example.com",
+            &["commit", "-q", "-m", "base"],
+            &[],
+        );
+
+        git(&dir, &["checkout", "-q", "-b", "branch-x"]);
+        std::fs::write(&file, "shared\nline2\nline3\n").unwrap();
+        run_git_as(&dir, "x@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "x@example.com",
+            &["commit", "-q", "-m", "x changes line1"],
+            &[],
+        );
+
+        git(&dir, &["checkout", "-q", "main"]);
+        git(&dir, &["checkout", "-q", "-b", "branch-y"]);
+        // Same resulting text as branch-x, written independently.
+        std::fs::write(&file, "shared\nline2\nline3\n").unwrap();
+        run_git_as(&dir, "y@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "y@example.com",
+            &["commit", "-q", "-m", "y changes line1 identically"],
+            &[],
+        );
+
+        git(&dir, &["checkout", "-q", "branch-x"]);
+        run_git_as(
+            &dir,
+            "merger@example.com",
+            &["merge", "-q", "--no-edit", "branch-y", "-m", "merge"],
+            &[],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), file.clone());
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files.len(), 1);
+        let ownership = &report.files[0];
+        let by_email: std::collections::HashMap<_, _> = ownership
+            .authors
+            .iter()
+            .map(|author| (author.email.as_str(), author.lines))
+            .collect();
+        assert_eq!(by_email.get("x@example.com"), Some(&1));
+        assert_eq!(by_email.get("base@example.com"), Some(&2));
+        assert_eq!(
+            by_email.get("y@example.com"),
+            None,
+            "y's independent, identical edit is invisible to blame once merged"
+        );
+        assert_eq!(
+            by_email.get("merger@example.com"),
+            None,
+            "a clean, non-conflicting merge commit is never itself a blame suspect"
+        );
+    }
+
+    /// Undecidable fixture (todo.md §17.5): a single real person commits
+    /// under two different email addresses (e.g. after switching employers
+    /// or machines) with no `.mailmap` in the repository to unify them.
+    /// `file_ownership` keys strictly by `author.email` (see its
+    /// `lines_by_email` map), so this one person is counted as two
+    /// authors — bus factor 2 instead of the true 1 — and `low-bus-factor`
+    /// does not fire at all, a false negative on real knowledge
+    /// concentration. This is a generic, well-known git-blame limitation
+    /// (identity resolution needs a mailmap or external identity data, both
+    /// out of scope here), not a bug in this rule's logic — documented, not
+    /// fixed.
+    #[test]
+    fn same_person_with_two_emails_and_no_mailmap_is_double_counted_as_two_authors() {
+        let dir = TempDir::new("ownership-split-identity");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let file = dir.join("solo.rs");
+        std::fs::write(&file, "fn a() {}\nfn b() {}\n").unwrap();
+        run_git_as(&dir, "solo.old@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "solo.old@example.com",
+            &["commit", "-q", "-m", "first half, old email"],
+            &[],
+        );
+
+        std::fs::write(&file, "fn a() {}\nfn b() {}\nfn c() {}\nfn d() {}\n").unwrap();
+        run_git_as(&dir, "solo.new@example.com", &["add", "."], &[]);
+        run_git_as(
+            &dir,
+            "solo.new@example.com",
+            &["commit", "-q", "-m", "second half, new email"],
+            &[],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), file.clone());
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let ownership = &report.files[0];
+        assert_eq!(
+            ownership.authors.len(),
+            2,
+            "the same person's two emails are counted as two distinct authors: {:?}",
+            ownership.authors
+        );
+        assert_eq!(
+            ownership.bus_factor, 2,
+            "the true bus factor is 1 (one person), but email-keyed blame reports 2"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.rule != LOW_BUS_FACTOR_RULE),
+            "low-bus-factor false-negatives on this file because of the split identity: {:?}",
+            report.findings
+        );
     }
 
     #[test]

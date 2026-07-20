@@ -1230,6 +1230,45 @@ mod tests {
     }
 
     #[test]
+    fn crate_boundary_violation_fires_regardless_of_cfg_gating_on_the_dependency_declaration() {
+        // `crate-boundary-violation` is deliberately scoped to what
+        // `cargo_metadata` reports for a crate's declared dependencies (see
+        // module docs) — it never inspects the actual code, so it cannot be
+        // cfg-aware either. `cargo metadata` (without `--filter-platform`,
+        // which `build_crate_graph` never passes) reports every
+        // `[target.'cfg(...)'.dependencies]` entry unconditionally,
+        // regardless of the host running judge. This test documents that: a
+        // dependency gated to `cfg(target_os = "windows")` still produces a
+        // graph edge — and therefore still fires the rule — even though this
+        // test itself does not run on Windows.
+        let dir = TempDir::new("boundaries-cfg-gated-dependency");
+        std::fs::create_dir_all(dir.join("ui").join("src")).unwrap();
+        std::fs::write(
+            dir.join("ui").join("Cargo.toml"),
+            "[package]\nname = \"ui\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[target.'cfg(target_os = \"windows\")'.dependencies]\ndb = { path = \"../db\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("ui").join("src/lib.rs"), "pub fn ui() {}\n").unwrap();
+        write_crate(&dir, "db", &[]);
+        write_workspace_manifest(&dir, &["ui", "db"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let mut r = rule("ui-must-not-touch-db", &["ui"], Reach::Direct);
+        r.forbidden = vec!["db".to_string()];
+        let config = BoundaryConfig {
+            boundaries: vec![r],
+            crate_profiles: Vec::new(),
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert_eq!(result.findings.len(), 1);
+        assert_eq!(result.findings[0].rule, BOUNDARY_VIOLATION_RULE);
+    }
+
+    #[test]
     fn required_rule_violates_when_unreachable() {
         let dir = TempDir::new("boundaries-required-missing");
         write_crate(&dir, "core", &[]);
@@ -1361,6 +1400,45 @@ mod tests {
             .collect();
         assert_eq!(cycle_findings.len(), 1);
         assert_eq!(cycle_findings[0].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn dependency_cycle_fires_for_a_cycle_formed_only_through_a_dev_dependency() {
+        // `CrateGraph::edges`'s doc comment states dependency `kind`
+        // (normal/dev/build) doesn't matter — every kind counts as an
+        // architectural edge. This documents that in practice: `a` depends
+        // on `b` normally, `b` depends on `a` only as a `[dev-dependencies]`
+        // entry (which never causes a real build-graph cycle, since dev-deps
+        // aren't used to build `b` itself) — `dependency-cycle` still fires,
+        // because `build_crate_graph` does not distinguish dependency kinds.
+        let dir = TempDir::new("boundaries-dev-dependency-cycle");
+        std::fs::create_dir_all(dir.join("a").join("src")).unwrap();
+        std::fs::write(
+            dir.join("a").join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nb = { path = \"../b\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("a").join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::create_dir_all(dir.join("b").join("src")).unwrap();
+        std::fs::write(
+            dir.join("b").join("Cargo.toml"),
+            "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dev-dependencies]\na = { path = \"../a\" }\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b").join("src/lib.rs"), "pub fn b() {}\n").unwrap();
+        write_workspace_manifest(&dir, &["a", "b"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let config = BoundaryConfig::default();
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        let cycle_findings: Vec<_> = result
+            .findings
+            .iter()
+            .filter(|f| f.rule == DEPENDENCY_CYCLE_RULE)
+            .collect();
+        assert_eq!(cycle_findings.len(), 1);
     }
 
     #[test]
@@ -1943,6 +2021,113 @@ order = ["domain", "application", "infrastructure"]
                 .findings
                 .iter()
                 .all(|f| f.rule != MODULE_BOUNDARY_VIOLATION_RULE)
+        );
+    }
+
+    #[test]
+    fn module_boundary_does_not_flag_a_self_qualified_path_reference() {
+        // Module docs "Module-level boundaries" call out that module path
+        // resolution only handles `crate::`/`super::`-leading paths (see
+        // `resolve_leading_segments`) — `self::` is deliberately not one of
+        // them. This documents the resulting false negative: a `self::`
+        // qualified reference to something that would be a violation via
+        // `crate::` is not recognized at all.
+        let dir = TempDir::new("module-boundary-self-path");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+        std::fs::write(
+            dir.join("my-core/src/lib.rs"),
+            "pub mod domain;\npub mod io;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("my-core/src/domain")).unwrap();
+        std::fs::write(
+            dir.join("my-core/src/domain/mod.rs"),
+            "pub fn run() {\n    self::io::read_file();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("my-core/src/io.rs"), "pub fn read_file() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "my-core",
+                "domain",
+                &["io"],
+            )],
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .all(|f| f.rule != MODULE_BOUNDARY_VIOLATION_RULE),
+            "a `self::`-qualified reference is not resolved, so it is never flagged \
+             even though the equivalent `crate::io::...` reference would be"
+        );
+    }
+
+    #[test]
+    fn module_boundary_misses_a_violation_in_a_file_relocated_via_path_attribute() {
+        // Module docs "Module-level boundaries" call out that module path
+        // resolution is a directory-convention heuristic, not `mod`-graph
+        // resolution — a file wired in via `#[path = "..."]` is misplaced.
+        // Here `src/domain/mod.rs` pulls in a submodule whose *physical*
+        // file lives under `src/shared/`, via `#[path = "../shared/..."]`.
+        // `module_path_for_file` derives the module path purely from the
+        // file's position on disk, so it resolves to `shared::domain_impl`
+        // — not `domain::domain_impl`, its logical position. A rule scoped
+        // to `from = "domain"` therefore never examines this file at all,
+        // even though it contains a real forbidden `crate::io` reference.
+        let dir = TempDir::new("module-boundary-path-attribute");
+        write_crate(&dir, "my-core", &[]);
+        write_workspace_manifest(&dir, &["my-core"]);
+        std::fs::write(
+            dir.join("my-core/src/lib.rs"),
+            "pub mod domain;\npub mod io;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("my-core/src/domain")).unwrap();
+        std::fs::write(
+            dir.join("my-core/src/domain/mod.rs"),
+            "#[path = \"../shared/domain_impl.rs\"]\nmod domain_impl;\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("my-core/src/shared")).unwrap();
+        std::fs::write(
+            dir.join("my-core/src/shared/domain_impl.rs"),
+            "pub fn run() {\n    crate::io::read_file();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("my-core/src/io.rs"), "pub fn read_file() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-io",
+                "my-core",
+                "domain",
+                &["io"],
+            )],
+            ..Default::default()
+        };
+
+        let result = evaluate(&workspace, &config).unwrap();
+
+        assert!(
+            result
+                .findings
+                .iter()
+                .all(|f| f.rule != MODULE_BOUNDARY_VIOLATION_RULE),
+            "the relocated file resolves to module path `shared::domain_impl`, \
+             not `domain::domain_impl`, so it falls outside the rule's `from` scope \
+             and the real crate::io reference inside it is missed"
         );
     }
 

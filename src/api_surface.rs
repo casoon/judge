@@ -12,9 +12,12 @@
 //! `#[non_exhaustive]` attribute (`missing_non_exhaustive_enum`), and a
 //! `pub struct` with at least one `pub` field and no `#[non_exhaustive]`
 //! attribute (`missing_non_exhaustive_struct_fields`). The third sub-case —
-//! a dependency's type leaking through a public signature — needs type
-//! resolution across crate boundaries the Fast Tier doesn't have; it is
-//! deliberately out of scope here, not merely forgotten.
+//! a dependency's type leaking through a `pub fn`'s parameter or return type
+//! (`leaked_dependency_type`) — needs type resolution across crate
+//! boundaries the Fast Tier doesn't have; it lives in
+//! [`crate::api_surface_deep`] instead, behind the `deep` feature, reusing
+//! this module's [`PubFnCandidate`] item population but wired into the same
+//! `semver-hazard` rule id (see that module's docs).
 //!
 //! ## Item-level visibility only
 //!
@@ -63,9 +66,10 @@ pub const UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION: u32 = 1;
 /// comment's "`semver-hazard` scope" section); `evidence.kind` distinguishes
 /// `missing_non_exhaustive_enum` from `missing_non_exhaustive_struct_fields`.
 pub const SEMVER_HAZARD_RULE: &str = "semver-hazard";
-/// Bump when either semver-hazard sub-case's logic changes (see todo.md §5
-/// "Regelversions-Schutz").
-pub const SEMVER_HAZARD_RULE_REVISION: u32 = 1;
+/// Bump when any semver-hazard sub-case's logic changes, including the
+/// Deep-Tier `leaked_dependency_type` sub-case in
+/// [`crate::api_surface_deep`] (see todo.md §5 "Regelversions-Schutz").
+pub const SEMVER_HAZARD_RULE_REVISION: u32 = 2;
 
 #[derive(Debug)]
 pub enum ApiSurfaceError {
@@ -150,11 +154,14 @@ pub struct WorkspaceApiSurface {
 }
 
 /// Parses a single Rust source file, returning every
-/// `undocumented-public-item`/`semver-hazard` finding plus the number of
-/// public top-level items counted along the way (see [`ApiSurfaceSize`]) —
-/// the shared implementation behind both [`analyze_file`] and
-/// [`analyze_workspace`], so the item-collection walk itself is written once.
-fn analyze_file_inner(path: &Path) -> Result<(Vec<Finding>, usize), ApiSurfaceError> {
+/// `undocumented-public-item`/`semver-hazard` finding, the number of public
+/// top-level items counted along the way (see [`ApiSurfaceSize`]), and the
+/// [`PubFnCandidate`]s collected along the way — the shared implementation
+/// behind [`analyze_file`], [`analyze_workspace`], and [`pub_fn_candidates`],
+/// so the item-collection walk itself is written once.
+fn analyze_file_inner(
+    path: &Path,
+) -> Result<(Vec<Finding>, usize, Vec<PubFnCandidate>), ApiSurfaceError> {
     let source = std::fs::read_to_string(path)
         .map_err(|err| ApiSurfaceError::Io(path.to_path_buf(), err))?;
     let ast =
@@ -167,15 +174,31 @@ fn analyze_file_inner(path: &Path) -> Result<(Vec<Finding>, usize), ApiSurfaceEr
         cfg_test_depth: 0,
         in_trait_impl: Vec::new(),
         item_count: 0,
+        pub_fn_candidates: Vec::new(),
     };
     visitor.visit_file(&ast);
-    Ok((visitor.findings, visitor.item_count))
+    Ok((
+        visitor.findings,
+        visitor.item_count,
+        visitor.pub_fn_candidates,
+    ))
 }
 
 /// Parses a single Rust source file and returns every `undocumented-public-item`
 /// finding in it.
 pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, ApiSurfaceError> {
-    analyze_file_inner(path).map(|(findings, _)| findings)
+    analyze_file_inner(path).map(|(findings, _, _)| findings)
+}
+
+/// Parses a single Rust source file and returns its [`PubFnCandidate`]s for
+/// the Deep Tier's `leaked_dependency_type` `semver-hazard` sub-case (see
+/// [`crate::api_surface_deep`]) — the exact same item population
+/// [`analyze_file`] already computes for `undocumented-public-item`, from the
+/// same walk. `pub(crate)`: only [`crate::api_surface_deep`] calls this; a
+/// build without the `deep` feature never does.
+#[cfg_attr(not(feature = "deep"), allow(dead_code))]
+pub(crate) fn pub_fn_candidates(path: &Path) -> Result<Vec<PubFnCandidate>, ApiSurfaceError> {
+    analyze_file_inner(path).map(|(_, _, candidates)| candidates)
 }
 
 /// Runs [`analyze_file`] over every crate's source files and aggregates the
@@ -196,7 +219,7 @@ pub fn analyze_workspace<'a>(
                 continue;
             }
             match analyze_file_inner(&file.path) {
-                Ok((mut findings, item_count)) => {
+                Ok((mut findings, item_count, _pub_fn_candidates)) => {
                     report.findings.append(&mut findings);
                     crate_item_count += item_count;
                 }
@@ -209,6 +232,28 @@ pub fn analyze_workspace<'a>(
             .insert(krate.name.clone(), crate_item_count);
     }
     report
+}
+
+/// One `pub fn` candidate for the Deep Tier's `leaked_dependency_type`
+/// `semver-hazard` sub-case (see [`crate::api_surface_deep`]): a module-level
+/// free fn or inherent-impl method matching the exact item population
+/// [`check_doc_fn`](ApiSurfaceVisitor::check_doc_fn) already computes for
+/// `undocumented-public-item` — `pub`, not `#[test]`-attributed, not
+/// `#[cfg(test)]`-gated, not inside a trait impl (see the module doc
+/// comment's "Scope" section). Collected by the exact same walk rather than
+/// re-derived, so the Fast-Tier item population and the Deep-Tier one for
+/// this rule can never drift apart. Only consumed behind the `deep` feature,
+/// hence the conditional allow (mirrors [`crate::functions::FunctionSite`]'s
+/// same pattern).
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "deep"), allow(dead_code))]
+pub struct PubFnCandidate {
+    pub item_path: String,
+    pub file: PathBuf,
+    /// Span of just the function's identifier — enough to position a Deep
+    /// Tier query on the name token, from which the fn's parameter/return
+    /// types are reached structurally (see [`crate::api_surface_deep`]).
+    pub ident_span: proc_macro2::Span,
 }
 
 /// Walks a whole parsed file, tracking the enclosing `mod`/`impl`/`trait`/
@@ -232,6 +277,13 @@ struct ApiSurfaceVisitor<'a> {
     /// alongside `undocumented-public-item`'s own check in
     /// [`check_doc`](Self::check_doc) instead of a second walk.
     item_count: usize,
+    /// `pub fn` candidates for the Deep Tier's `leaked_dependency_type`
+    /// sub-case (see [`PubFnCandidate`]), collected alongside
+    /// `undocumented-public-item`'s own check in
+    /// [`check_doc_fn`](Self::check_doc_fn) instead of a second walk. Only
+    /// consumed behind the `deep` feature.
+    #[cfg_attr(not(feature = "deep"), allow(dead_code))]
+    pub_fn_candidates: Vec<PubFnCandidate>,
 }
 
 impl ApiSurfaceVisitor<'_> {
@@ -286,6 +338,18 @@ impl ApiSurfaceVisitor<'_> {
         });
     }
 
+    /// Whether an item is `pub` and not gated by `#[cfg(test)]` (on itself or
+    /// an enclosing item) — the shared population check both
+    /// [`check_doc`](Self::check_doc) and
+    /// [`check_doc_fn`](Self::check_doc_fn) (for [`PubFnCandidate`]
+    /// collection) test against, so the two can't independently drift.
+    fn is_checkable_pub_item(&self, vis: &Visibility, attrs: &[Attribute]) -> bool {
+        if self.cfg_test_depth > 0 || attrs_have_cfg_test(attrs) {
+            return false;
+        }
+        matches!(vis, Visibility::Public(_))
+    }
+
     /// A `pub` item with no `#[doc = ...]` attribute (see [`has_doc_comment`]),
     /// unless it — or an enclosing item — is gated by `#[cfg(test)]`. Callers
     /// pass the item's own attrs and span *before* pushing that item's own
@@ -297,10 +361,7 @@ impl ApiSurfaceVisitor<'_> {
     /// kinds this rule already checks, counted once each instead of walked a
     /// second time.
     fn check_doc(&mut self, vis: &Visibility, attrs: &[Attribute], span: proc_macro2::Span) {
-        if self.cfg_test_depth > 0 || attrs_have_cfg_test(attrs) {
-            return;
-        }
-        if !matches!(vis, Visibility::Public(_)) {
+        if !self.is_checkable_pub_item(vis, attrs) {
             return;
         }
         self.item_count += 1;
@@ -311,10 +372,27 @@ impl ApiSurfaceVisitor<'_> {
     }
 
     /// Same as [`check_doc`](Self::check_doc), additionally skipping a
-    /// `#[test]`-attributed function (see todo.md §I, point 3).
-    fn check_doc_fn(&mut self, vis: &Visibility, attrs: &[Attribute], span: proc_macro2::Span) {
+    /// `#[test]`-attributed function (see todo.md §I, point 3), and
+    /// collecting a [`PubFnCandidate`] for the Deep Tier's
+    /// `leaked_dependency_type` sub-case when the function is in scope for
+    /// it. `ident_span` is the function's own identifier span (narrower than
+    /// `span`, which covers the whole item) — see [`PubFnCandidate`].
+    fn check_doc_fn(
+        &mut self,
+        vis: &Visibility,
+        attrs: &[Attribute],
+        span: proc_macro2::Span,
+        ident_span: proc_macro2::Span,
+    ) {
         if attrs.iter().any(|attr| attr.path().is_ident("test")) {
             return;
+        }
+        if self.is_checkable_pub_item(vis, attrs) {
+            self.pub_fn_candidates.push(PubFnCandidate {
+                item_path: self.current_item_path(),
+                file: self.file.to_path_buf(),
+                ident_span,
+            });
         }
         self.check_doc(vis, attrs, span);
     }
@@ -556,7 +634,7 @@ impl<'ast> Visit<'ast> for ApiSurfaceVisitor<'_> {
             self.cfg_test_depth += 1;
         }
         self.path.push(node.sig.ident.to_string());
-        self.check_doc_fn(&node.vis, &node.attrs, node.span());
+        self.check_doc_fn(&node.vis, &node.attrs, node.span(), node.sig.ident.span());
         visit::visit_item_fn(self, node);
         self.path.pop();
         if gated {
@@ -571,7 +649,7 @@ impl<'ast> Visit<'ast> for ApiSurfaceVisitor<'_> {
         }
         self.path.push(node.sig.ident.to_string());
         if !self.current_in_trait_impl() {
-            self.check_doc_fn(&node.vis, &node.attrs, node.span());
+            self.check_doc_fn(&node.vis, &node.attrs, node.span(), node.sig.ident.span());
         }
         visit::visit_impl_item_fn(self, node);
         self.path.pop();
