@@ -511,6 +511,11 @@ pub struct FixtureIndex {
     /// If set, every lookup fails with this error instead of consulting
     /// `crates` — used to test error propagation without a real network.
     forced_error: Option<String>,
+    /// When `forced_error` is set, whether to surface it as
+    /// `SlopsquatError::Connection` (simulating a real network outage, e.g.
+    /// a timeout) instead of the default `SlopsquatError::Other` (e.g. an
+    /// unparsable response) — see [`Self::with_connection_error`].
+    forced_connection_error: bool,
 }
 
 impl FixtureIndex {
@@ -527,12 +532,26 @@ impl FixtureIndex {
         self.forced_error = Some(message.to_string());
         self
     }
+
+    /// Like [`Self::with_error`], but every lookup fails with
+    /// `SlopsquatError::Connection` instead of `SlopsquatError::Other` —
+    /// simulates a network-level outage (DNS failure, timeout, ...) rather
+    /// than a per-crate lookup failure (bad status, unparsable body, ...).
+    pub fn with_connection_error(mut self, message: &str) -> Self {
+        self.forced_error = Some(message.to_string());
+        self.forced_connection_error = true;
+        self
+    }
 }
 
 impl CratesIoIndex for FixtureIndex {
     fn lookup(&self, crate_name: &str) -> Result<Option<IndexEntry>, SlopsquatError> {
         if let Some(message) = &self.forced_error {
-            return Err(SlopsquatError::Other(message.clone().into()));
+            return Err(if self.forced_connection_error {
+                SlopsquatError::Connection(message.clone().into())
+            } else {
+                SlopsquatError::Other(message.clone().into())
+            });
         }
         Ok(self.crates.get(crate_name).map(|versions| IndexEntry {
             versions: versions.clone(),
@@ -545,6 +564,9 @@ impl CratesIoIndex for FixtureIndex {
 #[derive(Default)]
 pub struct FixtureMetadata {
     crates: HashMap<String, CrateMetadata>,
+    /// If set, every lookup fails with this error instead of consulting
+    /// `crates` — mirrors [`FixtureIndex::forced_error`].
+    forced_error: Option<String>,
 }
 
 impl FixtureMetadata {
@@ -556,10 +578,18 @@ impl FixtureMetadata {
         self.crates.insert(name.to_string(), metadata);
         self
     }
+
+    pub fn with_error(mut self, message: &str) -> Self {
+        self.forced_error = Some(message.to_string());
+        self
+    }
 }
 
 impl CratesIoMetadata for FixtureMetadata {
     fn metadata(&self, crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError> {
+        if let Some(message) = &self.forced_error {
+            return Err(SlopsquatError::Other(message.clone().into()));
+        }
         Ok(self.crates.get(crate_name).cloned())
     }
 }
@@ -954,6 +984,32 @@ edition = "2021"
         assert_eq!(levenshtein("kitten", "sitting"), 3);
     }
 
+    #[test]
+    fn a_structurally_similar_but_plausibly_legitimate_successor_name_is_still_flagged() {
+        // "anyhow2" reads like a plausible name for a legitimate v2
+        // successor/fork of "anyhow" -- but unlike a same-family suffix
+        // (`anyhow_v2`, excluded by `is_family_pair`), it is exactly one edit
+        // away from the popular crate, which is structurally indistinguishable
+        // from a typosquat. This is not a threshold edge case (see the
+        // ordinary near-miss/exact-match tests above) -- it's a documented
+        // limitation: the rule cannot tell "intentional successor" from
+        // "typo" apart, only proximity. It fires here regardless, which is
+        // the expected, hedged (`Warn`, `heuristic`) behavior, not a bug.
+        let dir = TempDir::new("slopsquat-collision-legit-successor");
+        let manifest = write_manifest(&dir, &[("anyhow2", "1.0")]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let findings = analyze_name_collision(&workspace);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, NAME_COLLISION_RISK_RULE);
+        assert_eq!(findings[0].severity, Severity::Warn);
+        assert_eq!(findings[0].evidence_class, EvidenceClass::Heuristic);
+        let evidence = findings[0].evidence.as_ref().unwrap();
+        assert_eq!(evidence["nearest_popular_crate"], "anyhow");
+        assert_eq!(evidence["edit_distance"], 1);
+    }
+
     // -- phantom-crate / phantom-version --
 
     #[test]
@@ -1020,6 +1076,32 @@ edition = "2021"
 
         assert!(report.findings.is_empty());
         assert_eq!(report.errors.len(), 1);
+    }
+
+    #[test]
+    fn a_simulated_network_outage_never_produces_a_phantom_crate_finding() {
+        // A connection-level failure (DNS, timeout, TLS handshake -- see
+        // `is_connection_error`) means crates.io itself wasn't reachable, not
+        // that any of these crates don't exist. This must never be
+        // interpreted as `phantom-crate`/`phantom-version` evidence -- it has
+        // to surface as a report error instead. Two dependencies are declared
+        // so this also exercises the de-duplication in
+        // `analyze_phantom_dependencies` (one connection error message for
+        // the whole run, not one per dependency).
+        let dir = TempDir::new("slopsquat-phantom-network-outage");
+        let manifest = write_manifest(&dir, &[("widgetcrate", "1.0"), ("othercrate", "1.0")]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let index = FixtureIndex::new().with_connection_error("connection timed out");
+
+        let report = analyze_phantom_dependencies(&workspace, &index);
+
+        assert!(
+            report.findings.is_empty(),
+            "a network outage must never be reported as a phantom-crate/phantom-version finding: {:?}",
+            report.findings
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("unreachable"));
     }
 
     // -- fresh-low-reputation-dep --
@@ -1102,6 +1184,26 @@ edition = "2021"
         };
         let report = analyze_fresh_low_reputation(&workspace, &metadata_source, &strict_config);
         assert_eq!(report.findings.len(), 1);
+    }
+
+    #[test]
+    fn a_metadata_lookup_error_surfaces_as_an_error_with_no_findings_and_no_panic() {
+        // Same non-negotiable as the phantom-crate/phantom-version network
+        // tests above: an unparsable REST response, a 500, or any other
+        // lookup failure must not be silently read as "not fresh/low-rep" (0
+        // findings, indistinguishable from an established, well-downloaded
+        // crate) -- it has to surface as a report error, and produce no
+        // finding for the affected dependency.
+        let dir = TempDir::new("slopsquat-fresh-error");
+        let manifest = write_manifest(&dir, &[("brandnewcrate", "1.0")]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let metadata_source = FixtureMetadata::new().with_error("unparsable response body");
+        let config = SlopsquatConfig::default();
+
+        let report = analyze_fresh_low_reputation(&workspace, &metadata_source, &config);
+
+        assert!(report.findings.is_empty());
+        assert_eq!(report.errors.len(), 1);
     }
 
     #[test]

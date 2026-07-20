@@ -38,6 +38,7 @@
 //! functions, and anything gated by `#[cfg(test)]` (on the item itself or an
 //! enclosing item).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -49,7 +50,7 @@ use syn::{
 };
 
 use crate::finding::{Finding, Location, Origin, Severity};
-use crate::ingest::SourceFile;
+use crate::ingest::CrateInfo;
 
 /// Rule id for a module-level `pub` item with no doc comment (see todo.md
 /// §I).
@@ -83,6 +84,58 @@ impl std::fmt::Display for ApiSurfaceError {
 
 impl std::error::Error for ApiSurfaceError {}
 
+/// Per-crate count of public top-level API items — `pub fn`/`struct`/`enum`/
+/// `trait`/`const`/`static`/`type` at module level, plus a `pub fn` inside an
+/// inherent `impl` (the same item kinds
+/// [`check_doc`](ApiSurfaceVisitor::check_doc) already visits for
+/// `undocumented-public-item`, reused rather than duplicated). A pure count,
+/// not a finding — a report metadatum like `Report.counts`/
+/// `analysis_universe`, with no fail/warn/info severity of its own (see
+/// todo.md §I "API-Surface-Größe pro Crate, Trend gegen Baseline").
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ApiSurfaceSize {
+    pub per_crate: HashMap<String, usize>,
+}
+
+/// One crate's api-surface-size trend against a baseline (see
+/// [`ApiSurfaceSize`]'s doc comment). `delta` is `None` when the baseline
+/// recorded no `api_surface_size` at all — an older baseline schema, or one
+/// saved by a different command — or the crate didn't exist in it yet,
+/// mirroring how [`crate::health_score::Trend::NotComparable`] reports an
+/// explicit reason instead of a false delta, at per-crate granularity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateSizeTrend {
+    pub crate_name: String,
+    pub item_count: usize,
+    pub delta: Option<i64>,
+}
+
+/// Computes [`CrateSizeTrend`] for every crate in `current`, sorted by crate
+/// name for stable output. `baseline_size` is the baseline's stored
+/// `api_surface_size` (`None` when absent — see [`CrateSizeTrend`]'s doc
+/// comment).
+pub fn size_trend(
+    current: &ApiSurfaceSize,
+    baseline_size: Option<&HashMap<String, usize>>,
+) -> Vec<CrateSizeTrend> {
+    let mut trend: Vec<CrateSizeTrend> = current
+        .per_crate
+        .iter()
+        .map(|(crate_name, &item_count)| {
+            let delta = baseline_size
+                .and_then(|baseline| baseline.get(crate_name))
+                .map(|&previous| item_count as i64 - previous as i64);
+            CrateSizeTrend {
+                crate_name: crate_name.clone(),
+                item_count,
+                delta,
+            }
+        })
+        .collect();
+    trend.sort_by(|a, b| a.crate_name.cmp(&b.crate_name));
+    trend
+}
+
 /// Aggregated api-surface findings across a set of files, keeping findings
 /// separate from files that could not be parsed.
 #[derive(Debug, Default)]
@@ -92,11 +145,16 @@ pub struct WorkspaceApiSurface {
     /// Generated files skipped because `include_generated` was `false` (see
     /// todo.md §3.A "Generated-Code-Policy").
     pub excluded_generated: usize,
+    /// Per-crate api-surface-size count (see [`ApiSurfaceSize`]).
+    pub api_surface_size: ApiSurfaceSize,
 }
 
-/// Parses a single Rust source file and returns every `undocumented-public-item`
-/// finding in it.
-pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, ApiSurfaceError> {
+/// Parses a single Rust source file, returning every
+/// `undocumented-public-item`/`semver-hazard` finding plus the number of
+/// public top-level items counted along the way (see [`ApiSurfaceSize`]) —
+/// the shared implementation behind both [`analyze_file`] and
+/// [`analyze_workspace`], so the item-collection walk itself is written once.
+fn analyze_file_inner(path: &Path) -> Result<(Vec<Finding>, usize), ApiSurfaceError> {
     let source = std::fs::read_to_string(path)
         .map_err(|err| ApiSurfaceError::Io(path.to_path_buf(), err))?;
     let ast =
@@ -108,29 +166,47 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, ApiSurfaceError> {
         findings: Vec::new(),
         cfg_test_depth: 0,
         in_trait_impl: Vec::new(),
+        item_count: 0,
     };
     visitor.visit_file(&ast);
-    Ok(visitor.findings)
+    Ok((visitor.findings, visitor.item_count))
 }
 
-/// Runs [`analyze_file`] over every file in `source_files` and aggregates the
-/// results. Generated files are skipped unless `include_generated` is set
-/// (see todo.md §3.A) — documentation completeness on generated code isn't
-/// actionable the way it is on authored code.
+/// Parses a single Rust source file and returns every `undocumented-public-item`
+/// finding in it.
+pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, ApiSurfaceError> {
+    analyze_file_inner(path).map(|(findings, _)| findings)
+}
+
+/// Runs [`analyze_file`] over every crate's source files and aggregates the
+/// results, plus each crate's api-surface-size count (see [`ApiSurfaceSize`]).
+/// Generated files are skipped unless `include_generated` is set (see
+/// todo.md §3.A) — documentation completeness, and surface size, on
+/// generated code isn't actionable the way it is on authored code.
 pub fn analyze_workspace<'a>(
-    source_files: impl IntoIterator<Item = &'a SourceFile>,
+    crates: impl IntoIterator<Item = &'a CrateInfo>,
     include_generated: bool,
 ) -> WorkspaceApiSurface {
     let mut report = WorkspaceApiSurface::default();
-    for file in source_files {
-        if !include_generated && !file.kind.is_locally_reportable() {
-            report.excluded_generated += 1;
-            continue;
+    for krate in crates {
+        let mut crate_item_count = 0;
+        for file in &krate.source_files {
+            if !include_generated && !file.kind.is_locally_reportable() {
+                report.excluded_generated += 1;
+                continue;
+            }
+            match analyze_file_inner(&file.path) {
+                Ok((mut findings, item_count)) => {
+                    report.findings.append(&mut findings);
+                    crate_item_count += item_count;
+                }
+                Err(err) => report.errors.push(err),
+            }
         }
-        match analyze_file(&file.path) {
-            Ok(mut findings) => report.findings.append(&mut findings),
-            Err(err) => report.errors.push(err),
-        }
+        report
+            .api_surface_size
+            .per_crate
+            .insert(krate.name.clone(), crate_item_count);
     }
     report
 }
@@ -151,6 +227,11 @@ struct ApiSurfaceVisitor<'a> {
     /// enclosing `impl` block — mirrors [`crate::functions::Walker`]'s same
     /// stack.
     in_trait_impl: Vec<bool>,
+    /// Count of `pub`, non-`#[cfg(test)]`-gated items visited so far — the
+    /// api-surface-size count (see [`ApiSurfaceSize`]), incremented
+    /// alongside `undocumented-public-item`'s own check in
+    /// [`check_doc`](Self::check_doc) instead of a second walk.
+    item_count: usize,
 }
 
 impl ApiSurfaceVisitor<'_> {
@@ -209,6 +290,12 @@ impl ApiSurfaceVisitor<'_> {
     /// unless it — or an enclosing item — is gated by `#[cfg(test)]`. Callers
     /// pass the item's own attrs and span *before* pushing that item's own
     /// name onto `path`, so `current_item_path` already reflects it.
+    ///
+    /// Also increments `item_count` for every `pub`, non-`#[cfg(test)]`-gated
+    /// item this visits, whether or not it ends up flagged — that is exactly
+    /// the api-surface-size count (see [`ApiSurfaceSize`]): the same item
+    /// kinds this rule already checks, counted once each instead of walked a
+    /// second time.
     fn check_doc(&mut self, vis: &Visibility, attrs: &[Attribute], span: proc_macro2::Span) {
         if self.cfg_test_depth > 0 || attrs_have_cfg_test(attrs) {
             return;
@@ -216,6 +303,7 @@ impl ApiSurfaceVisitor<'_> {
         if !matches!(vis, Visibility::Public(_)) {
             return;
         }
+        self.item_count += 1;
         if has_doc_comment(attrs) {
             return;
         }
@@ -496,6 +584,7 @@ impl<'ast> Visit<'ast> for ApiSurfaceVisitor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::SourceFile;
     use crate::test_util::TempDir;
 
     fn write_and_analyze(dir: &TempDir, source: &str) -> Vec<Finding> {
@@ -638,6 +727,21 @@ mod tests {
         }
     }
 
+    /// A minimal [`CrateInfo`] fixture wrapping `source_files` — the other
+    /// fields aren't read by this module's own analysis (mirrors
+    /// `deps.rs`'s own `CrateInfo` test fixtures).
+    fn test_crate(dir: &TempDir, name: &str, source_files: Vec<SourceFile>) -> CrateInfo {
+        CrateInfo {
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            manifest_path: dir.join("Cargo.toml"),
+            root: dir.to_path_buf(),
+            source_files,
+            entry_points: Vec::new(),
+            dependencies: Vec::new(),
+        }
+    }
+
     #[test]
     fn analyze_workspace_skips_generated_files_unless_included() {
         let dir = TempDir::new("api-surface-generated");
@@ -646,21 +750,94 @@ mod tests {
         std::fs::write(&authored_file, "pub fn ok() {}\n").unwrap();
         std::fs::write(&generated_file, "pub fn also_ok() {}\n").unwrap();
 
-        let files = [
-            authored(authored_file),
-            SourceFile {
-                path: generated_file,
-                kind: crate::ingest::SourceKind::Generated,
-            },
-        ];
+        let krate = test_crate(
+            &dir,
+            "fixture",
+            vec![
+                authored(authored_file),
+                SourceFile {
+                    path: generated_file,
+                    kind: crate::ingest::SourceKind::Generated,
+                },
+            ],
+        );
 
-        let excluded = analyze_workspace(files.iter(), false);
+        let excluded = analyze_workspace([&krate], false);
         assert_eq!(excluded.findings.len(), 1);
         assert_eq!(excluded.excluded_generated, 1);
+        assert_eq!(excluded.api_surface_size.per_crate["fixture"], 1);
 
-        let included = analyze_workspace(files.iter(), true);
+        let included = analyze_workspace([&krate], true);
         assert_eq!(included.findings.len(), 2);
         assert_eq!(included.excluded_generated, 0);
+        assert_eq!(included.api_surface_size.per_crate["fixture"], 2);
+    }
+
+    #[test]
+    fn analyze_workspace_counts_public_items_per_crate() {
+        let dir = TempDir::new("api-surface-size");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "/// Doc.\npub fn a() {}\n\n/// Doc.\npub fn b() {}\n\nfn private() {}\n",
+        )
+        .unwrap();
+        let krate = test_crate(&dir, "fixture", vec![authored(file)]);
+
+        let report = analyze_workspace([&krate], false);
+        assert!(
+            report.findings.is_empty(),
+            "unexpected findings: {:?}",
+            report.findings
+        );
+        assert_eq!(report.api_surface_size.per_crate.len(), 1);
+        assert_eq!(report.api_surface_size.per_crate["fixture"], 2);
+    }
+
+    #[test]
+    fn analyze_workspace_counts_each_crate_separately() {
+        let dir_a = TempDir::new("api-surface-size-crate-a");
+        let file_a = dir_a.join("lib.rs");
+        std::fs::write(&file_a, "/// Doc.\npub fn a() {}\n").unwrap();
+        let krate_a = test_crate(&dir_a, "crate-a", vec![authored(file_a)]);
+
+        let dir_b = TempDir::new("api-surface-size-crate-b");
+        let file_b = dir_b.join("lib.rs");
+        std::fs::write(
+            &file_b,
+            "/// Doc.\npub fn a() {}\n\n/// Doc.\npub fn b() {}\n\n/// Doc.\npub fn c() {}\n",
+        )
+        .unwrap();
+        let krate_b = test_crate(&dir_b, "crate-b", vec![authored(file_b)]);
+
+        let report = analyze_workspace([&krate_a, &krate_b], false);
+        assert_eq!(report.api_surface_size.per_crate.len(), 2);
+        assert_eq!(report.api_surface_size.per_crate["crate-a"], 1);
+        assert_eq!(report.api_surface_size.per_crate["crate-b"], 3);
+    }
+
+    #[test]
+    fn size_trend_reports_delta_against_a_baseline() {
+        let mut current = ApiSurfaceSize::default();
+        current.per_crate.insert("fixture".to_string(), 5);
+        let baseline = HashMap::from([("fixture".to_string(), 3)]);
+
+        let trend = size_trend(&current, Some(&baseline));
+        assert_eq!(trend.len(), 1);
+        assert_eq!(trend[0].crate_name, "fixture");
+        assert_eq!(trend[0].item_count, 5);
+        assert_eq!(trend[0].delta, Some(2));
+    }
+
+    #[test]
+    fn size_trend_is_not_comparable_without_a_baseline_size() {
+        let mut current = ApiSurfaceSize::default();
+        current.per_crate.insert("fixture".to_string(), 5);
+
+        let trend = size_trend(&current, None);
+        assert_eq!(trend.len(), 1);
+        assert_eq!(trend[0].item_count, 5);
+        assert_eq!(trend[0].delta, None);
     }
 
     #[test]
@@ -826,16 +1003,20 @@ pub enum Bar {
         )
         .unwrap();
 
-        let files = [SourceFile {
-            path: generated_file,
-            kind: crate::ingest::SourceKind::Generated,
-        }];
+        let krate = test_crate(
+            &dir,
+            "fixture",
+            vec![SourceFile {
+                path: generated_file,
+                kind: crate::ingest::SourceKind::Generated,
+            }],
+        );
 
-        let excluded = analyze_workspace(files.iter(), false);
+        let excluded = analyze_workspace([&krate], false);
         assert!(semver_hazard_findings(&excluded.findings).is_empty());
         assert_eq!(excluded.excluded_generated, 1);
 
-        let included = analyze_workspace(files.iter(), true);
+        let included = analyze_workspace([&krate], true);
         assert_eq!(semver_hazard_findings(&included.findings).len(), 1);
     }
 }

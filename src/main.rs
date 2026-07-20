@@ -1101,6 +1101,7 @@ fn handle_baseline(
         analysis_errors,
         options,
         None,
+        None,
         out,
     )
 }
@@ -1110,12 +1111,20 @@ fn handle_baseline(
 /// --baseline` computes one — see todo.md §15.1: the trend is emitted in
 /// JSON too, with an explicit `comparable: false` reason instead of a false
 /// delta). TTY trend output stays in `run_health`, written before this runs.
+///
+/// `api_surface_size` is `Some` only for `cargo judge api-surface
+/// --save-baseline` — it's attached to the saved [`judge::baseline::Baseline`]
+/// (see [`judge::baseline::Baseline::with_api_surface_size`]). The
+/// api-surface-size *trend* against a compared baseline is computed and
+/// printed by `run_api_surface` itself, before this runs, the same way
+/// `run_health` handles the health-score trend for TTY.
 fn handle_baseline_with_trend(
     workspace_root: &Path,
     findings: &[Finding],
     analysis_errors: &[String],
     options: BaselineOptions<'_>,
     score_trend: Option<&judge::health_score::Trend>,
+    api_surface_size: Option<&std::collections::HashMap<String, usize>>,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let BaselineOptions {
@@ -1148,13 +1157,16 @@ fn handle_baseline_with_trend(
     if save {
         let commit = judge::git::head_commit(workspace_root)?;
         let config = load_judge_toml(workspace_root)?;
-        let baseline = judge::baseline::Baseline::new(
+        let mut baseline = judge::baseline::Baseline::new(
             &findings,
             commit,
             rule_revisions,
             total_loc,
             judge::health_score::ScoreContext::from_profiles(&config.crate_profiles),
         );
+        if let Some(size) = api_surface_size {
+            baseline = baseline.with_api_surface_size(size.clone());
+        }
         let save_path = workspace_root.join(default_save_path);
         judge::baseline::save(&save_path, &baseline)?;
         writeln!(
@@ -2270,16 +2282,32 @@ fn run_api_surface(
     } = options;
     let workspace = judge::ingest::load(None)?;
 
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let report = judge::api_surface::analyze_workspace(source_files, include_generated);
+    let report = judge::api_surface::analyze_workspace(workspace.crates.iter(), include_generated);
     let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (findings, suppressed_inline) =
         judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
+
+    // API-surface-size trend against a saved baseline (see todo.md §I
+    // "API-Surface-Größe pro Crate, Trend gegen Baseline") — computed before
+    // `handle_baseline`/`handle_baseline_with_trend` run below, same "trend
+    // vor Absolutwert" ordering `run_health` uses for the health-score
+    // trend, since a failing findings-delta verdict there ends the run
+    // before reaching any code after it. `baseline_size` stays `None` for a
+    // plain run and for `--save-baseline` — every crate's `delta` is then
+    // `None` too, which is exactly what a save needs (only `item_count`
+    // matters there).
+    let baseline_size = if !save_baseline && let Some(path) = &baseline {
+        judge::baseline::load(path)?.api_surface_size
+    } else {
+        None
+    };
+    let size_trend =
+        judge::api_surface::size_trend(&report.api_surface_size, baseline_size.as_ref());
+    if matches!(format, OutputFormat::Tty) {
+        print_api_surface_size(out, &size_trend, baseline.is_some() && !save_baseline)?;
+    }
 
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([
@@ -2292,7 +2320,11 @@ fn run_api_surface(
                 judge::api_surface::SEMVER_HAZARD_RULE_REVISION,
             ),
         ]);
-        return handle_baseline(
+        let current_size: std::collections::HashMap<String, usize> = size_trend
+            .iter()
+            .map(|trend| (trend.crate_name.clone(), trend.item_count))
+            .collect();
+        return handle_baseline_with_trend(
             &workspace.root,
             &findings,
             &analysis_errors,
@@ -2304,6 +2336,8 @@ fn run_api_surface(
                 format,
                 total_loc: judge::health_score::total_authored_loc(&workspace),
             },
+            None,
+            Some(&current_size),
             out,
         );
     }
@@ -2311,7 +2345,13 @@ fn run_api_surface(
     match format {
         OutputFormat::Json => {
             let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
+                .with_suppressed_inline(suppressed_inline)
+                .with_api_surface_size(
+                    size_trend
+                        .iter()
+                        .map(|trend| (trend.crate_name.clone(), trend.item_count))
+                        .collect(),
+                );
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
         OutputFormat::Sarif => {
@@ -2355,6 +2395,42 @@ fn run_api_surface(
         }
     }
     Ok(CommandOutcome::Clean)
+}
+
+/// One `api surface: <crate> <count> items` line per crate (see todo.md §I
+/// "API-Surface-Größe pro Crate, Trend gegen Baseline"). Appends `(Δ<delta>
+/// vs baseline)` when [`judge::api_surface::CrateSizeTrend::delta`] is
+/// comparable; when `--baseline` was given but the loaded baseline recorded
+/// no `api_surface_size` (older schema, or a baseline saved by a different
+/// command) or lacks that particular crate, `baseline_requested` makes this
+/// say so explicitly instead of silently printing a plain count as if no
+/// baseline had been given (mirrors [`print_score_trend`]'s "explicit reason
+/// instead of a false delta" rule).
+fn print_api_surface_size(
+    out: &mut dyn Write,
+    trend: &[judge::api_surface::CrateSizeTrend],
+    baseline_requested: bool,
+) -> std::io::Result<()> {
+    for crate_trend in trend {
+        match crate_trend.delta {
+            Some(delta) => writeln!(
+                out,
+                "api surface: {} {} items (\u{394}{delta:+} vs baseline)",
+                crate_trend.crate_name, crate_trend.item_count
+            )?,
+            None if baseline_requested => writeln!(
+                out,
+                "api surface: {} {} items (not comparable to baseline)",
+                crate_trend.crate_name, crate_trend.item_count
+            )?,
+            None => writeln!(
+                out,
+                "api surface: {} {} items",
+                crate_trend.crate_name, crate_trend.item_count
+            )?,
+        }
+    }
+    Ok(())
 }
 
 /// Heuristic author-class breakdowns of churn, duplication, and suppression
@@ -3328,6 +3404,7 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
                 total_loc,
             },
             score_trend.as_ref(),
+            None,
             out,
         );
     }
@@ -3895,6 +3972,107 @@ mod tests {
             "unexpected output: {text}"
         );
         assert!(text.contains("hello"), "unexpected output: {text}");
+    }
+
+    /// (c) `--save-baseline` records each crate's api-surface-size count; a
+    /// later run with 2 more `pub fn`s shows the delta against it (see
+    /// todo.md §I "API-Surface-Größe pro Crate, Trend gegen Baseline").
+    #[test]
+    fn api_surface_baseline_shows_a_size_delta() {
+        let dir = TempDir::new("api-surface-baseline-delta");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            api_surface_cli(OutputFormat::Tty, true, None),
+            &mut out,
+        )
+        .expect("saving a baseline must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("api surface: fixture 1 items"),
+            "unexpected output: {text}"
+        );
+
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn hello() {}\n\npub fn a() {}\n\npub fn b() {}\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add two more pub fns"]);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            api_surface_cli(
+                OutputFormat::Tty,
+                false,
+                Some(PathBuf::from(DEFAULT_BASELINE_API_SURFACE)),
+            ),
+            &mut out,
+        )
+        .expect("comparing against the baseline must not error");
+        // The two new items are `undocumented-public-item` findings, but
+        // that rule is `Severity::Info` — informational findings never fail
+        // the verdict (see `judge::baseline::Delta::verdict`).
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("api surface: fixture 3 items (\u{394}+2 vs baseline)"),
+            "unexpected output: {text}"
+        );
+    }
+
+    /// (d) A baseline saved before `api_surface_size` existed — or by some
+    /// other command's `--save-baseline` — still loads; the trend line says
+    /// "not comparable" instead of crashing or showing a false delta (see
+    /// todo.md §I, and `judge::baseline`'s own
+    /// `baseline_without_api_surface_size_still_loads` unit test for the same
+    /// backward-compatibility rule at the schema level).
+    #[test]
+    fn api_surface_baseline_without_size_field_is_not_comparable() {
+        let dir = TempDir::new("api-surface-baseline-old-schema");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+        let commit = commit_sha(&dir, "HEAD");
+
+        let baseline_path = dir.join("old-baseline.json");
+        std::fs::write(
+            &baseline_path,
+            format!(
+                r#"{{
+                    "schema_version": 2,
+                    "judge_version": "0.1.0",
+                    "commit": "{commit}",
+                    "rule_revisions": {{}},
+                    "total_loc": 1,
+                    "findings": []
+                }}"#
+            ),
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            api_surface_cli(OutputFormat::Tty, false, Some(baseline_path)),
+            &mut out,
+        )
+        .expect("comparing against an old-schema baseline must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("api surface: fixture 1 items (not comparable to baseline)"),
+            "unexpected output: {text}"
+        );
     }
 
     /// A fixture crate with two `catch-all-error` boundary functions and a

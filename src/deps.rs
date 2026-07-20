@@ -1245,6 +1245,46 @@ edition = "2021"
     }
 
     #[test]
+    fn a_normal_dependency_used_only_inside_a_platform_cfg_gate_is_not_misclassified_as_dev_only() {
+        // The dependency is referenced only inside a
+        // `#[cfg(target_os = "windows")]`-gated module in src/lib.rs -- code
+        // that will never actually compile on most developer/CI machines.
+        // Usage-domain classification is purely path-based (see module
+        // docs "Usage-domain classification"), and `collect_identifiers`'s
+        // syn-based scan doesn't evaluate `cfg` predicates at all -- it just
+        // records the path reference inside a file that isn't under
+        // tests/examples/benches. So this still counts as `Normal`-domain
+        // usage: the todo.md §17.5 hypothesis (fast-tier usage detection
+        // mis-attributing cfg-gated usage as "only from tests/examples")
+        // does not hold here. Documents the actual (correct, non-buggy)
+        // behavior.
+        let dir = TempDir::new("deps-platform-cfg-gate");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[(
+                "src/lib.rs",
+                "#[cfg(target_os = \"windows\")]\nmod windows {\n    pub fn go() { depcrate::noop(); }\n}\n",
+            )],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == MISPLACED_DEPENDENCY_KIND_RULE),
+            "a cfg-gated normal-domain usage must not be misclassified as dev-only: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
     fn a_normal_dependency_used_from_src_and_tests_is_not_flagged() {
         let dir = TempDir::new("deps-src-and-tests");
         let manifest = write_fixture(
@@ -1888,5 +1928,37 @@ edition = "2021"
                 .iter()
                 .any(|f| f.rule == UNUSED_DEPENDENCY_RULE)
         );
+    }
+
+    #[test]
+    fn a_genuine_compile_error_surfaces_as_a_report_error_not_as_zero_findings() {
+        // If `cargo check --workspace --all-targets` fails because the
+        // workspace doesn't compile at all (a real syntax error here,
+        // unrelated to the lint), that must not be silently read as "the
+        // lint ran and found zero unused dependencies" -- those two outcomes
+        // look identical as an empty `findings` vec, but mean very different
+        // things. It has to surface as a `DepsError::RustcCheck` instead, so
+        // the caller can tell "checked, nothing unused" apart from "could not
+        // check at all".
+        let dir = TempDir::new("deps-rustc-lint-compile-error");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[("src/lib.rs", "this is not valid rust syntax {{{\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_rustc_unused_dependencies(&workspace);
+
+        assert!(
+            report.findings.is_empty(),
+            "unexpected findings from an unbuildable workspace: {:?}",
+            report.findings
+        );
+        assert_eq!(report.errors.len(), 1);
+        assert!(matches!(report.errors[0], DepsError::RustcCheck(_)));
     }
 }

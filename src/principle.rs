@@ -2246,4 +2246,392 @@ mod tests {
         assert!(principles.contains(&DesignPrinciple::FunctionalCoreImperativeShell));
         assert!(cohesion_heuristics(&heuristics).is_empty());
     }
+
+    // --- Multi-crate workspace fixtures (todo.md §16.7) ---------------------
+    //
+    // Everything above builds a single synthetic crate (`workspace_with_crate`)
+    // or, for `DependencyInversion`, a single real on-disk crate inside a
+    // one-member workspace (`dependency_inversion_workspace`). The tests below
+    // instead build a real on-disk `[workspace] members = [...]` with *two*
+    // crates via `crate::ingest::load` (the same `cargo metadata`-backed path
+    // `dependency_inversion_workspace` and `dep_graph.rs`'s own multi-crate
+    // fixtures already use), to prove each rule stays crate-local: evidence
+    // from one crate does not bleed into another, and an unrelated second
+    // crate in the same workspace neither gets falsely flagged nor causes a
+    // crash. Each rule also gets a deliberate orchestrator/facade negative
+    // fixture, so structural size alone (many pub items, several sequenced
+    // calls) is never mistaken for the rule's actual two-signal evidence.
+
+    /// Writes a virtual `[workspace]` manifest listing `members` at `dir`'s
+    /// `Cargo.toml` — the multi-crate counterpart of
+    /// `dependency_inversion_workspace`'s single-member manifest.
+    fn write_multi_crate_manifest(dir: &TempDir, members: &[&str]) {
+        let members_toml = members
+            .iter()
+            .map(|m| format!("\"{m}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[workspace]\nmembers = [{members_toml}]\nresolver = \"2\"\n"),
+        )
+        .unwrap();
+    }
+
+    /// Writes one workspace member crate named `name` at `dir/<name>`, with
+    /// `lib_rs` as its entire `src/lib.rs` body.
+    fn write_crate_member(dir: &TempDir, name: &str, lib_rs: &str) {
+        std::fs::create_dir_all(dir.join(name).join("src")).unwrap();
+        std::fs::write(
+            dir.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join(name).join("src/lib.rs"), lib_rs).unwrap();
+    }
+
+    /// Writes one workspace member crate named `name` with a `domain`/`infra`
+    /// module split — the multi-crate counterpart of
+    /// `dependency_inversion_workspace`'s single-crate `fixture`.
+    fn write_domain_infra_crate_member(
+        dir: &TempDir,
+        name: &str,
+        domain_body: &str,
+        infra_body: &str,
+    ) {
+        std::fs::create_dir_all(dir.join(name).join("src/domain")).unwrap();
+        std::fs::write(
+            dir.join(name).join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(name).join("src/lib.rs"),
+            "pub mod domain;\npub mod infra;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(name).join("src/domain/mod.rs"), domain_body).unwrap();
+        std::fs::write(dir.join(name).join("src/infra.rs"), infra_body).unwrap();
+    }
+
+    /// `FunctionalCoreImperativeShell`: `crate_a` has a function mixing both
+    /// signals; `crate_b` only has pure computation. Both in the same
+    /// `cargo judge principles` run ⇒ exactly one heuristic, scoped to
+    /// `crate_a` — not zero (crate_a's evidence must still be found) and not
+    /// two (crate_b's unrelated pure function must not be flagged).
+    #[test]
+    fn functional_core_signal_is_scoped_to_the_crate_that_has_it() {
+        let dir = TempDir::new("principle-fcis-multi-crate");
+        write_multi_crate_manifest(&dir, &["crate_a", "crate_b"]);
+        write_crate_member(
+            &dir,
+            "crate_a",
+            &format!(
+                "pub fn read_and_branch(path: &str) -> i32 {{\n\
+                 \x20   let contents = std::fs::read_to_string(path).unwrap();\n\
+                 \x20   let mut total = contents.len() as i32;\n\
+                 {NINE_IFS}\n\
+                 \x20   total\n\
+                 }}\n"
+            ),
+        );
+        write_crate_member(
+            &dir,
+            "crate_b",
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        );
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let heuristics = analyze(&workspace);
+        let fcis: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::FunctionalCoreImperativeShell)
+            .collect();
+
+        assert_eq!(fcis.len(), 1);
+        assert_eq!(fcis[0].scope.krate, "crate_a");
+    }
+
+    /// `FunctionalCoreImperativeShell` orchestrator/facade negative fixture:
+    /// a function that sequences several I/O calls one after another (looks
+    /// structurally busy) but has no non-trivial branching, so its cyclomatic
+    /// complexity stays well below the threshold ⇒ no heuristic, even though
+    /// signal 1 (I/O calls) alone is present. An unrelated second crate sits
+    /// in the same workspace and stays unaffected.
+    #[test]
+    fn thin_orchestrator_sequencing_io_without_branching_produces_no_fcis_heuristic() {
+        let dir = TempDir::new("principle-fcis-orchestrator");
+        write_multi_crate_manifest(&dir, &["orchestrator", "other"]);
+        write_crate_member(
+            &dir,
+            "orchestrator",
+            "pub fn run_pipeline(path: &str) -> std::io::Result<()> {\n\
+             \x20   let _a = std::fs::read_to_string(path)?;\n\
+             \x20   let _b = std::fs::read_to_string(path)?;\n\
+             \x20   std::fs::write(path, \"done\")?;\n\
+             \x20   Ok(())\n\
+             }\n",
+        );
+        write_crate_member(&dir, "other", "pub fn noop() {}\n");
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::FunctionalCoreImperativeShell)
+        );
+    }
+
+    /// `InterfaceSegregation`: `crate_a` has a wide `Wide` trait with two
+    /// disjoint-overriding impls; `crate_b` declares a same-named `Wide`
+    /// trait that is a completely different, narrow (below-threshold) trait.
+    /// Exactly one heuristic, scoped to `crate_a` — proves traits are grouped
+    /// strictly per crate (`workspace.crates` is iterated one crate at a
+    /// time), not matched by name across crate boundaries.
+    #[test]
+    fn interface_segregation_signal_is_scoped_to_the_crate_that_has_it() {
+        let dir = TempDir::new("principle-interface-segregation-multi-crate");
+        write_multi_crate_manifest(&dir, &["crate_a", "crate_b"]);
+        write_crate_member(
+            &dir,
+            "crate_a",
+            &format!(
+                "{WIDE_TRAIT}\n\
+                 pub struct Left;\n\
+                 impl Wide for Left {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 }}\n\
+                 pub struct Right;\n\
+                 impl Wide for Right {{\n\
+                 \x20   fn c(&self) {{}}\n\
+                 \x20   fn d(&self) {{}}\n\
+                 }}\n"
+            ),
+        );
+        write_crate_member(
+            &dir,
+            "crate_b",
+            "pub trait Wide {\n\
+             \x20   fn x(&self) { let _ = 1; }\n\
+             \x20   fn y(&self) { let _ = 1; }\n\
+             }\n\
+             pub struct Left;\n\
+             impl Wide for Left {\n\
+             \x20   fn x(&self) {}\n\
+             }\n\
+             pub struct Right;\n\
+             impl Wide for Right {\n\
+             \x20   fn y(&self) {}\n\
+             }\n",
+        );
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let heuristics = analyze(&workspace);
+        let interface_segregation: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::InterfaceSegregation)
+            .collect();
+
+        assert_eq!(interface_segregation.len(), 1);
+        assert_eq!(interface_segregation[0].scope.krate, "crate_a");
+    }
+
+    /// `InterfaceSegregation` orchestrator/facade negative fixture: two
+    /// deliberate full adapters, each implementing *every* method of the wide
+    /// trait (not a partial/disjoint split) ⇒ no heuristic — the trait is
+    /// structurally wide (signal 1), but signal 2 (a genuine disjoint usage
+    /// split) never fires since the adapters' overridden sets fully overlap.
+    #[test]
+    fn full_adapters_implementing_the_whole_interface_produce_no_interface_segregation_heuristic() {
+        let dir = TempDir::new("principle-interface-segregation-full-adapters");
+        write_multi_crate_manifest(&dir, &["adapters", "other"]);
+        write_crate_member(
+            &dir,
+            "adapters",
+            &format!(
+                "{WIDE_TRAIT}\n\
+                 pub struct AdapterOne;\n\
+                 impl Wide for AdapterOne {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 \x20   fn c(&self) {{}}\n\
+                 \x20   fn d(&self) {{}}\n\
+                 \x20   fn e(&self) {{}}\n\
+                 }}\n\
+                 pub struct AdapterTwo;\n\
+                 impl Wide for AdapterTwo {{\n\
+                 \x20   fn a(&self) {{}}\n\
+                 \x20   fn b(&self) {{}}\n\
+                 \x20   fn c(&self) {{}}\n\
+                 \x20   fn d(&self) {{}}\n\
+                 \x20   fn e(&self) {{}}\n\
+                 }}\n"
+            ),
+        );
+        write_crate_member(&dir, "other", "pub fn noop() {}\n");
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::InterfaceSegregation)
+        );
+    }
+
+    /// `DependencyInversion`: the `[[module_boundary]]` rule only names
+    /// `crate_a` (which has both the call-level violation and the signature
+    /// leak); `crate_b` is not mentioned in config at all. Exactly one
+    /// heuristic, scoped to `crate_a`, and `crate_b`'s presence causes no
+    /// crash despite having no config entry of its own.
+    #[test]
+    fn dependency_inversion_signal_is_scoped_to_the_configured_crate() {
+        let dir = TempDir::new("principle-dependency-inversion-multi-crate");
+        write_multi_crate_manifest(&dir, &["crate_a", "crate_b"]);
+        write_domain_infra_crate_member(
+            &dir,
+            "crate_a",
+            "pub fn run() {\n    crate::infra::read_file();\n}\n\n\
+             pub fn build() -> crate::infra::Client {\n    todo!()\n}\n",
+            "pub fn read_file() {}\npub struct Client;\n",
+        );
+        write_crate_member(
+            &dir,
+            "crate_b",
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        );
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-infra",
+                "crate_a",
+                "domain",
+                &["infra"],
+            )],
+            ..Default::default()
+        };
+
+        let heuristics = analyze_with_boundary_config(&workspace, Some(&config));
+        let dependency_inversion = dependency_inversion_heuristics(&heuristics);
+
+        assert_eq!(dependency_inversion.len(), 1);
+        assert_eq!(dependency_inversion[0].scope.krate, "crate_a");
+    }
+
+    /// `DependencyInversion` orchestrator/facade negative fixture: `domain`
+    /// sequences calls into `infra` (a genuine call-level violation, the
+    /// first signal), but its own public signatures never name an infra
+    /// type — the properly abstracted orchestrator shape this heuristic is
+    /// meant to leave alone, so no heuristic despite the call-level finding
+    /// existing.
+    #[test]
+    fn orchestrator_calling_infra_without_leaking_its_types_produces_no_dependency_inversion_heuristic()
+     {
+        let dir = TempDir::new("principle-dependency-inversion-orchestrator");
+        write_multi_crate_manifest(&dir, &["crate_a", "crate_b"]);
+        write_domain_infra_crate_member(
+            &dir,
+            "crate_a",
+            "pub fn run() -> bool {\n    \
+             crate::infra::read_file();\n    \
+             crate::infra::write_file();\n    \
+             true\n}\n",
+            "pub fn read_file() {}\npub fn write_file() {}\npub struct Client;\n",
+        );
+        write_crate_member(
+            &dir,
+            "crate_b",
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        );
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let config = BoundaryConfig {
+            module_boundaries: vec![module_boundary_rule(
+                "domain-no-infra",
+                "crate_a",
+                "domain",
+                &["infra"],
+            )],
+            ..Default::default()
+        };
+
+        let heuristics = analyze_with_boundary_config(&workspace, Some(&config));
+        assert!(dependency_inversion_heuristics(&heuristics).is_empty());
+    }
+
+    /// `Cohesion`: `crate_a` has a file with >= threshold public items where
+    /// two different items show different effect categories; `crate_b` has a
+    /// file with >= threshold public items that all show the *same* category.
+    /// Exactly one heuristic, scoped to `crate_a`.
+    #[test]
+    fn cohesion_signal_is_scoped_to_the_crate_that_has_it() {
+        let dir = TempDir::new("principle-cohesion-multi-crate");
+        write_multi_crate_manifest(&dir, &["crate_a", "crate_b"]);
+        write_crate_member(
+            &dir,
+            "crate_a",
+            &format!(
+                "pub fn read_file(path: &str) -> String {{\n\
+                 \x20   std::fs::read_to_string(path).unwrap()\n\
+                 }}\n\
+                 pub fn compute(mut total: i32) -> i32 {{\n\
+                 {NINE_IFS}\n\
+                 \x20   total\n\
+                 }}\n\
+                 pub struct Marker;\n"
+            ),
+        );
+        write_crate_member(
+            &dir,
+            "crate_b",
+            &format!(
+                "pub fn compute_a(mut total: i32) -> i32 {{\n{NINE_IFS}\n\x20   total\n}}\n\
+                 pub fn compute_b(mut total: i32) -> i32 {{\n{NINE_IFS}\n\x20   total\n}}\n\
+                 pub fn compute_c(mut total: i32) -> i32 {{\n{NINE_IFS}\n\x20   total\n}}\n"
+            ),
+        );
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let heuristics = analyze(&workspace);
+        let cohesion: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::Cohesion)
+            .collect();
+
+        assert_eq!(cohesion.len(), 1);
+        assert_eq!(cohesion[0].scope.krate, "crate_a");
+    }
+
+    /// `Cohesion` orchestrator/facade negative fixture: a deliberate
+    /// orchestration file bundling several pre-existing steps behind public
+    /// wrapper functions — enough public items to satisfy the structural
+    /// signal, but none of them show any of this heuristic's effect
+    /// categories (no I/O, no terminal output, no complexity at/above the
+    /// threshold) ⇒ no heuristic, even though the file looks structurally
+    /// big.
+    #[test]
+    fn orchestrator_module_bundling_delegate_calls_produces_no_cohesion_heuristic() {
+        let dir = TempDir::new("principle-cohesion-orchestrator");
+        write_multi_crate_manifest(&dir, &["facade", "other"]);
+        write_crate_member(
+            &dir,
+            "facade",
+            "pub fn step_one() -> i32 {\n    1\n}\n\
+             pub fn step_two() -> i32 {\n    2\n}\n\
+             pub fn step_three() -> i32 {\n    3\n}\n\
+             pub fn run_all() -> i32 {\n    step_one() + step_two() + step_three()\n}\n",
+        );
+        write_crate_member(&dir, "other", "pub fn noop() {}\n");
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::Cohesion)
+        );
+    }
 }

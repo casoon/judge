@@ -56,6 +56,16 @@ pub struct Baseline {
     /// §15.1).
     #[serde(default)]
     pub score_context: Option<ScoreContext>,
+    /// Per-crate public-API-surface item count at save time (see
+    /// [`crate::api_surface::ApiSurfaceSize`]), used by `cargo judge
+    /// api-surface`'s trend line. `None` for baselines saved by older judge
+    /// versions, and for baselines saved by any command other than
+    /// `api-surface` — [`crate::api_surface::size_trend`] then reports "not
+    /// comparable" per crate instead of a false delta (see todo.md §I
+    /// "API-Surface-Größe pro Crate, Trend gegen Baseline", and
+    /// `score_context` above for the same additive-field pattern).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_surface_size: Option<HashMap<String, usize>>,
     pub findings: Vec<BaselineFinding>,
 }
 
@@ -74,6 +84,7 @@ impl Baseline {
             rule_revisions,
             total_loc,
             score_context: Some(score_context),
+            api_surface_size: None,
             findings: findings
                 .iter()
                 .map(|finding| BaselineFinding {
@@ -86,6 +97,15 @@ impl Baseline {
                 })
                 .collect(),
         }
+    }
+
+    /// Attaches a per-crate api-surface-size count to this baseline before
+    /// saving (see [`crate::api_surface::ApiSurfaceSize`]) — builder-style,
+    /// so only `cargo judge api-surface --save-baseline` opts in and every
+    /// other baseline keeps `api_surface_size: None`.
+    pub fn with_api_surface_size(mut self, size: HashMap<String, usize>) -> Self {
+        self.api_surface_size = Some(size);
+        self
     }
 
     /// Migrates baselines written by older judge versions in the same
@@ -424,6 +444,30 @@ mod tests {
         let baseline = load(&path).unwrap();
 
         assert!(baseline.score_context.is_none());
+        assert_eq!(baseline.commit, "abc123");
+    }
+
+    #[test]
+    fn baseline_without_api_surface_size_still_loads() {
+        // A baseline saved before `api_surface_size` existed — or saved by a
+        // command other than `api-surface` — must still load, with the field
+        // `None` rather than a parse failure (see todo.md §I "API-Surface-
+        // Größe pro Crate, Trend gegen Baseline").
+        let (_dir, path) = write_baseline_json(
+            "baseline-no-api-surface-size",
+            r#"{
+                "schema_version": 2,
+                "judge_version": "0.1.0",
+                "commit": "abc123",
+                "rule_revisions": {},
+                "total_loc": 1000,
+                "findings": []
+            }"#,
+        );
+
+        let baseline = load(&path).unwrap();
+
+        assert!(baseline.api_surface_size.is_none());
         assert_eq!(baseline.commit, "abc123");
     }
 

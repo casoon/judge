@@ -550,6 +550,13 @@ pub struct Report {
     /// omitted from JSON when zero, matching `analysis_universe`'s pattern.
     #[serde(skip_serializing_if = "is_zero")]
     pub suppressed_inline: usize,
+    /// Per-crate public-API-surface item count (see
+    /// [`crate::api_surface::ApiSurfaceSize`], todo.md §I "API-Surface-Größe
+    /// pro Crate, Trend gegen Baseline") — additive, no version bump; only
+    /// `cargo judge api-surface` fills it in, matching `analysis_universe`'s
+    /// pattern of an omitted-when-absent field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_surface_size: Option<HashMap<String, usize>>,
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -573,6 +580,7 @@ impl Report {
             findings,
             errors,
             suppressed_inline: 0,
+            api_surface_size: None,
         }
     }
 
@@ -591,6 +599,14 @@ impl Report {
     /// [`with_universe`]: Report::with_universe
     pub fn with_suppressed_inline(mut self, count: usize) -> Self {
         self.suppressed_inline = count;
+        self
+    }
+
+    /// Attaches the per-crate api-surface-size count — builder-style like
+    /// [`with_universe`](Self::with_universe), so only `cargo judge
+    /// api-surface` opts in.
+    pub fn with_api_surface_size(mut self, size: HashMap<String, usize>) -> Self {
+        self.api_surface_size = Some(size);
         self
     }
 }
