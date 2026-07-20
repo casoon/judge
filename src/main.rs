@@ -2282,10 +2282,16 @@ fn run_api_surface(
         judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
 
     if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([(
-            judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE.to_string(),
-            judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION,
-        )]);
+        let rule_revisions = std::collections::HashMap::from([
+            (
+                judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE.to_string(),
+                judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION,
+            ),
+            (
+                judge::api_surface::SEMVER_HAZARD_RULE.to_string(),
+                judge::api_surface::SEMVER_HAZARD_RULE_REVISION,
+            ),
+        ]);
         return handle_baseline(
             &workspace.root,
             &findings,

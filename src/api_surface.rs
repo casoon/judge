@@ -1,6 +1,20 @@
 //! Fast-tier public-API-surface analysis (see todo.md §I "Public-API-
 //! Oberfläche"): `undocumented-public-item`, a `syn`-only check for a
-//! module-level `pub` item with no doc comment.
+//! module-level `pub` item with no doc comment, and `semver-hazard`, a
+//! `syn`-only check for two API-evolvability gaps.
+//!
+//! ## `semver-hazard` scope
+//!
+//! Two of the three sub-cases todo.md §I lists are implemented, both exact
+//! syntax facts distinguished by `evidence.kind` (the same bundling
+//! [`crate::slop_structural::ABSTRACTION_INFLATION_RULE`] uses for its own
+//! sub-patterns): a `pub enum` with at least two variants and no
+//! `#[non_exhaustive]` attribute (`missing_non_exhaustive_enum`), and a
+//! `pub struct` with at least one `pub` field and no `#[non_exhaustive]`
+//! attribute (`missing_non_exhaustive_struct_fields`). The third sub-case —
+//! a dependency's type leaking through a public signature — needs type
+//! resolution across crate boundaries the Fast Tier doesn't have; it is
+//! deliberately out of scope here, not merely forgotten.
 //!
 //! ## Item-level visibility only
 //!
@@ -26,6 +40,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
@@ -42,6 +57,14 @@ pub const UNDOCUMENTED_PUBLIC_ITEM_RULE: &str = "undocumented-public-item";
 /// Bump when the undocumented-public-item rule's logic changes (see todo.md
 /// §5 "Regelversions-Schutz").
 pub const UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION: u32 = 1;
+
+/// Rule id shared by both `semver-hazard` sub-cases (see the module doc
+/// comment's "`semver-hazard` scope" section); `evidence.kind` distinguishes
+/// `missing_non_exhaustive_enum` from `missing_non_exhaustive_struct_fields`.
+pub const SEMVER_HAZARD_RULE: &str = "semver-hazard";
+/// Bump when either semver-hazard sub-case's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const SEMVER_HAZARD_RULE_REVISION: u32 = 1;
 
 #[derive(Debug)]
 pub enum ApiSurfaceError {
@@ -143,9 +166,19 @@ impl ApiSurfaceVisitor<'_> {
         self.in_trait_impl.last().copied().unwrap_or(false)
     }
 
-    fn record(&mut self, span: proc_macro2::Span) {
+    /// Shared finding constructor for both rules this module reports —
+    /// `rule_id` picks the rule, `evidence` is `None` for
+    /// `undocumented-public-item` and `Some(json!({"kind": ...}))` for
+    /// `semver-hazard` (mirrors [`crate::slop_structural`]'s single
+    /// `abstraction_finding` helper backing several `evidence.kind`s).
+    fn record(
+        &mut self,
+        rule_id: &str,
+        span: proc_macro2::Span,
+        evidence: Option<serde_json::Value>,
+    ) {
         let start = span.start();
-        let rule = crate::finding::RuleId::from(UNDOCUMENTED_PUBLIC_ITEM_RULE);
+        let rule = crate::finding::RuleId::from(rule_id);
         let evidence_class = crate::finding::evidence_class_for_rule(&rule);
         let item_path = self.current_item_path();
         self.findings.push(Finding {
@@ -166,7 +199,7 @@ impl ApiSurfaceVisitor<'_> {
             },
             evidence_class,
             origin: Origin::Code,
-            evidence: None,
+            evidence,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });
@@ -186,7 +219,7 @@ impl ApiSurfaceVisitor<'_> {
         if has_doc_comment(attrs) {
             return;
         }
-        self.record(span);
+        self.record(UNDOCUMENTED_PUBLIC_ITEM_RULE, span, None);
     }
 
     /// Same as [`check_doc`](Self::check_doc), additionally skipping a
@@ -196,6 +229,67 @@ impl ApiSurfaceVisitor<'_> {
             return;
         }
         self.check_doc(vis, attrs, span);
+    }
+
+    /// `semver-hazard` sub-case A: a `pub enum` with at least two variants
+    /// and no `#[non_exhaustive]` attribute — adding a variant is a breaking
+    /// change for an external exhaustive `match` with no wildcard arm. Same
+    /// `#[cfg(test)]` exemption as [`check_doc`](Self::check_doc); a
+    /// single-variant enum is exempt (see the module's `semver-hazard`
+    /// scope section — a lone variant is usually deliberate, e.g. a wrapper
+    /// pattern).
+    fn check_semver_hazard_enum(&mut self, node: &ItemEnum) {
+        if self.cfg_test_depth > 0 || attrs_have_cfg_test(&node.attrs) {
+            return;
+        }
+        if !matches!(node.vis, Visibility::Public(_)) {
+            return;
+        }
+        if node.variants.len() < 2 || has_non_exhaustive(&node.attrs) {
+            return;
+        }
+        self.record(
+            SEMVER_HAZARD_RULE,
+            node.span(),
+            Some(json!({
+                "kind": "missing_non_exhaustive_enum",
+                "variant_count": node.variants.len(),
+            })),
+        );
+    }
+
+    /// `semver-hazard` sub-case B: a `pub struct` with at least one `pub`
+    /// field and no `#[non_exhaustive]` attribute — a new or removed field
+    /// is a breaking change for struct-literal syntax at consumers. A unit
+    /// struct, or one whose fields are all private, already encapsulates its
+    /// layout and is not checked. Same `#[cfg(test)]` exemption as
+    /// [`check_doc`](Self::check_doc).
+    fn check_semver_hazard_struct(&mut self, node: &ItemStruct) {
+        if self.cfg_test_depth > 0 || attrs_have_cfg_test(&node.attrs) {
+            return;
+        }
+        if !matches!(node.vis, Visibility::Public(_)) {
+            return;
+        }
+        if has_non_exhaustive(&node.attrs) {
+            return;
+        }
+        let pub_field_count = node
+            .fields
+            .iter()
+            .filter(|field| matches!(field.vis, Visibility::Public(_)))
+            .count();
+        if pub_field_count == 0 {
+            return;
+        }
+        self.record(
+            SEMVER_HAZARD_RULE,
+            node.span(),
+            Some(json!({
+                "kind": "missing_non_exhaustive_struct_fields",
+                "pub_field_count": pub_field_count,
+            })),
+        );
     }
 }
 
@@ -218,6 +312,14 @@ fn type_name(ty: &Type) -> String {
 /// same way).
 fn has_doc_comment(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("doc"))
+}
+
+/// Whether any attribute in `attrs` is `#[non_exhaustive]` — the exact
+/// syntax fact both `semver-hazard` sub-cases turn on.
+fn has_non_exhaustive(attrs: &[Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("non_exhaustive"))
 }
 
 /// Whether `attrs` contains a `#[cfg(...)]` attribute whose predicate
@@ -295,6 +397,7 @@ impl<'ast> Visit<'ast> for ApiSurfaceVisitor<'_> {
         }
         self.path.push(node.ident.to_string());
         self.check_doc(&node.vis, &node.attrs, node.span());
+        self.check_semver_hazard_struct(node);
         visit::visit_item_struct(self, node);
         self.path.pop();
         if gated {
@@ -309,6 +412,7 @@ impl<'ast> Visit<'ast> for ApiSurfaceVisitor<'_> {
         }
         self.path.push(node.ident.to_string());
         self.check_doc(&node.vis, &node.attrs, node.span());
+        self.check_semver_hazard_enum(node);
         visit::visit_item_enum(self, node);
         self.path.pop();
         if gated {
@@ -417,12 +521,13 @@ mod tests {
     fn pub_struct_and_pub_enum_without_doc_comment_are_flagged() {
         let dir = TempDir::new("api-surface-pub-struct-enum");
         let findings = write_and_analyze(&dir, "pub struct Foo;\n\npub enum Bar { A, B }\n");
-        assert_eq!(findings.len(), 2);
-        assert!(
-            findings
-                .iter()
-                .all(|f| f.rule == UNDOCUMENTED_PUBLIC_ITEM_RULE)
-        );
+        // `Bar` also has 2 variants and no `#[non_exhaustive]`, so it additionally
+        // fires `semver-hazard` — filter down to this test's own rule.
+        let undocumented: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule == UNDOCUMENTED_PUBLIC_ITEM_RULE)
+            .collect();
+        assert_eq!(undocumented.len(), 2);
     }
 
     #[test]
@@ -569,5 +674,168 @@ mod tests {
             ApiSurfaceError::Parse(path, _) => assert_eq!(path, file),
             other => panic!("expected a parse error, got {other:?}"),
         }
+    }
+
+    fn semver_hazard_findings(findings: &[Finding]) -> Vec<&Finding> {
+        findings
+            .iter()
+            .filter(|f| f.rule == SEMVER_HAZARD_RULE)
+            .collect()
+    }
+
+    #[test]
+    fn pub_enum_with_two_variants_and_no_non_exhaustive_is_flagged() {
+        let dir = TempDir::new("api-surface-semver-enum-flagged");
+        let findings = write_and_analyze(
+            &dir,
+            r#"
+/// Doc.
+pub enum Bar {
+    A,
+    B,
+}
+"#,
+        );
+        let hits = semver_hazard_findings(&findings);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].evidence.as_ref().unwrap()["kind"],
+            "missing_non_exhaustive_enum"
+        );
+        assert_eq!(hits[0].evidence.as_ref().unwrap()["variant_count"], 2);
+        assert_eq!(hits[0].severity, Severity::Info);
+        assert_eq!(
+            hits[0].evidence_class,
+            crate::finding::EvidenceClass::DerivedFact
+        );
+    }
+
+    #[test]
+    fn pub_enum_with_non_exhaustive_is_not_flagged() {
+        let dir = TempDir::new("api-surface-semver-enum-exempt");
+        let findings = write_and_analyze(
+            &dir,
+            r#"
+/// Doc.
+#[non_exhaustive]
+pub enum Bar {
+    A,
+    B,
+}
+"#,
+        );
+        assert!(semver_hazard_findings(&findings).is_empty());
+    }
+
+    #[test]
+    fn pub_enum_with_single_variant_is_not_flagged() {
+        let dir = TempDir::new("api-surface-semver-enum-single-variant");
+        let findings = write_and_analyze(
+            &dir,
+            r#"
+/// Doc.
+pub enum Bar {
+    A,
+}
+"#,
+        );
+        assert!(semver_hazard_findings(&findings).is_empty());
+    }
+
+    #[test]
+    fn pub_struct_with_pub_field_and_no_non_exhaustive_is_flagged() {
+        let dir = TempDir::new("api-surface-semver-struct-flagged");
+        let findings = write_and_analyze(
+            &dir,
+            r#"
+/// Doc.
+pub struct Foo {
+    pub value: i32,
+}
+"#,
+        );
+        let hits = semver_hazard_findings(&findings);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].evidence.as_ref().unwrap()["kind"],
+            "missing_non_exhaustive_struct_fields"
+        );
+        assert_eq!(hits[0].evidence.as_ref().unwrap()["pub_field_count"], 1);
+    }
+
+    #[test]
+    fn pub_struct_with_non_exhaustive_is_not_flagged() {
+        let dir = TempDir::new("api-surface-semver-struct-exempt");
+        let findings = write_and_analyze(
+            &dir,
+            r#"
+/// Doc.
+#[non_exhaustive]
+pub struct Foo {
+    pub value: i32,
+}
+"#,
+        );
+        assert!(semver_hazard_findings(&findings).is_empty());
+    }
+
+    #[test]
+    fn pub_struct_with_only_private_fields_is_not_flagged() {
+        let dir = TempDir::new("api-surface-semver-struct-private-fields");
+        let findings = write_and_analyze(
+            &dir,
+            r#"
+/// Doc.
+pub struct Foo {
+    value: i32,
+}
+"#,
+        );
+        assert!(semver_hazard_findings(&findings).is_empty());
+    }
+
+    #[test]
+    fn tuple_and_unit_structs_are_not_flagged() {
+        let dir = TempDir::new("api-surface-semver-struct-tuple-unit");
+        let findings = write_and_analyze(
+            &dir,
+            r#"
+/// Doc.
+pub struct Tuple(i32);
+
+/// Doc.
+pub struct Unit;
+"#,
+        );
+        assert!(semver_hazard_findings(&findings).is_empty());
+    }
+
+    #[test]
+    fn analyze_workspace_hides_semver_hazard_in_generated_files_by_default() {
+        let dir = TempDir::new("api-surface-semver-generated");
+        let generated_file = dir.join("schema.rs");
+        std::fs::write(
+            &generated_file,
+            r#"
+/// Doc.
+pub enum Bar {
+    A,
+    B,
+}
+"#,
+        )
+        .unwrap();
+
+        let files = [SourceFile {
+            path: generated_file,
+            kind: crate::ingest::SourceKind::Generated,
+        }];
+
+        let excluded = analyze_workspace(files.iter(), false);
+        assert!(semver_hazard_findings(&excluded.findings).is_empty());
+        assert_eq!(excluded.excluded_generated, 1);
+
+        let included = analyze_workspace(files.iter(), true);
+        assert_eq!(semver_hazard_findings(&included.findings).len(), 1);
     }
 }

@@ -619,6 +619,110 @@ mod tests {
         );
     }
 
+    /// Runs `git` in `dir` with a fixed test identity, so these fixtures
+    /// don't depend on the host's global git config (mirrors `crate::git`'s
+    /// own test helper of the same name).
+    fn git(dir: &Path, args: &[&str]) {
+        run_git(dir, args, &[]);
+    }
+
+    fn run_git(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=judge-test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .envs(extra_env.iter().copied())
+            .status()
+            .expect("failed to run git — required for these fixtures");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Commits with both author and committer date pinned to `epoch_seconds`
+    /// (`@<seconds> +0000`, git's own epoch date syntax), so `legacy_freeze`
+    /// fixtures below can place commits precisely inside or outside its
+    /// 365-day window without racing the wall clock.
+    fn git_dated(dir: &Path, args: &[&str], epoch_seconds: i64) {
+        let date = format!("@{epoch_seconds} +0000");
+        run_git(
+            dir,
+            args,
+            &[
+                ("GIT_AUTHOR_DATE", date.as_str()),
+                ("GIT_COMMITTER_DATE", date.as_str()),
+            ],
+        );
+    }
+
+    fn now_unix_seconds() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// `churn-hotspot` (todo.md §17.5 candidate 1) — unentscheidbar: a file
+    /// renamed mid-window. [`crate::git::churn`] walks a plain tree diff
+    /// with no rewrite/rename tracking configured, so a `git mv` commit is
+    /// reported as a `Deletion` at the old path plus an `Addition` at the
+    /// new path — each counted as one commit "touching" its own path. A
+    /// file edited often enough to clear [`CHURN_HOTSPOT_THRESHOLD`] under
+    /// one continuous identity can therefore split into two paths that each
+    /// stay under threshold, and the hotspot goes unreported entirely.
+    /// Golden test of that honest, git-primitive-based limitation — not a
+    /// bug.
+    #[test]
+    fn churn_hotspot_history_splits_across_a_rename_and_stays_under_threshold() {
+        let dir = TempDir::new("churn-hotspot-rename");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("old.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "create"]);
+
+        std::fs::write(dir.join("old.rs"), "fn a() { 1 }\n").unwrap();
+        git(&dir, &["commit", "-q", "-am", "edit 1"]);
+
+        std::fs::write(dir.join("old.rs"), "fn a() { 2 }\n").unwrap();
+        git(&dir, &["commit", "-q", "-am", "edit 2"]);
+
+        git(&dir, &["mv", "old.rs", "new.rs"]);
+        git(&dir, &["commit", "-q", "-m", "rename"]);
+
+        std::fs::write(dir.join("new.rs"), "fn a() { 3 }\n").unwrap();
+        git(&dir, &["commit", "-q", "-am", "edit 3"]);
+
+        std::fs::write(dir.join("new.rs"), "fn a() { 4 }\n").unwrap();
+        git(&dir, &["commit", "-q", "-am", "edit 4"]);
+
+        // 6 commits touched what is, by content lineage, a single file —
+        // at or above CHURN_HOTSPOT_THRESHOLD if the history were merged
+        // across the rename.
+        let churn = crate::git::churn(&dir, CHURN_HOTSPOT_WINDOW_DAYS).unwrap();
+        assert!(
+            churn.get(&PathBuf::from("old.rs")).copied().unwrap_or(0) < CHURN_HOTSPOT_THRESHOLD,
+            "old.rs count: {churn:?}"
+        );
+        assert!(
+            churn.get(&PathBuf::from("new.rs")).copied().unwrap_or(0) < CHURN_HOTSPOT_THRESHOLD,
+            "new.rs count: {churn:?}"
+        );
+
+        let findings = churn_hotspots(&churn);
+
+        assert!(
+            findings.is_empty(),
+            "expected the rename to split churn across two paths, neither reaching \
+             the threshold alone: {churn:?}"
+        );
+    }
+
     fn function_info(lines_of_code: usize, cyclomatic: u32) -> FunctionInfo {
         FunctionInfo {
             qualified_name: "f".to_string(),
@@ -645,6 +749,47 @@ mod tests {
             findings[0].evidence,
             Some(json!({"lines_of_code": 50, "cyclomatic": 2}))
         );
+    }
+
+    /// `complexity-inflation` (todo.md §17.5 candidate 2) — unentscheidbar:
+    /// [`crate::complexity::analyze_file`] parses with plain
+    /// `syn::parse_file`, which has no `cfg` resolution (see
+    /// `crate::finding::AnalysisUniverse::features`'s doc: "the syntactic
+    /// pass is feature-blind and parses every `cfg`-gated line regardless of
+    /// any selection"). A function with two mutually exclusive
+    /// `#[cfg(feature = "x")]` / `#[cfg(not(feature = "x"))]` blocks, each
+    /// too short on its own to trip [`MIN_LOC_FOR_INFLATION`], is counted as
+    /// one function spanning both — long enough to fire — even though any
+    /// real build only ever compiles one of the two blocks. Golden test of
+    /// that honest, feature-blind behavior — not a bug.
+    #[test]
+    fn complexity_inflation_counts_both_arms_of_a_cfg_gated_function() {
+        let dir = TempDir::new("complexity-inflation-cfg-gated");
+        let file = dir.join("lib.rs");
+
+        let mut source = String::from("pub fn configure() {\n    #[cfg(feature = \"x\")]\n    {\n");
+        for i in 0..20 {
+            source.push_str(&format!("        let a{i} = {i};\n"));
+        }
+        source.push_str("    }\n    #[cfg(not(feature = \"x\"))]\n    {\n");
+        for i in 0..20 {
+            source.push_str(&format!("        let b{i} = {i};\n"));
+        }
+        source.push_str("    }\n}\n");
+        std::fs::write(&file, &source).unwrap();
+
+        let functions = crate::complexity::analyze_file(&file).unwrap();
+        assert_eq!(functions.len(), 1);
+        // Either cfg arm alone would be well under MIN_LOC_FOR_INFLATION;
+        // parsed together (both arms present, neither stripped) they clear
+        // it, while the branch-free statements inside each arm keep
+        // cyclomatic complexity at its floor of 1.
+        assert!(functions[0].lines_of_code >= MIN_LOC_FOR_INFLATION);
+        assert_eq!(functions[0].cyclomatic, 1);
+
+        let findings = complexity_inflation(&functions);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
     }
 
     #[test]
@@ -687,6 +832,76 @@ mod tests {
         ];
 
         assert!(legacy_freeze(&churn, &all_files).is_empty());
+    }
+
+    /// `legacy-freeze` (todo.md §17.5 candidate 3) — unentscheidbar:
+    /// [`legacy_freeze`] only sees whether *any* commit landed inside the
+    /// 365-day window, never how much history a file had before that window
+    /// opened. A file with exactly one commit ever (created once, never
+    /// touched again) and a file that was actively edited for a while and
+    /// then went quiet look identical to this rule once both trails end
+    /// more than 365 days ago — same `is_active = false`, same evidence
+    /// shape. Golden test of that: both fire, with indistinguishable
+    /// evidence, so "just created and abandoned" and "was active, now
+    /// frozen since X" can't be told apart from `churn_12mo` alone.
+    #[test]
+    fn legacy_freeze_cannot_distinguish_created_once_from_once_active_then_frozen() {
+        let dir = TempDir::new("legacy-freeze-created-vs-frozen");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let old_time = now_unix_seconds() - 400 * 24 * 3600;
+        let older_time = old_time - 10 * 24 * 3600;
+        let oldest_time = older_time - 10 * 24 * 3600;
+
+        std::fs::write(dir.join("once.rs"), "fn once() {}\n").unwrap();
+        std::fs::write(dir.join("long_lived.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git_dated(&dir, &["commit", "-q", "-m", "create both"], oldest_time);
+
+        std::fs::write(dir.join("long_lived.rs"), "fn a() { 1 }\n").unwrap();
+        git_dated(
+            &dir,
+            &["commit", "-q", "-am", "edit long_lived"],
+            older_time,
+        );
+
+        std::fs::write(dir.join("long_lived.rs"), "fn a() { 2 }\n").unwrap();
+        git_dated(
+            &dir,
+            &["commit", "-q", "-am", "edit long_lived again"],
+            old_time,
+        );
+
+        std::fs::write(dir.join("a.rs"), "fn s() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn s() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "recent sibling activity"]);
+
+        let churn = crate::git::churn(&dir, LEGACY_FREEZE_WINDOW_DAYS).unwrap();
+        assert!(!churn.contains_key(&PathBuf::from("once.rs")));
+        assert!(!churn.contains_key(&PathBuf::from("long_lived.rs")));
+
+        let all_files = vec![
+            PathBuf::from("once.rs"),
+            PathBuf::from("long_lived.rs"),
+            PathBuf::from("a.rs"),
+            PathBuf::from("b.rs"),
+        ];
+
+        let findings = legacy_freeze(&churn, &all_files);
+        let find = |name: &str| {
+            findings
+                .iter()
+                .find(|f| f.location.file == Path::new(name))
+                .unwrap_or_else(|| panic!("expected {name} to be flagged: {findings:?}"))
+        };
+        let once_finding = find("once.rs");
+        let long_lived_finding = find("long_lived.rs");
+
+        assert_eq!(
+            once_finding.evidence, long_lived_finding.evidence,
+            "created-once and actively-developed-then-frozen produce identical evidence"
+        );
     }
 
     fn authored(paths: impl IntoIterator<Item = PathBuf>) -> Vec<SourceFile> {
@@ -854,6 +1069,55 @@ impl Wrapper {
         assert!(hits.is_empty());
     }
 
+    /// `abstraction-inflation` / `delegating-wrapper` (todo.md §17.5
+    /// candidate 4, wrapper-struct sub-case) — unentscheidbar:
+    /// [`FileCollector`] only records inherent methods it sees as literal
+    /// `ImplItem::Fn` nodes inside a literal `syn::ItemImpl`. A macro
+    /// invocation that *expands* to exactly the pure-delegation
+    /// `impl Wrapper { fn len(&self) -> usize { self.0.len() } }` this
+    /// sub-check looks for is, to `syn::parse_file`, just an opaque
+    /// `Item::Macro` — the struct definition is still visible (so
+    /// `field_count`/`sole_field` are correct), but `inherent_methods` for
+    /// `Wrapper` stays empty, so the `methods.is_empty()` guard skips it.
+    /// Golden test that the rule stays silent rather than guessing at what
+    /// the expansion contains (mirrors `pattern.rs`'s `boolean-state-cluster`
+    /// macro-generated golden test).
+    #[test]
+    fn delegating_wrapper_generated_entirely_by_macro_produces_no_finding() {
+        let dir = TempDir::new("abstraction-wrapper-macro-generated");
+        let file = dir.join("wrapper.rs");
+        std::fs::write(
+            &file,
+            r#"
+struct Wrapper(Vec<i32>);
+
+macro_rules! delegate_len {
+    ($ty:ty) => {
+        impl $ty {
+            fn len(&self) -> usize {
+                self.0.len()
+            }
+        }
+    };
+}
+
+delegate_len!(Wrapper);
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let findings = analyze_workspace_structural(files.iter());
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "delegating-wrapper")
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "macro-generated delegation is invisible to the syn-based collector: {hits:?}"
+        );
+    }
+
     #[test]
     fn builder_for_small_struct_fires_but_not_for_a_larger_target() {
         let dir = TempDir::new("abstraction-builder-small");
@@ -911,5 +1175,54 @@ impl FooBuilder {
             .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "builder-for-small-struct")
             .collect();
         assert!(hits.is_empty());
+    }
+
+    /// `abstraction-inflation` / `builder-for-small-struct` (todo.md §17.5
+    /// candidate 4, builder-struct sub-case) — unentscheidbar: same macro
+    /// blindness as the wrapper case above, applied to sub-check 3a.
+    /// `is_build_method_for` only matches a literal `fn build` inside a
+    /// literal `syn::ItemImpl`; a `build()` produced by macro expansion is
+    /// an opaque `Item::Macro` to `syn::parse_file`, so `FooBuilder` never
+    /// enters `builder_matches` even though a real build gives `Foo` a
+    /// working `FooBuilder::build()`. Golden test that the rule stays
+    /// silent rather than guessing.
+    #[test]
+    fn builder_build_method_generated_entirely_by_macro_produces_no_finding() {
+        let dir = TempDir::new("abstraction-builder-macro-generated");
+        let file = dir.join("builder.rs");
+        std::fs::write(
+            &file,
+            r#"
+struct Foo {
+    a: i32,
+    b: i32,
+}
+struct FooBuilder;
+
+macro_rules! impl_build {
+    ($builder:ty, $target:ty) => {
+        impl $builder {
+            fn build(self) -> $target {
+                Foo { a: 0, b: 0 }
+            }
+        }
+    };
+}
+
+impl_build!(FooBuilder, Foo);
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let findings = analyze_workspace_structural(files.iter());
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "builder-for-small-struct")
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "macro-generated build() is invisible to the syn-based collector: {hits:?}"
+        );
     }
 }

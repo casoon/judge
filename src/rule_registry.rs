@@ -77,6 +77,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: "State only that no doc comment was found on this `pub` item — never that its documentation is 'bad' or 'incomplete' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
     },
+    RuleMetadata {
+        id: "semver-hazard",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; `cargo judge api-surface`, subcommand-only).",
+        exclusions: "Covers two of the three todo.md §I sub-cases via `evidence.kind`: a `pub enum` with at least two variants and no `#[non_exhaustive]` attribute (`missing_non_exhaustive_enum`; a single-variant enum is exempt), and a `pub struct` with at least one `pub` field and no `#[non_exhaustive]` attribute (`missing_non_exhaustive_struct_fields`; a unit struct or one with only private fields is exempt). The third sub-case — a dependency's type leaking through a public signature — needs type resolution across crate boundaries the Fast Tier doesn't have and is not implemented. Same `#[cfg(test)]`/generated-code exemptions as `undocumented-public-item`.",
+        allowed_wording: "State only the exact syntax fact (attribute absence plus variant/field count) — never that the type is 'badly designed'; adding a variant/field is a known Rust API-evolvability fact, not this crate's opinion (todo.md §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
     // -- boundaries.rs --------------------------------------------------
     RuleMetadata {
         id: "crate-boundary-violation",
@@ -525,6 +533,7 @@ mod tests {
     fn every_fast_tier_rule_id_has_a_registry_entry() {
         let ids: &[&str] = &[
             crate::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE,
+            crate::api_surface::SEMVER_HAZARD_RULE,
             crate::boundaries::BOUNDARY_VIOLATION_RULE,
             crate::boundaries::DEPENDENCY_CYCLE_RULE,
             crate::coverage::UNTESTED_HOTSPOT_RULE,

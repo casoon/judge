@@ -25,15 +25,16 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus three real detectors —
+//! sixteen table entries), plus four real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
 //! (see [`functional_core_imperative_shell_candidates`]),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
-//! [`interface_segregation_candidates`]), and
+//! [`interface_segregation_candidates`]),
 //! [`DependencyInversion`](DesignPrinciple::DependencyInversion) (see
-//! [`dependency_inversion_candidates`]). The remaining `DesignPrinciple`
-//! variants are unused for now; they document the target space rather than
-//! being implemented.
+//! [`dependency_inversion_candidates`]), and
+//! [`Cohesion`](DesignPrinciple::Cohesion) (see [`cohesion_candidates`]). The
+//! remaining `DesignPrinciple` variants are unused for now; they document the
+//! target space rather than being implemented.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -64,6 +65,12 @@ pub const FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD: u32 = 10;
 /// focused interface (contrast with a two- or three-method trait, which is
 /// unremarkable on its own).
 pub const INTERFACE_SEGREGATION_METHOD_THRESHOLD: usize = 5;
+
+/// Minimum count of public top-level items (`pub fn`, `pub struct`, `pub
+/// enum`, `pub trait`) [`cohesion_candidates`] treats as "several public
+/// items in one file" (signal 1) — chosen to mean more than the one or two
+/// items a small, single-purpose file typically declares.
+pub const COHESION_ITEM_THRESHOLD: usize = 3;
 
 /// A prüffähiges Designprinzip from todo.md §16.7's table. All sixteen table
 /// entries are represented so the enum documents the full target space, even
@@ -231,9 +238,9 @@ pub struct PrincipleHeuristic {
 /// config, if any) as [`dependency_inversion_candidates`]' precondition —
 /// that detector produces nothing when `boundary_config` is `None` or has no
 /// `[[module_boundary]]` entries (todo.md §17: never guess project intent).
-/// Merges results from [`interface_segregation_candidates`] and
-/// [`dependency_inversion_candidates`] — this is the dispatch point future
-/// detectors from todo.md §16.7's table attach to.
+/// Merges results from [`interface_segregation_candidates`],
+/// [`dependency_inversion_candidates`], and [`cohesion_candidates`] — this is
+/// the dispatch point future detectors from todo.md §16.7's table attach to.
 ///
 /// Returns [`BoundaryConfigError`] only via [`dependency_inversion_candidates`]
 /// (an invalid `[[module_boundary]]`/`[[boundary]]` rule in `boundary_config`
@@ -247,6 +254,7 @@ pub fn analyze_workspace(
     let mut heuristics = functional_core_imperative_shell_candidates(workspace, complexity);
     heuristics.extend(interface_segregation_candidates(workspace));
     heuristics.extend(dependency_inversion_candidates(workspace, boundary_config)?);
+    heuristics.extend(cohesion_candidates(workspace, complexity));
     Ok(heuristics)
 }
 
@@ -279,13 +287,7 @@ fn functional_core_imperative_shell_candidates(
     workspace: &Workspace,
     complexity: &WorkspaceComplexity,
 ) -> Vec<PrincipleHeuristic> {
-    let mut cyclomatic_by_function: BTreeMap<(PathBuf, String), u32> = BTreeMap::new();
-    for info in &complexity.functions {
-        cyclomatic_by_function.insert(
-            (info.file.clone(), info.qualified_name.clone()),
-            info.cyclomatic,
-        );
-    }
+    let cyclomatic_by_function = cyclomatic_by_function_map(complexity);
 
     let mut heuristics = Vec::new();
     for krate in &workspace.crates {
@@ -320,6 +322,24 @@ fn functional_core_imperative_shell_candidates(
         }
     }
     heuristics
+}
+
+/// Builds `(file, qualified_name) -> cyclomatic complexity` from
+/// `judge::complexity::analyze_workspace`'s per-function output — shared by
+/// [`functional_core_imperative_shell_candidates`] (signal 2) and
+/// [`cohesion_candidates`] (the `ComplexComputation` effect category), which
+/// both need the same independently-computed metric.
+fn cyclomatic_by_function_map(
+    complexity: &WorkspaceComplexity,
+) -> BTreeMap<(PathBuf, String), u32> {
+    let mut map = BTreeMap::new();
+    for info in &complexity.functions {
+        map.insert(
+            (info.file.clone(), info.qualified_name.clone()),
+            info.cyclomatic,
+        );
+    }
+    map
 }
 
 const IO_PATH_PREFIX_PAIRS: &[(&str, &str)] = &[
@@ -1107,6 +1127,365 @@ fn build_dependency_inversion_heuristic(
     }
 }
 
+/// One of the three effect categories [`cohesion_candidates`]'s signal 2
+/// checks for independently on each public item — see that function's doc
+/// comment for the detection rule per category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectCategory {
+    IoOperations,
+    TerminalOutput,
+    ComplexComputation,
+}
+
+impl EffectCategory {
+    fn label(self) -> &'static str {
+        match self {
+            Self::IoOperations => "I/O operations",
+            Self::TerminalOutput => "terminal output",
+            Self::ComplexComputation => "complex computation",
+        }
+    }
+}
+
+const TERMINAL_OUTPUT_MACROS: &[&str] = &["println", "eprintln", "print", "eprint"];
+const WRITE_MACROS: &[&str] = &["write", "writeln"];
+const TERMINAL_STREAM_MARKERS: &[&str] = &["stdout", "stderr", "Stdout", "Stderr"];
+
+/// Rendered source text of every macro call in `block` matching
+/// [`cohesion_candidates`]'s `TerminalOutput` category: `println!`/
+/// `eprintln!`/`print!`/`eprint!`, or `write!`/`writeln!` on an expression
+/// whose token stream textually contains `stdout`/`stderr`/`Stdout`/
+/// `Stderr`. Matched via `visit_macro` (not `visit_expr_macro`), the same
+/// approach `slop.rs` uses, so this also sees macro invocations used as
+/// statements, not just as expressions.
+fn terminal_output_hits(block: &syn::Block) -> Vec<String> {
+    struct Finder {
+        hits: Vec<String>,
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if let Some(name) = node.path.get_ident().map(ToString::to_string) {
+                let is_terminal_output = TERMINAL_OUTPUT_MACROS.contains(&name.as_str())
+                    || (WRITE_MACROS.contains(&name.as_str())
+                        && TERMINAL_STREAM_MARKERS
+                            .iter()
+                            .any(|marker| node.tokens.to_string().contains(marker)));
+                if is_terminal_output {
+                    self.hits.push(format!("{name}!(...)"));
+                }
+            }
+            syn::visit::visit_macro(self, node);
+        }
+    }
+    let mut finder = Finder { hits: Vec::new() };
+    finder.visit_block(block);
+    finder.hits
+}
+
+/// One effect category a [`FileItem`] shows, plus a short rendering of the
+/// concrete evidence for it (the I/O call, the output macro, or the
+/// cyclomatic complexity value).
+struct CategoryHit {
+    category: EffectCategory,
+    detail: String,
+}
+
+/// One public top-level item counted toward [`cohesion_candidates`]'s signal
+/// 1 (`pub fn`/impl method, `pub struct`, `pub enum`, `pub trait`), together
+/// with whichever [`EffectCategory`] hits signal 2 found on it — empty for
+/// `struct`/`enum`/`trait` declarations, which have no body to check.
+struct FileItem {
+    name: String,
+    location: EvidenceLocation,
+    categories: Vec<CategoryHit>,
+}
+
+/// Collects public top-level `struct`/`enum`/`trait` declarations in one
+/// parsed file — part of [`cohesion_candidates`]'s signal-1 item count.
+/// Public `fn`/impl-method items are collected separately via
+/// [`walk_functions`] in [`collect_file_items`], since that helper already
+/// tracks their impl `Self`-type-qualified names and bodies (needed for
+/// signal 2).
+struct DeclaredItemCollector {
+    file: PathBuf,
+    items: Vec<FileItem>,
+}
+
+impl DeclaredItemCollector {
+    fn push(&mut self, name: String) {
+        self.items.push(FileItem {
+            location: EvidenceLocation {
+                file: self.file.clone(),
+                item_path: Some(name.clone()),
+            },
+            name,
+            categories: Vec::new(),
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for DeclaredItemCollector {
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            self.push(node.ident.to_string());
+        }
+        syn::visit::visit_item_struct(self, node);
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            self.push(node.ident.to_string());
+        }
+        syn::visit::visit_item_enum(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if matches!(node.vis, syn::Visibility::Public(_)) {
+            self.push(node.ident.to_string());
+        }
+        syn::visit::visit_item_trait(self, node);
+    }
+}
+
+/// Every public top-level item in one parsed file, in source order: `pub
+/// fn`s and `pub` impl methods first (via [`walk_functions`], each carrying
+/// whichever [`EffectCategory`] hits [`cohesion_candidates`]'s signal 2
+/// found in its body), followed by `pub struct`/`pub enum`/`pub trait`
+/// declarations (via [`DeclaredItemCollector`], which never carry a
+/// category — they have no body to check).
+fn collect_file_items(
+    ast: &syn::File,
+    file: &Path,
+    cyclomatic_by_function: &BTreeMap<(PathBuf, String), u32>,
+) -> Vec<FileItem> {
+    let mut items = Vec::new();
+
+    walk_functions(ast, |site| {
+        let Some(vis) = site.vis else {
+            return;
+        };
+        if !matches!(vis, syn::Visibility::Public(_)) {
+            return;
+        }
+
+        let mut categories = Vec::new();
+        let io_hits = io_call_hits(site.block);
+        if !io_hits.is_empty() {
+            categories.push(CategoryHit {
+                category: EffectCategory::IoOperations,
+                detail: io_hits.join(", "),
+            });
+        }
+        let output_hits = terminal_output_hits(site.block);
+        if !output_hits.is_empty() {
+            categories.push(CategoryHit {
+                category: EffectCategory::TerminalOutput,
+                detail: output_hits.join(", "),
+            });
+        }
+        if let Some(&cyclomatic) =
+            cyclomatic_by_function.get(&(file.to_path_buf(), site.qualified_name.clone()))
+            && cyclomatic >= FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD
+        {
+            categories.push(CategoryHit {
+                category: EffectCategory::ComplexComputation,
+                detail: format!("cyclomatic complexity {cyclomatic}"),
+            });
+        }
+
+        items.push(FileItem {
+            location: EvidenceLocation {
+                file: file.to_path_buf(),
+                item_path: Some(site.qualified_name.clone()),
+            },
+            name: site.qualified_name,
+            categories,
+        });
+    });
+
+    let mut declared = DeclaredItemCollector {
+        file: file.to_path_buf(),
+        items: Vec::new(),
+    };
+    declared.visit_file(ast);
+    items.extend(declared.items);
+
+    items
+}
+
+/// The first pair of distinct items in `items` (in list order) that each
+/// show at least one [`EffectCategory`], where those categories differ — see
+/// [`cohesion_candidates`]'s signal 2. An item showing more than one
+/// category on its own does not count against itself; only a category held
+/// by one item and a *different* category held by a *different* item
+/// qualifies (functional-core-imperative-shell's domain is a single item
+/// mixing categories, not this).
+fn first_differing_category_pair(items: &[FileItem]) -> Option<(usize, usize)> {
+    for i in 0..items.len() {
+        for j in (i + 1)..items.len() {
+            let differs = items[i].categories.iter().any(|hit_i| {
+                items[j]
+                    .categories
+                    .iter()
+                    .any(|hit_j| hit_i.category != hit_j.category)
+            });
+            if differs {
+                return Some((i, j));
+            }
+        }
+    }
+    None
+}
+
+/// Single Responsibility / Cohesion (todo.md §16.7's table): "getrennte
+/// Call-/Dependency-/Change-Cluster, gemischte Effektarten, kaum interne
+/// Interaktion" → "Möglicher Kohäsionsmangel; Split prüfen".
+///
+/// Two independent signals, both required for the same file:
+///
+/// 1. **Structural (item count)** — the file declares at least
+///    [`COHESION_ITEM_THRESHOLD`] public top-level items: `pub fn`s and
+///    `pub` impl methods (via [`walk_functions`]), plus `pub struct`/`pub
+///    enum`/`pub trait` declarations.
+/// 2. **Categorical diversity (independent of item count)** — at least two
+///    *different* items in the file each show a *different*
+///    [`EffectCategory`]: `IoOperations` (reusing
+///    [`functional_core_imperative_shell_candidates`]'s I/O-call detection,
+///    [`io_call_hits`]), `TerminalOutput` ([`terminal_output_hits`]), or
+///    `ComplexComputation` (the same cyclomatic-complexity threshold as
+///    `functional-core-imperative-shell`,
+///    [`FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD`], via `complexity`). One item
+///    mixing several categories itself does not satisfy this signal — that
+///    is `functional-core-imperative-shell`'s domain, not this one's; see
+///    [`first_differing_category_pair`].
+///
+/// Only files satisfying both produce a heuristic — exactly one per file.
+fn cohesion_candidates(
+    workspace: &Workspace,
+    complexity: &WorkspaceComplexity,
+) -> Vec<PrincipleHeuristic> {
+    let cyclomatic_by_function = cyclomatic_by_function_map(complexity);
+
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+
+            let items = collect_file_items(&ast, &source.path, &cyclomatic_by_function);
+            if items.len() < COHESION_ITEM_THRESHOLD {
+                continue;
+            }
+            if first_differing_category_pair(&items).is_some() {
+                heuristics.push(build_cohesion_heuristic(krate, &source.path, &items));
+            }
+        }
+    }
+    heuristics
+}
+
+fn build_cohesion_heuristic(
+    krate: &CrateInfo,
+    file: &Path,
+    items: &[FileItem],
+) -> PrincipleHeuristic {
+    let module =
+        module_path_for_file(&krate.root, file).unwrap_or_else(|| file.display().to_string());
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![module],
+    };
+
+    let item_names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+    let structural = Evidence {
+        description: format!(
+            "This file declares {} public top-level items, at or above the \
+             {COHESION_ITEM_THRESHOLD} threshold this heuristic treats as several public items \
+             in one file: {}.",
+            items.len(),
+            item_names.join(", "),
+        ),
+        locations: items.iter().map(|item| item.location.clone()).collect(),
+    };
+
+    let categorized: Vec<&FileItem> = items
+        .iter()
+        .filter(|item| !item.categories.is_empty())
+        .collect();
+    let category_descriptions: Vec<String> = categorized
+        .iter()
+        .map(|item| {
+            let hits: Vec<String> = item
+                .categories
+                .iter()
+                .map(|hit| format!("{} ({})", hit.category.label(), hit.detail))
+                .collect();
+            format!("`{}` shows {}", item.name, hits.join(" and "))
+        })
+        .collect();
+    let category_evidence = Evidence {
+        description: format!(
+            "At least two of these items show a different effect category from each other, \
+             independently of one another: {}.",
+            category_descriptions.join("; "),
+        ),
+        locations: categorized
+            .iter()
+            .map(|item| item.location.clone())
+            .collect(),
+    };
+
+    let evidence_identities: Vec<String> = items.iter().map(|item| item.name.clone()).collect();
+    let id = PrincipleHeuristicId::compute(DesignPrinciple::Cohesion, &scope, &evidence_identities);
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::Cohesion,
+        scope,
+        evidence: vec![structural, category_evidence],
+        interpretation: "This file defines several public items, and at least two of them \
+            exhibit different effect categories (I/O, terminal output, complex computation) \
+            independently of each other. That may indicate the file bundles more than one \
+            responsibility."
+            .to_string(),
+        contraindications: vec![
+            Contraindication {
+                description: "A module deliberately organized as a small orchestration/facade \
+                    layer may legitimately touch several effect kinds by design — that's its \
+                    job, not a cohesion problem."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "Three or more public items in one file is extremely common in \
+                    Rust and not inherently a signal on its own without the category-diversity \
+                    evidence."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether these items are actually called together/interdependently \
+                (true coupling) or are just co-located is not checked here — only that they \
+                exist in the same file with different effect signatures."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the file as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Split the file along the observed effect-category boundaries \
+                    into separate modules, each with a narrower responsibility."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,6 +1868,20 @@ mod tests {
         )
         .unwrap();
         std::fs::write(
+            dir.join("fixture/src/cohesion.rs"),
+            format!(
+                "pub fn read_config(path: &str) -> String {{\n\
+                 \x20   std::fs::read_to_string(path).unwrap()\n\
+                 }}\n\
+                 pub fn compute(mut total: i32) -> i32 {{\n\
+                 {NINE_IFS}\n\
+                 \x20   total\n\
+                 }}\n\
+                 pub struct Marker;\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
             dir.join("Cargo.toml"),
             "[workspace]\nmembers = [\"fixture\"]\nresolver = \"2\"\n",
         )
@@ -1513,8 +1906,9 @@ mod tests {
         assert!(
             principles.contains(&DesignPrinciple::FunctionalCoreImperativeShell)
                 && principles.contains(&DesignPrinciple::InterfaceSegregation)
-                && principles.contains(&DesignPrinciple::DependencyInversion),
-            "fixture must exercise all three rules' wording: {principles:?}"
+                && principles.contains(&DesignPrinciple::DependencyInversion)
+                && principles.contains(&DesignPrinciple::Cohesion),
+            "fixture must exercise all four rules' wording: {principles:?}"
         );
 
         for heuristic in &heuristics {
@@ -1724,5 +2118,132 @@ mod tests {
         let empty_config = BoundaryConfig::default();
         let heuristics = analyze_with_boundary_config(&workspace, Some(&empty_config));
         assert!(dependency_inversion_heuristics(&heuristics).is_empty());
+    }
+
+    // --- Cohesion -----------------------------------------------------------
+
+    fn cohesion_heuristics(heuristics: &[PrincipleHeuristic]) -> Vec<&PrincipleHeuristic> {
+        heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::Cohesion)
+            .collect()
+    }
+
+    /// (a) A file with >= [`COHESION_ITEM_THRESHOLD`] public items, where one
+    /// item shows `IoOperations` and a *different* item shows
+    /// `ComplexComputation` ⇒ exactly one `Cohesion` heuristic, with both
+    /// evidence slots populated.
+    #[test]
+    fn mixed_categories_across_items_produces_one_heuristic() {
+        let dir = TempDir::new("principle-cohesion-mixed-categories");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            format!(
+                "pub fn read_file(path: &str) -> String {{\n\
+                 \x20   std::fs::read_to_string(path).unwrap()\n\
+                 }}\n\
+                 pub fn compute(mut total: i32) -> i32 {{\n\
+                 {NINE_IFS}\n\
+                 \x20   total\n\
+                 }}\n\
+                 pub struct Marker;\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let cohesion = cohesion_heuristics(&heuristics);
+
+        assert_eq!(cohesion.len(), 1);
+        let heuristic = cohesion[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) A file with >= threshold public items, all showing the *same*
+    /// single category (`ComplexComputation`) ⇒ no heuristic — category
+    /// diversity, not just item count, is required.
+    #[test]
+    fn same_category_across_all_items_produces_no_heuristic() {
+        let dir = TempDir::new("principle-cohesion-single-category");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            format!(
+                "pub fn compute_a(mut total: i32) -> i32 {{\n{NINE_IFS}\n\x20   total\n}}\n\
+                 pub fn compute_b(mut total: i32) -> i32 {{\n{NINE_IFS}\n\x20   total\n}}\n\
+                 pub fn compute_c(mut total: i32) -> i32 {{\n{NINE_IFS}\n\x20   total\n}}\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze(&workspace).is_empty());
+    }
+
+    /// (c) Only 2 public items, even with different categories ⇒ no
+    /// heuristic (item-count threshold of 3 not reached).
+    #[test]
+    fn below_item_threshold_produces_no_heuristic() {
+        let dir = TempDir::new("principle-cohesion-below-threshold");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            format!(
+                "pub fn read_file(path: &str) -> String {{\n\
+                 \x20   std::fs::read_to_string(path).unwrap()\n\
+                 }}\n\
+                 pub fn compute(mut total: i32) -> i32 {{\n\
+                 {NINE_IFS}\n\
+                 \x20   total\n\
+                 }}\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        assert!(analyze(&workspace).is_empty());
+    }
+
+    /// (d) Abgrenzung from `functional-core-imperative-shell`: one function
+    /// mixes `IoOperations` and `ComplexComputation` *itself*, and the file
+    /// has enough other public items to reach the item-count threshold, but
+    /// none of those other items show any effect category at all. Only one
+    /// item in the whole file carries a category, so no *pair of different
+    /// items* with differing categories exists ⇒ no `Cohesion` heuristic,
+    /// even though `functional-core-imperative-shell` fires for that same
+    /// function.
+    #[test]
+    fn single_item_mixing_categories_produces_no_cohesion_heuristic() {
+        let dir = TempDir::new("principle-cohesion-single-item-mix");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            format!(
+                "pub fn read_and_branch(path: &str) -> i32 {{\n\
+                 \x20   let contents = std::fs::read_to_string(path).unwrap();\n\
+                 \x20   let mut total = contents.len() as i32;\n\
+                 {NINE_IFS}\n\
+                 \x20   total\n\
+                 }}\n\
+                 pub struct Marker;\n\
+                 pub struct OtherMarker;\n"
+            ),
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+
+        let principles: Vec<DesignPrinciple> = heuristics.iter().map(|h| h.principle).collect();
+        assert!(principles.contains(&DesignPrinciple::FunctionalCoreImperativeShell));
+        assert!(cohesion_heuristics(&heuristics).is_empty());
     }
 }
