@@ -17,6 +17,17 @@ pub struct FunctionInfo {
     pub line: usize,
     pub cyclomatic: u32,
     pub lines_of_code: usize,
+    /// Maximum nesting depth of branching/looping/closure constructs (see
+    /// todo.md §3.C "Nesting Depth").
+    pub nesting_depth: u32,
+    /// Total number of `match` arms across the function body (see todo.md
+    /// §3.C "`match`-Arm-Anzahl"). Distinct from `cyclomatic`, which counts
+    /// `arms.len().saturating_sub(1)` per `match` for branch-counting
+    /// purposes.
+    pub match_arm_count: u32,
+    /// Number of parameters in the function's signature (see todo.md §3.C
+    /// "Argument Count").
+    pub arg_count: usize,
 }
 
 #[derive(Debug)]
@@ -53,7 +64,12 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
 
     let mut functions = Vec::new();
     walk_functions(&ast, |site| {
-        let mut complexity = ComplexityVisitor { complexity: 1 };
+        let mut complexity = ComplexityVisitor {
+            complexity: 1,
+            nesting_depth: 0,
+            current_depth: 0,
+            match_arm_count: 0,
+        };
         complexity.visit_block(site.block);
 
         let start_line = site.span.start().line;
@@ -65,6 +81,9 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
             line: start_line,
             cyclomatic: complexity.complexity,
             lines_of_code: end_line - start_line + 1,
+            nesting_depth: complexity.nesting_depth,
+            match_arm_count: complexity.match_arm_count,
+            arg_count: site.arg_count,
         });
     });
     Ok(functions)
@@ -108,6 +127,16 @@ pub fn analyze_workspace<'a>(
 /// [`walk_functions`] analyzes them as their own, separate functions.
 struct ComplexityVisitor {
     complexity: u32,
+    /// Maximum nesting depth of branching/looping/closure constructs seen so
+    /// far — this is the value stored in [`FunctionInfo::nesting_depth`].
+    nesting_depth: u32,
+    /// Running nesting depth at the current point of the walk; scratch
+    /// counter for `nesting_depth`, incremented on entry to a nesting
+    /// construct and decremented on exit.
+    current_depth: u32,
+    /// Total number of `match` arms across the function body — see
+    /// [`FunctionInfo::match_arm_count`].
+    match_arm_count: u32,
 }
 
 impl<'ast> Visit<'ast> for ComplexityVisitor {
@@ -120,13 +149,32 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
                 self.complexity += node.arms.len().saturating_sub(1) as u32;
                 self.complexity +=
                     node.arms.iter().filter(|arm| arm.guard.is_some()).count() as u32;
+                self.match_arm_count += node.arms.len() as u32;
             }
             Expr::Binary(node) if matches!(node.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) => {
                 self.complexity += 1;
             }
             _ => {}
         }
+
+        let nests = matches!(
+            expr,
+            Expr::If(_)
+                | Expr::While(_)
+                | Expr::ForLoop(_)
+                | Expr::Loop(_)
+                | Expr::Match(_)
+                | Expr::Closure(_)
+                | Expr::Block(_)
+        );
+        if nests {
+            self.current_depth += 1;
+            self.nesting_depth = self.nesting_depth.max(self.current_depth);
+        }
         visit::visit_expr(self, expr);
+        if nests {
+            self.current_depth -= 1;
+        }
     }
 
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
@@ -192,6 +240,22 @@ fn match_arms(x: i32) -> i32 {
         _ => 0,
     }
 }
+
+fn mixed_nesting(x: i32) {
+    match x {
+        n if n > 0 => for i in 0..n {
+            if i % 2 == 0 {
+                let _ = i;
+            }
+        },
+        _ => {}
+    }
+}
+
+fn closure_only() {
+    let cl = || 1;
+    cl();
+}
 "#,
         )
         .unwrap();
@@ -204,6 +268,20 @@ fn match_arms(x: i32) -> i32 {
                 .unwrap_or_else(|| panic!("missing function {name}"))
                 .cyclomatic
         };
+        let nesting_depth = |name: &str| {
+            functions
+                .iter()
+                .find(|f| f.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing function {name}"))
+                .nesting_depth
+        };
+        let match_arm_count = |name: &str| {
+            functions
+                .iter()
+                .find(|f| f.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing function {name}"))
+                .match_arm_count
+        };
 
         assert_eq!(complexity("straight_line"), 1);
         assert_eq!(complexity("single_if"), 2);
@@ -212,6 +290,28 @@ fn match_arms(x: i32) -> i32 {
         assert_eq!(complexity("loops"), 4);
         assert_eq!(complexity("try_operator"), 2);
         assert_eq!(complexity("match_arms"), 5);
+
+        assert_eq!(nesting_depth("straight_line"), 0);
+        assert_eq!(nesting_depth("single_if"), 1);
+        assert_eq!(nesting_depth("if_else_if"), 2);
+        assert_eq!(nesting_depth("boolean_operators"), 0);
+        assert_eq!(nesting_depth("loops"), 1);
+        assert_eq!(nesting_depth("try_operator"), 0);
+        assert_eq!(nesting_depth("match_arms"), 1);
+        // if inside a loop inside a match: proves max-depth tracking works
+        // across different node kinds, not just repetitions of one kind.
+        assert_eq!(nesting_depth("mixed_nesting"), 3);
+        assert_eq!(nesting_depth("closure_only"), 1);
+
+        assert_eq!(match_arm_count("straight_line"), 0);
+        assert_eq!(match_arm_count("single_if"), 0);
+        assert_eq!(match_arm_count("if_else_if"), 0);
+        assert_eq!(match_arm_count("boolean_operators"), 0);
+        assert_eq!(match_arm_count("loops"), 0);
+        assert_eq!(match_arm_count("try_operator"), 0);
+        assert_eq!(match_arm_count("match_arms"), 4);
+        assert_eq!(match_arm_count("mixed_nesting"), 2);
+        assert_eq!(match_arm_count("closure_only"), 0);
     }
 
     #[test]

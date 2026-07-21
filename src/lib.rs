@@ -30,6 +30,7 @@ pub mod provenance;
 pub mod reachability;
 pub mod rule_registry;
 pub mod sarif;
+pub mod security;
 pub mod slop;
 pub mod slop_structural;
 #[cfg(feature = "deep")]

@@ -16,6 +16,9 @@ pub struct FunctionSite<'ast> {
     pub qualified_name: String,
     pub span: Span,
     pub block: &'ast Block,
+    /// Number of parameters in the function's signature (`self` included),
+    /// i.e. `sig.inputs.len()`.
+    pub arg_count: usize,
     /// Span of just the function's identifier — narrower than `span`, which
     /// covers the whole item. Needed to position a Deep Tier query exactly
     /// on the name token (see [`crate::deep`]). Only consumed behind the
@@ -91,6 +94,7 @@ where
         name: &str,
         spanned: &impl Spanned,
         block: &'ast Block,
+        arg_count: usize,
         ident_span: Span,
         vis: Option<&'ast syn::Visibility>,
         attrs: &'ast [syn::Attribute],
@@ -101,6 +105,7 @@ where
             qualified_name,
             span: spanned.span(),
             block,
+            arg_count,
             ident_span,
             vis,
             attrs,
@@ -153,6 +158,7 @@ where
             &node.sig.ident.to_string(),
             node,
             &node.block,
+            node.sig.inputs.len(),
             node.sig.ident.span(),
             Some(&node.vis),
             &node.attrs,
@@ -167,6 +173,7 @@ where
             &node.sig.ident.to_string(),
             node,
             &node.block,
+            node.sig.inputs.len(),
             node.sig.ident.span(),
             Some(&node.vis),
             &node.attrs,
@@ -181,6 +188,7 @@ where
                 &node.sig.ident.to_string(),
                 node,
                 block,
+                node.sig.inputs.len(),
                 node.sig.ident.span(),
                 None,
                 &node.attrs,
@@ -251,6 +259,31 @@ trait Required {
         walk_functions(&file, |site| names.push(site.qualified_name));
 
         assert!(names.is_empty());
+    }
+
+    #[test]
+    fn arg_count_reflects_the_signature_parameter_count() {
+        let file: syn::File = syn::parse_str(
+            r#"
+fn no_args() {}
+
+fn several_args(a: i32, b: i32, c: i32) {}
+"#,
+        )
+        .unwrap();
+
+        let mut counts = Vec::new();
+        walk_functions(&file, |site| {
+            counts.push((site.qualified_name, site.arg_count))
+        });
+
+        assert_eq!(
+            counts,
+            vec![
+                ("no_args".to_string(), 0),
+                ("several_args".to_string(), 3),
+            ]
+        );
     }
 
     #[test]

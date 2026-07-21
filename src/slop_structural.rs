@@ -14,20 +14,30 @@
 //! that only the Deep Tier's `find_all_refs` (see [`crate::deep`]) can
 //! supply reliably — they are implemented separately as Deep Tier rules
 //! reusing that infrastructure, not here.
+//!
+//! A fifth, unrelated rule also lives here: `fragile-substring-classification`
+//! (todo.md §G "Wartbarkeit & Slop", "K1"), a single-signal per-function-body
+//! shape check (an if/else-if chain classifying via `.contains("literal")`
+//! with no word-boundary check) — not a G4 structural signal, but the
+//! closest existing analog for its shape (single precise `Finding` location,
+//! `syn`-only, per-function `walk_functions` pass) is `abstraction-inflation`
+//! right above, so it's kept in this module rather than starting a new one.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Expr, Fields, FnArg, GenericArgument, ImplItem, ImplItemFn, ItemImpl, ItemStruct, Member,
-    PathArguments, ReturnType, Stmt, Type,
+    BinOp, Expr, ExprBinary, ExprCall, ExprIf, ExprMethodCall, Fields, FnArg, GenericArgument,
+    ImplItem, ImplItemFn, ItemFn, ItemImpl, ItemStruct, Lit, Member, PathArguments, ReturnType,
+    Stmt, Type,
 };
 
 use crate::complexity::FunctionInfo;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
+use crate::functions::walk_functions;
 use crate::ingest::{SourceFile, SourceKind};
 
 /// Rule id for a file reworked often within a short window (see todo.md
@@ -54,6 +64,14 @@ pub const LEGACY_FREEZE_RULE_REVISION: u32 = 1;
 /// `unimplemented!()` under one id.
 pub const ABSTRACTION_INFLATION_RULE: &str = "abstraction-inflation";
 pub const ABSTRACTION_INFLATION_RULE_REVISION: u32 = 1;
+
+/// Rule id for an if/else-if chain that classifies via `.contains("literal")`
+/// with no word-boundary check found in the same condition (see todo.md §G
+/// "K1 — `fragile-substring-classification`").
+pub const FRAGILE_SUBSTRING_CLASSIFICATION_RULE: &str = "fragile-substring-classification";
+/// Bump when the fragile-substring-classification rule's logic changes (see
+/// todo.md §5 "Regelversions-Schutz").
+pub const FRAGILE_SUBSTRING_CLASSIFICATION_RULE_REVISION: u32 = 1;
 
 /// Minimum commits touching a single file within the 14-day churn window
 /// (see todo.md §3.G `churn-hotspot`: "hoher 2-Wochen-Churn — Rework, nicht
@@ -599,6 +617,219 @@ pub fn analyze_workspace_structural<'a>(
     findings
 }
 
+/// Minimum number of chained conditions (the head `if` plus at least one
+/// `else if`) for `fragile-substring-classification` to consider a chain at
+/// all — see [`fragile_substring_classification`]. First-cut, adjustable
+/// threshold.
+const MIN_CHAIN_CONDITIONS: usize = 2;
+
+/// Method/function names recognized as an explicit word-boundary check
+/// inside a condition (see [`condition_is_fragile`]), matched
+/// case-insensitively against a method name or the last path segment of a
+/// called function — todo.md §G K1's own sketch: "keine Wortgrenzen-Funktion
+/// in der Bedingung".
+const WORD_BOUNDARY_FN_NAMES: &[&str] = &["is_word", "word_boundary", "is_word_boundary"];
+
+fn is_word_boundary_name(name: &str) -> bool {
+    WORD_BOUNDARY_FN_NAMES
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
+/// Collects, over a single condition expression, whether it contains
+/// `.contains(<string literal>)` and whether it contains any of the
+/// recognized word-boundary checks — an `==` comparison,
+/// `.split_whitespace()`, or a call to a function/method named like
+/// [`WORD_BOUNDARY_FN_NAMES`]. A plain `syn::visit::Visit` walk, so either
+/// signal is recognized anywhere in the condition, including nested inside a
+/// `&&`/`||` combination — no De Morgan handling attempted (see
+/// [`fragile_substring_classification`]'s doc comment on v1 scope).
+#[derive(Default)]
+struct ConditionSignals {
+    has_fragile_contains: bool,
+    has_word_boundary_check: bool,
+}
+
+impl<'ast> Visit<'ast> for ConditionSignals {
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        let name = node.method.to_string();
+        if name == "contains"
+            && node.args.len() == 1
+            && matches!(
+                node.args.first(),
+                Some(Expr::Lit(expr_lit)) if matches!(expr_lit.lit, Lit::Str(_))
+            )
+        {
+            self.has_fragile_contains = true;
+        }
+        if name == "split_whitespace" || is_word_boundary_name(&name) {
+            self.has_word_boundary_check = true;
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        if let Expr::Path(path_expr) = node.func.as_ref()
+            && let Some(last) = path_expr.path.segments.last()
+            && is_word_boundary_name(&last.ident.to_string())
+        {
+            self.has_word_boundary_check = true;
+        }
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast ExprBinary) {
+        if matches!(node.op, BinOp::Eq(_)) {
+            self.has_word_boundary_check = true;
+        }
+        visit::visit_expr_binary(self, node);
+    }
+}
+
+/// Whether `condition` matches criterion 1 (`.contains(<string literal>)`)
+/// without criterion 2 (an accompanying word-boundary check) — see
+/// [`ConditionSignals`].
+fn condition_is_fragile(condition: &Expr) -> bool {
+    let mut signals = ConditionSignals::default();
+    signals.visit_expr(condition);
+    signals.has_fragile_contains && !signals.has_word_boundary_check
+}
+
+/// Walks a single function body for if/else-if chains matching
+/// `fragile-substring-classification` (see
+/// [`fragile_substring_classification`]). Overrides `visit_item_fn` to a
+/// no-op — a nested `fn` item defined inside this body is a separate
+/// function [`crate::functions::walk_functions`] already visits (and checks)
+/// on its own, same convention as `crate::security::UnsafeVisitor`.
+#[derive(Default)]
+struct FragileSubstringVisitor {
+    /// Identity of every `else if` node already accounted for as part of a
+    /// longer chain headed further up the chain — so when the default
+    /// recursion below reaches it, it isn't independently re-evaluated as
+    /// its own (too-short) chain head.
+    consumed: HashSet<*const ExprIf>,
+    /// Span of each matching chain's own leading `if` keyword.
+    hits: Vec<proc_macro2::Span>,
+}
+
+impl<'ast> Visit<'ast> for FragileSubstringVisitor {
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        if self.consumed.contains(&(node as *const ExprIf)) {
+            visit::visit_expr_if(self, node);
+            return;
+        }
+
+        let mut conditions: Vec<&Expr> = vec![node.cond.as_ref()];
+        let mut tail = node;
+        while let Some((_, else_expr)) = &tail.else_branch {
+            let Expr::If(next) = else_expr.as_ref() else {
+                break;
+            };
+            self.consumed.insert(next as *const ExprIf);
+            conditions.push(next.cond.as_ref());
+            tail = next;
+        }
+
+        if conditions.len() >= MIN_CHAIN_CONDITIONS
+            && conditions.iter().any(|cond| condition_is_fragile(cond))
+        {
+            self.hits.push(node.if_token.span());
+        }
+
+        visit::visit_expr_if(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+fn fragile_substring_classification_finding(
+    file: &Path,
+    line: usize,
+    item_path: String,
+) -> Finding {
+    Finding {
+        id: format!(
+            "{FRAGILE_SUBSTRING_CLASSIFICATION_RULE}:{}:{line}:{item_path}",
+            file.display()
+        )
+        .into(),
+        rule: FRAGILE_SUBSTRING_CLASSIFICATION_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: file.to_path_buf(),
+            line: OneBasedLine::new(line).expect("proc-macro2 span lines are 1-based"),
+            item_path,
+        },
+        evidence_class: EvidenceClass::Heuristic,
+        origin: Origin::Code,
+        evidence: Some(json!({
+            "reason": "this if/else chain classifies via `.contains()` on a short string \
+                literal with no word-boundary check found in the condition — this can \
+                misclassify if the string appears as a substring of something unrelated",
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+/// Flags an if/else-if chain that classifies via `.contains("literal")` with
+/// no accompanying word-boundary check in the same condition — the short
+/// string can match accidentally as a substring of an unrelated word (see
+/// todo.md §G "Wartbarkeit & Slop", "K1 — `fragile-substring-classification`",
+/// a practice finding from `auditmysite`).
+///
+/// Scope, kept simple for v1: only chains of at least
+/// [`MIN_CHAIN_CONDITIONS`] conditions (i.e. at least one `else if`) are
+/// considered — a plain `if cond { .. } else { .. }` has only one condition
+/// and is out of scope, since a single binary branch has no competing
+/// substring candidates the way a longer classification chain does. Within a
+/// qualifying chain, a condition is flagged if it contains
+/// `.contains(<string literal>)` and none of an `==` comparison, a
+/// `.split_whitespace()` call, or a call to a function/method named like
+/// `is_word`/`word_boundary`/`is_word_boundary` appear anywhere else in that
+/// same condition (checked via a `syn::visit::Visit` walk over the condition
+/// expression, so a check nested inside a `&&`/`||` combination is still
+/// recognized — no De Morgan handling attempted). The whole chain fires at
+/// most once, anchored at its own leading `if` keyword, even if more than
+/// one of its conditions matches.
+///
+/// Only [`SourceKind::Authored`] files are analyzed, matching the rest of
+/// the codebase's Generated-Code-Policy (todo.md §3.A).
+pub fn fragile_substring_classification<'a>(
+    source_files: impl IntoIterator<Item = &'a SourceFile>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for file in source_files {
+        if file.kind != SourceKind::Authored {
+            continue;
+        }
+        let Ok(source) = std::fs::read_to_string(&file.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&source) else {
+            continue;
+        };
+
+        walk_functions(&ast, |site| {
+            let mut visitor = FragileSubstringVisitor::default();
+            visitor.visit_block(site.block);
+            for span in visitor.hits {
+                findings.push(fragile_substring_classification_finding(
+                    &file.path,
+                    span.start().line,
+                    site.qualified_name.clone(),
+                ));
+            }
+        });
+    }
+    // Deterministic output, matching `analyze_workspace_structural`'s own
+    // sort convention.
+    findings.sort_by(|a, b| {
+        (&a.location.file, a.location.line, &a.id).cmp(&(&b.location.file, b.location.line, &b.id))
+    });
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +961,9 @@ mod tests {
             line: 1,
             cyclomatic,
             lines_of_code,
+            nesting_depth: 0,
+            match_arm_count: 0,
+            arg_count: 0,
         }
     }
 
@@ -1224,5 +1458,85 @@ impl_build!(FooBuilder, Foo);
             hits.is_empty(),
             "macro-generated build() is invisible to the syn-based collector: {hits:?}"
         );
+    }
+
+    #[test]
+    fn fragile_substring_classification_fires_for_contains_chain_with_no_word_boundary_check() {
+        let dir = TempDir::new("fragile-substring-classification-positive");
+        let file = dir.join("classify.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn classify(input: &str) -> &'static str {
+    if input.contains("foo") {
+        "is foo"
+    } else if input.contains("bar") {
+        "is bar"
+    } else {
+        "unknown"
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let findings = fragile_substring_classification(files.iter());
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, FRAGILE_SUBSTRING_CLASSIFICATION_RULE);
+        assert_eq!(findings[0].location.item_path, "classify");
+    }
+
+    #[test]
+    fn fragile_substring_classification_does_not_fire_with_a_word_boundary_check() {
+        let dir = TempDir::new("fragile-substring-classification-word-boundary");
+        let file = dir.join("classify.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn classify(input: &str) -> &'static str {
+    if input == "foo" {
+        "is foo"
+    } else if input.contains("bar") && input.split_whitespace().any(|w| w == "bar") {
+        "is bar"
+    } else {
+        "unknown"
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let findings = fragile_substring_classification(files.iter());
+
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[test]
+    fn fragile_substring_classification_does_not_fire_for_non_literal_contains_argument() {
+        let dir = TempDir::new("fragile-substring-classification-non-literal");
+        let file = dir.join("classify.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn classify(input: &str, needle: &str) -> &'static str {
+    if input.contains(needle) {
+        "matched"
+    } else if input.contains(needle) {
+        "matched again"
+    } else {
+        "unknown"
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let findings = fragile_substring_classification(files.iter());
+
+        assert!(findings.is_empty(), "{findings:?}");
     }
 }

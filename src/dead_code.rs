@@ -2,16 +2,21 @@
 //! "Reachability & Dead Code", §14.2 P1). Requires the `deep` feature —
 //! semantic reachability isn't available at the Fast Tier.
 //!
-//! Scope: `unused-pub-workspace` only, for free functions, impl/trait
-//! methods ([`crate::functions::walk_functions`]'s items), and top-level
-//! structs/enums/traits/consts/statics plus associated consts/types inside
-//! impls ([`walk_type_items`], below).
+//! Scope: `unused-pub-workspace`/`unused-pub-api`, for free functions,
+//! impl/trait methods ([`crate::functions::walk_functions`]'s items), and
+//! top-level structs/enums/traits/consts/statics plus associated
+//! consts/types inside impls ([`walk_type_items`], below); `dead-enum-variant`
+//! for individual enum variants ([`walk_enum_variants`]); `test-only-pub` for
+//! the same items `unused-pub-workspace`/`unused-pub-api` check.
 //!
 //! **Simplification, documented rather than hidden:** every workspace crate
-//! is treated as workspace-internal. todo.md §3.A distinguishes
-//! `unused-pub-workspace` (a real finding) from `unused-pub-api` on a
-//! *published* crate (info-only, semver-sensitive) — this module doesn't yet
-//! check a crate's `publish` field to tell the two apart.
+//! is treated as workspace-internal for `dead-enum-variant` and
+//! `test-only-pub` — todo.md §3.A's distinction between a real
+//! `unused-pub-workspace` finding and an info-only `unused-pub-api` finding
+//! on a *published* crate is only implemented for the top-level
+//! function/type-item check below (see [`publishable_crates`]); the other
+//! two rules don't yet narrow their scope by a crate's `publish` field
+//! either.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -29,6 +34,44 @@ pub const UNUSED_PUB_WORKSPACE_RULE: &str = "unused-pub-workspace";
 /// Bump when the unused-pub-workspace rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
 pub const UNUSED_PUB_WORKSPACE_RULE_REVISION: u32 = 1;
+
+/// The `unused-pub-workspace` sibling for a crate whose resolved `publish`
+/// field allows publishing (see [`publishable_crates`]): the same
+/// referencing_files + is_reachable_from_entry query, but `Info`/`Heuristic`
+/// rather than `Warn`/`BoundedSemantic` — a published crate's whole purpose
+/// is exposing API to consumers outside the loaded workspace, so "zero
+/// internal reference" is the expected normal state for most of a healthy
+/// library's public surface, not a defect signal (the same
+/// `Severity::Info` + `EvidenceClass::Heuristic`, informational-only shape as
+/// `heavy-dependency` in `crate::deps`). Classifying this `BoundedSemantic`
+/// (gating) would fail CI for nearly every well-formed library crate.
+pub const UNUSED_PUB_API_RULE: &str = "unused-pub-api";
+/// Bump when the unused-pub-api rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const UNUSED_PUB_API_RULE_REVISION: u32 = 1;
+
+/// An enum variant with no construction-position reference found anywhere in
+/// the examined workspace view (see [`walk_enum_variants`],
+/// [`check_enum_variant`]) — a variant only ever matched against, never
+/// constructed, is a stronger and more specific signal than
+/// `unused-pub-workspace` sees at the whole-item granularity `walk_type_items`
+/// checks an enum at.
+pub const DEAD_ENUM_VARIANT_RULE: &str = "dead-enum-variant";
+/// Bump when the dead-enum-variant rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const DEAD_ENUM_VARIANT_RULE_REVISION: u32 = 1;
+
+/// A `pub` item reachable only through `#[cfg(test)]`/test-target code —
+/// unreachable in the "production" reachability mode but reachable in the
+/// "all" mode, and with no cross-crate reference either (see
+/// [`check_test_only_pub`]). Same v1 simplification as
+/// `unused-pub-workspace`'s own module doc: every workspace crate is treated
+/// as workspace-internal, so this doesn't yet narrow by a crate's `publish`
+/// field the way `unused-pub-api` does for the top-level item check.
+pub const TEST_ONLY_PUB_RULE: &str = "test-only-pub";
+/// Bump when the test-only-pub rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const TEST_ONLY_PUB_RULE_REVISION: u32 = 1;
 
 #[derive(Debug)]
 pub enum DeadCodeError {
@@ -55,9 +98,12 @@ impl std::error::Error for DeadCodeError {}
 pub struct WorkspaceDeadCode {
     pub findings: Vec<Finding>,
     pub errors: Vec<DeadCodeError>,
-    /// Number of `pub` items actually queried (functions, methods, structs,
-    /// enums, traits, consts — see todo.md §7, evidence for how thorough the
-    /// run was, not just its findings).
+    /// Number of `pub` items/variants actually queried (functions, methods,
+    /// structs, enums, traits, consts, enum variants — see todo.md §7,
+    /// evidence for how thorough the run was, not just its findings). Each of
+    /// `check_item`'s, `check_enum_variant`'s, and `check_test_only_pub`'s own
+    /// query counts separately, so an item checked by more than one rule
+    /// increments this more than once.
     pub checked: usize,
 }
 
@@ -169,6 +215,167 @@ fn walk_type_items<'ast>(file: &'ast syn::File, on_item: impl FnMut(TypeItemSite
     walker.visit_file(file);
 }
 
+/// A single `enum` variant discovered while walking a file — the
+/// `dead-enum-variant` counterpart to [`TypeItemSite`], which only tracks the
+/// enclosing `enum` as a whole. Deliberately a separate walker rather than a
+/// change to [`walk_type_items`]: that function's per-enum (not per-variant)
+/// shape is relied on by `unused-pub-workspace`'s existing item counting, and
+/// changing it risks breaking that rule's behavior.
+struct EnumVariantSite<'ast> {
+    /// The enclosing enum's qualified name plus `::variant_name`, e.g.
+    /// `outer::MyEnum::Variant` — matches `walk_type_items`'s naming scheme.
+    qualified_name: String,
+    /// The bare variant identifier (no enum/module prefix) — used to match
+    /// construction-position occurrences in [`file_constructs_variant`],
+    /// since a construction site only ever writes the variant's own trailing
+    /// path segment (`MyEnum::Variant`, or bare `Variant` after `use
+    /// MyEnum::Variant;`), never the qualified name this module computes.
+    variant_name: String,
+    ident_span: Span,
+    /// `syn::Variant` has no `vis` field of its own — a variant's visibility
+    /// is inherited from the enclosing `enum`.
+    vis: &'ast syn::Visibility,
+}
+
+/// Visits every variant of every `enum` in `file`, tracking the enclosing
+/// `mod` path the same way [`walk_type_items`] does.
+fn walk_enum_variants<'ast>(file: &'ast syn::File, on_variant: impl FnMut(EnumVariantSite<'ast>)) {
+    struct Walker<F> {
+        path: Vec<String>,
+        on_variant: F,
+    }
+
+    impl<F> Walker<F> {
+        fn qualified_name(&self, name: &str) -> String {
+            if self.path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}::{name}", self.path.join("::"))
+            }
+        }
+    }
+
+    impl<'ast, F: FnMut(EnumVariantSite<'ast>)> Visit<'ast> for Walker<F> {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            if node.content.is_some() {
+                self.path.push(node.ident.to_string());
+                visit::visit_item_mod(self, node);
+                self.path.pop();
+            } else {
+                visit::visit_item_mod(self, node);
+            }
+        }
+
+        fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+            let enum_qualified_name = self.qualified_name(&node.ident.to_string());
+            for variant in &node.variants {
+                let variant_name = variant.ident.to_string();
+                (self.on_variant)(EnumVariantSite {
+                    qualified_name: format!("{enum_qualified_name}::{variant_name}"),
+                    variant_name,
+                    ident_span: variant.ident.span(),
+                    vis: &node.vis,
+                });
+            }
+            visit::visit_item_enum(self, node);
+        }
+    }
+
+    let mut walker = Walker {
+        path: Vec::new(),
+        on_variant,
+    };
+    walker.visit_file(file);
+}
+
+/// Whether `ast` contains at least one construction-position occurrence of
+/// `variant_name` as a path's trailing segment — `Expr::Path` (a unit
+/// variant used as a bare value), `Expr::Call` (a tuple variant constructor;
+/// its callee is itself an `Expr::Path`, so `visit_expr_path` already covers
+/// it), or `Expr::Struct` (a struct variant literal). Deliberately does not
+/// count a `Pat::TupleStruct`/`Pat::Struct` match/if-let occurrence (real,
+/// distinct `syn` node kinds with their own `visit_pat_tuple_struct`/
+/// `visit_pat_struct` callbacks, never dispatched through
+/// `visit_expr_call`/`visit_expr_struct`) — [`crate::deep::referencing_files`]
+/// only reports which files reference a position, not whether that reference
+/// constructs or merely matches against it, so [`check_enum_variant`]
+/// re-parses each referencing file with `syn` to tell the two apart.
+///
+/// **`Pat::Path` is a subtler case, handled explicitly rather than by node
+/// kind alone:** `syn` defines `PatPath` as a type alias for `ExprPath` (see
+/// `syn::pat`'s `pub use crate::expr::{.., ExprPath as PatPath, ..}), since a
+/// bare `MyEnum::Variant` written in pattern position (`Status::Retired =>
+/// ..`) and the identical text written in expression position
+/// (`Status::Retired` as a value) parse to the exact same node — `syn`
+/// itself doesn't distinguish the two by *kind*, only by *tree position*
+/// (`Pat::Path` dispatches straight to `visit_expr_path`, bypassing
+/// `visit_expr` entirely, so there is no separate `visit_pat_path` callback
+/// to override). This visitor tracks that position explicitly via
+/// `in_pattern`, toggled by `visit_pat`/`visit_expr` themselves, so a unit
+/// variant used only as a match pattern is correctly not counted as a
+/// construction even though it and a real construction share one node type.
+///
+/// **Known blind spot, documented rather than hidden:** `syn` parses a macro
+/// invocation's input as an opaque token stream, not as `Expr`/`Pat` nodes —
+/// a variant constructed only inside a macro call (e.g.
+/// `some_macro!(MyEnum::Variant)`) is invisible to this scan even though
+/// [`crate::deep::referencing_files`] (which resolves symbols through macro
+/// expansion) correctly lists the containing file as a referencing file.
+/// Matches the module's existing "im Zweifel nicht melden" stance
+/// imperfectly: this is a genuine false-positive source, not yet closed.
+fn file_constructs_variant(ast: &syn::File, variant_name: &str) -> bool {
+    struct ConstructionVisitor<'a> {
+        variant_name: &'a str,
+        found: bool,
+        /// Whether the node currently being visited is (transitively) part
+        /// of a `Pat`, not an `Expr` — see this function's doc comment for
+        /// why this can't be told apart by node kind alone for `Pat::Path`.
+        in_pattern: bool,
+    }
+
+    fn path_ends_with(path: &syn::Path, name: &str) -> bool {
+        path.segments.last().is_some_and(|segment| segment.ident == name)
+    }
+
+    impl<'a, 'ast> Visit<'ast> for ConstructionVisitor<'a> {
+        fn visit_pat(&mut self, node: &'ast syn::Pat) {
+            let previously_in_pattern = self.in_pattern;
+            self.in_pattern = true;
+            visit::visit_pat(self, node);
+            self.in_pattern = previously_in_pattern;
+        }
+
+        fn visit_expr(&mut self, node: &'ast syn::Expr) {
+            let previously_in_pattern = self.in_pattern;
+            self.in_pattern = false;
+            visit::visit_expr(self, node);
+            self.in_pattern = previously_in_pattern;
+        }
+
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if !self.in_pattern && path_ends_with(&node.path, self.variant_name) {
+                self.found = true;
+            }
+            visit::visit_expr_path(self, node);
+        }
+
+        fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+            if !self.in_pattern && path_ends_with(&node.path, self.variant_name) {
+                self.found = true;
+            }
+            visit::visit_expr_struct(self, node);
+        }
+    }
+
+    let mut visitor = ConstructionVisitor {
+        variant_name,
+        found: false,
+        in_pattern: false,
+    };
+    visitor.visit_file(ast);
+    visitor.found
+}
+
 /// Workspace member crate names with at least one direct (`normal` or
 /// `build`, not `dev`) dependency whose own compiled target is a proc-macro
 /// (`cargo_metadata::Target::is_proc_macro`). Attached to
@@ -248,6 +455,41 @@ fn proc_macro_exposed_crates(
     Ok(exposed)
 }
 
+/// Workspace member crate names whose resolved `publish` field allows
+/// publishing — `cargo_metadata::Package::publish` is `None` (no `publish`
+/// key at all, or a bare `publish = true`) or `Some(non_empty_list)` (a
+/// restricted registry list); only `Some(empty_list)` means `publish =
+/// false`. Drives `unused-pub-api` vs. `unused-pub-workspace`: an item in a
+/// publishable crate's whole purpose is exposing API to consumers outside
+/// the loaded workspace, so a zero-reference finding there is informational
+/// (`unused-pub-api`), not the same signal as in a crate that will never
+/// leave this workspace (`unused-pub-workspace`).
+///
+/// Runs its own `cargo_metadata::MetadataCommand` call, same pattern and same
+/// rationale as [`proc_macro_exposed_crates`] (see that function's doc
+/// comment) — a full, non-`--no-deps` resolve is needed to see `publish` at
+/// all, since [`crate::ingest::load`]'s own `--no-deps` resolve only reads
+/// the workspace member manifests' dependency declarations.
+fn publishable_crates(workspace_root: &Path) -> Result<HashSet<String>, cargo_metadata::Error> {
+    let manifest_path = workspace_root.join("Cargo.toml");
+    let metadata = MetadataCommand::new()
+        .manifest_path(&manifest_path)
+        .exec()?;
+
+    Ok(metadata
+        .packages
+        .iter()
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .filter(|package| {
+            package
+                .publish
+                .as_ref()
+                .is_none_or(|registries| !registries.is_empty())
+        })
+        .map(|package| package.name.clone())
+        .collect())
+}
+
 /// Checks one `pub` item for cross-crate usage and records a finding if
 /// neither that nor entry-point reachability found it live — the shared
 /// logic both [`walk_functions`]'s and [`walk_type_items`]'s callbacks
@@ -260,6 +502,13 @@ fn proc_macro_exposed_crates(
 /// live even with zero cross-crate references (see
 /// [`crate::reachability::is_reachable_from_entry`]'s own entry-point scope
 /// caveats — this inherits them).
+///
+/// `rule_id`/`severity`/`evidence_class`/`reason` are parameterized rather
+/// than hardcoded so this one query can back both `unused-pub-workspace` and
+/// `unused-pub-api` (see [`publishable_crates`]) — the two rules share
+/// exactly the same reachability mechanism and differ only in how a
+/// publishable crate's "nothing referenced it in this workspace" result
+/// should be read.
 #[allow(clippy::too_many_arguments)]
 fn check_item(
     analysis: &ra_ap_ide::Analysis,
@@ -273,6 +522,10 @@ fn check_item(
     offset: u32,
     line: usize,
     include_tests: bool,
+    rule_id: &str,
+    severity: Severity,
+    evidence_class: EvidenceClass,
+    reason: &str,
     report: &mut WorkspaceDeadCode,
 ) {
     report.checked += 1;
@@ -312,26 +565,21 @@ fn check_item(
                 "searched_crates": searched_crates.len(),
                 "references_found": referencing.len(),
                 "root_set_size": entry_keys.len(),
-                "reason": "no reference from another workspace crate and unreachable \
-                    from any recognized entry point (fn main in a [[bin]] or [[example]] target)",
+                "reason": reason,
             });
             if proc_macro_exposed.contains(krate_name) {
                 evidence["limitations"] = serde_json::json!(["proc_macro_expansion_disabled"]);
             }
             report.findings.push(Finding {
-                id: format!(
-                    "{UNUSED_PUB_WORKSPACE_RULE}:{}:{qualified_name}",
-                    file.path.display()
-                )
-                .into(),
-                rule: UNUSED_PUB_WORKSPACE_RULE.into(),
-                severity: Severity::Warn,
+                id: format!("{rule_id}:{}:{qualified_name}", file.path.display()).into(),
+                rule: rule_id.into(),
+                severity,
                 location: Location {
                     file: file.path.clone(),
                     line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
                     item_path: qualified_name.to_string(),
                 },
-                evidence_class: EvidenceClass::BoundedSemantic,
+                evidence_class,
                 origin: Origin::Code,
                 evidence: Some(evidence),
                 caused_by: Vec::new(),
@@ -341,6 +589,21 @@ fn check_item(
         Err(err) => report.errors.push(reachability_error(err)),
     }
 }
+
+/// `check_item`'s `reason` text for `unused-pub-workspace` (see
+/// [`UNUSED_PUB_WORKSPACE_RULE`]) — a factored-out constant so both the real
+/// call site in [`analyze_workspace`] and its tests can refer to the exact
+/// wording.
+const UNUSED_PUB_WORKSPACE_REASON: &str = "no reference from another workspace crate and \
+    unreachable from any recognized entry point (fn main in a [[bin]] or [[example]] target)";
+
+/// `check_item`'s `reason` text for `unused-pub-api` (see
+/// [`UNUSED_PUB_API_RULE`]) — matches `unused-pub-workspace`'s "no reference
+/// found" wording pattern, extended with the "this crate is published, so
+/// external ecosystem usage is not inferable and expected" clause its
+/// `RULE_REGISTRY` entry requires (todo.md §17.3, §17.4).
+const UNUSED_PUB_API_REASON: &str = "no reference found within the examined workspace; this \
+    crate is published, so external ecosystem usage is not inferable and expected";
 
 /// Converts a [`crate::reachability::ReachabilityError`] into the closest
 /// matching [`DeadCodeError`] variant, so the two modules' errors can share
@@ -362,6 +625,223 @@ fn reachability_error(err: crate::reachability::ReachabilityError) -> DeadCodeEr
     }
 }
 
+/// Checks one enum variant for a construction-position reference anywhere in
+/// the examined workspace view — `dead-enum-variant`. Unlike [`check_item`],
+/// this does not consult reachability from an entry point at all: a variant
+/// that is genuinely constructed somewhere is live regardless of whether the
+/// surrounding code happens to be reachable from `fn main`, so the only
+/// question is whether a construction site exists anywhere.
+///
+/// `file_path_by_id` narrows the candidate set before re-parsing: only files
+/// [`crate::deep::referencing_files`] already reports as referencing the
+/// variant's position are re-parsed with `syn` to classify the reference
+/// (see [`file_constructs_variant`]) — the same crate-wide simplification
+/// `unused-pub-workspace`'s own module doc documents (every workspace crate
+/// counts as workspace-internal) applies here too, unmodified.
+#[allow(clippy::too_many_arguments)]
+fn check_enum_variant(
+    analysis: &ra_ap_ide::Analysis,
+    file_path_by_id: &HashMap<FileId, PathBuf>,
+    file: &SourceFile,
+    file_id: FileId,
+    qualified_name: &str,
+    variant_name: &str,
+    offset: u32,
+    line: usize,
+    include_tests: bool,
+    report: &mut WorkspaceDeadCode,
+) {
+    report.checked += 1;
+    let position = ra_ap_ide::FilePosition {
+        file_id,
+        offset: offset.into(),
+    };
+
+    let referencing = match crate::deep::referencing_files(analysis, position, include_tests) {
+        Ok(referencing) => referencing,
+        Err(err) => {
+            report.errors.push(DeadCodeError::Deep(err));
+            return;
+        }
+    };
+
+    let mut construction_found = false;
+    for referencing_file_id in &referencing {
+        let Some(path) = file_path_by_id.get(referencing_file_id) else {
+            continue;
+        };
+        let source = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(err) => {
+                report.errors.push(DeadCodeError::Io(path.clone(), err));
+                continue;
+            }
+        };
+        let ast = match syn::parse_file(&source) {
+            Ok(ast) => ast,
+            Err(err) => {
+                report.errors.push(DeadCodeError::Parse(path.clone(), err));
+                continue;
+            }
+        };
+        if file_constructs_variant(&ast, variant_name) {
+            construction_found = true;
+            break;
+        }
+    }
+
+    if construction_found {
+        return;
+    }
+
+    let evidence = serde_json::json!({
+        "tier": "deep",
+        "referencing_files": referencing.len(),
+        "reason": "no construction site found in the examined workspace view",
+    });
+    report.findings.push(Finding {
+        id: format!(
+            "{DEAD_ENUM_VARIANT_RULE}:{}:{qualified_name}",
+            file.path.display()
+        )
+        .into(),
+        rule: DEAD_ENUM_VARIANT_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: file.path.clone(),
+            line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
+            item_path: qualified_name.to_string(),
+        },
+        evidence_class: EvidenceClass::BoundedSemantic,
+        origin: Origin::Code,
+        evidence: Some(evidence),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    });
+}
+
+/// Checks one `pub` item for `test-only-pub`: reachable only through
+/// `#[cfg(test)]`/test-target code, not in production, and not referenced
+/// from another workspace crate either. Calls
+/// [`crate::reachability::is_reachable_from_entry`] twice — once against the
+/// "production" root set (`include_tests: false`), once against the "all"
+/// root set (`include_tests: true`) — since todo.md §3.A's two reachability
+/// modes are exactly what distinguishes "genuinely dead" from "alive only
+/// because tests exercise it". Real, accepted extra query volume per item
+/// (see this module's `TEST_ONLY_PUB_RULE` doc comment); restructuring
+/// [`analyze_workspace`] to compute both modes in one pass is out of scope
+/// here.
+///
+/// Same v1 simplification as `unused-pub-workspace`: every workspace crate is
+/// treated as workspace-internal, so this doesn't attempt `unused-pub-api`'s
+/// `publish`-field-aware narrowing either.
+#[allow(clippy::too_many_arguments)]
+fn check_test_only_pub(
+    analysis: &ra_ap_ide::Analysis,
+    crate_of_file: &HashMap<FileId, &str>,
+    entry_keys_production: &std::collections::HashSet<(FileId, u32)>,
+    entry_keys_all: &std::collections::HashSet<(FileId, u32)>,
+    file: &SourceFile,
+    file_id: FileId,
+    krate_name: &str,
+    qualified_name: &str,
+    offset: u32,
+    line: usize,
+    report: &mut WorkspaceDeadCode,
+) {
+    report.checked += 1;
+    let position = ra_ap_ide::FilePosition {
+        file_id,
+        offset: offset.into(),
+    };
+
+    // The cross-crate check uses the "all" search — a reference from another
+    // workspace crate's test code is still evidence this item has a life
+    // outside its own crate, the same disqualifying condition `check_item`
+    // applies.
+    let referencing = match crate::deep::referencing_files(analysis, position, true) {
+        Ok(referencing) => referencing,
+        Err(err) => {
+            report.errors.push(DeadCodeError::Deep(err));
+            return;
+        }
+    };
+    let used_externally = referencing.iter().any(|referencing_file| {
+        crate_of_file
+            .get(referencing_file)
+            .is_some_and(|owner| *owner != krate_name)
+    });
+    if used_externally {
+        return;
+    }
+
+    let production_reachable = match crate::reachability::is_reachable_from_entry(
+        analysis,
+        entry_keys_production,
+        position,
+        false,
+    ) {
+        Ok(reachable) => reachable,
+        Err(err) => {
+            report.errors.push(reachability_error(err));
+            return;
+        }
+    };
+    if production_reachable {
+        // Reachable in production already — not test-only.
+        return;
+    }
+
+    let all_reachable = match crate::reachability::is_reachable_from_entry(
+        analysis,
+        entry_keys_all,
+        position,
+        true,
+    ) {
+        Ok(reachable) => reachable,
+        Err(err) => {
+            report.errors.push(reachability_error(err));
+            return;
+        }
+    };
+    if !all_reachable {
+        // Unreachable even with tests counted — `unused-pub-workspace`'s/
+        // `unused-pub-api`'s territory, not this rule's.
+        return;
+    }
+
+    let searched_crates: std::collections::HashSet<&str> =
+        crate_of_file.values().copied().collect();
+    let evidence = serde_json::json!({
+        "tier": "deep",
+        "searched_crates": searched_crates.len(),
+        "references_found": referencing.len(),
+        "root_set_size_production": entry_keys_production.len(),
+        "root_set_size_all": entry_keys_all.len(),
+        "reason": "reachable only through #[cfg(test)]/test-target code in the examined \
+            workspace view",
+    });
+    report.findings.push(Finding {
+        id: format!(
+            "{TEST_ONLY_PUB_RULE}:{}:{qualified_name}",
+            file.path.display()
+        )
+        .into(),
+        rule: TEST_ONLY_PUB_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: file.path.clone(),
+            line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
+            item_path: qualified_name.to_string(),
+        },
+        evidence_class: EvidenceClass::BoundedSemantic,
+        origin: Origin::Code,
+        evidence: Some(evidence),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    });
+}
+
 /// Finds `pub` functions/methods referenced only from their own defining
 /// crate — or not at all — never from another workspace crate. This is
 /// `unused-pub-workspace`, todo.md §3.A's "Kernregel": exposing something as
@@ -370,7 +850,9 @@ fn reachability_error(err: crate::reachability::ReachabilityError) -> DeadCodeEr
 ///
 /// `include_tests` selects between the "production" and "all" reachability
 /// modes from todo.md §3.A — a reference only from a `#[test]` doesn't count
-/// as external use when `include_tests` is `false`.
+/// as external use when `include_tests` is `false`. `test-only-pub` (see
+/// [`check_test_only_pub`]) needs both modes regardless of this parameter, so
+/// both are computed unconditionally below.
 pub fn analyze_workspace(
     workspace: &Workspace,
     include_tests: bool,
@@ -379,20 +861,33 @@ pub fn analyze_workspace(
     let analysis = ctx.analysis();
 
     let mut crate_of_file: HashMap<FileId, &str> = HashMap::new();
+    let mut file_path_by_id: HashMap<FileId, PathBuf> = HashMap::new();
     for krate in &workspace.crates {
         for file in &krate.source_files {
             if let Some(file_id) = ctx.file_id(&file.path) {
                 crate_of_file.insert(file_id, krate.name.as_str());
+                file_path_by_id.insert(file_id, file.path.clone());
             }
         }
     }
 
-    let entries = crate::reachability::entry_point_positions(workspace, &ctx, include_tests)
+    let entries_production = crate::reachability::entry_point_positions(workspace, &ctx, false)
         .map_err(reachability_error)?;
-    let entry_keys: std::collections::HashSet<(FileId, u32)> = entries
+    let entry_keys_production: std::collections::HashSet<(FileId, u32)> = entries_production
         .iter()
         .map(|(_, position)| crate::reachability::position_key(*position))
         .collect();
+    let entries_all = crate::reachability::entry_point_positions(workspace, &ctx, true)
+        .map_err(reachability_error)?;
+    let entry_keys_all: std::collections::HashSet<(FileId, u32)> = entries_all
+        .iter()
+        .map(|(_, position)| crate::reachability::position_key(*position))
+        .collect();
+    let entry_keys = if include_tests {
+        &entry_keys_all
+    } else {
+        &entry_keys_production
+    };
 
     let mut report = WorkspaceDeadCode::default();
 
@@ -403,8 +898,35 @@ pub fn analyze_workspace(
             HashSet::new()
         }
     };
+    // On a metadata failure, an empty set conservatively treats every crate
+    // as non-publishable — falling back to the stricter, gating
+    // `unused-pub-workspace` rather than silently downgrading a real finding
+    // to `unused-pub-api`'s `Info`/advisory-only shape.
+    let publishable = match publishable_crates(&workspace.root) {
+        Ok(publishable) => publishable,
+        Err(err) => {
+            report.errors.push(DeadCodeError::Metadata(err));
+            HashSet::new()
+        }
+    };
 
     for krate in &workspace.crates {
+        let (rule_id, severity, evidence_class, reason) = if publishable.contains(&krate.name) {
+            (
+                UNUSED_PUB_API_RULE,
+                Severity::Info,
+                EvidenceClass::Heuristic,
+                UNUSED_PUB_API_REASON,
+            )
+        } else {
+            (
+                UNUSED_PUB_WORKSPACE_RULE,
+                Severity::Warn,
+                EvidenceClass::BoundedSemantic,
+                UNUSED_PUB_WORKSPACE_REASON,
+            )
+        };
+
         for file in &krate.source_files {
             if !file.kind.is_locally_reportable() {
                 continue;
@@ -438,18 +960,37 @@ pub fn analyze_workspace(
                 let Some(syn::Visibility::Public(_)) = site.vis else {
                     return;
                 };
+                let offset = site.ident_span.byte_range().start as u32;
+                let line = site.ident_span.start().line;
                 check_item(
                     &analysis,
                     &crate_of_file,
-                    &entry_keys,
+                    entry_keys,
                     &proc_macro_exposed,
                     file,
                     file_id,
                     &krate.name,
                     &site.qualified_name,
-                    site.ident_span.byte_range().start as u32,
-                    site.ident_span.start().line,
+                    offset,
+                    line,
                     include_tests,
+                    rule_id,
+                    severity,
+                    evidence_class,
+                    reason,
+                    &mut report,
+                );
+                check_test_only_pub(
+                    &analysis,
+                    &crate_of_file,
+                    &entry_keys_production,
+                    &entry_keys_all,
+                    file,
+                    file_id,
+                    &krate.name,
+                    &site.qualified_name,
+                    offset,
+                    line,
                     &mut report,
                 );
             });
@@ -458,15 +999,52 @@ pub fn analyze_workspace(
                 if !matches!(site.vis, syn::Visibility::Public(_)) {
                     return;
                 }
+                let offset = site.ident_span.byte_range().start as u32;
+                let line = site.ident_span.start().line;
                 check_item(
                     &analysis,
                     &crate_of_file,
-                    &entry_keys,
+                    entry_keys,
                     &proc_macro_exposed,
                     file,
                     file_id,
                     &krate.name,
                     &site.qualified_name,
+                    offset,
+                    line,
+                    include_tests,
+                    rule_id,
+                    severity,
+                    evidence_class,
+                    reason,
+                    &mut report,
+                );
+                check_test_only_pub(
+                    &analysis,
+                    &crate_of_file,
+                    &entry_keys_production,
+                    &entry_keys_all,
+                    file,
+                    file_id,
+                    &krate.name,
+                    &site.qualified_name,
+                    offset,
+                    line,
+                    &mut report,
+                );
+            });
+
+            walk_enum_variants(&ast, |site| {
+                if !matches!(site.vis, syn::Visibility::Public(_)) {
+                    return;
+                }
+                check_enum_variant(
+                    &analysis,
+                    &file_path_by_id,
+                    file,
+                    file_id,
+                    &site.qualified_name,
+                    &site.variant_name,
                     site.ident_span.byte_range().start as u32,
                     site.ident_span.start().line,
                     include_tests,
@@ -604,14 +1182,31 @@ pub fn never_called() -> i32 {
 
     #[test]
     fn finding_shape_matches_the_documented_contract() {
+        // `publish = false` keeps this crate out of `unused-pub-api`'s scope
+        // (see `publishable_crates`) — this test documents
+        // `unused-pub-workspace`'s own finding shape specifically.
         let dir = TempDir::new("dead-code-finding-shape");
-        let workspace = load_single_crate_workspace(
-            &dir,
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
             r#"pub fn never_called() -> i32 {
     1
 }
 "#,
-        );
+        )
+        .unwrap();
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
 
         let report = analyze_workspace(&workspace, true).unwrap();
 
@@ -958,6 +1553,10 @@ pub extern "C" fn exported_b() -> i32 {
             offset,
             2,
             true,
+            UNUSED_PUB_WORKSPACE_RULE,
+            Severity::Warn,
+            EvidenceClass::BoundedSemantic,
+            UNUSED_PUB_WORKSPACE_REASON,
             &mut report,
         );
 
@@ -1264,9 +1863,16 @@ mod tests {
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let report = analyze_workspace(&workspace, true).unwrap();
+        // Scoped to the `unused-pub-workspace`/`unused-pub-api` rule family
+        // this test is actually about — `helper` is also reachable only
+        // through `calls_helper`'s test in "production" mode (the feature
+        // gate makes no difference there), so `test-only-pub` correctly
+        // fires for it separately; that is not what this regression test
+        // guards against.
         let names: HashSet<&str> = report
             .findings
             .iter()
+            .filter(|f| f.rule == UNUSED_PUB_WORKSPACE_RULE || f.rule == UNUSED_PUB_API_RULE)
             .map(|f| f.location.item_path.as_str())
             .collect();
 
@@ -1280,6 +1886,405 @@ mod tests {
             "`helper` is called from `calls_helper`, a #[test] fn only active with the \
              non-default `extra` feature — now that the Deep Tier loads with all features, the \
              test is a live entry point and `helper` must not be flagged dead"
+        );
+    }
+
+    // -- unused-pub-api ---------------------------------------------------
+
+    #[test]
+    fn a_dead_pub_item_in_a_publishable_crate_is_flagged_unused_pub_api() {
+        // No `publish` field set at all — publishable by default (see
+        // `publishable_crates`), so the top-level dead-item check routes
+        // through `unused-pub-api`, not `unused-pub-workspace`.
+        let dir = TempDir::new("dead-code-unused-pub-api");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"pub fn never_called() -> i32 {
+    1
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.rule, UNUSED_PUB_API_RULE);
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
+        assert_eq!(finding.location.item_path, "never_called");
+
+        let evidence = finding.evidence.as_ref().expect("evidence must be present");
+        assert_eq!(evidence["reason"], serde_json::json!(UNUSED_PUB_API_REASON));
+    }
+
+    #[test]
+    fn a_dead_pub_item_in_a_publish_false_crate_stays_unused_pub_workspace() {
+        let dir = TempDir::new("dead-code-publish-false");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r#"pub fn never_called() -> i32 {
+    1
+}
+"#,
+        )
+        .unwrap();
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, UNUSED_PUB_WORKSPACE_RULE);
+        assert_eq!(report.findings[0].severity, Severity::Warn);
+        assert_eq!(
+            report.findings[0].evidence_class,
+            EvidenceClass::BoundedSemantic
+        );
+    }
+
+    #[test]
+    fn a_dead_pub_item_in_a_crate_restricted_to_a_registry_is_still_flagged_unused_pub_api() {
+        // `publish = ["some-internal-registry"]` is `Some(non_empty_list)` —
+        // still publishable per `cargo_metadata::Package::publish`'s
+        // documented semantics, only `Some(vec![])` means `publish = false`.
+        let dir = TempDir::new("dead-code-restricted-registry");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = ["some-internal-registry"]
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r#"pub fn never_called() -> i32 {
+    1
+}
+"#,
+        )
+        .unwrap();
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, UNUSED_PUB_API_RULE);
+    }
+
+    // -- dead-enum-variant ------------------------------------------------
+
+    #[test]
+    fn an_enum_variant_never_constructed_is_flagged_dead_enum_variant() {
+        let dir = TempDir::new("dead-code-enum-variant-dead");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"pub enum Status {
+    Active,
+    Retired,
+}
+
+pub fn describe(status: Status) -> &'static str {
+    match status {
+        Status::Active => "active",
+        Status::Retired => "retired",
+    }
+}
+
+pub fn make() -> Status {
+    Status::Active
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+        let dead_variants: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == DEAD_ENUM_VARIANT_RULE)
+            .collect();
+
+        assert_eq!(dead_variants.len(), 1, "{dead_variants:?}");
+        let finding = dead_variants[0];
+        assert_eq!(finding.location.item_path, "Status::Retired");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.evidence_class, EvidenceClass::BoundedSemantic);
+        assert_eq!(
+            finding.evidence.as_ref().unwrap()["reason"],
+            serde_json::json!("no construction site found in the examined workspace view")
+        );
+    }
+
+    #[test]
+    fn an_enum_variant_constructed_only_in_another_workspace_crate_is_not_flagged() {
+        let dir = TempDir::new("dead-code-enum-variant-cross-crate");
+        write_crate(
+            &dir,
+            "core",
+            &[],
+            r#"pub enum Status {
+    Active,
+}
+"#,
+        );
+        write_crate(
+            &dir,
+            "consumer",
+            &[("core", "../core")],
+            r#"pub fn make() -> core::Status {
+    core::Status::Active
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["core", "consumer"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        let dead_variants: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == DEAD_ENUM_VARIANT_RULE)
+            .map(|f| f.location.item_path.as_str())
+            .collect();
+
+        assert!(
+            dead_variants.is_empty(),
+            "Status::Active is constructed from `consumer`, a different workspace crate: \
+             {dead_variants:?}"
+        );
+    }
+
+    #[test]
+    fn a_variant_of_a_private_enum_is_not_checked() {
+        let dir = TempDir::new("dead-code-enum-variant-private");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"enum Status {
+    Active,
+    Retired,
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == DEAD_ENUM_VARIANT_RULE),
+            "a private enum's variants are rustc's own dead_code lint's job, not this rule's"
+        );
+    }
+
+    // -- test-only-pub -----------------------------------------------------
+
+    #[test]
+    fn a_pub_fn_reachable_only_from_a_test_is_flagged_test_only_pub() {
+        let dir = TempDir::new("dead-code-test-only-pub");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r#"pub fn test_only_helper() -> i32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_test() {
+        assert_eq!(test_only_helper(), 1);
+    }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/bin/tool.rs"), "fn main() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        // `include_tests: true` so the top-level `unused-pub-workspace` check
+        // sees the same "all" reachability `test-only-pub` does, and does
+        // not also fire for the same item — isolating this test to the
+        // signal it is actually about.
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        let test_only_pub_findings: Vec<&Finding> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == TEST_ONLY_PUB_RULE)
+            .collect();
+        assert_eq!(test_only_pub_findings.len(), 1, "{:?}", report.findings);
+        let finding = test_only_pub_findings[0];
+        assert_eq!(finding.location.item_path, "test_only_helper");
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.evidence_class, EvidenceClass::BoundedSemantic);
+
+        assert!(
+            !report.findings.iter().any(|f| f.location.item_path
+                == "test_only_helper"
+                && f.rule != TEST_ONLY_PUB_RULE),
+            "test_only_helper is reachable via the test entry point in \"all\" mode, so \
+             unused-pub-workspace/unused-pub-api must not also fire for it: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_pub_fn_reachable_from_main_is_not_flagged_test_only_pub() {
+        let dir = TempDir::new("dead-code-test-only-pub-negative-main");
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r#"pub fn used_by_main() -> i32 {
+    1
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/bin/tool.rs"),
+            r#"fn main() {
+    dead_code_fixture::used_by_main();
+}
+"#,
+        )
+        .unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(
+            !report.findings.iter().any(|f| f.rule == TEST_ONLY_PUB_RULE),
+            "used_by_main is reachable from main in production too — must not be flagged \
+             test-only-pub: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_pub_fn_used_by_another_workspace_crate_is_not_flagged_test_only_pub_even_if_also_tested()
+     {
+        let dir = TempDir::new("dead-code-test-only-pub-cross-crate");
+        write_crate(
+            &dir,
+            "core",
+            &[],
+            r#"pub fn shared() -> i32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_test() {
+        assert_eq!(shared(), 1);
+    }
+}
+"#,
+        );
+        write_crate(
+            &dir,
+            "consumer",
+            &[("core", "../core")],
+            r#"pub fn run() -> i32 {
+    core::shared()
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["core", "consumer"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == TEST_ONLY_PUB_RULE && f.location.item_path == "shared"),
+            "`shared` is referenced from `consumer`, a different workspace crate — must not be \
+             flagged test-only-pub even though it also has a #[cfg(test)] caller: {:?}",
+            report.findings
+        );
+    }
+
+    /// Directly exercises the `syn`-level construction/pattern
+    /// classification (no Deep Tier needed) — the specific regression this
+    /// guards against: `syn`'s `PatPath` is a type alias for `ExprPath` (see
+    /// `file_constructs_variant`'s doc comment), so a naive
+    /// `visit_expr_path`-only classifier would wrongly count a unit variant
+    /// used only in a match arm's pattern as "constructed".
+    #[test]
+    fn file_constructs_variant_does_not_count_a_bare_pattern_match_as_construction() {
+        let ast: syn::File = syn::parse_str(
+            r#"
+pub enum Status {
+    Active,
+    Retired,
+}
+
+pub fn describe(status: Status) -> &'static str {
+    match status {
+        Status::Active => "active",
+        Status::Retired => "retired",
+    }
+}
+
+pub fn make() -> Status {
+    Status::Active
+}
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            file_constructs_variant(&ast, "Active"),
+            "Active is constructed in `make`"
+        );
+        assert!(
+            !file_constructs_variant(&ast, "Retired"),
+            "Retired only ever appears as a match-arm pattern, never constructed"
         );
     }
 }

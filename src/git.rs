@@ -663,6 +663,9 @@ mod tests {
             line: 1,
             cyclomatic,
             lines_of_code: 1,
+            nesting_depth: 0,
+            match_arm_count: 0,
+            arg_count: 0,
         }
     }
 

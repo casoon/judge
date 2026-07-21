@@ -23,6 +23,14 @@
 //! transitive footprint is large relative to how many distinct items of it
 //! the crate actually references).
 //!
+//! `dep-without-repo` (todo.md §F) shares `heavy-dependency`'s single full
+//! (non `--no-deps`) `cargo_metadata` resolve (see [`resolve_full_metadata`],
+//! [`analyze_full_metadata_dependencies`]) rather than resolving again: it
+//! flags a declared dependency whose own manifest has no (or an empty)
+//! `repository` field. A missing `repository` field is not itself a defect —
+//! private/internal crates legitimately omit it — so this is reported as
+//! `Severity::Info`, the same hygiene-signal precedent as `heavy-dependency`.
+//!
 //! ## Usage-domain classification
 //!
 //! Source files are classified into a [`UsageDomain`] purely by path
@@ -126,8 +134,16 @@ pub const UNUSED_DEPENDENCY_RULE: &str = "unused-dependency";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const UNUSED_DEPENDENCY_RULE_REVISION: u32 = 1;
 
+/// Rule id used for dep-without-repo findings (see todo.md §F): a dependency
+/// whose own manifest declares no `repository` field, read from the same
+/// full `cargo_metadata` resolve as `heavy-dependency` (see
+/// [`resolve_full_metadata`]).
+pub const DEP_WITHOUT_REPO_RULE: &str = "dep-without-repo";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const DEP_WITHOUT_REPO_RULE_REVISION: u32 = 1;
+
 /// Above this many transitive dependencies (from a full, non `--no-deps`
-/// resolve — see `resolve_transitive_dependency_counts`), combined with
+/// resolve — see [`resolve_full_metadata`]), combined with
 /// fewer than [`HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD`] distinct items used
 /// from it, a dependency is flagged as heavy for its usage footprint (see
 /// `is_heavy_dependency`).
@@ -175,8 +191,9 @@ pub enum DepsError {
     Io(PathBuf, std::io::Error),
     Parse(PathBuf, syn::Error),
     /// A full (non `--no-deps`) `cargo metadata` resolve failed — only
-    /// produced by `heavy-dependency`'s transitive-count lookup (see
-    /// `resolve_transitive_dependency_counts`).
+    /// produced by `heavy-dependency`'s transitive-count lookup and
+    /// `dep-without-repo`'s repository-field lookup, which share one resolve
+    /// (see [`resolve_full_metadata`]).
     Metadata(cargo_metadata::Error),
     /// A crate's manifest failed to parse as TOML — only produced by
     /// `default-features-unused`'s manifest lookup (see
@@ -306,9 +323,9 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
         }
     }
 
-    let (heavy_findings, heavy_errors) = analyze_heavy_dependencies(workspace);
-    findings.extend(heavy_findings);
-    errors.extend(heavy_errors);
+    let (metadata_findings, metadata_errors) = analyze_full_metadata_dependencies(workspace);
+    findings.extend(metadata_findings);
+    errors.extend(metadata_errors);
 
     WorkspaceDeps {
         findings,
@@ -529,19 +546,23 @@ fn is_heavy_dependency(transitive_deps: usize, used_items: usize) -> bool {
         && used_items < HEAVY_DEPENDENCY_USED_ITEMS_THRESHOLD
 }
 
-/// Runs the `heavy-dependency` detector (todo.md §B) over every crate in
-/// `workspace`. Always `heuristic` (todo.md §17.3, `evidence_class_for_rule`'s
-/// catch-all — no explicit arm for this rule): the transitive count depends
-/// on feature unification and platform/target resolution this Fast Tier pass
-/// doesn't fully model, and "used items" is a path-segment approximation
-/// (see [`collect_used_items`]), not resolved item usage.
-fn analyze_heavy_dependencies(workspace: &Workspace) -> (Vec<Finding>, Vec<DepsError>) {
+/// Runs both `heavy-dependency` and `dep-without-repo` (todo.md §B, §F) over
+/// every crate in `workspace`, sharing the single full (non `--no-deps`)
+/// `cargo metadata` resolve both need (see [`resolve_full_metadata`]) rather
+/// than running it twice. `heavy-dependency` is always `heuristic` (todo.md
+/// §17.3, `evidence_class_for_rule`'s catch-all — no explicit arm for this
+/// rule): the transitive count depends on feature unification and
+/// platform/target resolution this Fast Tier pass doesn't fully model, and
+/// "used items" is a path-segment approximation (see [`collect_used_items`]),
+/// not resolved item usage. `dep-without-repo` is `derived_fact`: the
+/// dependency's own `repository` field is read directly from the resolve.
+fn analyze_full_metadata_dependencies(workspace: &Workspace) -> (Vec<Finding>, Vec<DepsError>) {
     let mut findings = Vec::new();
     let mut errors = Vec::new();
 
     let manifest_path = workspace.root.join("Cargo.toml");
-    let counts = match resolve_transitive_dependency_counts(&manifest_path) {
-        Ok(counts) => counts,
+    let metadata = match resolve_full_metadata(&manifest_path) {
+        Ok(metadata) => metadata,
         Err(err) => {
             errors.push(DepsError::Metadata(err));
             return (findings, errors);
@@ -550,22 +571,37 @@ fn analyze_heavy_dependencies(workspace: &Workspace) -> (Vec<Finding>, Vec<DepsE
 
     for krate in &workspace.crates {
         for dep in &krate.dependencies {
-            let Some(&transitive_deps) = counts.get(&dep.name) else {
-                continue;
-            };
-            let used_items = collect_used_items(krate, &dep.code_identifier);
-            if is_heavy_dependency(transitive_deps, used_items.len()) {
-                findings.push(heavy_dependency_finding(
-                    krate,
-                    dep,
-                    transitive_deps,
-                    &used_items,
-                ));
+            if let Some(&transitive_deps) = metadata.transitive_deps.get(&dep.name) {
+                let used_items = collect_used_items(krate, &dep.code_identifier);
+                if is_heavy_dependency(transitive_deps, used_items.len()) {
+                    findings.push(heavy_dependency_finding(
+                        krate,
+                        dep,
+                        transitive_deps,
+                        &used_items,
+                    ));
+                }
+            }
+
+            if let Some(repository) = metadata.repository.get(&dep.name)
+                && repository_is_missing(repository)
+            {
+                findings.push(dep_without_repo_finding(krate, dep));
             }
         }
     }
 
     (findings, errors)
+}
+
+/// Whether a dependency's own `repository` field counts as missing for
+/// `dep-without-repo`: either the manifest omits the field entirely
+/// (`None`), or it is present but blank.
+fn repository_is_missing(repository: &Option<String>) -> bool {
+    match repository {
+        None => true,
+        Some(text) => text.trim().is_empty(),
+    }
 }
 
 /// Renders a `heavy-dependency` finding. Same `location` convention as
@@ -602,21 +638,68 @@ fn heavy_dependency_finding(
     }
 }
 
-/// Runs a full (non `--no-deps`) `cargo metadata` resolve to compute how many
-/// transitive dependencies each package in the graph pulls in — needed for
-/// `heavy-dependency`, which [`crate::ingest::load`]'s deliberately
-/// `--no-deps` ingest (todo.md §14.2 P1) cannot answer. Runs its own metadata
-/// command rather than reusing another module's resolve: a parallel
+/// Renders a `dep-without-repo` finding (todo.md §F). `Severity::Info`,
+/// mirroring `heavy-dependency`'s hygiene-signal precedent above: a missing
+/// `repository` field is not inherently a defect — private/internal crates
+/// legitimately omit it. Same `location` convention as [`misplaced_finding`].
+fn dep_without_repo_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency) -> Finding {
+    Finding {
+        id: format!("{DEP_WITHOUT_REPO_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: DEP_WITHOUT_REPO_RULE.into(),
+        severity: Severity::Info,
+        location: Location {
+            file: krate.manifest_path.clone(),
+            line: OneBasedLine::FIRST,
+            item_path: dep.name.clone(),
+        },
+        evidence_class: EvidenceClass::DerivedFact,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "reason": "no `repository` field found in this dependency's own manifest",
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+/// Package metadata read from a single full (non `--no-deps`)
+/// `cargo_metadata` resolve, shared by [`analyze_full_metadata_dependencies`]
+/// — needed for `heavy-dependency`/`dep-without-repo`, which
+/// [`crate::ingest::load`]'s deliberately `--no-deps` ingest (todo.md §14.2
+/// P1) cannot answer either half of.
+#[derive(Debug, Default)]
+struct FullMetadataResolve {
+    /// Package name -> count of distinct transitive dependencies (see
+    /// [`is_heavy_dependency`]).
+    transitive_deps: HashMap<String, usize>,
+    /// Package name -> its own manifest's `repository` field, exactly as
+    /// `cargo_metadata` read it (`None` when the manifest omits the field
+    /// entirely — see [`repository_is_missing`]).
+    repository: HashMap<String, Option<String>>,
+}
+
+/// Runs a full (non `--no-deps`) `cargo metadata` resolve and reads both
+/// pieces of package metadata `heavy-dependency` and `dep-without-repo` need
+/// from it (see [`FullMetadataResolve`]) — one resolve, not two. Runs its own
+/// metadata command rather than reusing another module's resolve: a parallel
 /// `dep_graph.rs` effort resolves a full graph too, for its own manifest/graph
 /// rules; consolidating the two runs into one is left as follow-up work.
-fn resolve_transitive_dependency_counts(
+fn resolve_full_metadata(
     manifest_path: &Path,
-) -> Result<HashMap<String, usize>, cargo_metadata::Error> {
+) -> Result<FullMetadataResolve, cargo_metadata::Error> {
     let metadata = cargo_metadata::MetadataCommand::new()
         .manifest_path(manifest_path)
         .exec()?;
+    let repository: HashMap<String, Option<String>> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.name.to_string(), package.repository.clone()))
+        .collect();
     let Some(resolve) = metadata.resolve else {
-        return Ok(HashMap::new());
+        return Ok(FullMetadataResolve {
+            transitive_deps: HashMap::new(),
+            repository,
+        });
     };
 
     let adjacency: HashMap<&cargo_metadata::PackageId, &[cargo_metadata::PackageId]> = resolve
@@ -630,7 +713,7 @@ fn resolve_transitive_dependency_counts(
         .map(|package| (&package.id, package.name.to_string()))
         .collect();
 
-    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut transitive_deps: HashMap<String, usize> = HashMap::new();
     for node in &resolve.nodes {
         let mut visited: HashSet<&cargo_metadata::PackageId> = HashSet::new();
         let mut stack: Vec<&cargo_metadata::PackageId> = node.dependencies.iter().collect();
@@ -642,10 +725,13 @@ fn resolve_transitive_dependency_counts(
             }
         }
         if let Some(name) = id_to_name.get(&node.id) {
-            counts.entry(name.clone()).or_insert(visited.len());
+            transitive_deps.entry(name.clone()).or_insert(visited.len());
         }
     }
-    Ok(counts)
+    Ok(FullMetadataResolve {
+        transitive_deps,
+        repository,
+    })
 }
 
 /// Result of [`analyze_rustc_unused_dependencies`] — kept separate from
@@ -1148,7 +1234,10 @@ mod tests {
     /// in `dependency_section` (e.g. `"[dependencies]"` or
     /// `"[build-dependencies]"`). Path dependencies keep these tests fully
     /// offline — no registry/network access needed (verified against a real
-    /// `cargo metadata --no-deps` run).
+    /// `cargo metadata --no-deps` run). The vendored dependency declares a
+    /// `repository` field so these otherwise-unrelated fixtures don't also
+    /// pick up a `dep-without-repo` finding from the full-resolve pass that
+    /// `analyze_workspace` always runs alongside `heavy-dependency`.
     fn write_fixture(
         dir: &TempDir,
         dependency_section: &str,
@@ -1202,6 +1291,7 @@ edition = "2021"
 name = "{dep_crate_name}"
 version = "0.1.0"
 edition = "2021"
+repository = "https://example.com/{dep_crate_name}"
 "#
             ),
         )
@@ -1465,6 +1555,7 @@ edition = "2021"
 name = "depcrate"
 version = "0.1.0"
 edition = "2021"
+repository = "https://example.com/depcrate"
 "#,
         )
         .unwrap();
@@ -1796,6 +1887,135 @@ edition = "2021"
         assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
         assert!(!finding.is_gating());
         assert_eq!(finding.evidence.unwrap()["transitive_deps"], 42);
+    }
+
+    #[test]
+    fn repository_is_missing_treats_absent_and_blank_as_missing() {
+        assert!(repository_is_missing(&None));
+        assert!(repository_is_missing(&Some(String::new())));
+        assert!(repository_is_missing(&Some("   ".to_string())));
+        assert!(!repository_is_missing(&Some(
+            "https://example.com/repo".to_string()
+        )));
+    }
+
+    #[test]
+    fn dep_without_repo_finding_is_gating_info() {
+        let krate = CrateInfo {
+            name: "fixture".to_string(),
+            version: "0.1.0".to_string(),
+            manifest_path: PathBuf::from("fixture/Cargo.toml"),
+            root: PathBuf::from("fixture"),
+            source_files: Vec::new(),
+            entry_points: Vec::new(),
+            dependencies: Vec::new(),
+        };
+        let dep = crate::ingest::DeclaredDependency {
+            name: "norepo_crate".to_string(),
+            kind: DependencyKind::Normal,
+            code_identifier: "norepo_crate".to_string(),
+            target: None,
+            features: Vec::new(),
+            version_req: "*".to_string(),
+        };
+        let finding = dep_without_repo_finding(&krate, &dep);
+
+        assert_eq!(finding.rule, DEP_WITHOUT_REPO_RULE);
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.evidence_class, EvidenceClass::DerivedFact);
+        assert!(finding.is_gating());
+        assert_eq!(finding.location.item_path, "norepo_crate");
+    }
+
+    /// End-to-end: a real (non `--no-deps`) `cargo metadata` resolve over a
+    /// vendored path dependency whose manifest has no `repository` field —
+    /// proves [`resolve_full_metadata`]/`analyze_workspace` wire the field
+    /// through, not just the pure `dep_without_repo_finding` builder above.
+    #[test]
+    fn a_dependency_without_a_repository_field_is_flagged_end_to_end() {
+        let dir = TempDir::new("deps-dep-without-repo");
+        std::fs::create_dir_all(dir.join("main/src")).unwrap();
+        std::fs::create_dir_all(dir.join("dep_crate/src")).unwrap();
+        std::fs::write(
+            dir.join("main/Cargo.toml"),
+            r#"
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+norepo = { path = "../dep_crate" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("main/src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("dep_crate/Cargo.toml"),
+            r#"
+[package]
+name = "norepo"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep_crate/src/lib.rs"), "pub fn noop() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("main/Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.rule == DEP_WITHOUT_REPO_RULE)
+            .expect("expected a dep-without-repo finding");
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.evidence_class, EvidenceClass::DerivedFact);
+        assert_eq!(finding.location.item_path, "norepo");
+    }
+
+    #[test]
+    fn a_dependency_with_a_repository_field_is_not_flagged_end_to_end() {
+        let dir = TempDir::new("deps-dep-with-repo");
+        std::fs::create_dir_all(dir.join("main/src")).unwrap();
+        std::fs::create_dir_all(dir.join("dep_crate/src")).unwrap();
+        std::fs::write(
+            dir.join("main/Cargo.toml"),
+            r#"
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hasrepo = { path = "../dep_crate" }
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("main/src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("dep_crate/Cargo.toml"),
+            r#"
+[package]
+name = "hasrepo"
+version = "0.1.0"
+edition = "2021"
+repository = "https://example.com/hasrepo"
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep_crate/src/lib.rs"), "pub fn noop() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("main/Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == DEP_WITHOUT_REPO_RULE)
+        );
     }
 
     #[test]

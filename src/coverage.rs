@@ -540,6 +540,9 @@ end_of_record
             line,
             cyclomatic,
             lines_of_code,
+            nesting_depth: 0,
+            match_arm_count: 0,
+            arg_count: 0,
         }
     }
 

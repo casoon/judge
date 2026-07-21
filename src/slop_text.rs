@@ -21,12 +21,16 @@ use crate::finding::{Finding, Location, Origin, Severity};
 use crate::slop::ItemSpan;
 
 /// One `//`/`///`/`//!` or `/* */`/`/** */`/`/*! */` comment, as found by
-/// [`extract_comments`].
-struct CommentSpan {
-    start_line: usize,
-    end_line: usize,
-    text: String,
-    is_doc: bool,
+/// [`extract_comments`]. `pub(crate)`: also read by [`crate::security`]'s
+/// `unsafe-surface` detector, which needs the same raw-source-text comment
+/// spans to find a `// SAFETY:` comment adjacent to an `unsafe { .. }` block
+/// — `syn` discards plain comments just as it does here, so that detector
+/// reuses this scanner rather than duplicating it.
+pub(crate) struct CommentSpan {
+    pub(crate) start_line: usize,
+    pub(crate) end_line: usize,
+    pub(crate) text: String,
+    pub(crate) is_doc: bool,
 }
 
 /// Which comment marker [`find_comment_start`] found.
@@ -78,8 +82,9 @@ fn find_comment_start(text: &str) -> Option<(usize, CommentMarker)> {
 /// lines is still returned as one [`CommentSpan`]. Does NOT handle nested
 /// `/* /* */ */` block comments — the first `*/` closes the outermost
 /// comment, unlike `rustc`'s own nesting lexer. This is an accepted v1
-/// limitation of a heuristic scanner, not a parser.
-fn extract_comments(source: &str) -> Vec<CommentSpan> {
+/// limitation of a heuristic scanner, not a parser. `pub(crate)`: see
+/// [`CommentSpan`].
+pub(crate) fn extract_comments(source: &str) -> Vec<CommentSpan> {
     let mut spans = Vec::new();
     let mut in_block_comment = false;
     let mut block_start_line = 0usize;

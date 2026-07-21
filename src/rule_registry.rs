@@ -116,8 +116,32 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "unused-pub-workspace",
         evidence_class: EvidenceClass::BoundedSemantic,
         preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier).",
-        exclusions: "Every workspace crate is treated as workspace-internal; does not yet distinguish a real `unused-pub-workspace` finding from `unused-pub-api` on a published crate (semver-sensitive, info-only) via the crate's `publish` field.",
+        exclusions: "Every workspace crate is treated as workspace-internal; a crate whose resolved `publish` field allows publishing gets `unused-pub-api` instead of this rule for the same underlying condition (see `crate::dead_code::publishable_crates`).",
         allowed_wording: "State as 'no reference found in the loaded workspace' — never as 'unused' outright or as clearance for deletion; external ecosystem usage is not_inferable (todo.md §17.3, §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "unused-pub-api",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier). Only emitted for items belonging to a crate whose resolved `publish` field allows publishing (`None`, or `Some` of a non-empty registry list — only `Some(vec![])`, i.e. `publish = false`, is excluded).",
+        exclusions: "Same reachability query and same 'every workspace crate is workspace-internal' scope as `unused-pub-workspace`; a published crate's whole purpose is exposing API to consumers outside the loaded workspace, so 'zero internal reference' is the expected normal state for most of a healthy library's public surface, not a defect signal — that is why this is `Heuristic`/advisory rather than `unused-pub-workspace`'s `BoundedSemantic`/gating.",
+        allowed_wording: "State as 'no reference found within the examined workspace; this crate is published, so external ecosystem usage is not inferable and expected' — never as 'unused' or as clearance for deletion (todo.md §17.3, §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
+    RuleMetadata {
+        id: "dead-enum-variant",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier).",
+        exclusions: "Every workspace crate is treated as workspace-internal, same simplification as `unused-pub-workspace`. Only a `pub` enum's variants are checked. Construction-vs-pattern classification is a `syn` re-parse of each file `crate::deep::referencing_files` reports as referencing the variant, looking for `Expr::Path`/`Expr::Call`/`Expr::Struct` occurrences of the variant's trailing path segment; `syn` parses a macro invocation's body as an opaque token stream, so a variant constructed only inside a macro call (e.g. `some_macro!(MyEnum::Variant)`) is invisible to this scan and can be misreported as having no construction site.",
+        allowed_wording: "State as 'no construction site found in the examined workspace view' — never 'never constructed' or 'dead' outright (todo.md §17.3, §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "test-only-pub",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier).",
+        exclusions: "Every workspace crate is treated as workspace-internal, same simplification as `unused-pub-workspace`; does not narrow by a crate's `publish` field the way `unused-pub-api` does. Runs the entry-point reachability query twice per checked item (once production-only, once counting tests) — real, accepted extra Deep Tier query volume.",
+        allowed_wording: "State as 'reachable only through #[cfg(test)]/test-target code in the examined workspace view' — never a prescriptive claim like 'should be pub(crate)' (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::Gating,
     },
     // -- dep_graph.rs -----------------------------------------------------
@@ -192,6 +216,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         preconditions: "Opt-in only: `cargo judge deps --check-rustc-lints` — runs a full `cargo check --workspace --all-targets` with rustc's stable `unused_crate_dependencies` lint enabled; never part of bare `cargo judge`, `audit`, or `cargo judge deps` without the flag (a full compile is a different order of cost than this module's other, instant syntactic passes).",
         exclusions: "Restricted to `normal` dependencies (`dev`/`build` are out of scope; `dev-dependencies` has its own `unused-dev-dependency` detector). Only fires when rustc's lint reports the dependency unused in every target compiled for the package — a dependency used by only one target (e.g. only from a `[[test]]`) is a known, documented multi-target false positive of the raw lint and is deliberately not flagged (see `crate::deps` module docs). A workspace that does not currently compile produces a report error from this detector, never a finding.",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "dep-without-repo",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `cargo judge deps`). Reads a dependency's own manifest via the same full, non `--no-deps` `cargo_metadata` resolve as `heavy-dependency`, since the primary `--no-deps` ingest cannot see a dependency's own manifest fields.",
+        exclusions: "Fires when the dependency's own `repository` field is absent or blank. A missing field is not itself a defect — private/internal crates legitimately omit it, and the finding never claims otherwise (`Severity::Info`).",
+        allowed_wording: "State only that no `repository` field was found in the dependency's own manifest — never that the dependency is 'untrustworthy' or 'suspicious' (that framing belongs to the separate `fresh-low-reputation-dep`/`phantom-crate` rules).",
         verdict_effect: VerdictEffect::Gating,
     },
     // -- duplication.rs -------------------------------------------------
@@ -311,6 +343,23 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         preconditions: "Requires git history with commit trailers/metadata; subcommand-only via `cargo judge provenance` — not part of bare `cargo judge`.",
         exclusions: "Commit trailers/markers are optional, unverified, and trivially fakeable; attribution is via blame, which is not a knowledge measurement.",
         allowed_wording: "Must always be shown together with `crate::provenance::PROVENANCE_CAVEAT`: a distribution trend, not a judgment on any single commit or person; never used to evaluate individual people or commits (todo.md §17.4, §3.G G6).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
+    // -- security.rs (Fast Tier security-shaped signals) -------------------
+    RuleMetadata {
+        id: "unsafe-surface",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
+        exclusions: "Scoped to `unsafe { .. }` expression blocks only — `unsafe fn`/`unsafe impl`/`unsafe trait` declarations are out of scope (a different existing convention: a `# Safety` doc section). The adjacency check for a `// SAFETY:` comment is a line-range heuristic (immediately preceding line, or the first inner line of the block) over `crate::slop_text`'s raw-source-text comment scan, not a semantic link between the comment and the block — a `SAFETY:` comment placed elsewhere (e.g. at the top of the enclosing function) is not credited.",
+        allowed_wording: "State only that no `SAFETY:` comment was found adjacent to this unsafe block — never that the code is 'unsound' or 'a vulnerability' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "integer-cast-risk",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
+        exclusions: "A syntax-only proxy, not a truncation proof: true truncation detection needs the source expression's real type (a type checker), not available at the Fast Tier — the same limitation already documented for `silent-default`/`context-free-propagation` in `crate::slop`'s module doc. Only the cast's written target type is checked (`u8`/`i8`/`u16`/`i16`/`u32`/`i32`/`usize`/`isize`); false-positives on an already-narrow source (e.g. `byte_var as u8`), and false-negatives on a float cast to `u64`/`i64`/`u128`/`i128` (still narrowing, but not covered by this v1 target-type list).",
+        allowed_wording: "State only that this is a possible truncation candidate based on the cast's target type — never 'this truncates' or 'this is a bug' (todo.md §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
     // -- slop.rs (G1 error-masking, G2 stub/theater-code, G3 lexical) -------
@@ -459,6 +508,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
+    RuleMetadata {
+        id: "fragile-substring-classification",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
+        exclusions: "Only if/else-if chains of 2+ conditions are considered, and a condition is only flagged for a missing word-boundary check within that same condition expression; whether the string literal ever actually collides with an unrelated substring in real input is not evaluated — a shape-based hint, not a misclassification proof.",
+        allowed_wording: HEURISTIC_WORDING,
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
     // -- slop_structural_deep.rs (G4 remainder, Deep Tier, `--features deep`)
     RuleMetadata {
         id: "duplicative-reinvention",
@@ -563,6 +620,7 @@ mod tests {
             crate::deps::UNUSED_FEATURE_FLAG_RULE,
             crate::deps::DEFAULT_FEATURES_UNUSED_RULE,
             crate::deps::UNUSED_DEPENDENCY_RULE,
+            crate::deps::DEP_WITHOUT_REPO_RULE,
             crate::duplication::DUPLICATE_RULE,
             crate::git::HOTSPOT_RULE,
             crate::module_graph::UNLINKED_FILE_RULE,
@@ -577,6 +635,8 @@ mod tests {
             crate::provenance::PROVENANCE_CHURN_RULE,
             crate::provenance::PROVENANCE_DUPLICATION_RATE_RULE,
             crate::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE,
+            crate::security::UNSAFE_SURFACE_RULE,
+            crate::security::INTEGER_CAST_RISK_RULE,
             crate::slop::SWALLOWED_RESULT_RULE,
             crate::slop::EMPTY_ERROR_ARM_RULE,
             crate::slop::CATCH_ALL_ERROR_RULE,
@@ -595,6 +655,7 @@ mod tests {
             crate::slop_structural::COMPLEXITY_INFLATION_RULE,
             crate::slop_structural::LEGACY_FREEZE_RULE,
             crate::slop_structural::ABSTRACTION_INFLATION_RULE,
+            crate::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
             crate::slopsquat::NAME_COLLISION_RISK_RULE,
             crate::slopsquat::PHANTOM_CRATE_RULE,
             crate::slopsquat::PHANTOM_VERSION_RULE,
@@ -617,6 +678,9 @@ mod tests {
     fn every_deep_tier_rule_id_has_a_registry_entry() {
         let ids: &[&str] = &[
             crate::dead_code::UNUSED_PUB_WORKSPACE_RULE,
+            crate::dead_code::UNUSED_PUB_API_RULE,
+            crate::dead_code::DEAD_ENUM_VARIANT_RULE,
+            crate::dead_code::TEST_ONLY_PUB_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
         ];

@@ -124,16 +124,20 @@ pub enum Severity {
 /// | `semver-hazard` | `derived_fact` for the two Fast-Tier sub-cases (the absence of a `#[non_exhaustive]` attribute on a `pub enum`/`pub struct` is an exact syntax fact — see `crate::api_surface`); `bounded_semantic` for the Deep-Tier `leaked_dependency_type` sub-case, overridden at its own creation site (see `crate::api_surface_deep`) |
 /// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::duplication::CloneMember::to_finding`]) |
 /// | `duplicate-crate-versions`, `msrv-drift`, `workspace-dep-drift` | `derived_fact` (manifest/resolve-graph facts read directly from `cargo_metadata`) |
+/// | `dep-without-repo` | `derived_fact` (a manifest fact — the dependency's own `repository` field — read directly from a full `cargo_metadata` resolve, same class as `duplicate-crate-versions`/`msrv-drift`/`workspace-dep-drift`) |
+/// | `unsafe-surface` | `derived_fact` (a syntax-fact pairing: an `unsafe { .. }` block's span plus the absence of an adjacent `// SAFETY:` comment, both read directly from the parsed source — see `crate::security`) |
 /// | `unused-feature-flag` | `derived_fact` (the feature is declared in the manifest, and zero usage of the dependency was found anywhere in the examined view — both read directly from the declared inputs, see [`crate::deps`] module docs "Feature-only evidence") |
 /// | `default-features-unused` | `derived_fact` (the manifest text explicitly sets `default-features = true`, and zero usage of the dependency was found anywhere in the examined view — see [`crate::deps`] module docs "Feature-only evidence") |
 /// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
+/// | `dead-enum-variant`, `test-only-pub` | `bounded_semantic` (Deep Tier; same "every workspace crate is workspace-internal" simplification as `unused-pub-workspace` — see `crate::dead_code` module docs) |
+/// | `unused-pub-api` | `heuristic` (Deep Tier; a published crate's public surface is expected to have zero *internal* reference — see `crate::dead_code`'s `UNUSED_PUB_API_RULE` doc comment) |
 /// | `unlinked-file`, `orphan-module` | `bounded_semantic` (proven only within the crate's own resolved `mod` tree / the loaded workspace's cross-file reference scan — see `crate::module_graph`) |
 /// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::boundaries`] module docs "Module-level boundaries") |
 /// | `unused-dev-dependency` | `bounded_semantic` (no usage found in the examined view — tests/examples/benches and `#[cfg(test)]` modules of the declaring package; doctests are not scanned) |
 /// | `unused-dependency` | `bounded_semantic` (rustc's own `unused_crate_dependencies` lint result, narrowed to the intersection across every target compiled for the package — see [`crate::deps`] module docs "Importing rustc's `unused_crate_dependencies` lint") |
 /// | `phantom-crate`, `phantom-version`, `fresh-low-reputation-dep` | `external_measurement` (a crates.io lookup snapshot) |
 /// | `untested-hotspot` | `external_measurement` (complexity and churn are `derived_fact`/`heuristic` in isolation, but the imported `cargo-llvm-cov` coverage snapshot is the rarest, least locally-verifiable ingredient in the combination, so it sets the class — see `crate::coverage::untested_hotspots`) |
-/// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt` | `heuristic` (reproducible interpretation, not proof) |
+/// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt`, `integer-cast-risk`, `fragile-substring-classification` | `heuristic` (reproducible interpretation, not proof) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceClass {
@@ -198,7 +202,9 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "duplicate-code"
         | "duplicate-crate-versions"
         | "msrv-drift"
-        | "workspace-dep-drift" => EvidenceClass::DerivedFact,
+        | "workspace-dep-drift"
+        | "dep-without-repo"
+        | "unsafe-surface" => EvidenceClass::DerivedFact,
         "unused-feature-flag" => EvidenceClass::DerivedFact,
         "default-features-unused" => EvidenceClass::DerivedFact,
         "unused-pub-workspace"
@@ -208,10 +214,13 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "unused-dev-dependency"
         | "unused-dependency"
         | "unlinked-file"
-        | "orphan-module" => EvidenceClass::BoundedSemantic,
+        | "orphan-module"
+        | "dead-enum-variant"
+        | "test-only-pub" => EvidenceClass::BoundedSemantic,
         "phantom-crate" | "phantom-version" | "fresh-low-reputation-dep" | "untested-hotspot" => {
             EvidenceClass::ExternalMeasurement
         }
+        "unused-pub-api" => EvidenceClass::Heuristic,
         _ => EvidenceClass::Heuristic,
     }
 }

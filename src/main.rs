@@ -743,6 +743,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
         ),
         (
+            judge::deps::DEP_WITHOUT_REPO_RULE.to_string(),
+            judge::deps::DEP_WITHOUT_REPO_RULE_REVISION,
+        ),
+        (
             judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
             judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE_REVISION,
         ),
@@ -834,6 +838,18 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
             judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
         ),
+        (
+            judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE.to_string(),
+            judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE_REVISION,
+        ),
+        (
+            judge::security::UNSAFE_SURFACE_RULE.to_string(),
+            judge::security::UNSAFE_SURFACE_RULE_REVISION,
+        ),
+        (
+            judge::security::INTEGER_CAST_RISK_RULE.to_string(),
+            judge::security::INTEGER_CAST_RISK_RULE_REVISION,
+        ),
     ]);
 
     let complexity_source_files = workspace
@@ -923,6 +939,22 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
     findings.extend(judge::slop_structural::analyze_workspace_structural(
         abstraction_source_files,
     ));
+
+    let fragile_substring_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    findings.extend(judge::slop_structural::fragile_substring_classification(
+        fragile_substring_source_files,
+    ));
+
+    let security_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let security = judge::security::analyze_workspace(security_source_files, false);
+    analysis_errors.extend(security.errors.iter().map(ToString::to_string));
+    findings.extend(security.findings);
 
     let deps = judge::deps::analyze_workspace(workspace);
     analysis_errors.extend(deps.errors.iter().map(ToString::to_string));
@@ -1805,6 +1837,10 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
         (
             judge::deps::DEFAULT_FEATURES_UNUSED_RULE.to_string(),
             judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
+        ),
+        (
+            judge::deps::DEP_WITHOUT_REPO_RULE.to_string(),
+            judge::deps::DEP_WITHOUT_REPO_RULE_REVISION,
         ),
         (
             judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
@@ -3197,6 +3233,18 @@ fn run_dead_code_deep(
                 judge::dead_code::UNUSED_PUB_WORKSPACE_RULE_REVISION,
             ),
             (
+                judge::dead_code::UNUSED_PUB_API_RULE.to_string(),
+                judge::dead_code::UNUSED_PUB_API_RULE_REVISION,
+            ),
+            (
+                judge::dead_code::DEAD_ENUM_VARIANT_RULE.to_string(),
+                judge::dead_code::DEAD_ENUM_VARIANT_RULE_REVISION,
+            ),
+            (
+                judge::dead_code::TEST_ONLY_PUB_RULE.to_string(),
+                judge::dead_code::TEST_ONLY_PUB_RULE_REVISION,
+            ),
+            (
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE.to_string(),
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE_REVISION,
             ),
@@ -3266,6 +3314,9 @@ fn run_dead_code_deep(
             }
             for rule in [
                 judge::dead_code::UNUSED_PUB_WORKSPACE_RULE,
+                judge::dead_code::UNUSED_PUB_API_RULE,
+                judge::dead_code::DEAD_ENUM_VARIANT_RULE,
+                judge::dead_code::TEST_ONLY_PUB_RULE,
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             ] {
@@ -3489,13 +3540,30 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
         abstraction_source_files,
     ));
 
+    let fragile_substring_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    findings.extend(judge::slop_structural::fragile_substring_classification(
+        fragile_substring_source_files,
+    ));
+
+    let security_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let security = judge::security::analyze_workspace(security_source_files, include_generated);
+    analysis_errors.extend(security.errors.iter().map(ToString::to_string));
+    findings.extend(security.findings);
+
     // Inline `judge-ignore` suppression (todo.md §5): applied after every
     // detector above has merged its findings in, so a suppressed finding
     // never reaches score, baseline diff, or verdict below.
     let (findings, suppressed_inline) =
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
 
-    let excluded_generated = report.excluded_generated + slop.excluded_generated;
+    let excluded_generated =
+        report.excluded_generated + slop.excluded_generated + security.excluded_generated;
 
     // The LOC denominator is only computed — and an unreadable file only
     // fatal — where a score or a saved baseline depends on it (see todo.md
@@ -3603,6 +3671,18 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
             (
                 judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
                 judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
+            ),
+            (
+                judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE.to_string(),
+                judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE_REVISION,
+            ),
+            (
+                judge::security::UNSAFE_SURFACE_RULE.to_string(),
+                judge::security::UNSAFE_SURFACE_RULE_REVISION,
+            ),
+            (
+                judge::security::INTEGER_CAST_RISK_RULE.to_string(),
+                judge::security::INTEGER_CAST_RISK_RULE_REVISION,
             ),
         ]);
         return handle_baseline_with_trend(
@@ -3905,7 +3985,7 @@ fn print_hotspots(
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 18] = [
+const SLOP_RULES: [&str; 21] = [
     judge::slop::SWALLOWED_RESULT_RULE,
     judge::slop::EMPTY_ERROR_ARM_RULE,
     judge::slop::CATCH_ALL_ERROR_RULE,
@@ -3924,6 +4004,9 @@ const SLOP_RULES: [&str; 18] = [
     judge::slop_structural::COMPLEXITY_INFLATION_RULE,
     judge::slop_structural::LEGACY_FREEZE_RULE,
     judge::slop_structural::ABSTRACTION_INFLATION_RULE,
+    judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
+    judge::security::UNSAFE_SURFACE_RULE,
+    judge::security::INTEGER_CAST_RISK_RULE,
 ];
 
 fn print_slop(
