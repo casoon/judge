@@ -9,6 +9,7 @@ use gix::bstr::ByteSlice;
 
 use crate::complexity::FunctionInfo;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
+use crate::ingest::Workspace;
 
 /// Default lookback window for churn: 12 months.
 pub const DEFAULT_WINDOW_DAYS: i64 = 365;
@@ -19,6 +20,23 @@ pub const HOTSPOT_RULE: &str = "hotspot";
 /// older revision doesn't silently protect findings from a real rule change
 /// (see todo.md §5 "Regelversions-Schutz").
 pub const HOTSPOT_RULE_REVISION: u32 = 1;
+
+/// Rule id used for [`size_distribution`] findings (see todo.md §E
+/// "Verteilungs-Audits: ... `size-distribution` (Gini über Dateigrößen,
+/// 'God File')").
+pub const SIZE_DISTRIBUTION_RULE: &str = "size-distribution";
+/// Bump when the size-distribution rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const SIZE_DISTRIBUTION_RULE_REVISION: u32 = 1;
+
+/// Minimum population Gini coefficient (see [`gini`]) over a crate's
+/// authored-file LOC distribution for that crate's top-decile files to be
+/// flagged as concentrated (see [`size_distribution`]). First-cut,
+/// adjustable threshold — not yet backed by a distribution study of what
+/// counts as normal file-size spread across real crates (mirrors
+/// [`crate::duplication::DEFAULT_MIN_TOKENS`]'s arbitrary-but-documented
+/// style).
+pub const SIZE_DISTRIBUTION_GINI_THRESHOLD: f64 = 0.6;
 
 #[derive(Debug)]
 pub enum GitError {
@@ -308,6 +326,156 @@ pub fn hotspots(
     hotspots.sort_by_key(|hotspot| std::cmp::Reverse(hotspot.score()));
 
     Ok(hotspots)
+}
+
+/// Population Gini coefficient over non-negative `values` (order-independent
+/// — sorted internally): `0.0` (perfect equality) for `n <= 1` or an
+/// all-zero/empty slice, since concentration is undefined without at least
+/// two comparable, non-zero values to compare — not a divide-by-zero panic
+/// (see [`size_distribution`]).
+///
+/// Given `values` sorted ascending `x_1 ≤ x_2 ≤ … ≤ x_n` (1-indexed) with `S
+/// = Σx_i`: `G = (2 · Σ(i · x_i)) / (n · S) − (n + 1) / n`.
+fn gini(values: &[u64]) -> f64 {
+    if values.len() <= 1 {
+        return 0.0;
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let sum: u64 = sorted.iter().sum();
+    if sum == 0 {
+        return 0.0;
+    }
+
+    let n = sorted.len() as f64;
+    let weighted_sum: f64 = sorted
+        .iter()
+        .enumerate()
+        .map(|(zero_based_index, &value)| (zero_based_index as f64 + 1.0) * value as f64)
+        .sum();
+
+    (2.0 * weighted_sum) / (n * sum as f64) - (n + 1.0) / n
+}
+
+/// Number of files in a crate's top LOC decile (top ~10%, by file count):
+/// `file_count − floor(file_count × 0.9)`, computed via integer division to
+/// avoid float rounding at the boundary. Always at least 1 for a non-empty
+/// crate (see [`size_distribution`]).
+fn top_decile_count(file_count: usize) -> usize {
+    file_count - (file_count * 9 / 10)
+}
+
+/// A file whose LOC lands in its crate's top decile while that crate's own
+/// file-size distribution is concentrated (Gini coefficient above
+/// [`SIZE_DISTRIBUTION_GINI_THRESHOLD`]) — see [`size_distribution`].
+#[derive(Debug, Clone)]
+pub struct SizeDistributionOutlier {
+    pub file: PathBuf,
+    pub loc: u64,
+    pub crate_name: String,
+    pub crate_gini: f64,
+    pub crate_file_count: usize,
+}
+
+impl SizeDistributionOutlier {
+    /// Renders this outlier as a [`Finding`]. Severity is `Info` and the
+    /// evidence class is `Heuristic`, mirroring [`Hotspot::to_finding`]:
+    /// this repo's own `main.rs` is large and would trip almost any flat
+    /// "God File" line-count threshold, yet a large, concentrated file is
+    /// routinely legitimate (a CLI dispatch table, an enum-heavy config
+    /// module), so this must never gate. The wording states only the LOC,
+    /// crate, file count, and Gini coefficient — never that the file "is too
+    /// big" or "needs refactoring" (todo.md §17.4).
+    pub fn to_finding(&self) -> Finding {
+        Finding {
+            id: format!("{SIZE_DISTRIBUTION_RULE}:{}", self.file.display()).into(),
+            rule: SIZE_DISTRIBUTION_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: self.file.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: self.file.display().to_string(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "lines_of_code": self.loc,
+                "crate": self.crate_name,
+                "crate_file_count": self.crate_file_count,
+                "crate_gini": self.crate_gini,
+                "gini_threshold": SIZE_DISTRIBUTION_GINI_THRESHOLD,
+                "reason": format!(
+                    "this file has {} lines of code, in the top decile for crate `{}` ({} authored files), whose file-size distribution has a Gini coefficient of {:.2} (threshold: {SIZE_DISTRIBUTION_GINI_THRESHOLD})",
+                    self.loc, self.crate_name, self.crate_file_count, self.crate_gini
+                ),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+}
+
+/// Per workspace crate, flags authored files whose LOC lands in that crate's
+/// top decile (top ~10% by file count, see [`top_decile_count`]) when the
+/// crate's own authored-file LOC distribution is concentrated — Gini
+/// coefficient (see [`gini`]) above [`SIZE_DISTRIBUTION_GINI_THRESHOLD`].
+/// Both conditions are required: a bare large-file LOC number alone says
+/// nothing about concentration, and the crate-level Gini gate is what makes
+/// this a distribution claim rather than an arbitrary LOC cutoff.
+///
+/// Needs no git history at all — pure per-file LOC plus per-crate
+/// aggregation over the already-loaded [`Workspace`] — unlike [`hotspots`],
+/// which needs `churn`'s git walk.
+///
+/// A crate with only one authored file always has Gini `0.0` (the `n <= 1`
+/// edge case in [`gini`]), so it never fires — correct, since concentration
+/// requires more than one file to compare against, not a bug. An unreadable
+/// file is silently skipped, matching [`crate::health_score::total_authored_loc`]'s
+/// tolerance.
+pub fn size_distribution(workspace: &Workspace) -> Vec<SizeDistributionOutlier> {
+    let mut outliers = Vec::new();
+
+    for krate in &workspace.crates {
+        let mut file_locs: Vec<(PathBuf, u64)> = krate
+            .source_files
+            .iter()
+            .filter(|file| file.kind.is_locally_reportable())
+            .filter_map(|file| {
+                std::fs::read_to_string(&file.path)
+                    .ok()
+                    .map(|content| (file.path.clone(), content.lines().count() as u64))
+            })
+            .collect();
+        if file_locs.is_empty() {
+            continue;
+        }
+
+        let loc_values: Vec<u64> = file_locs.iter().map(|(_, loc)| *loc).collect();
+        let crate_gini = gini(&loc_values);
+        if crate_gini <= SIZE_DISTRIBUTION_GINI_THRESHOLD {
+            continue;
+        }
+
+        file_locs.sort_by_key(|(_, loc)| std::cmp::Reverse(*loc));
+        let crate_file_count = file_locs.len();
+        let flagged_count = top_decile_count(crate_file_count);
+
+        outliers.extend(
+            file_locs
+                .into_iter()
+                .take(flagged_count)
+                .map(|(file, loc)| SizeDistributionOutlier {
+                    file,
+                    loc,
+                    crate_name: krate.name.clone(),
+                    crate_gini,
+                    crate_file_count,
+                }),
+        );
+    }
+
+    outliers
 }
 
 /// The current `HEAD` commit as a full hex object id (see todo.md §5,
@@ -895,6 +1063,160 @@ mod tests {
         assert_eq!(finding.rule, HOTSPOT_RULE);
         assert_eq!(finding.severity, Severity::Info);
         assert_eq!(finding.location.file, PathBuf::from("src/lib.rs"));
+    }
+
+    #[test]
+    fn gini_is_zero_for_perfect_equality() {
+        assert_eq!(gini(&[1, 1, 1, 1]), 0.0);
+    }
+
+    #[test]
+    fn gini_approaches_the_n_minus_one_over_n_bound_for_maximal_inequality() {
+        // One file holds everything, the rest are empty: the most unequal
+        // distribution representable — should land close to `(n-1)/n`.
+        let values = [0, 0, 0, 100];
+        let g = gini(&values);
+        assert!((g - 0.75).abs() < 1e-9, "expected ~0.75, got {g}");
+    }
+
+    #[test]
+    fn gini_is_zero_for_an_empty_slice() {
+        assert_eq!(gini(&[]), 0.0);
+    }
+
+    #[test]
+    fn gini_is_zero_for_a_single_value() {
+        assert_eq!(gini(&[42]), 0.0);
+    }
+
+    #[test]
+    fn gini_is_zero_when_every_value_is_zero() {
+        assert_eq!(gini(&[0, 0, 0]), 0.0);
+    }
+
+    /// Builds a single-crate `Workspace` rooted at `dir`, with one authored
+    /// `SourceFile` per `(relative_path, line_count)` pair — each file
+    /// written with exactly that many lines, matching how [`size_distribution`]
+    /// counts LOC (`content.lines().count()`).
+    fn workspace_with_sized_files(
+        dir: &Path,
+        crate_name: &str,
+        files: &[(&str, usize)],
+    ) -> Workspace {
+        let mut source_files = Vec::new();
+        for (relative_path, line_count) in files {
+            let path = dir.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let content = "x\n".repeat(*line_count);
+            std::fs::write(&path, content).unwrap();
+            source_files.push(crate::ingest::SourceFile {
+                path,
+                kind: crate::ingest::SourceKind::Authored,
+            });
+        }
+
+        Workspace {
+            root: dir.to_path_buf(),
+            crates: vec![crate::ingest::CrateInfo {
+                name: crate_name.to_string(),
+                version: "0.1.0".to_string(),
+                manifest_path: dir.join("Cargo.toml"),
+                root: dir.to_path_buf(),
+                source_files,
+                entry_points: Vec::new(),
+                dependencies: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn size_distribution_flags_the_top_decile_file_of_a_concentrated_crate() {
+        let dir = TempDir::new("size-distribution-concentrated");
+        let workspace = workspace_with_sized_files(
+            &dir,
+            "concentrated",
+            &[
+                ("src/huge.rs", 1000),
+                ("src/small_a.rs", 10),
+                ("src/small_b.rs", 10),
+                ("src/small_c.rs", 10),
+                ("src/small_d.rs", 10),
+            ],
+        );
+
+        let outliers = size_distribution(&workspace);
+
+        assert_eq!(outliers.len(), 1);
+        assert_eq!(outliers[0].file, dir.join("src/huge.rs"));
+        assert_eq!(outliers[0].loc, 1000);
+        assert_eq!(outliers[0].crate_name, "concentrated");
+        assert_eq!(outliers[0].crate_file_count, 5);
+        assert!(outliers[0].crate_gini > SIZE_DISTRIBUTION_GINI_THRESHOLD);
+    }
+
+    #[test]
+    fn size_distribution_does_not_fire_for_uniformly_sized_files() {
+        let dir = TempDir::new("size-distribution-uniform");
+        let workspace = workspace_with_sized_files(
+            &dir,
+            "uniform",
+            &[
+                ("src/a.rs", 100),
+                ("src/b.rs", 100),
+                ("src/c.rs", 100),
+                ("src/d.rs", 105),
+            ],
+        );
+
+        let outliers = size_distribution(&workspace);
+
+        assert!(
+            outliers.is_empty(),
+            "expected no outliers for a near-uniform crate, got {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn size_distribution_never_fires_for_a_single_file_crate() {
+        let dir = TempDir::new("size-distribution-single-file");
+        let workspace = workspace_with_sized_files(&dir, "solo", &[("src/lib.rs", 5000)]);
+
+        let outliers = size_distribution(&workspace);
+
+        assert!(outliers.is_empty());
+    }
+
+    #[test]
+    fn size_distribution_handles_a_crate_with_no_authored_files() {
+        let dir = TempDir::new("size-distribution-no-files");
+        let workspace = workspace_with_sized_files(&dir, "empty", &[]);
+
+        let outliers = size_distribution(&workspace);
+
+        assert!(outliers.is_empty());
+    }
+
+    #[test]
+    fn size_distribution_to_finding_states_facts_not_a_verdict() {
+        let outlier = SizeDistributionOutlier {
+            file: PathBuf::from("src/main.rs"),
+            loc: 2000,
+            crate_name: "judge".to_string(),
+            crate_gini: 0.72,
+            crate_file_count: 12,
+        };
+        let finding = outlier.to_finding();
+
+        assert_eq!(finding.rule, SIZE_DISTRIBUTION_RULE);
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
+        assert_eq!(finding.location.file, PathBuf::from("src/main.rs"));
+        let evidence = finding.evidence.expect("evidence must be populated");
+        assert_eq!(evidence["lines_of_code"], 2000);
+        assert_eq!(evidence["crate"], "judge");
+        assert_eq!(evidence["crate_file_count"], 12);
     }
 
     fn commit_sha(dir: &Path, rev: &str) -> String {

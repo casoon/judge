@@ -230,6 +230,18 @@ pub struct BoundaryConfig {
     pub layers: Option<LayersConfig>,
     #[serde(rename = "crate_profile", default)]
     pub crate_profiles: Vec<CrateProfile>,
+    /// Crate names configured as "internal" for `internal-leak` (see
+    /// `crate::api_surface_deep`, todo.md §3.H): a `pub fn`'s signature
+    /// resolving to an ADT defined in one of these crates is flagged, on top
+    /// of (not instead of) `semver-hazard`'s own unconditional
+    /// `leaked_dependency_type` sub-case. Validated to exist in the
+    /// workspace, same precedent as `[[boundary]]`'s
+    /// `from`/`forbidden`/`required` (see [`validate_internal_crates_config`]).
+    /// Empty by default — with no entries, `internal-leak` performs no
+    /// analysis at all (todo.md §17 "Kein Raten von Projektabsicht": an
+    /// architecture rule needs explicit config, not a guess).
+    #[serde(default)]
+    pub internal_crates: Vec<String>,
     #[serde(default)]
     pub slopsquat: SlopsquatConfig,
     /// Flattened so `[[provenance_label]]` sits at the top level of
@@ -392,6 +404,44 @@ fn validate_config(
         }
     }
     Ok(())
+}
+
+/// Validates that every crate named in `internal_crates` actually exists in
+/// the workspace — same "hard config error, not a silent no-op" precedent as
+/// [`validate_config`]/[`validate_module_boundary_config`] (see todo.md §17
+/// "Kein Raten von Projektabsicht"). `internal_crates` has no `allow_empty`
+/// escape hatch (unlike [`BoundaryRule`]) — a typo'd internal crate name is
+/// always an error.
+fn validate_internal_crates_config(
+    config: &BoundaryConfig,
+    crate_names: &HashSet<&str>,
+) -> Result<(), BoundaryConfigError> {
+    for name in &config.internal_crates {
+        if !crate_names.contains(name.as_str()) {
+            return Err(BoundaryConfigError::UnknownCrate {
+                rule: "internal_crates".to_string(),
+                crate_name: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates `config.internal_crates` against `workspace`'s crate names —
+/// exposed separately from [`evaluate`] since `internal-leak` (see
+/// `crate::api_surface_deep`) is evaluated by `cargo judge api-surface`, not
+/// `cargo judge boundaries`, but must apply the exact same hard-error
+/// precedent for an unknown crate name (see [`validate_internal_crates_config`]).
+pub fn validate_internal_crates(
+    workspace: &Workspace,
+    config: &BoundaryConfig,
+) -> Result<(), BoundaryConfigError> {
+    let crate_names: HashSet<&str> = workspace
+        .crates
+        .iter()
+        .map(|krate| krate.name.as_str())
+        .collect();
+    validate_internal_crates_config(config, &crate_names)
 }
 
 /// Validates every `[[module_boundary]]` rule: its `crate` must name a
@@ -630,6 +680,7 @@ pub fn evaluate(
         .collect();
     validate_config(config, &crate_names)?;
     validate_module_boundary_config(config, &crate_names)?;
+    validate_internal_crates_config(config, &crate_names)?;
     let layer_rules = match &config.layers {
         Some(layers) => generate_layer_rules(layers, &crate_names)?,
         None => Vec::new(),
@@ -1354,6 +1405,50 @@ mod tests {
 
         let err = evaluate(&workspace, &config).unwrap_err();
         assert!(matches!(err, BoundaryConfigError::UnknownCrate { .. }));
+    }
+
+    #[test]
+    fn internal_crates_naming_an_unknown_crate_is_a_config_error() {
+        let dir = TempDir::new("boundaries-internal-crates-unknown");
+        write_crate(&dir, "ui", &[]);
+        write_workspace_manifest(&dir, &["ui"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            internal_crates: vec!["not-a-workspace-crate".to_string()],
+            crate_profiles: Vec::new(),
+            ..Default::default()
+        };
+
+        let err = evaluate(&workspace, &config).unwrap_err();
+        assert!(matches!(err, BoundaryConfigError::UnknownCrate { .. }));
+
+        // `validate_internal_crates` (the entry point `run_api_surface` uses,
+        // since `internal-leak` is evaluated by `cargo judge api-surface`,
+        // not `cargo judge boundaries`) must reject the same config the same
+        // way.
+        let err = validate_internal_crates(&workspace, &config).unwrap_err();
+        assert!(matches!(err, BoundaryConfigError::UnknownCrate { .. }));
+    }
+
+    #[test]
+    fn internal_crates_naming_a_real_workspace_crate_is_accepted() {
+        let dir = TempDir::new("boundaries-internal-crates-known");
+        write_crate(&dir, "ui", &[]);
+        write_crate(&dir, "other", &[]);
+        write_workspace_manifest(&dir, &["ui", "other"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let config = BoundaryConfig {
+            internal_crates: vec!["other".to_string()],
+            crate_profiles: Vec::new(),
+            ..Default::default()
+        };
+
+        assert!(evaluate(&workspace, &config).is_ok());
+        assert!(validate_internal_crates(&workspace, &config).is_ok());
     }
 
     #[test]

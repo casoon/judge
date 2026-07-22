@@ -170,7 +170,7 @@ pub enum UsageDomain {
 }
 
 /// Classifies `relative` (a source file path relative to its crate root).
-fn classify_domain(relative: &Path) -> UsageDomain {
+pub(crate) fn classify_domain(relative: &Path) -> UsageDomain {
     if relative == Path::new("build.rs") {
         return UsageDomain::Build;
     }
@@ -1142,7 +1142,7 @@ fn collect_identifiers(path: &Path) -> Result<(HashSet<String>, HashSet<String>)
 /// mentions `test` as a whole word (`#[cfg(test)]`, `#[cfg(any(test, ...))]`,
 /// `#[cfg(all(test, ...))]`) — a crude but conservative parse of the
 /// attribute's raw tokens, not a full `cfg` predicate evaluator.
-fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         if !attr.path().is_ident("cfg") {
             return false;

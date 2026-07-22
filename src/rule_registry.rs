@@ -102,6 +102,23 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
     },
+    // -- api_surface_deep.rs (Deep Tier, `--features deep`) ---------------
+    RuleMetadata {
+        id: "internal-leak",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Requires `--features deep` and `cargo judge api-surface` (same subcommand as `semver-hazard`'s `leaked_dependency_type` sub-case, which this rule reuses the type resolution of), plus a `judge.toml` with a non-empty `internal_crates` list (see `crate::boundaries::BoundaryConfig::internal_crates`). With `internal_crates` empty or absent (the default), this rule performs no analysis at all and emits zero findings — that must never be read as 'no internal leaks found', only that none were checked for (todo.md §17 'Kein Raten von Projektabsicht': an architecture rule needs explicit config, not a guess).",
+        exclusions: "Same resolution and the same documented boundary as `semver-hazard`'s `leaked_dependency_type` sub-case (see `crate::api_surface_deep` module docs 'Ehrliche Grenze'): only direct parameter/return types plus one level of generic unwrapping through a `std`/`core`/`alloc` container are checked; a `dyn Trait` receiver, raw pointer, function pointer, tuple, or slice/array element type is not unwrapped.",
+        allowed_wording: "State only that this pub item's signature resolves to a type defined in `<crate>`, which is configured as internal — never that crossing this boundary is 'unintentional' or that the crate's public API is 'broken' (todo.md §17.4); judge does not know whether crossing the boundary was deliberate.",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "re-export-chain",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `--features deep` and `cargo judge api-surface` (same subcommand as `semver-hazard`/`internal-leak`); always evaluated when the Deep Tier is available, no `judge.toml` config needed.",
+        exclusions: "Only a plain, non-glob, non-braced `pub use path::Item;` (optionally renamed) at a file's own module-root level is considered a candidate or an intermediate hop — a `pub use` nested inside an inline `mod { .. }` block in the same file, a glob (`pub use foo::*;`), or a braced group (`pub use foo::{A, B};`) is invisible to this scan (see `crate::api_surface_deep` module docs). A hop count capped at 5 (`RE_EXPORT_CHAIN_MAX_HOPS`) is reported as `evidence.capped: true` rather than an exact count — chosen to bound the walk against a `pub use` cycle, not derived from a study of real-world chain depths. A single direct re-export (hop count 1) is deliberately never flagged — only 2 or more hops are, since curated top-level re-exports, prelude modules, and workspace umbrella crates routinely add exactly one hop and are not themselves a sign of obscured ownership.",
+        allowed_wording: "State only that this item's public path resolves through `<hop_count>` `pub use` hops before reaching its defining module `<defining_path>` — when `evidence.capped` is true, phrase `<hop_count>` as 'at least 5', not an exact count; never phrase a chain's existence as 'bad practice' or as 'hiding implementation details' (todo.md §17.4) — re-export facades are a common, legitimate pattern judge cannot tell apart from an unintentional one.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
     // -- coverage.rs ------------------------------------------------------
     RuleMetadata {
         id: "untested-hotspot",
@@ -242,6 +259,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`/`audit`'s hotspot block and `cargo judge health`).",
         exclusions: "Ranked complexity × churn over the last `DEFAULT_WINDOW_DAYS` (365) days, capped to the top `HOTSPOT_LIMIT` (15) files — a genuinely risky file that doesn't make the cap is not surfaced. A file rewritten for legitimate reasons (e.g. a planned refactor) scores the same as unplanned churn.",
         allowed_wording: HEURISTIC_WORDING,
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
+    RuleMetadata {
+        id: "size-distribution",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier, no git history needed — pure per-file LOC plus per-crate aggregation over the loaded workspace; part of bare `cargo judge` and `audit`).",
+        exclusions: "First-cut, adjustable Gini threshold (`SIZE_DISTRIBUTION_GINI_THRESHOLD`, 0.6, mirrors `crate::duplication::DEFAULT_MIN_TOKENS`'s style); only fires when a file's LOC is in its crate's top decile *and* the crate's own file-size Gini coefficient exceeds the threshold — a large, concentrated file (e.g. a CLI dispatch table or an enum-heavy config module) is routinely legitimate, not a defect. A crate with only one authored file always has Gini `0.0` by construction and never fires.",
+        allowed_wording: "State only the file's LOC, the crate's file count, and the crate's Gini coefficient against the threshold — never that the file 'is too big' or 'needs refactoring' (todo.md §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
     // -- module_graph.rs ------------------------------------------------
@@ -623,6 +648,7 @@ mod tests {
             crate::deps::DEP_WITHOUT_REPO_RULE,
             crate::duplication::DUPLICATE_RULE,
             crate::git::HOTSPOT_RULE,
+            crate::git::SIZE_DISTRIBUTION_RULE,
             crate::module_graph::UNLINKED_FILE_RULE,
             crate::module_graph::ORPHAN_MODULE_RULE,
             crate::ownership::LOW_BUS_FACTOR_RULE,
@@ -683,6 +709,8 @@ mod tests {
             crate::dead_code::TEST_ONLY_PUB_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
+            crate::api_surface_deep::INTERNAL_LEAK_RULE,
+            crate::api_surface_deep::RE_EXPORT_CHAIN_RULE,
         ];
         for id in ids {
             assert!(

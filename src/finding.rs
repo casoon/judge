@@ -133,11 +133,12 @@ pub enum Severity {
 /// | `unused-pub-api` | `heuristic` (Deep Tier; a published crate's public surface is expected to have zero *internal* reference — see `crate::dead_code`'s `UNUSED_PUB_API_RULE` doc comment) |
 /// | `unlinked-file`, `orphan-module` | `bounded_semantic` (proven only within the crate's own resolved `mod` tree / the loaded workspace's cross-file reference scan — see `crate::module_graph`) |
 /// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::boundaries`] module docs "Module-level boundaries") |
+/// | `internal-leak` | `bounded_semantic` (Deep Tier; an explicitly configured `internal_crates` edge over the same semantically resolved type reference `leaked_dependency_type`'s `bounded_semantic` override already relies on — see `crate::api_surface_deep`, [`crate::boundaries::BoundaryConfig::internal_crates`]) |
 /// | `unused-dev-dependency` | `bounded_semantic` (no usage found in the examined view — tests/examples/benches and `#[cfg(test)]` modules of the declaring package; doctests are not scanned) |
 /// | `unused-dependency` | `bounded_semantic` (rustc's own `unused_crate_dependencies` lint result, narrowed to the intersection across every target compiled for the package — see [`crate::deps`] module docs "Importing rustc's `unused_crate_dependencies` lint") |
 /// | `phantom-crate`, `phantom-version`, `fresh-low-reputation-dep` | `external_measurement` (a crates.io lookup snapshot) |
 /// | `untested-hotspot` | `external_measurement` (complexity and churn are `derived_fact`/`heuristic` in isolation, but the imported `cargo-llvm-cov` coverage snapshot is the rarest, least locally-verifiable ingredient in the combination, so it sets the class — see `crate::coverage::untested_hotspots`) |
-/// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt`, `integer-cast-risk`, `fragile-substring-classification` | `heuristic` (reproducible interpretation, not proof) |
+/// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt`, `integer-cast-risk`, `fragile-substring-classification`, `size-distribution`, `re-export-chain` | `heuristic` (reproducible interpretation, not proof) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceClass {
@@ -211,6 +212,7 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "crate-boundary-violation"
         | "dependency-cycle"
         | "module-boundary-violation"
+        | "internal-leak"
         | "unused-dev-dependency"
         | "unused-dependency"
         | "unlinked-file"
@@ -221,6 +223,8 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
             EvidenceClass::ExternalMeasurement
         }
         "unused-pub-api" => EvidenceClass::Heuristic,
+        "size-distribution" => EvidenceClass::Heuristic,
+        "re-export-chain" => EvidenceClass::Heuristic,
         _ => EvidenceClass::Heuristic,
     }
 }

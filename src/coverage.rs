@@ -13,9 +13,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
 
 use crate::complexity::FunctionInfo;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
+use crate::ingest::Workspace;
 
 /// Rule id for [`untested_hotspots`] (see todo.md §J).
 pub const UNTESTED_HOTSPOT_RULE: &str = "untested-hotspot";
@@ -350,6 +353,140 @@ pub fn untested_hotspots(
         .collect();
     findings.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
     findings
+}
+
+/// A crate's authored test-to-production LOC split (see todo.md §J
+/// "Test-zu-Code-Ratio pro Crate, Verteilung"). A pure metric, not a
+/// `Finding`: there is no universal "good" ratio to gate on — a pure
+/// data-types crate can legitimately have zero tests, and a proc-macro
+/// crate's real tests often live entirely in a separate integration-test
+/// crate this per-crate LOC count cannot see. Any threshold here would
+/// assert "undertested" as fact, which todo.md §5's wording rule forbids for
+/// anything short of `derived_fact` evidence. Mirrors
+/// `crate::complexity::FunctionInfo::cyclomatic`: a bare value other things
+/// can read, never a standalone claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateTestRatio {
+    pub crate_name: String,
+    pub production_loc: u64,
+    pub test_loc: u64,
+}
+
+impl CrateTestRatio {
+    /// `test_loc / production_loc`, or `None` when `production_loc` is zero
+    /// — nothing to divide by (mirrors [`FileCoverage::covered_pct`]'s
+    /// no-fabricated-number precedent). A crate with `test_loc == 0` and
+    /// nonzero `production_loc` yields `Some(0.0)`: "no tests" is a
+    /// well-defined ratio, not a missing one.
+    pub fn ratio(&self) -> Option<f64> {
+        if self.production_loc == 0 {
+            None
+        } else {
+            Some(self.test_loc as f64 / self.production_loc as f64)
+        }
+    }
+}
+
+/// Line spans (1-based, inclusive) of every `#[cfg(test)]`-attributed module
+/// in a parsed file — adapts `crate::deps`'s `CfgTestIdentCollector` (which
+/// collects identifiers referenced inside such a module) into a span
+/// collector instead, reusing its exact `#[cfg(test)]` detection
+/// (`crate::deps::attrs_have_cfg_test`) rather than re-parsing attributes
+/// from scratch. Like `CfgTestIdentCollector`, doesn't descend into a
+/// `#[cfg(test)]` module once found, so sibling/nested test modules never
+/// double-count a line.
+#[derive(Default)]
+struct CfgTestModSpanCollector {
+    spans: Vec<(usize, usize)>,
+}
+
+impl<'ast> Visit<'ast> for CfgTestModSpanCollector {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if crate::deps::attrs_have_cfg_test(&node.attrs) {
+            let start_line = node.span().start().line;
+            let end_line = node.span().end().line.max(start_line);
+            self.spans.push((start_line, end_line));
+        } else {
+            visit::visit_item_mod(self, node);
+        }
+    }
+}
+
+/// Parses `path` and returns the line spans of its top-level `#[cfg(test)]`
+/// modules (see [`CfgTestModSpanCollector`]). `None` if the file can't be
+/// read or parsed — the caller then falls back to treating the whole file as
+/// production code, matching how [`size_distribution`](crate::git::size_distribution)
+/// and `crate::health_score::total_authored_loc` silently skip unreadable
+/// files rather than failing outright.
+fn cfg_test_mod_line_spans(path: &Path) -> Option<Vec<(usize, usize)>> {
+    let source = std::fs::read_to_string(path).ok()?;
+    let ast = syn::parse_file(&source).ok()?;
+    let mut collector = CfgTestModSpanCollector::default();
+    collector.visit_file(&ast);
+    Some(collector.spans)
+}
+
+/// Computes [`CrateTestRatio`] for every crate in `workspace`, over its
+/// [`crate::ingest::SourceKind::Authored`] files.
+///
+/// A file counts entirely towards `test_loc` if it sits under a `tests/`
+/// directory — reusing `crate::deps::classify_domain`'s existing path
+/// classification, which also groups `examples/`/`benches/` files into the
+/// same `Dev` domain; those are counted as test LOC here too, rather than
+/// re-deriving a narrower "`tests/` only" classifier (a deliberate reuse
+/// choice, not an oversight — see this task's judgment-call note).
+/// Otherwise, a `src/`-located file contributes to both counts if it
+/// contains one or more `#[cfg(test)] mod ...` blocks: the lines inside
+/// those blocks count as `test_loc`, the rest of the file as
+/// `production_loc`. Everything else (including `build.rs`) counts entirely
+/// as `production_loc`. An unreadable or unparseable file is skipped, not
+/// treated as either.
+pub fn test_ratios(workspace: &Workspace) -> Vec<CrateTestRatio> {
+    workspace
+        .crates
+        .iter()
+        .map(|krate| {
+            let mut production_loc: u64 = 0;
+            let mut test_loc: u64 = 0;
+
+            for file in &krate.source_files {
+                if !file.kind.is_locally_reportable() {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(&file.path) else {
+                    continue;
+                };
+                let total_lines = content.lines().count() as u64;
+
+                let relative = file
+                    .path
+                    .strip_prefix(&krate.root)
+                    .unwrap_or(file.path.as_path());
+                if crate::deps::classify_domain(relative) == crate::deps::UsageDomain::Dev {
+                    test_loc += total_lines;
+                    continue;
+                }
+
+                match cfg_test_mod_line_spans(&file.path) {
+                    Some(spans) if !spans.is_empty() => {
+                        let test_lines_in_file: u64 = spans
+                            .iter()
+                            .map(|&(start, end)| (end - start + 1) as u64)
+                            .sum();
+                        test_loc += test_lines_in_file;
+                        production_loc += total_lines.saturating_sub(test_lines_in_file);
+                    }
+                    _ => production_loc += total_lines,
+                }
+            }
+
+            CrateTestRatio {
+                crate_name: krate.name.clone(),
+                production_loc,
+                test_loc,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -768,5 +905,148 @@ end_of_record
             findings.is_empty(),
             "no coverage data must not be treated as 0% coverage"
         );
+    }
+
+    /// Builds a single-crate `Workspace` rooted at `dir`, with one authored
+    /// `SourceFile` per `(relative_path, content)` pair — mirrors
+    /// `crate::git`'s `workspace_with_sized_files` fixture helper, but writes
+    /// real Rust source (needed here so `test_ratios` can parse `#[cfg(test)]`
+    /// modules) instead of placeholder lines.
+    fn workspace_with_files(dir: &Path, crate_name: &str, files: &[(&str, &str)]) -> Workspace {
+        let mut source_files = Vec::new();
+        for (relative_path, content) in files {
+            let path = dir.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, content).unwrap();
+            source_files.push(crate::ingest::SourceFile {
+                path,
+                kind: crate::ingest::SourceKind::Authored,
+            });
+        }
+
+        Workspace {
+            root: dir.to_path_buf(),
+            crates: vec![crate::ingest::CrateInfo {
+                name: crate_name.to_string(),
+                version: "0.1.0".to_string(),
+                manifest_path: dir.join("Cargo.toml"),
+                root: dir.to_path_buf(),
+                source_files,
+                entry_points: Vec::new(),
+                dependencies: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_ratios_counts_a_tests_directory_file_as_test_loc_only() {
+        let dir = TempDir::new("coverage-test-ratio-tests-dir");
+        let workspace = workspace_with_files(
+            &dir,
+            "with-tests-dir",
+            &[
+                ("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n"),
+                (
+                    "tests/it.rs",
+                    "#[test]\nfn it_adds() {\n    assert_eq!(1 + 1, 2);\n}\n",
+                ),
+            ],
+        );
+
+        let ratios = test_ratios(&workspace);
+
+        assert_eq!(ratios.len(), 1);
+        assert_eq!(ratios[0].crate_name, "with-tests-dir");
+        assert_eq!(ratios[0].production_loc, 3);
+        assert_eq!(ratios[0].test_loc, 4);
+    }
+
+    #[test]
+    fn test_ratios_splits_an_inline_cfg_test_module_from_its_surrounding_file() {
+        let dir = TempDir::new("coverage-test-ratio-inline-cfg-test");
+        let content = "\
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn it_adds() {
+        assert_eq!(add(1, 1), 2);
+    }
+}
+";
+        let workspace =
+            workspace_with_files(&dir, "with-inline-cfg-test", &[("src/lib.rs", content)]);
+
+        let ratios = test_ratios(&workspace);
+
+        assert_eq!(ratios.len(), 1);
+        // Lines 1-3 (the `add` function) plus the blank line before the
+        // `#[cfg(test)]` module: 4 production lines.
+        assert_eq!(ratios[0].production_loc, 4);
+        // Lines 5-13: the `#[cfg(test)] mod tests { ... }` block, inclusive.
+        assert_eq!(ratios[0].test_loc, 9);
+    }
+
+    #[test]
+    fn test_ratios_is_zero_and_well_defined_for_a_crate_with_no_test_code() {
+        let dir = TempDir::new("coverage-test-ratio-no-tests");
+        let workspace = workspace_with_files(
+            &dir,
+            "no-tests",
+            &[("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n")],
+        );
+
+        let ratios = test_ratios(&workspace);
+
+        assert_eq!(ratios.len(), 1);
+        assert_eq!(ratios[0].test_loc, 0);
+        assert_eq!(ratios[0].production_loc, 3);
+        assert_eq!(ratios[0].ratio(), Some(0.0));
+    }
+
+    #[test]
+    fn test_ratios_are_computed_per_crate_not_pooled_across_the_workspace() {
+        let dir = TempDir::new("coverage-test-ratio-multi-crate");
+        let mut workspace = workspace_with_files(
+            &dir.join("crate-a"),
+            "crate-a",
+            &[
+                ("src/lib.rs", "pub fn a() {}\n"),
+                ("tests/it.rs", "#[test]\nfn t() {}\n"),
+            ],
+        );
+        let crate_b = workspace_with_files(
+            &dir.join("crate-b"),
+            "crate-b",
+            &[("src/lib.rs", "pub fn b() {}\n")],
+        );
+        workspace.crates.extend(crate_b.crates);
+
+        let ratios = test_ratios(&workspace);
+
+        assert_eq!(ratios.len(), 2);
+        let ratio_a = ratios.iter().find(|r| r.crate_name == "crate-a").unwrap();
+        assert_eq!(ratio_a.production_loc, 1);
+        assert_eq!(ratio_a.test_loc, 2);
+        let ratio_b = ratios.iter().find(|r| r.crate_name == "crate-b").unwrap();
+        assert_eq!(ratio_b.production_loc, 1);
+        assert_eq!(ratio_b.test_loc, 0);
+    }
+
+    #[test]
+    fn crate_test_ratio_ratio_is_none_when_production_loc_is_zero() {
+        let ratio = CrateTestRatio {
+            crate_name: "tests-only".to_string(),
+            production_loc: 0,
+            test_loc: 5,
+        };
+        assert_eq!(ratio.ratio(), None);
     }
 }

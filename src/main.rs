@@ -719,6 +719,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::git::HOTSPOT_RULE_REVISION,
         ),
         (
+            judge::git::SIZE_DISTRIBUTION_RULE.to_string(),
+            judge::git::SIZE_DISTRIBUTION_RULE_REVISION,
+        ),
+        (
             judge::duplication::DUPLICATE_RULE.to_string(),
             judge::duplication::DUPLICATE_RULE_REVISION,
         ),
@@ -871,6 +875,11 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         ),
         Err(err) => analysis_errors.push(err.to_string()),
     }
+    findings.extend(
+        judge::git::size_distribution(workspace)
+            .iter()
+            .map(judge::git::SizeDistributionOutlier::to_finding),
+    );
     findings.extend(judge::slop_structural::complexity_inflation(
         &complexity.functions,
     ));
@@ -2058,6 +2067,8 @@ fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<Command
         no_coverage_data_source_files.map(|file| file.path.as_path()),
     );
 
+    let test_ratios = judge::coverage::test_ratios(&workspace);
+
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([(
             judge::coverage::UNTESTED_HOTSPOT_RULE.to_string(),
@@ -2087,6 +2098,20 @@ fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<Command
                 no_coverage_data
                     .iter()
                     .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            value["test_ratios"] = serde_json::to_value(
+                test_ratios
+                    .iter()
+                    .map(|ratio| {
+                        serde_json::json!({
+                            "crate": ratio.crate_name,
+                            "production_loc": ratio.production_loc,
+                            "test_loc": ratio.test_loc,
+                            "ratio": ratio.ratio(),
+                        })
+                    })
                     .collect::<Vec<_>>(),
             )
             .unwrap();
@@ -2124,6 +2149,24 @@ fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<Command
                 )?;
                 for file in &no_coverage_data {
                     writeln!(out, "  {}", file.display())?;
+                }
+            }
+            if !test_ratios.is_empty() {
+                writeln!(out)?;
+                writeln!(out, "test-to-code LOC ratio (metric only, no verdict):")?;
+                for ratio in &test_ratios {
+                    match ratio.ratio() {
+                        Some(value) => writeln!(
+                            out,
+                            "  {}: {:.2} (test {} / production {})",
+                            ratio.crate_name, value, ratio.test_loc, ratio.production_loc
+                        )?,
+                        None => writeln!(
+                            out,
+                            "  {}: undefined (test {} / production 0)",
+                            ratio.crate_name, ratio.test_loc
+                        )?,
+                    }
                 }
             }
         }
@@ -2486,6 +2529,8 @@ fn run_api_surface(
         include_generated,
     } = options;
     let workspace = judge::ingest::load(None)?;
+    let boundary_config = load_judge_toml(&workspace.root)?;
+    judge::boundaries::validate_internal_crates(&workspace, &boundary_config)?;
 
     let report = judge::api_surface::analyze_workspace(workspace.crates.iter(), include_generated);
     #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
@@ -2507,8 +2552,11 @@ fn run_api_surface(
     if judge::AnalysisTier::Deep.is_available() {
         #[cfg(feature = "deep")]
         {
-            let deep_report = judge::api_surface_deep::analyze_workspace(&workspace)
-                .map_err(|err| CliError::Analyzer(err.to_string()))?;
+            let deep_report = judge::api_surface_deep::analyze_workspace(
+                &workspace,
+                &boundary_config.internal_crates,
+            )
+            .map_err(|err| CliError::Analyzer(err.to_string()))?;
             deep_checked = Some(deep_report.checked);
             findings.extend(deep_report.findings);
             deep_errors = deep_report.errors.iter().map(ToString::to_string).collect();
@@ -2547,7 +2595,8 @@ fn run_api_surface(
     }
 
     if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
+        #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+        let mut rule_revisions = std::collections::HashMap::from([
             (
                 judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE.to_string(),
                 judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION,
@@ -2557,6 +2606,16 @@ fn run_api_surface(
                 judge::api_surface::SEMVER_HAZARD_RULE_REVISION,
             ),
         ]);
+        #[cfg(feature = "deep")]
+        rule_revisions.insert(
+            judge::api_surface_deep::INTERNAL_LEAK_RULE.to_string(),
+            judge::api_surface_deep::INTERNAL_LEAK_RULE_REVISION,
+        );
+        #[cfg(feature = "deep")]
+        rule_revisions.insert(
+            judge::api_surface_deep::RE_EXPORT_CHAIN_RULE.to_string(),
+            judge::api_surface_deep::RE_EXPORT_CHAIN_RULE_REVISION,
+        );
         let current_size: std::collections::HashMap<String, usize> = size_trend
             .iter()
             .map(|trend| (trend.crate_name.clone(), trend.item_count))
