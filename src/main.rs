@@ -23,9 +23,10 @@ const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
 /// Top-N cap on git hotspot findings — shared by the dedicated `health`
 /// hotspot print path and every combined findings list `git::hotspots`
-/// feeds into. `git::hotspots` already sorts by score (complexity × changes)
-/// descending, so `.take(HOTSPOT_LIMIT)` keeps the highest-score files, not
-/// an arbitrary prefix. Without this cap a repo where every file crosses
+/// feeds into. `git::hotspots` already sorts by score (complexity ×
+/// recency-weighted changes) descending, so `.take(HOTSPOT_LIMIT)` keeps
+/// the highest-score files, not an arbitrary prefix. Without this cap a
+/// repo where every file crosses
 /// both complexity and churn thresholds floods the findings list with one
 /// hotspot per file instead of surfacing genuine outliers.
 const HOTSPOT_LIMIT: usize = 15;
@@ -213,6 +214,13 @@ struct DepsOptions {
     /// `unused_crate_dependencies` lint").
     #[arg(long)]
     check_rustc_lints: bool,
+    /// Opt-in: cross-reference an already-generated `cargo audit --json`
+    /// report against the resolved dependency graph (`known-vulnerability`).
+    /// judge never runs `cargo-audit` itself — generate the report with
+    /// `cargo audit --json > PATH` first (see `judge::advisories` module
+    /// docs).
+    #[arg(long, value_name = "PATH")]
+    audit_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -230,6 +238,20 @@ struct BoundariesOptions {
     /// Compare findings against a previously saved baseline.
     #[arg(long, value_name = "PATH")]
     baseline: Option<PathBuf>,
+    /// Print the workspace's crate dependency graph in this format instead
+    /// of checking boundary rules, and exit — a pure projection of the
+    /// existing architecture graph (todo.md §H), not a new rule engine.
+    /// Ignores every other flag above; does not require `judge.toml`.
+    #[arg(long, value_enum)]
+    graph: Option<GraphFormat>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GraphFormat {
+    /// Graphviz DOT (see `judge::boundaries::CrateGraph::to_dot`).
+    Dot,
+    /// Mermaid `flowchart` (see `judge::boundaries::CrateGraph::to_mermaid`).
+    Mermaid,
 }
 
 #[derive(Debug, Args)]
@@ -580,6 +602,12 @@ impl From<judge::coverage::LcovError> for CliError {
     }
 }
 
+impl From<judge::advisories::AuditImportError> for CliError {
+    fn from(err: judge::advisories::AuditImportError) -> Self {
+        Self::Config(err.to_string())
+    }
+}
+
 impl From<judge::suppression::SuppressionError> for CliError {
     fn from(err: judge::suppression::SuppressionError) -> Self {
         Self::Config(err.to_string())
@@ -747,6 +775,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
         ),
         (
+            judge::deps::UNUSED_FEATURE_RULE.to_string(),
+            judge::deps::UNUSED_FEATURE_RULE_REVISION,
+        ),
+        (
             judge::deps::DEP_WITHOUT_REPO_RULE.to_string(),
             judge::deps::DEP_WITHOUT_REPO_RULE_REVISION,
         ),
@@ -853,6 +885,14 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         (
             judge::security::INTEGER_CAST_RISK_RULE.to_string(),
             judge::security::INTEGER_CAST_RISK_RULE_REVISION,
+        ),
+        (
+            judge::security::PANIC_IN_LIB_RULE.to_string(),
+            judge::security::PANIC_IN_LIB_RULE_REVISION,
+        ),
+        (
+            judge::security::HARDCODED_SECRET_RULE.to_string(),
+            judge::security::HARDCODED_SECRET_RULE_REVISION,
         ),
     ]);
 
@@ -1009,6 +1049,38 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
             judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
         );
+
+        match judge::boundaries::change_coupling_signals(
+            workspace,
+            &config,
+            judge::git::DEFAULT_WINDOW_DAYS,
+        ) {
+            Ok(coupling_findings) => {
+                findings.extend(coupling_findings);
+                rule_revisions.insert(
+                    judge::boundaries::CHANGE_COUPLING_SIGNAL_RULE.to_string(),
+                    judge::boundaries::CHANGE_COUPLING_SIGNAL_RULE_REVISION,
+                );
+            }
+            Err(err) => analysis_errors.push(err.to_string()),
+        }
+    }
+
+    // `feature-graph-cycle` is always-on, unlike the `judge.toml`-gated
+    // boundary rules above — see `judge::boundaries` module docs
+    // "`feature-graph-cycle`" for why: a `[features]` table is either
+    // cyclic or it isn't, a fact needing no project-intent config to
+    // interpret.
+    let feature_graph_manifest = workspace.root.join("Cargo.toml");
+    match judge::boundaries::feature_graph_cycles(Some(&feature_graph_manifest)) {
+        Ok(cycle_findings) => {
+            findings.extend(cycle_findings);
+            rule_revisions.insert(
+                judge::boundaries::FEATURE_GRAPH_CYCLE_RULE.to_string(),
+                judge::boundaries::FEATURE_GRAPH_CYCLE_RULE_REVISION,
+            );
+        }
+        Err(err) => analysis_errors.push(err.to_string()),
     }
 
     // Inline `judge-ignore` suppression (todo.md §5): a generic, per-rule
@@ -1819,6 +1891,7 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
         baseline,
         check_crates_io,
         check_rustc_lints,
+        audit_json,
     } = options;
     let workspace = judge::ingest::load(None)?;
 
@@ -1846,6 +1919,10 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
         (
             judge::deps::DEFAULT_FEATURES_UNUSED_RULE.to_string(),
             judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
+        ),
+        (
+            judge::deps::UNUSED_FEATURE_RULE.to_string(),
+            judge::deps::UNUSED_FEATURE_RULE_REVISION,
         ),
         (
             judge::deps::DEP_WITHOUT_REPO_RULE.to_string(),
@@ -1892,7 +1969,7 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
             judge::slopsquat::PHANTOM_VERSION_RULE_REVISION,
         );
 
-        let metadata_client = judge::slopsquat::RestMetadataClient::new(cache_root);
+        let metadata_client = judge::slopsquat::RestMetadataClient::new(cache_root.clone());
         let fresh_report = judge::slopsquat::analyze_fresh_low_reputation(
             &workspace,
             &metadata_client,
@@ -1904,6 +1981,25 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
             judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE.to_string(),
             judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE_REVISION,
         );
+
+        let yanked_report =
+            judge::slopsquat::analyze_yanked_dependencies(&workspace, &index_client);
+        findings.extend(yanked_report.findings);
+        analysis_errors.extend(yanked_report.errors);
+        rule_revisions.insert(
+            judge::slopsquat::YANKED_DEPENDENCY_RULE.to_string(),
+            judge::slopsquat::YANKED_DEPENDENCY_RULE_REVISION,
+        );
+
+        let owners_client = judge::slopsquat::RestOwnersClient::new(cache_root);
+        let single_maintainer_report =
+            judge::slopsquat::analyze_single_maintainer_dependencies(&workspace, &owners_client);
+        findings.extend(single_maintainer_report.findings);
+        analysis_errors.extend(single_maintainer_report.errors);
+        rule_revisions.insert(
+            judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE.to_string(),
+            judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE_REVISION,
+        );
     }
 
     if check_rustc_lints {
@@ -1913,6 +2009,18 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
         rule_revisions.insert(
             judge::deps::UNUSED_DEPENDENCY_RULE.to_string(),
             judge::deps::UNUSED_DEPENDENCY_RULE_REVISION,
+        );
+    }
+
+    if let Some(audit_json_path) = audit_json {
+        let vulnerabilities = judge::advisories::read_audit_report(&audit_json_path)?;
+        let advisory_report =
+            judge::advisories::analyze_vulnerabilities(&workspace, &vulnerabilities);
+        findings.extend(advisory_report.findings);
+        analysis_errors.extend(advisory_report.errors);
+        rule_revisions.insert(
+            judge::advisories::KNOWN_VULNERABILITY_RULE.to_string(),
+            judge::advisories::KNOWN_VULNERABILITY_RULE_REVISION,
         );
     }
 
@@ -2183,7 +2291,19 @@ fn run_boundaries(
         format,
         save_baseline,
         baseline,
+        graph,
     } = options;
+
+    if let Some(graph_format) = graph {
+        let crate_graph = judge::boundaries::build_crate_graph(None)?;
+        let rendered = match graph_format {
+            GraphFormat::Dot => crate_graph.to_dot(),
+            GraphFormat::Mermaid => crate_graph.to_mermaid(),
+        };
+        write!(out, "{rendered}")?;
+        return Ok(CommandOutcome::Clean);
+    }
+
     let workspace = judge::ingest::load(None)?;
 
     let config_path = config_path.unwrap_or_else(|| workspace.root.join("judge.toml"));
@@ -2203,13 +2323,45 @@ fn run_boundaries(
         })?;
 
     let boundaries = judge::boundaries::evaluate(&workspace, &config)?;
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut findings = boundaries.findings;
+    // `evaluate()` itself has no per-file soft-error channel (its
+    // `--no-deps` `cargo_metadata` resolve either succeeds outright or
+    // fails via `?` above) — this only ever gets entries from the Deep-Tier
+    // pass below.
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut analysis_errors: Vec<String> = Vec::new();
+
+    // Deep-Tier upgrade to `[[module_boundary]]`: real symbol reference
+    // resolution instead of the Fast Tier's `syn`-based text scan — see
+    // `judge::boundaries_deep` module docs. Only available in a build
+    // compiled with `--features deep`; a Fast Tier build silently skips it
+    // (the Fast-Tier `module-boundary-violation` check above already ran),
+    // matching `run_api_surface`'s same precedent for `semver-hazard`'s
+    // Deep-Tier sub-case.
+    if judge::AnalysisTier::Deep.is_available() {
+        #[cfg(feature = "deep")]
+        {
+            let deep_report = judge::boundaries_deep::analyze_workspace(&workspace, &config)
+                .map_err(|err| CliError::Analyzer(err.to_string()))?;
+            findings.extend(deep_report.findings);
+            analysis_errors.extend(deep_report.errors.iter().map(ToString::to_string));
+        }
+        #[cfg(not(feature = "deep"))]
+        {
+            unreachable!(
+                "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
+            );
+        }
+    }
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(boundaries.findings, &workspace.root)?;
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
 
     if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
+        #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+        let mut rule_revisions = std::collections::HashMap::from([
             (
                 judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
                 judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
@@ -2223,10 +2375,17 @@ fn run_boundaries(
                 judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
             ),
         ]);
+        #[cfg(feature = "deep")]
+        if judge::AnalysisTier::Deep.is_available() {
+            rule_revisions.insert(
+                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE.to_string(),
+                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE_REVISION,
+            );
+        }
         return handle_baseline(
             &workspace.root,
             &findings,
-            &[],
+            &analysis_errors,
             BaselineOptions {
                 rule_revisions,
                 save: save_baseline,
@@ -2241,11 +2400,12 @@ fn run_boundaries(
 
     match format {
         OutputFormat::Json => {
-            let report = Report::new(findings).with_suppressed_inline(suppressed_inline);
+            let report = Report::with_errors(findings, analysis_errors)
+                .with_suppressed_inline(suppressed_inline);
             writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
         }
         OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, Vec::new(), None)?;
+            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
         }
         OutputFormat::Markdown => {
             return Err(unsupported_format(
@@ -2257,6 +2417,12 @@ fn run_boundaries(
         OutputFormat::Tty => {
             writeln!(out, "boundary rules: {}", config.boundaries.len())?;
             writeln!(out, "findings: {}", findings.len())?;
+            if !analysis_errors.is_empty() {
+                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
+                for error in &analysis_errors {
+                    writeln!(out, "  {error}")?;
+                }
+            }
             if suppressed_inline > 0 {
                 writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
@@ -2781,6 +2947,10 @@ fn run_provenance(
                 judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE.to_string(),
                 judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE_REVISION,
             ),
+            (
+                judge::provenance::DEP_ADDED_BY_AGENT_RULE.to_string(),
+                judge::provenance::DEP_ADDED_BY_AGENT_RULE_REVISION,
+            ),
         ]);
         return handle_baseline(
             &workspace.root,
@@ -2836,6 +3006,32 @@ fn run_provenance(
                     summary.duplication,
                     summary.suppression_debt
                 )?;
+            }
+
+            // `dep-added-by-agent` findings are per-instance, not part of
+            // the `by_class` aggregate table above (see `ClassSummary`'s
+            // doc comment: it's a count model, this rule isn't a count).
+            let dep_added_findings: Vec<&Finding> = breakdown
+                .findings
+                .iter()
+                .filter(|finding| finding.rule == judge::provenance::DEP_ADDED_BY_AGENT_RULE)
+                .collect();
+            if !dep_added_findings.is_empty() {
+                writeln!(out)?;
+                writeln!(
+                    out,
+                    "dependencies added in an agent-classified commit, with no same-commit usage found:"
+                )?;
+                for finding in dep_added_findings {
+                    let evidence = finding.evidence.as_ref().expect("always set");
+                    writeln!(
+                        out,
+                        "  {} (commit {}, {})",
+                        evidence["dependency"].as_str().unwrap_or("?"),
+                        evidence["commit"].as_str().unwrap_or("?"),
+                        evidence["author_class"].as_str().unwrap_or("?")
+                    )?;
+                }
             }
         }
     }
@@ -3743,6 +3939,14 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
                 judge::security::INTEGER_CAST_RISK_RULE.to_string(),
                 judge::security::INTEGER_CAST_RISK_RULE_REVISION,
             ),
+            (
+                judge::security::PANIC_IN_LIB_RULE.to_string(),
+                judge::security::PANIC_IN_LIB_RULE_REVISION,
+            ),
+            (
+                judge::security::HARDCODED_SECRET_RULE.to_string(),
+                judge::security::HARDCODED_SECRET_RULE_REVISION,
+            ),
         ]);
         return handle_baseline_with_trend(
             &workspace.root,
@@ -3987,12 +4191,12 @@ fn trend_json(trend: &judge::health_score::Trend) -> serde_json::Value {
     }
 }
 
-/// Hotspot = complexity × change frequency (see todo.md §3.E). Files with no
-/// recorded churn (or no git history at all) are left out rather than shown
-/// as zero-risk. Reduced to root findings unless `show_cascades` is set (see
-/// todo.md §14.2 P0#2) — currently a no-op, since nothing yet populates
-/// `caused_by` for hotspot findings, but the mechanism is exercised here so
-/// future detectors that do can rely on it.
+/// Hotspot = complexity × recency-weighted change frequency (see todo.md
+/// §3.E). Files with no recorded churn (or no git history at all) are left
+/// out rather than shown as zero-risk. Reduced to root findings unless
+/// `show_cascades` is set (see todo.md §14.2 P0#2) — currently a no-op,
+/// since nothing yet populates `caused_by` for hotspot findings, but the
+/// mechanism is exercised here so future detectors that do can rely on it.
 fn print_hotspots(
     out: &mut dyn Write,
     hotspots: &[judge::git::Hotspot],
@@ -4019,7 +4223,7 @@ fn print_hotspots(
 
     writeln!(
         out,
-        "hotspots (complexity × changes in the last {} days — advisory, no verdict effect):",
+        "hotspots (complexity × recency-weighted changes in the last {} days — advisory, no verdict effect):",
         judge::git::DEFAULT_WINDOW_DAYS
     )?;
     for hotspot in hotspots.iter().take(HOTSPOT_LIMIT) {
@@ -4029,9 +4233,10 @@ fn print_hotspots(
         }
         writeln!(
             out,
-            "  {:>6}  {} × {} changes  {}",
+            "  {:>6}  {} × {:.1} weighted ({} raw) changes  {}",
             hotspot.score(),
             hotspot.complexity,
+            hotspot.recency_weight,
             hotspot.changes,
             hotspot.file.display()
         )?;
@@ -4044,7 +4249,7 @@ fn print_hotspots(
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 21] = [
+const SLOP_RULES: [&str; 23] = [
     judge::slop::SWALLOWED_RESULT_RULE,
     judge::slop::EMPTY_ERROR_ARM_RULE,
     judge::slop::CATCH_ALL_ERROR_RULE,
@@ -4066,6 +4271,8 @@ const SLOP_RULES: [&str; 21] = [
     judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
     judge::security::UNSAFE_SURFACE_RULE,
     judge::security::INTEGER_CAST_RISK_RULE,
+    judge::security::PANIC_IN_LIB_RULE,
+    judge::security::HARDCODED_SECRET_RULE,
 ];
 
 fn print_slop(
@@ -4833,6 +5040,7 @@ fn dup_two(x: i32) -> i32 {
                 format: OutputFormat::Tty,
                 save_baseline: false,
                 baseline: None,
+                graph: None,
             })),
             &mut out,
         )
@@ -4843,6 +5051,57 @@ fn dup_two(x: i32) -> i32 {
             }
             other => panic!("expected CliError::Config, got {other:?}"),
         }
+    }
+
+    /// `cargo judge boundaries --graph dot` is a pure projection of the
+    /// crate graph (todo.md §H) — it must work without a `judge.toml`
+    /// (boundaries proper are opt-in and require one; the graph does not),
+    /// and must not touch findings/baseline machinery at all.
+    #[test]
+    fn run_boundaries_graph_dot_renders_the_crate_graph_without_a_judge_toml() {
+        let dir = TempDir::new("boundaries-graph-dot");
+        write_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::Boundaries(BoundariesOptions {
+                config: None,
+                format: OutputFormat::Tty,
+                save_baseline: false,
+                baseline: None,
+                graph: Some(GraphFormat::Dot),
+            })),
+            &mut out,
+        )
+        .expect("graph projection must not require judge.toml");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "digraph crates {\n  \"fixture\";\n}\n");
+    }
+
+    /// Same fixture, Mermaid format — todo.md §H names both `dot` and
+    /// `mermaid` as the two graph output formats.
+    #[test]
+    fn run_boundaries_graph_mermaid_renders_the_crate_graph() {
+        let dir = TempDir::new("boundaries-graph-mermaid");
+        write_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        run_in_dir(
+            &dir,
+            cli_with(Command::Boundaries(BoundariesOptions {
+                config: None,
+                format: OutputFormat::Tty,
+                save_baseline: false,
+                baseline: None,
+                graph: Some(GraphFormat::Mermaid),
+            })),
+            &mut out,
+        )
+        .expect("graph projection must not require judge.toml");
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text, "flowchart TD\n  fixture[\"fixture\"]\n");
     }
 
     /// Config-error path: a baseline with an unknown `schema_version` is a
@@ -5788,8 +6047,8 @@ pub fn quiet_three() -> u32 {
     /// `hotspot` finding per file (see `HOTSPOT_LIMIT`'s doc comment: 317/317
     /// files flagged in a real repo, no "outlier" signal left). `collect_findings`
     /// caps at `HOTSPOT_LIMIT`, and — since `git::hotspots` already sorts by
-    /// score (complexity × changes) descending — keeps the *highest*-score
-    /// files, not an arbitrary prefix.
+    /// score (complexity × recency-weighted changes) descending — keeps the
+    /// *highest*-score files, not an arbitrary prefix.
     #[test]
     fn collect_findings_caps_hotspots_at_the_shared_limit_keeping_the_highest_scores() {
         let _guard = lock_cwd();

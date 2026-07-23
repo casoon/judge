@@ -16,8 +16,8 @@ Early stage. The Fast Tier (no build required, `syn`- and `gix`-based) and a fir
 - `cargo judge inspect` — crates, source files, and entry points detected via `cargo metadata`
 - `cargo judge health [--score]` — cyclomatic complexity, git hotspots, syntax-level slop signals, and an optional health score (see below)
 - `cargo judge dupes --mode strict|mild|weak|semantic` — duplicated token spans grouped into clone families
-- `cargo judge deps [--check-crates-io]` — dependency-kind hygiene plus local name-collision checks; the crates.io lookups (`phantom-crate`, `phantom-version`, `fresh-low-reputation-dep`) are opt-in because judge makes no network calls otherwise
-- `cargo judge boundaries` — opt-in crate boundaries from `judge.toml`, plus dependency cycles
+- `cargo judge deps [--check-crates-io] [--audit-json PATH]` — dependency-kind hygiene plus local name-collision checks; the crates.io lookups (`phantom-crate`, `phantom-version`, `fresh-low-reputation-dep`, `yanked-dependency`, `dep-single-maintainer`) are opt-in because judge makes no network calls otherwise; `--audit-json` cross-references an already-generated `cargo audit --json` report against the resolved dependency graph (`known-vulnerability`) — judge never runs `cargo-audit` itself
+- `cargo judge boundaries` — opt-in crate boundaries from `judge.toml`, plus dependency cycles; `--graph dot|mermaid` prints the crate dependency graph itself instead of checking rules
 - `cargo judge distribution` — ownership and bus-factor findings from git blame
 - `cargo judge audit --since REF` — pass/warn/fail verdict scoped to findings introduced since a commit; requires a previously saved baseline
 - `cargo judge dead-code [--include-tests]` — Deep Tier, needs `--features deep` (see below)
@@ -89,7 +89,9 @@ cargo judge dead-code          # Deep Tier — binary must be built with --featu
 
 `cargo judge provenance` breaks churn, duplication, and suppression debt down
 by heuristically classified author class (commit trailers/markers like
-`Co-authored-by: Claude`, or a configured `[[provenance_label]]`). It is
+`Co-authored-by: Claude`, or a configured `[[provenance_label]]`), and flags
+`dep-added-by-agent`: a dependency declared in an agent-classified commit
+with no same-commit reference to it found in any other touched file. It is
 opt-in — not part of bare `cargo judge` — and always prints this caveat:
 
 > Provenance labels are a distribution trend, not a judgment on any single

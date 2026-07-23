@@ -45,6 +45,22 @@ pub const PROVENANCE_SUPPRESSION_DEBT_RULE: &str = "provenance-suppression-debt"
 /// todo.md §5 "Regelversions-Schutz").
 pub const PROVENANCE_SUPPRESSION_DEBT_RULE_REVISION: u32 = 1;
 
+/// Rule id for a dependency declared in a commit's `Cargo.toml` diff, where
+/// that same commit is classified [`AuthorClass::Agent`] and no other file
+/// the commit touched textually references the new dependency (see todo.md
+/// §3.G G5 `dep-added-by-agent`, [`dep_added_by_agent`]).
+pub const DEP_ADDED_BY_AGENT_RULE: &str = "dep-added-by-agent";
+/// Bump when the dep-added-by-agent rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const DEP_ADDED_BY_AGENT_RULE_REVISION: u32 = 1;
+
+/// `Cargo.toml` tables [`dep_added_by_agent`] reads dependency names from.
+/// Deliberately does not include target-specific tables
+/// (`[target.'cfg(...)'.dependencies]`) — a known, undramatic gap: those are
+/// rarer, and a miss there only means a false negative (a dependency this
+/// rule doesn't check), never a false positive.
+const DEPENDENCY_TABLE_NAMES: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
+
 /// The misuse-warning caveat mandated by todo.md §3.G G6. Must appear in
 /// every finding's evidence, as an unconditional TTY header, and as a
 /// top-level JSON envelope field — see `main.rs`'s `run_provenance`.
@@ -256,10 +272,19 @@ pub fn analyze_workspace(
     by_class.sort_by_key(|a| a.class.key());
 
     let cargo_toml = workspace.root.join("Cargo.toml");
-    let findings = by_class
+    let mut findings: Vec<Finding> = by_class
         .iter()
         .flat_map(|summary| summary.to_findings(&cargo_toml))
         .collect();
+
+    let manifest_commits = match git::manifest_change_commits(&workspace.root, window_days) {
+        Ok(manifest_commits) => manifest_commits,
+        Err(err) => {
+            errors.push(ProvenanceError::Git(err));
+            Vec::new()
+        }
+    };
+    findings.extend(dep_added_by_agent(&manifest_commits, &classes));
 
     ProvenanceBreakdown {
         findings,
@@ -734,6 +759,126 @@ pub fn suppression_debt_by_class(
         *counts.entry(class.clone()).or_insert(0) += 1;
     }
     Ok(counts)
+}
+
+/// Dependency names declared under any of [`DEPENDENCY_TABLE_NAMES`] in a
+/// `Cargo.toml`'s text — empty if `text` doesn't parse as TOML at all
+/// (matching [`crate::git::manifest_change_commits`]'s "can't be read as
+/// text collapses to nothing" precedent). Does not resolve a `package =
+/// "..."` rename to the real crate name — the manifest *key* is used
+/// directly, both as the reported dependency name and as the basis for the
+/// same-commit usage check below; a known simplification.
+fn dependency_names_in_manifest(text: &str) -> HashSet<String> {
+    let Ok(value) = text.parse::<toml::Value>() else {
+        return HashSet::new();
+    };
+    DEPENDENCY_TABLE_NAMES
+        .iter()
+        .filter_map(|table_name| value.get(table_name)?.as_table())
+        .flat_map(|table| table.keys().cloned())
+        .collect()
+}
+
+/// Whether any of `contents` textually references `dependency_name` as Rust
+/// code would: `use <ident>`, `<ident>::`, or `extern crate <ident>` (the
+/// manifest name with `-` normalized to `_`, matching how Cargo itself
+/// derives the code identifier). A plain substring scan, not a `syn` parse —
+/// consistent with this module's own text/trailer-level rigor elsewhere
+/// (todo.md §17.2: heuristic, not proof). A `package = "..."` rename (see
+/// [`dependency_names_in_manifest`]) or a re-export under a different name
+/// would read as "not referenced" here — a known false-positive source.
+fn is_referenced(contents: &HashMap<PathBuf, String>, dependency_name: &str) -> bool {
+    let identifier = dependency_name.replace('-', "_");
+    let use_pattern = format!("use {identifier}");
+    let path_pattern = format!("{identifier}::");
+    let extern_pattern = format!("extern crate {identifier}");
+    contents.values().any(|content| {
+        content.contains(&use_pattern)
+            || content.contains(&path_pattern)
+            || content.contains(&extern_pattern)
+    })
+}
+
+/// `dep-added-by-agent` (see todo.md §3.G G5): for every
+/// [`ManifestChangeCommit`](git::ManifestChangeCommit) whose commit is
+/// classified [`AuthorClass::Agent`], diffs the manifest's dependency names
+/// before/after and flags any newly declared dependency that no other file
+/// the same commit touched textually references (see [`is_referenced`]) —
+/// a speculative or hallucinated dependency add, the kind of AI-slop G5
+/// describes. `AuthorClass::Labeled`/`AuthorClass::Unknown` commits are
+/// never checked: this rule is specifically about agents, not about
+/// correlating with human contributors.
+pub fn dep_added_by_agent(
+    manifest_commits: &[git::ManifestChangeCommit],
+    classes: &HashMap<String, Classification>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for commit in manifest_commits {
+        let Some((AuthorClass::Agent(agent_name), confidence, _)) = classes.get(&commit.commit_id)
+        else {
+            continue;
+        };
+
+        let before = commit
+            .manifest_before
+            .as_deref()
+            .map(dependency_names_in_manifest)
+            .unwrap_or_default();
+        let after = dependency_names_in_manifest(&commit.manifest_after);
+
+        let mut added: Vec<&String> = after.difference(&before).collect();
+        added.sort();
+        for dependency_name in added {
+            if !is_referenced(&commit.touched_file_contents, dependency_name) {
+                findings.push(dep_added_by_agent_finding(
+                    &commit.manifest_path,
+                    dependency_name,
+                    agent_name,
+                    *confidence,
+                    &commit.commit_id,
+                ));
+            }
+        }
+    }
+    findings.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    findings
+}
+
+/// Builds a `dep-added-by-agent` finding. `Info` severity and `Heuristic`
+/// evidence class, same as every other rule in this module (see
+/// [`metric_finding`]'s doc comment): the underlying G6 author-class
+/// classification is never proof, and this rule inherits that uncertainty
+/// regardless of how exact its own text-presence check is (todo.md §17.3:
+/// the weakest link sets the class).
+fn dep_added_by_agent_finding(
+    manifest_path: &Path,
+    dependency_name: &str,
+    agent_name: &str,
+    classification_confidence: f32,
+    commit_id: &str,
+) -> Finding {
+    Finding {
+        id: format!("{DEP_ADDED_BY_AGENT_RULE}:{commit_id}:{dependency_name}").into(),
+        rule: DEP_ADDED_BY_AGENT_RULE.into(),
+        severity: Severity::Info,
+        location: Location {
+            file: manifest_path.to_path_buf(),
+            line: OneBasedLine::FIRST,
+            item_path: dependency_name.to_string(),
+        },
+        evidence_class: EvidenceClass::Heuristic,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "dependency": dependency_name,
+            "commit": commit_id,
+            "author_class": format!("agent-{agent_name}"),
+            "classification_confidence": classification_confidence,
+            "reason": "declared in this commit's manifest diff; no other file this commit touched textually references it",
+            "caveat": PROVENANCE_CAVEAT,
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1256,5 +1401,185 @@ mod tests {
         let err = ProvenanceError::Git(GitError::InvalidWindow(0));
         let source = std::error::Error::source(&err).expect("Git must carry a source");
         assert!(source.downcast_ref::<GitError>().is_some());
+    }
+
+    // -- dep-added-by-agent --
+
+    fn agent_classes(commit_id: &str, agent: &str) -> HashMap<String, Classification> {
+        HashMap::from([(
+            commit_id.to_string(),
+            (
+                AuthorClass::Agent(agent.to_string()),
+                0.85,
+                serde_json::json!({}),
+            ),
+        )])
+    }
+
+    fn manifest_change_commit(
+        commit_id: &str,
+        manifest_before: Option<&str>,
+        manifest_after: &str,
+        touched: &[(&str, &str)],
+    ) -> git::ManifestChangeCommit {
+        git::ManifestChangeCommit {
+            commit_id: commit_id.to_string(),
+            manifest_path: PathBuf::from("Cargo.toml"),
+            manifest_before: manifest_before.map(str::to_string),
+            manifest_after: manifest_after.to_string(),
+            touched_file_contents: touched
+                .iter()
+                .map(|(path, content)| (PathBuf::from(path), content.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn dep_added_by_agent_fires_for_an_unused_new_dependency_in_an_agent_commit() {
+        let commit = manifest_change_commit(
+            "sha1",
+            Some("[package]\nname = \"fixture\"\n"),
+            "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n",
+            &[("src/lib.rs", "pub fn hello() {}\n")],
+        );
+        let classes = agent_classes("sha1", "claude");
+
+        let findings = dep_added_by_agent(&[commit], &classes);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DEP_ADDED_BY_AGENT_RULE);
+        assert_eq!(findings[0].severity, Severity::Info);
+        assert_eq!(findings[0].evidence_class, EvidenceClass::Heuristic);
+        assert!(!findings[0].is_gating());
+        let evidence = findings[0].evidence.as_ref().unwrap();
+        assert_eq!(evidence["dependency"], "serde");
+        assert_eq!(evidence["author_class"], "agent-claude");
+    }
+
+    #[test]
+    fn dep_added_by_agent_does_not_fire_when_the_new_dependency_is_referenced() {
+        let commit = manifest_change_commit(
+            "sha1",
+            Some("[package]\nname = \"fixture\"\n"),
+            "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n",
+            &[(
+                "src/lib.rs",
+                "pub fn hello() -> serde::de::IgnoredAny { todo!() }\n",
+            )],
+        );
+        let classes = agent_classes("sha1", "claude");
+
+        assert!(dep_added_by_agent(&[commit], &classes).is_empty());
+    }
+
+    #[test]
+    fn dep_added_by_agent_does_not_fire_for_a_non_agent_commit() {
+        let commit = manifest_change_commit(
+            "sha1",
+            Some("[package]\nname = \"fixture\"\n"),
+            "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n",
+            &[("src/lib.rs", "pub fn hello() {}\n")],
+        );
+        let classes = HashMap::from([(
+            "sha1".to_string(),
+            (AuthorClass::Unknown, 0.0, serde_json::json!({})),
+        )]);
+
+        assert!(dep_added_by_agent(&[commit], &classes).is_empty());
+    }
+
+    #[test]
+    fn dep_added_by_agent_does_not_fire_when_no_new_dependency_was_declared() {
+        // A version bump, not a newly declared dependency name.
+        let commit = manifest_change_commit(
+            "sha1",
+            Some("[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n"),
+            "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"2\"\n",
+            &[("src/lib.rs", "pub fn hello() {}\n")],
+        );
+        let classes = agent_classes("sha1", "claude");
+
+        assert!(dep_added_by_agent(&[commit], &classes).is_empty());
+    }
+
+    #[test]
+    fn dependency_names_in_manifest_reads_all_three_tables() {
+        let text = "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n\n[dev-dependencies]\nproptest = \"1\"\n\n[build-dependencies]\ncc = \"1\"\n";
+
+        let names = dependency_names_in_manifest(text);
+
+        assert_eq!(
+            names,
+            HashSet::from([
+                "serde".to_string(),
+                "proptest".to_string(),
+                "cc".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_names_in_manifest_is_empty_for_unparsable_text() {
+        assert!(dependency_names_in_manifest("this is { not toml").is_empty());
+    }
+
+    #[test]
+    fn is_referenced_matches_use_path_and_extern_crate_forms() {
+        let use_form =
+            HashMap::from([(PathBuf::from("a.rs"), "use serde::Deserialize;".to_string())]);
+        let path_form = HashMap::from([(
+            PathBuf::from("a.rs"),
+            "fn f() -> serde::de::IgnoredAny { todo!() }".to_string(),
+        )]);
+        let extern_form =
+            HashMap::from([(PathBuf::from("a.rs"), "extern crate serde;".to_string())]);
+        let hyphenated_identifier =
+            HashMap::from([(PathBuf::from("a.rs"), "use serde_json::Value;".to_string())]);
+        let unrelated = HashMap::from([(PathBuf::from("a.rs"), "fn f() {}".to_string())]);
+
+        assert!(is_referenced(&use_form, "serde"));
+        assert!(is_referenced(&path_form, "serde"));
+        assert!(is_referenced(&extern_form, "serde"));
+        assert!(is_referenced(&hyphenated_identifier, "serde-json"));
+        assert!(!is_referenced(&unrelated, "serde"));
+    }
+
+    #[test]
+    fn analyze_workspace_reports_dep_added_by_agent_for_an_unused_dependency() {
+        let dir = TempDir::new("provenance-dep-added-by-agent");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "pub fn hello() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        run_git(
+            &dir,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "add serde\n\nCo-authored-by: Claude <noreply@anthropic.com>",
+            ],
+            &[],
+        );
+
+        let workspace = workspace_of(dir.to_path_buf(), file);
+        let breakdown = analyze_workspace(&workspace, 30, &[]);
+
+        assert!(breakdown.errors.is_empty(), "{:?}", breakdown.errors);
+        let finding = breakdown
+            .findings
+            .iter()
+            .find(|f| f.rule == DEP_ADDED_BY_AGENT_RULE)
+            .expect("an unused dependency added by a Claude-trailer commit must be flagged");
+        assert_eq!(finding.evidence.as_ref().unwrap()["dependency"], "serde");
     }
 }

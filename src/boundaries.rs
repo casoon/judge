@@ -31,6 +31,55 @@
 //!
 //! `required` (crate-level boundaries' other half) is also not part of this
 //! first slice — only `forbidden` is supported.
+//!
+//! ## `feature-graph-cycle` (always-on, no config needed)
+//!
+//! [`feature_graph_cycles`] reuses [`find_cycles`]/[`CrateGraph`] — the same
+//! cycle-detection [`DEPENDENCY_CYCLE_RULE`] already uses, just over a
+//! different graph: nodes are one crate's own declared `[features]` names,
+//! edges are that feature's implication list, restricted to entries that
+//! exactly name another feature of the *same* package (a `dep:foo`,
+//! `pkg/feat`, or `pkg?/feat` entry names a dependency activation, not a
+//! sibling feature, and is excluded — see [`feature_implication_graph`]).
+//! Cargo tolerates a cyclic feature graph at resolution time (it's just a
+//! fixpoint activation set, not an error), so this is a structural-hygiene
+//! signal, not a claim that the build is broken.
+//!
+//! Deliberately **not** routed through [`evaluate`]/`cargo judge boundaries`
+//! the way [`DEPENDENCY_CYCLE_RULE`] is: that pipeline requires a `judge.toml`
+//! to exist at all ("boundaries are opt-in, nothing to check" — see
+//! `main.rs`'s `run_boundaries`), a gate that makes sense for
+//! `[[boundary]]`/`[[module_boundary]]` rules, which need explicit
+//! configuration to mean anything, but not for this rule: a `[features]`
+//! table is either cyclic or it isn't, a fact fully readable from
+//! `cargo_metadata` alone, needing no project-intent config to interpret (see
+//! todo.md §17 "Kein Raten von Projektabsicht" — the rule that motivates
+//! config-gating elsewhere doesn't apply here, since there's no intent to
+//! guess at). It runs unconditionally, alongside bare `cargo judge`/`audit`.
+//!
+//! ## `change-coupling-signal`
+//!
+//! [`change_coupling_signals`] is an empirical counterpart to the structural
+//! boundary rules above: instead of checking declared dependency edges, it
+//! asks whether two crates assigned to *different* `[layers]` (see
+//! [`LayersConfig::assign`]) change together, in the same commit, far more
+//! often than either changes on its own — a sign that whatever boundary the
+//! layers were meant to express isn't holding in practice, even if no
+//! `[[boundary]]` rule is technically violated.
+//!
+//! Requires `[layers]` with a non-empty `assign` — with no layer
+//! configuration, this performs no analysis at all rather than guessing
+//! which crates "should" be independent (todo.md §17 "Kein Raten von
+//! Projektabsicht"). Reuses [`crate::git::walk_commits`]'s same window
+//! semantics as the rest of judge's git-derived signals.
+//!
+//! **Heuristic, not proof** (`EvidenceClass::Heuristic`, matching
+//! [`crate::git::Hotspot`]/`churn-hotspot`'s own class): a large repo-wide
+//! commit (a rename, a formatting pass) can make unrelated crates look
+//! coupled for one window, and the ratio threshold (see
+//! [`CHANGE_COUPLING_RATIO_THRESHOLD`]) is a first-cut constant, not
+//! calibrated against a corpus of known-coupled vs. known-independent crate
+//! pairs.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -42,6 +91,7 @@ use syn::visit::{self, Visit};
 use syn::{ItemUse, UseTree};
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
+use crate::git::{self, GitError};
 use crate::health_score::DeductionMultiplier;
 use crate::ingest::{CrateInfo, Workspace};
 use crate::slopsquat::SlopsquatConfig;
@@ -87,6 +137,32 @@ pub const DEPENDENCY_CYCLE_RULE_REVISION: u32 = 1;
 pub const MODULE_BOUNDARY_VIOLATION_RULE: &str = "module-boundary-violation";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const MODULE_BOUNDARY_VIOLATION_RULE_REVISION: u32 = 1;
+
+/// Rule id for a cyclic chain of feature implications within one crate's own
+/// `[features]` table (see module docs "`feature-graph-cycle`", todo.md §H).
+pub const FEATURE_GRAPH_CYCLE_RULE: &str = "feature-graph-cycle";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const FEATURE_GRAPH_CYCLE_RULE_REVISION: u32 = 1;
+
+/// Rule id for two crates in different `[layers]` changing together, in the
+/// same commit, far more often than either changes alone (see module docs
+/// "`change-coupling-signal`", todo.md §H).
+pub const CHANGE_COUPLING_SIGNAL_RULE: &str = "change-coupling-signal";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const CHANGE_COUPLING_SIGNAL_RULE_REVISION: u32 = 1;
+
+/// Minimum number of same-commit co-changes between a crate pair before
+/// [`change_coupling_signals`] considers the sample large enough to mean
+/// anything — below this, a handful of shared commits (e.g. one repo-wide
+/// rename) could produce a misleadingly high ratio. First-cut, adjustable
+/// constant (see module docs).
+const MIN_CO_CHANGE_SAMPLE: u32 = 5;
+
+/// Minimum fraction of the less-changed crate's own commits that must be
+/// shared with the other crate before [`change_coupling_signals`] fires —
+/// see module docs. First-cut, adjustable threshold, not backed by a study
+/// of what ratio distinguishes genuine coupling from coincidence.
+const CHANGE_COUPLING_RATIO_THRESHOLD: f64 = 0.6;
 
 /// Whether a boundary is checked against direct neighbors only, or against
 /// anything reachable via any number of hops.
@@ -369,6 +445,67 @@ pub fn build_crate_graph(manifest_path: Option<&Path>) -> Result<CrateGraph, Bou
     }
 
     Ok(CrateGraph { edges })
+}
+
+/// Sanitizes a crate name into a Mermaid-safe node identifier: Mermaid
+/// flowchart syntax treats sequences like `-->` and `---` specially, so a
+/// bare crate name (many of which contain hyphens, e.g. `cargo-judge`) is
+/// not always a safe node id on its own. Every non-alphanumeric character
+/// becomes `_`; the original name is still shown via the node's `["label"]`
+/// (see [`CrateGraph::to_mermaid`]).
+fn mermaid_node_id(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect()
+}
+
+impl CrateGraph {
+    /// Renders this graph as Graphviz DOT source (todo.md §H) — a pure
+    /// projection of `edges`, one node per crate plus one directed edge per
+    /// workspace-internal dependency. No new graph is computed; this only
+    /// changes how the existing [`build_crate_graph`] output is displayed.
+    /// Crates and their dependency lists are printed in sorted order, so the
+    /// output is deterministic run to run.
+    pub fn to_dot(&self) -> String {
+        let mut names: Vec<&String> = self.edges.keys().collect();
+        names.sort();
+
+        let mut out = String::from("digraph crates {\n");
+        for name in &names {
+            out.push_str(&format!("  \"{name}\";\n"));
+        }
+        for name in &names {
+            for dep in &self.edges[*name] {
+                out.push_str(&format!("  \"{name}\" -> \"{dep}\";\n"));
+            }
+        }
+        out.push_str("}\n");
+        out
+    }
+
+    /// Renders this graph as a Mermaid `flowchart` (todo.md §H) — same
+    /// edges as [`Self::to_dot`], Mermaid syntax instead of DOT. Node ids
+    /// are sanitized (see [`mermaid_node_id`]); each node's original crate
+    /// name is preserved as its display label.
+    pub fn to_mermaid(&self) -> String {
+        let mut names: Vec<&String> = self.edges.keys().collect();
+        names.sort();
+
+        let mut out = String::from("flowchart TD\n");
+        for name in &names {
+            out.push_str(&format!("  {}[\"{name}\"]\n", mermaid_node_id(name)));
+        }
+        for name in &names {
+            for dep in &self.edges[*name] {
+                out.push_str(&format!(
+                    "  {} --> {}\n",
+                    mermaid_node_id(name),
+                    mermaid_node_id(dep)
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// Result of a full boundary evaluation: every violation and cycle found,
@@ -890,7 +1027,7 @@ fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
 /// `Some("")` (the crate root module). Anything not under `src/` (e.g.
 /// `build.rs`) returns `None` — it has no place in a module tree
 /// `[[module_boundary]]` can reason about.
-fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Option<String> {
+pub(crate) fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Option<String> {
     let relative = file_path.strip_prefix(crate_root).ok()?;
     let mut components: Vec<String> = relative
         .components()
@@ -928,7 +1065,7 @@ fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Option<String> {
 /// Whether `module_path` is `prefix` itself, or a descendant of it — a
 /// `::`-segment prefix match, not a raw string prefix match (`"io"` must not
 /// match `"ioutils"`).
-fn module_path_under(module_path: &str, prefix: &str) -> bool {
+pub(crate) fn module_path_under(module_path: &str, prefix: &str) -> bool {
     module_path == prefix || module_path.starts_with(&format!("{prefix}::"))
 }
 
@@ -1183,10 +1320,234 @@ pub fn find_cycles(graph: &CrateGraph) -> Vec<Vec<String>> {
     cycles
 }
 
+/// Builds a `CrateGraph` over `package`'s own declared `[features]` table
+/// (see module docs "`feature-graph-cycle`"): node = feature name, edge =
+/// feature `a` implying feature `b`, restricted to implication-list entries
+/// that exactly match another declared feature of this same package. A
+/// `dep:foo`/`pkg/feat`/`pkg?/feat` entry names a dependency activation, not
+/// a sibling feature — excluded, since it can never itself be a node in this
+/// graph (it isn't a key in `package.features`), and resolving it further
+/// would need cross-referencing `package.dependencies`, which this rule has
+/// no need for.
+fn feature_implication_graph(package: &cargo_metadata::Package) -> CrateGraph {
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new();
+    for (feature_name, implications) in &package.features {
+        let mut sibling_edges: Vec<String> = implications
+            .iter()
+            .filter(|name| package.features.contains_key(name.as_str()))
+            .cloned()
+            .collect();
+        sibling_edges.sort();
+        edges.insert(feature_name.clone(), sibling_edges);
+    }
+    CrateGraph { edges }
+}
+
+/// Runs `feature-graph-cycle` over every crate in the workspace rooted at
+/// `manifest_path` (or the current directory's workspace, if `None`) — see
+/// module docs "`feature-graph-cycle`" for why this is always-on rather than
+/// routed through [`evaluate`]. One full `cargo metadata --no-deps` call,
+/// same as [`build_crate_graph`].
+pub fn feature_graph_cycles(
+    manifest_path: Option<&Path>,
+) -> Result<Vec<Finding>, BoundaryConfigError> {
+    let mut cmd = MetadataCommand::new();
+    if let Some(path) = manifest_path {
+        cmd.manifest_path(path);
+    }
+    let metadata = cmd
+        .no_deps()
+        .exec()
+        .map_err(BoundaryConfigError::Metadata)?;
+
+    let mut findings = Vec::new();
+    for package in &metadata.packages {
+        let graph = feature_implication_graph(package);
+        let manifest = std::path::PathBuf::from(package.manifest_path.as_str());
+        for cycle in find_cycles(&graph) {
+            findings.push(feature_graph_cycle_finding(
+                &cycle,
+                &manifest,
+                &package.name,
+            ));
+        }
+    }
+    findings.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    Ok(findings)
+}
+
+/// Builds a `feature-graph-cycle` finding. Its evidence class is
+/// `derived_fact` — unlike [`DEPENDENCY_CYCLE_RULE`]'s `bounded_semantic`
+/// (scoped to the loaded workspace's own crate graph, which could in
+/// principle have edges outside what was examined), a single package's own
+/// `[features]` table is fully self-contained: `cargo_metadata` reports it
+/// completely, with no partial-view caveat to hedge with (see module docs
+/// "`feature-graph-cycle`").
+fn feature_graph_cycle_finding(
+    cycle: &[String],
+    manifest_path: &Path,
+    package_name: &str,
+) -> Finding {
+    let path_str = cycle.join(" -> ");
+    Finding {
+        id: format!("{FEATURE_GRAPH_CYCLE_RULE}:{package_name}:{path_str}").into(),
+        rule: FEATURE_GRAPH_CYCLE_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: manifest_path.to_path_buf(),
+            line: OneBasedLine::FIRST,
+            item_path: format!("{package_name}: {path_str}"),
+        },
+        evidence_class: EvidenceClass::DerivedFact,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "package": package_name,
+            "cycle": cycle,
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+/// Runs `change-coupling-signal` over `workspace`'s git history within
+/// `window_days`, using `config.layers`'s crate assignment (see module docs
+/// "`change-coupling-signal`"). `Ok(vec![])` with no analysis performed at
+/// all when `config.layers` is absent or its `assign` table is empty.
+pub fn change_coupling_signals(
+    workspace: &Workspace,
+    config: &BoundaryConfig,
+    window_days: i64,
+) -> Result<Vec<Finding>, GitError> {
+    let Some(layers) = &config.layers else {
+        return Ok(Vec::new());
+    };
+    if layers.assign.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let commits = git::walk_commits(&workspace.root, window_days)?;
+
+    // Longest-root-first, so a crate nested inside another workspace crate's
+    // directory tree (unusual, but not impossible) resolves to the more
+    // specific crate, not its parent.
+    let mut crate_roots: Vec<(&str, &Path)> = workspace
+        .crates
+        .iter()
+        .map(|krate| (krate.name.as_str(), krate.root.as_path()))
+        .collect();
+    crate_roots.sort_by_key(|(_, root)| std::cmp::Reverse(root.as_os_str().len()));
+
+    let mut total_touches: HashMap<&str, u32> = HashMap::new();
+    let mut co_touches: HashMap<(String, String), u32> = HashMap::new();
+
+    for commit in &commits {
+        let mut touched_crates: HashSet<&str> = HashSet::new();
+        for file in &commit.files_changed {
+            let absolute = workspace.root.join(file);
+            if let Some((name, _)) = crate_roots
+                .iter()
+                .find(|(_, root)| absolute.starts_with(root))
+            {
+                touched_crates.insert(name);
+            }
+        }
+
+        // Only crates assigned to a layer are this rule's concern.
+        let mut layered: Vec<&str> = touched_crates
+            .into_iter()
+            .filter(|name| layers.assign.contains_key(*name))
+            .collect();
+        layered.sort_unstable();
+
+        for name in &layered {
+            *total_touches.entry(*name).or_insert(0) += 1;
+        }
+        for i in 0..layered.len() {
+            for j in (i + 1)..layered.len() {
+                let (a, b) = (layered[i], layered[j]);
+                if layers.assign.get(a) == layers.assign.get(b) {
+                    continue; // same layer — not this rule's concern
+                }
+                co_touches
+                    .entry((a.to_string(), b.to_string()))
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+        }
+    }
+
+    let cargo_toml = workspace.root.join("Cargo.toml");
+    let mut findings = Vec::new();
+    for ((crate_a, crate_b), co_change_count) in &co_touches {
+        if *co_change_count < MIN_CO_CHANGE_SAMPLE {
+            continue;
+        }
+        let total_a = total_touches.get(crate_a.as_str()).copied().unwrap_or(0);
+        let total_b = total_touches.get(crate_b.as_str()).copied().unwrap_or(0);
+        let denominator = total_a.min(total_b);
+        if denominator == 0 {
+            continue;
+        }
+        let ratio = f64::from(*co_change_count) / f64::from(denominator);
+        if ratio >= CHANGE_COUPLING_RATIO_THRESHOLD {
+            findings.push(change_coupling_signal_finding(
+                &cargo_toml,
+                crate_a,
+                crate_b,
+                *co_change_count,
+                ratio,
+                layers,
+            ));
+        }
+    }
+    findings.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    Ok(findings)
+}
+
+/// Builds a `change-coupling-signal` finding. Its evidence class is
+/// `heuristic` (see module docs "`change-coupling-signal`"): the co-change
+/// counts themselves are exact, but reading them as evidence of genuine
+/// coupling — rather than coincidence within one git window — is an
+/// interpretation, never proof.
+fn change_coupling_signal_finding(
+    cargo_toml: &Path,
+    crate_a: &str,
+    crate_b: &str,
+    co_change_count: u32,
+    ratio: f64,
+    layers: &LayersConfig,
+) -> Finding {
+    let layer_a = layers.assign.get(crate_a).cloned().unwrap_or_default();
+    let layer_b = layers.assign.get(crate_b).cloned().unwrap_or_default();
+    Finding {
+        id: format!("{CHANGE_COUPLING_SIGNAL_RULE}:{crate_a}:{crate_b}").into(),
+        rule: CHANGE_COUPLING_SIGNAL_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: cargo_toml.to_path_buf(),
+            line: OneBasedLine::FIRST,
+            item_path: format!("{crate_a} ({layer_a}) <-> {crate_b} ({layer_b})"),
+        },
+        evidence_class: EvidenceClass::Heuristic,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "crate_a": crate_a,
+            "crate_b": crate_b,
+            "layer_a": layer_a,
+            "layer_b": layer_b,
+            "co_change_commits": co_change_count,
+            "ratio": ratio,
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_util::TempDir;
+    use std::path::PathBuf;
 
     fn write_crate(dir: &TempDir, name: &str, deps: &[(&str, &str)]) {
         std::fs::create_dir_all(dir.join(name).join("src")).unwrap();
@@ -1594,6 +1955,119 @@ mod tests {
                     .collect::<Vec<_>>(),
             ]
         );
+    }
+
+    // -- feature-graph-cycle --
+
+    fn write_crate_with_features(dir: &TempDir, features_block: &str) -> PathBuf {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{features_block}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        dir.join("Cargo.toml")
+    }
+
+    #[test]
+    fn feature_graph_cycles_fires_for_a_two_feature_cycle() {
+        let dir = TempDir::new("boundaries-feature-cycle-two");
+        let manifest = write_crate_with_features(&dir, "[features]\na = [\"b\"]\nb = [\"a\"]\n");
+
+        let findings = feature_graph_cycles(Some(&manifest)).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, FEATURE_GRAPH_CYCLE_RULE);
+        assert_eq!(findings[0].evidence_class, EvidenceClass::DerivedFact);
+        assert!(findings[0].is_gating());
+        let cycle = findings[0].evidence.as_ref().unwrap()["cycle"].clone();
+        assert_eq!(cycle, serde_json::json!(["a", "b", "a"]));
+    }
+
+    #[test]
+    fn feature_graph_cycles_returns_empty_for_an_acyclic_feature_graph() {
+        let dir = TempDir::new("boundaries-feature-cycle-acyclic");
+        let manifest =
+            write_crate_with_features(&dir, "[features]\ndefault = []\na = []\nfull = [\"a\"]\n");
+
+        let findings = feature_graph_cycles(Some(&manifest)).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn feature_graph_cycles_ignores_dependency_activation_entries() {
+        // "dep:foo" and "bar/baz" name dependency activations, not sibling
+        // features — neither is a key in this package's own `[features]`
+        // table, so they must not be treated as graph edges (and must not
+        // cause an error just because "foo"/"bar" aren't declared features).
+        let dir = TempDir::new("boundaries-feature-cycle-dep-activation");
+        let manifest = write_crate_with_features(
+            &dir,
+            "[features]\na = [\"dep:foo\", \"bar/baz\"]\n\n[dependencies]\nfoo = { version = \"1\", optional = true }\nbar = \"1\"\n",
+        );
+
+        let findings = feature_graph_cycles(Some(&manifest)).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn feature_graph_cycles_errors_for_a_nonexistent_manifest() {
+        let err = feature_graph_cycles(Some(Path::new("/nonexistent/judge-test/Cargo.toml")))
+            .unwrap_err();
+        assert!(matches!(err, BoundaryConfigError::Metadata(_)));
+    }
+
+    #[test]
+    fn to_dot_renders_nodes_and_edges_in_sorted_order() {
+        let graph = CrateGraph {
+            edges: HashMap::from([
+                ("b".to_string(), vec!["a".to_string()]),
+                ("a".to_string(), vec![]),
+            ]),
+        };
+
+        assert_eq!(
+            graph.to_dot(),
+            "digraph crates {\n  \"a\";\n  \"b\";\n  \"b\" -> \"a\";\n}\n"
+        );
+    }
+
+    #[test]
+    fn to_dot_declares_an_isolated_crate_with_no_edges() {
+        let graph = CrateGraph {
+            edges: HashMap::from([("lonely".to_string(), vec![])]),
+        };
+
+        assert_eq!(graph.to_dot(), "digraph crates {\n  \"lonely\";\n}\n");
+    }
+
+    #[test]
+    fn to_mermaid_sanitizes_hyphenated_crate_names_into_node_ids() {
+        let graph = CrateGraph {
+            edges: HashMap::from([
+                ("cargo-judge".to_string(), vec!["judge-mcp".to_string()]),
+                ("judge-mcp".to_string(), vec![]),
+            ]),
+        };
+
+        assert_eq!(
+            graph.to_mermaid(),
+            "flowchart TD\n  cargo_judge[\"cargo-judge\"]\n  judge_mcp[\"judge-mcp\"]\n  cargo_judge --> judge_mcp\n"
+        );
+    }
+
+    #[test]
+    fn to_mermaid_declares_an_isolated_crate_with_no_edges() {
+        let graph = CrateGraph {
+            edges: HashMap::from([("lonely".to_string(), vec![])]),
+        };
+
+        assert_eq!(graph.to_mermaid(), "flowchart TD\n  lonely[\"lonely\"]\n");
     }
 
     #[test]
@@ -2372,5 +2846,220 @@ order = ["domain", "application", "infrastructure"]
             module_path_for_file(root, Path::new("/ws/my-core/build.rs")),
             None
         );
+    }
+
+    // -- change-coupling-signal --
+
+    /// Runs `git` in `dir` with a fixed test identity, mirroring
+    /// `crate::git`'s own test helper of the same name.
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=judge-test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("failed to run git — required for these fixtures");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn commit_touching(dir: &TempDir, files: &[(&str, &str)], message: &str) {
+        for (relative, content) in files {
+            std::fs::write(dir.join(relative), content).unwrap();
+        }
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", message]);
+    }
+
+    fn workspace_of(root: std::path::PathBuf, crate_names: &[&str]) -> Workspace {
+        Workspace {
+            crates: crate_names
+                .iter()
+                .map(|name| CrateInfo {
+                    name: name.to_string(),
+                    version: "0.1.0".to_string(),
+                    manifest_path: root.join(name).join("Cargo.toml"),
+                    root: root.join(name),
+                    source_files: Vec::new(),
+                    entry_points: Vec::new(),
+                    dependencies: Vec::new(),
+                })
+                .collect(),
+            root,
+        }
+    }
+
+    #[test]
+    fn change_coupling_signal_fires_for_a_highly_correlated_crate_pair() {
+        let dir = TempDir::new("boundaries-change-coupling-fires");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_workspace_manifest(&dir, &["crate-a", "crate-b"]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init workspace"]);
+        // Each crate's own scaffolding commit is a *solo* touch — deliberately
+        // separate commits, so they don't themselves count as a co-change and
+        // skew the counts this test asserts on below.
+        write_crate(&dir, "crate-a", &[]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add crate-a"]);
+        write_crate(&dir, "crate-b", &[]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add crate-b"]);
+
+        for i in 0..6 {
+            commit_touching(
+                &dir,
+                &[
+                    ("crate-a/src/lib.rs", &format!("pub fn a{i}() {{}}\n")),
+                    ("crate-b/src/lib.rs", &format!("pub fn b{i}() {{}}\n")),
+                ],
+                &format!("touch both {i}"),
+            );
+        }
+
+        let workspace = workspace_of(dir.to_path_buf(), &["crate-a", "crate-b"]);
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Layered,
+                &["inner", "outer"],
+                None,
+                &[("crate-a", "inner"), ("crate-b", "outer")],
+            )),
+            ..Default::default()
+        };
+
+        let findings =
+            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, CHANGE_COUPLING_SIGNAL_RULE);
+        assert_eq!(findings[0].evidence_class, EvidenceClass::Heuristic);
+        assert!(!findings[0].is_gating());
+        let evidence = findings[0].evidence.as_ref().unwrap();
+        // 6 co-change commits, plus each crate's own solo scaffolding commit
+        // (1 apiece) in the denominator: 6 / (6 + 1) ≈ 0.857.
+        assert_eq!(evidence["co_change_commits"], 6);
+        let ratio = evidence["ratio"].as_f64().unwrap();
+        assert!(ratio > CHANGE_COUPLING_RATIO_THRESHOLD, "ratio was {ratio}");
+    }
+
+    #[test]
+    fn change_coupling_signal_does_not_fire_below_the_ratio_threshold() {
+        let dir = TempDir::new("boundaries-change-coupling-below-ratio");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_workspace_manifest(&dir, &["crate-a", "crate-b"]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "init workspace"]);
+        write_crate(&dir, "crate-a", &[]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add crate-a"]);
+        write_crate(&dir, "crate-b", &[]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add crate-b"]);
+
+        // 5 co-change commits clear `MIN_CO_CHANGE_SAMPLE`, but each crate's
+        // own scaffolding commit plus 4 solo commits (5 solo touches apiece)
+        // pull the ratio (5 / 10) comfortably under
+        // `CHANGE_COUPLING_RATIO_THRESHOLD` (0.6).
+        for i in 0..5 {
+            commit_touching(
+                &dir,
+                &[
+                    ("crate-a/src/lib.rs", &format!("pub fn a{i}() {{}}\n")),
+                    ("crate-b/src/lib.rs", &format!("pub fn b{i}() {{}}\n")),
+                ],
+                &format!("touch both {i}"),
+            );
+        }
+        for i in 0..4 {
+            commit_touching(
+                &dir,
+                &[("crate-a/src/lib.rs", &format!("pub fn solo_a{i}() {{}}\n"))],
+                &format!("touch a alone {i}"),
+            );
+            commit_touching(
+                &dir,
+                &[("crate-b/src/lib.rs", &format!("pub fn solo_b{i}() {{}}\n"))],
+                &format!("touch b alone {i}"),
+            );
+        }
+
+        let workspace = workspace_of(dir.to_path_buf(), &["crate-a", "crate-b"]);
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Layered,
+                &["inner", "outer"],
+                None,
+                &[("crate-a", "inner"), ("crate-b", "outer")],
+            )),
+            ..Default::default()
+        };
+
+        let findings =
+            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+
+    #[test]
+    fn change_coupling_signal_ignores_a_pair_assigned_to_the_same_layer() {
+        let dir = TempDir::new("boundaries-change-coupling-same-layer");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_workspace_manifest(&dir, &["crate-a", "crate-b"]);
+        write_crate(&dir, "crate-a", &[]);
+        write_crate(&dir, "crate-b", &[]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        for i in 0..6 {
+            commit_touching(
+                &dir,
+                &[
+                    ("crate-a/src/lib.rs", &format!("pub fn a{i}() {{}}\n")),
+                    ("crate-b/src/lib.rs", &format!("pub fn b{i}() {{}}\n")),
+                ],
+                &format!("touch both {i}"),
+            );
+        }
+
+        let workspace = workspace_of(dir.to_path_buf(), &["crate-a", "crate-b"]);
+        let config = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Layered,
+                &["inner"],
+                None,
+                &[("crate-a", "inner"), ("crate-b", "inner")],
+            )),
+            ..Default::default()
+        };
+
+        let findings =
+            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn change_coupling_signal_performs_no_analysis_without_layers_config() {
+        let dir = TempDir::new("boundaries-change-coupling-no-layers");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_workspace_manifest(&dir, &["crate-a"]);
+        write_crate(&dir, "crate-a", &[]);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let workspace = workspace_of(dir.to_path_buf(), &["crate-a"]);
+        let config = BoundaryConfig::default();
+
+        let findings =
+            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(findings.is_empty());
     }
 }

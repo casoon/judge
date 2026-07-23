@@ -19,7 +19,16 @@ pub const HOTSPOT_RULE: &str = "hotspot";
 /// Bump when the hotspot rule's logic changes, so a baseline taken under an
 /// older revision doesn't silently protect findings from a real rule change
 /// (see todo.md §5 "Regelversions-Schutz").
-pub const HOTSPOT_RULE_REVISION: u32 = 1;
+pub const HOTSPOT_RULE_REVISION: u32 = 2;
+
+/// Half-life, in days, for the exponential recency weight [`Hotspot::score`]
+/// applies to each commit inside the churn window (todo.md §3.E "... exponentielle
+/// Gewichtung neuerer Commits"): a commit exactly this many days old
+/// contributes half the weight of one made today, `2 * this` a quarter, and
+/// so on. First-cut, adjustable constant — not yet backed by a study of what
+/// half-life best separates "still hot" from "cooling off" (mirrors
+/// [`SIZE_DISTRIBUTION_GINI_THRESHOLD`]'s arbitrary-but-documented style).
+pub const RECENCY_HALF_LIFE_DAYS: f64 = 90.0;
 
 /// Rule id used for [`size_distribution`] findings (see todo.md §E
 /// "Verteilungs-Audits: ... `size-distribution` (Gini über Dateigrößen,
@@ -158,6 +167,71 @@ pub fn churn(repo_root: &Path, window_days: i64) -> Result<HashMap<PathBuf, u32>
     Ok(counts)
 }
 
+/// Like [`churn`], but alongside each file's raw commit count also
+/// accumulates an exponentially recency-weighted score (see
+/// [`RECENCY_HALF_LIFE_DAYS`]): a commit touching a file `age_days` ago
+/// contributes `0.5.powf(age_days / RECENCY_HALF_LIFE_DAYS)` to that file's
+/// weighted score, so several old commits inside the window count for less
+/// than the same number made today. Used only by [`hotspots`]; other
+/// `churn` callers (`churn-hotspot`, `legacy-freeze`, `untested-hotspot`)
+/// have no use for recency weighting and keep calling the plain [`churn`].
+fn churn_with_recency(
+    repo_root: &Path,
+    window_days: i64,
+) -> Result<HashMap<PathBuf, (u32, f64)>, GitError> {
+    let window = WindowDays::new(window_days)?;
+    let repo = gix::open(repo_root)?;
+    let mut counts: HashMap<PathBuf, (u32, f64)> = HashMap::new();
+
+    let Ok(head_id) = repo.head_id() else {
+        return Ok(counts);
+    };
+
+    let now = now_unix_seconds();
+    let walk = repo
+        .rev_walk(Some(head_id.detach()))
+        .sorting(window_sorting(window.cutoff_seconds()))
+        .all()
+        .map_err(|err| GitError::Walk(err.into()))?;
+
+    for info in walk {
+        let info = info.map_err(|err| GitError::Walk(err.into()))?;
+        let commit = info.object().map_err(|err| GitError::Walk(err.into()))?;
+        let commit_time = commit
+            .time()
+            .map_err(|err| GitError::Walk(err.into()))?
+            .seconds;
+        let age_days = (now - commit_time).max(0) as f64 / 86_400.0;
+        let weight = 0.5_f64.powf(age_days / RECENCY_HALF_LIFE_DAYS);
+
+        let tree = commit.tree().map_err(|err| GitError::Walk(err.into()))?;
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent_id) => parent_id
+                .object()
+                .map_err(|err| GitError::Walk(err.into()))?
+                .into_commit()
+                .tree()
+                .map_err(|err| GitError::Walk(err.into()))?,
+            None => repo.empty_tree(),
+        };
+
+        parent_tree
+            .changes()
+            .map_err(|err| GitError::Walk(err.into()))?
+            .for_each_to_obtain_tree(&tree, |change| {
+                if let Some(path) = path_of(&change) {
+                    let entry = counts.entry(path).or_insert((0, 0.0));
+                    entry.0 += 1;
+                    entry.1 += weight;
+                }
+                Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            })
+            .map_err(|err| GitError::Walk(err.into()))?;
+    }
+
+    Ok(counts)
+}
+
 /// One commit's metadata needed for provenance classification (see
 /// `crate::provenance`, todo.md §3.G G6): author, timestamp, message
 /// trailers/text, and the files it touched.
@@ -258,18 +332,150 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
     Ok(commits)
 }
 
+/// One commit that touched at least one `Cargo.toml`, with that manifest's
+/// content before (`None` if newly added by this commit, or the commit has
+/// no parent) and after, plus the post-commit text content of every other
+/// file the same commit touched (see [`manifest_change_commits`], todo.md
+/// §3.G `dep-added-by-agent`). A commit touching *multiple* `Cargo.toml`
+/// files (a multi-crate workspace) yields one entry per manifest, each
+/// sharing the same `touched_file_contents`.
+#[derive(Debug, Clone)]
+pub struct ManifestChangeCommit {
+    pub commit_id: String,
+    pub manifest_path: PathBuf,
+    pub manifest_before: Option<String>,
+    pub manifest_after: String,
+    /// Post-commit text content of every other file this commit touched,
+    /// keyed by its repo-relative path. Binary/non-UTF8 files are omitted —
+    /// see [`blob_text_at`].
+    pub touched_file_contents: HashMap<PathBuf, String>,
+}
+
+/// Walks commits reachable from `HEAD` within `window_days` of now (same
+/// cutoff semantics as [`walk_commits`]), yielding a [`ManifestChangeCommit`]
+/// for every `Cargo.toml` touched — see todo.md §3.G `dep-added-by-agent`.
+/// A separate walk from [`walk_commits`]/[`churn`] rather than an addition
+/// to either: those callers (G6 churn/duplication/suppression-debt
+/// tracking, in `crate::provenance`) don't need blob content and shouldn't
+/// pay its memory cost for every commit — the same "each rule walks commits
+/// its own way" split [`churn`] and [`walk_commits`] already established
+/// between themselves.
+pub fn manifest_change_commits(
+    repo_root: &Path,
+    window_days: i64,
+) -> Result<Vec<ManifestChangeCommit>, GitError> {
+    let window = WindowDays::new(window_days)?;
+    let repo = gix::open(repo_root)?;
+    let mut results = Vec::new();
+
+    let Ok(head_id) = repo.head_id() else {
+        return Ok(results);
+    };
+
+    let walk = repo
+        .rev_walk(Some(head_id.detach()))
+        .sorting(window_sorting(window.cutoff_seconds()))
+        .all()
+        .map_err(|err| GitError::Walk(err.into()))?;
+
+    for info in walk {
+        let info = info.map_err(|err| GitError::Walk(err.into()))?;
+        let commit = info.object().map_err(|err| GitError::Walk(err.into()))?;
+
+        let tree = commit.tree().map_err(|err| GitError::Walk(err.into()))?;
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent_id) => parent_id
+                .object()
+                .map_err(|err| GitError::Walk(err.into()))?
+                .into_commit()
+                .tree()
+                .map_err(|err| GitError::Walk(err.into()))?,
+            None => repo.empty_tree(),
+        };
+
+        let mut files_changed = Vec::new();
+        parent_tree
+            .changes()
+            .map_err(|err| GitError::Walk(err.into()))?
+            .for_each_to_obtain_tree(&tree, |change| {
+                if let Some(path) = path_of(&change) {
+                    files_changed.push(path);
+                }
+                Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            })
+            .map_err(|err| GitError::Walk(err.into()))?;
+
+        let manifest_paths: Vec<&PathBuf> = files_changed
+            .iter()
+            .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
+            .collect();
+        if manifest_paths.is_empty() {
+            continue;
+        }
+
+        let mut touched_file_contents = HashMap::new();
+        for path in &files_changed {
+            if manifest_paths.contains(&path) {
+                continue;
+            }
+            if let Some(text) = blob_text_at(&tree, path) {
+                touched_file_contents.insert(path.clone(), text);
+            }
+        }
+
+        for manifest_path in manifest_paths {
+            let manifest_after = blob_text_at(&tree, manifest_path).unwrap_or_default();
+            let manifest_before = blob_text_at(&parent_tree, manifest_path);
+            results.push(ManifestChangeCommit {
+                commit_id: commit.id.to_string(),
+                manifest_path: manifest_path.clone(),
+                manifest_before,
+                manifest_after,
+                touched_file_contents: touched_file_contents.clone(),
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Reads `path`'s blob content from `tree` as UTF-8 text — `None` if the
+/// path doesn't exist in this tree, isn't a blob, or isn't valid UTF-8
+/// (binary files are simply not [`manifest_change_commits`]'s concern). Every
+/// failure mode (missing entry, lookup error, decode error, invalid UTF-8)
+/// collapses to `None` on purpose: to this caller, "can't be read as text"
+/// and "doesn't exist" mean the same thing — there is no text to compare.
+fn blob_text_at(tree: &gix::Tree<'_>, path: &Path) -> Option<String> {
+    let entry = tree.lookup_entry_by_path(path).ok().flatten()?;
+    let mut object = entry.object().ok()?;
+    // `Object` implements `Drop`, so its `data` field can't be moved out of
+    // directly (E0509) — `mem::take` swaps in an empty `Vec` and hands back
+    // ownership of the real one, no clone needed.
+    String::from_utf8(std::mem::take(&mut object.data)).ok()
+}
+
 /// A file whose cyclomatic complexity and recent change frequency both stand
-/// out — `complexity × changes` (see todo.md §3.E, §4).
+/// out — `complexity × recency-weighted changes` (see todo.md §3.E, §4).
 #[derive(Debug, Clone)]
 pub struct Hotspot {
     pub file: PathBuf,
     pub complexity: u32,
+    /// Raw commit count touching this file inside the churn window.
     pub changes: u32,
+    /// Sum, over every commit inside the churn window that touched this
+    /// file, of that commit's exponential recency weight (see
+    /// [`RECENCY_HALF_LIFE_DAYS`]) — `<= changes`, and equal to it only if
+    /// every touching commit landed today.
+    pub recency_weight: f64,
 }
 
 impl Hotspot {
+    /// `complexity × recency_weight`, rounded to the nearest integer. Uses
+    /// the recency-weighted sum rather than the raw `changes` count, so a
+    /// file touched only near the far edge of the churn window scores lower
+    /// than one touched the same number of times, but recently.
     pub fn score(&self) -> u32 {
-        self.complexity * self.changes
+        (self.complexity as f64 * self.recency_weight).round() as u32
     }
 
     /// Renders this hotspot as a [`Finding`]. Severity is `Info`: there is no
@@ -304,7 +510,7 @@ pub fn hotspots(
     functions: &[FunctionInfo],
     window_days: i64,
 ) -> Result<Vec<Hotspot>, GitError> {
-    let churn_counts = churn(repo_root, window_days)?;
+    let churn_counts = churn_with_recency(repo_root, window_days)?;
 
     let mut file_complexity: HashMap<PathBuf, u32> = HashMap::new();
     for function in functions {
@@ -315,11 +521,12 @@ pub fn hotspots(
         .into_iter()
         .filter_map(|(file, complexity)| {
             let relative = file.strip_prefix(repo_root).ok()?;
-            let changes = *churn_counts.get(relative)?;
+            let (changes, recency_weight) = *churn_counts.get(relative)?;
             (changes > 0).then_some(Hotspot {
                 file,
                 complexity,
                 changes,
+                recency_weight,
             })
         })
         .collect();
@@ -824,6 +1031,99 @@ mod tests {
         assert!(commits.is_empty());
     }
 
+    #[test]
+    fn manifest_change_commits_captures_a_newly_added_dependency_and_touched_file_content() {
+        let dir = TempDir::new("git-manifest-change-basic");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        std::fs::write(dir.join("lib.rs"), "pub fn hello() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("lib.rs"),
+            "pub fn hello() {}\npub fn use_serde() -> serde::de::IgnoredAny { todo!() }\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add serde"]);
+
+        let results = manifest_change_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(results.len(), 2, "both commits touch Cargo.toml");
+        let with_serde = results
+            .iter()
+            .find(|r| r.manifest_after.contains("serde"))
+            .expect("the second commit's manifest_after must contain the new dependency");
+        assert!(
+            with_serde
+                .manifest_before
+                .as_deref()
+                .is_some_and(|before| !before.contains("serde"))
+        );
+        let lib_rs_content = with_serde
+            .touched_file_contents
+            .get(Path::new("lib.rs"))
+            .expect("lib.rs was touched in the same commit");
+        assert!(lib_rs_content.contains("serde::de::IgnoredAny"));
+    }
+
+    #[test]
+    fn manifest_change_commits_treats_the_first_commit_as_having_no_before_content() {
+        let dir = TempDir::new("git-manifest-change-first-commit");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n\n[dependencies]\nserde = \"1\"\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let results = manifest_change_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].manifest_before.is_none());
+        assert!(results[0].manifest_after.contains("serde"));
+    }
+
+    #[test]
+    fn manifest_change_commits_skips_commits_that_do_not_touch_a_manifest() {
+        let dir = TempDir::new("git-manifest-change-skip");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(dir.join("lib.rs"), "pub fn hello() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(
+            &dir,
+            &["commit", "-q", "-m", "add lib.rs, no manifest change"],
+        );
+
+        let results = manifest_change_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(results.len(), 1, "only the manifest-touching commit counts");
+    }
+
+    #[test]
+    fn manifest_change_commits_returns_empty_for_repo_without_commits() {
+        let dir = TempDir::new("git-manifest-change-no-commits");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let results = manifest_change_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+        assert!(results.is_empty());
+    }
+
     fn function_info(file: PathBuf, cyclomatic: u32) -> FunctionInfo {
         FunctionInfo {
             qualified_name: "f".to_string(),
@@ -980,14 +1280,14 @@ mod tests {
     }
 
     /// todo.md §3.E describes the hotspot formula as `Komplexität ×
-    /// Änderungsfrequenz (... exponentielle Gewichtung neuerer Commits)`,
-    /// but `Hotspot::score` is a flat `complexity * changes` and `changes`
-    /// is `churn`'s raw commit count inside the window — no recency
-    /// weighting is implemented. This test documents that gap: a file
-    /// touched only near the far edge of the window scores identically to
-    /// one touched the same number of times, but only very recently.
+    /// Änderungsfrequenz (... exponentielle Gewichtung neuerer Commits)`.
+    /// `Hotspot::score` weights each touching commit by
+    /// [`RECENCY_HALF_LIFE_DAYS`]-based recency, so a file touched only near
+    /// the far edge of the window scores lower than one touched the same
+    /// number of times, but only very recently — even though both report
+    /// the same raw `changes` count.
     #[test]
-    fn hotspots_score_has_no_recency_weighting_despite_the_docs() {
+    fn hotspots_score_weights_recent_changes_more_than_old_ones() {
         let dir = TempDir::new("git-hotspots-no-recency-weight");
         git(&dir, &["init", "-q", "-b", "main"]);
         git(&dir, &["commit", "-q", "--allow-empty", "-m", "root"]);
@@ -1037,8 +1337,19 @@ mod tests {
         assert_eq!(old_edge.changes, 3);
         assert_eq!(recent.changes, 3);
         // Same complexity, same raw commit count, wildly different recency
-        // — yet identical score, because no exponential weighting exists.
-        assert_eq!(old_edge.score(), recent.score());
+        // — the far-edge file's weighted score is markedly lower.
+        assert!(
+            old_edge.recency_weight < recent.recency_weight,
+            "expected old_edge's recency weight ({}) to be lower than recent's ({})",
+            old_edge.recency_weight,
+            recent.recency_weight
+        );
+        assert!(
+            old_edge.score() < recent.score(),
+            "expected old_edge's score ({}) to be lower than recent's ({})",
+            old_edge.score(),
+            recent.score()
+        );
     }
 
     /// Formats a Unix timestamp `days_ago` days before "now" the way `git`
@@ -1057,6 +1368,7 @@ mod tests {
             file: PathBuf::from("src/lib.rs"),
             complexity: 5,
             changes: 2,
+            recency_weight: 2.0,
         };
         let finding = hotspot.to_finding();
 

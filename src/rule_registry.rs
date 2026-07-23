@@ -102,6 +102,30 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
     },
+    RuleMetadata {
+        id: "feature-graph-cycle",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`/`audit`) — deliberately not gated behind `judge.toml` the way `dependency-cycle` is: a `[features]` table is either cyclic or it isn't, needing no project-intent config to interpret (see `crate::boundaries` module docs 'feature-graph-cycle').",
+        exclusions: "Reuses `dependency-cycle`'s own cycle-finding algorithm over a different graph: nodes are one crate's own declared feature names, edges are implication-list entries that exactly match another feature of the same package. A `dep:foo`/`pkg/feat`/`pkg?/feat` entry (a dependency activation, not a sibling feature) is excluded. Cargo tolerates a cyclic feature graph at resolution time — this is a structural-hygiene signal, not a claim the build is broken.",
+        allowed_wording: "State only that this cyclic chain of feature implications exists — never that the crate 'fails to build' or that the cycle is 'a bug' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "change-coupling-signal",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires a `judge.toml` with `[layers]` configured (a non-empty `assign` table) — with no layer config, this performs no analysis at all rather than guessing which crates 'should' be independent (todo.md §17 'Kein Raten von Projektabsicht'). Part of the same `judge.toml`-gated block as `dependency-cycle`/`crate-boundary-violation` in bare `cargo judge`/`audit`.",
+        exclusions: "Co-change is counted per commit at crate granularity (a crate is 'touched' if any of its files appear in the commit), not per file pair. `MIN_CO_CHANGE_SAMPLE` (5) and `CHANGE_COUPLING_RATIO_THRESHOLD` (0.6) are first-cut, adjustable constants, not calibrated against a corpus of known-coupled vs. known-independent crate pairs. A large repo-wide commit (a rename, a formatting pass) can make unrelated crates look coupled for one window.",
+        allowed_wording: "State only the co-change count and ratio for this crate pair within the examined git window — never that the crates 'are coupled' or 'violate the architecture' as settled fact (todo.md §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
+    RuleMetadata {
+        id: "module-boundary-violation",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Requires a `judge.toml` with `[[module_boundary]]` config; opt-in — `cargo judge boundaries` (and the boundaries block of bare `cargo judge`/`audit`) does nothing without it.",
+        exclusions: "Module path resolution is a directory-convention heuristic, not `mod`-graph resolution — a file wired into the build unconventionally (e.g. a `#[path = \"...\"]` attribute) is missed (see `crate::boundaries` module docs 'Module-level boundaries'). Only `direct` reach is supported — `transitive` would need a real module call graph, which the Fast Tier doesn't have; requesting it is a config error, not a silent downgrade. Only `forbidden` is supported, not `required` (crate-level boundaries' other half).",
+        allowed_wording: BOUNDED_SEMANTIC_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+    },
     // -- api_surface_deep.rs (Deep Tier, `--features deep`) ---------------
     RuleMetadata {
         id: "internal-leak",
@@ -109,6 +133,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         preconditions: "Requires `--features deep` and `cargo judge api-surface` (same subcommand as `semver-hazard`'s `leaked_dependency_type` sub-case, which this rule reuses the type resolution of), plus a `judge.toml` with a non-empty `internal_crates` list (see `crate::boundaries::BoundaryConfig::internal_crates`). With `internal_crates` empty or absent (the default), this rule performs no analysis at all and emits zero findings — that must never be read as 'no internal leaks found', only that none were checked for (todo.md §17 'Kein Raten von Projektabsicht': an architecture rule needs explicit config, not a guess).",
         exclusions: "Same resolution and the same documented boundary as `semver-hazard`'s `leaked_dependency_type` sub-case (see `crate::api_surface_deep` module docs 'Ehrliche Grenze'): only direct parameter/return types plus one level of generic unwrapping through a `std`/`core`/`alloc` container are checked; a `dyn Trait` receiver, raw pointer, function pointer, tuple, or slice/array element type is not unwrapped.",
         allowed_wording: "State only that this pub item's signature resolves to a type defined in `<crate>`, which is configured as internal — never that crossing this boundary is 'unintentional' or that the crate's public API is 'broken' (todo.md §17.4); judge does not know whether crossing the boundary was deliberate.",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "module-boundary-violation-deep",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Requires `--features deep` and a `judge.toml` with `[[module_boundary]]` config; runs alongside (not instead of) the Fast-Tier `module-boundary-violation` check in `cargo judge boundaries` — see `crate::boundaries_deep` module docs.",
+        exclusions: "Real Deep-Tier symbol reference resolution replaces the Fast Tier's `syn`-based text scan for the *reference edge* itself (catching a re-export or aliased `use` the text scan misses), but the `from`/`forbidden` module-path *scoping* is still the same directory-convention heuristic as the Fast-Tier rule. Only free functions, inherent/trait-impl methods, and trait default methods are checked as the referenced item — unlike the Fast-Tier text scan, which is item-kind-agnostic, this Deep-Tier pass does not yet cover structs/enums/traits/consts/statics. `Reach::Transitive` is not supported here either, same restriction as the Fast Tier.",
+        allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
     },
     RuleMetadata {
@@ -228,6 +260,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         verdict_effect: VerdictEffect::Gating,
     },
     RuleMetadata {
+        id: "unused-feature",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `cargo judge deps`).",
+        exclusions: "About a crate's own declared `[features]` table, not a dependency's features (see `unused-feature-flag`, the opposite direction). Never fires for `default`, or for a feature whose own value list is non-empty (an umbrella/bundle feature enabling other features/deps — a real effect even with no direct `cfg` reference). The same-crate reference check is a plain substring scan for `feature = \"x\"`/`feature=\"x\"` across the crate's own authored source, not a `syn`/token-tree parse of the `cfg` predicate — unusual whitespace around the `=` would be missed.",
+        allowed_wording: DERIVED_FACT_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
         id: "unused-dependency",
         evidence_class: EvidenceClass::BoundedSemantic,
         preconditions: "Opt-in only: `cargo judge deps --check-rustc-lints` — runs a full `cargo check --workspace --all-targets` with rustc's stable `unused_crate_dependencies` lint enabled; never part of bare `cargo judge`, `audit`, or `cargo judge deps` without the flag (a full compile is a different order of cost than this module's other, instant syntactic passes).",
@@ -257,7 +297,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "hotspot",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`/`audit`'s hotspot block and `cargo judge health`).",
-        exclusions: "Ranked complexity × churn over the last `DEFAULT_WINDOW_DAYS` (365) days, capped to the top `HOTSPOT_LIMIT` (15) files — a genuinely risky file that doesn't make the cap is not surfaced. A file rewritten for legitimate reasons (e.g. a planned refactor) scores the same as unplanned churn.",
+        exclusions: "Ranked complexity × recency-weighted churn (exponential decay, `RECENCY_HALF_LIFE_DAYS` half-life) over the last `DEFAULT_WINDOW_DAYS` (365) days, capped to the top `HOTSPOT_LIMIT` (15) files — a genuinely risky file that doesn't make the cap is not surfaced. A file rewritten for legitimate reasons (e.g. a planned refactor) scores the same as unplanned churn.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
@@ -370,6 +410,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: "Must always be shown together with `crate::provenance::PROVENANCE_CAVEAT`: a distribution trend, not a judgment on any single commit or person; never used to evaluate individual people or commits (todo.md §17.4, §3.G G6).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
+    RuleMetadata {
+        id: "dep-added-by-agent",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires git history with commit trailers/metadata; subcommand-only via `cargo judge provenance` — not part of bare `cargo judge`.",
+        exclusions: "Only checked for commits classified `AuthorClass::Agent` — the same fakeable trailer/marker/heuristic classification every other rule in this module relies on. The same-commit usage check is a plain substring scan (`use <ident>`, `<ident>::`, `extern crate <ident>`), not a `syn` parse — a `package = \"...\"` rename or a re-export under a different name reads as 'not referenced'. Target-specific dependency tables (`[target.'cfg(...)'.dependencies]`) are not read.",
+        allowed_wording: "Must always be shown together with `crate::provenance::PROVENANCE_CAVEAT`: a distribution trend, not a judgment on any single commit or person; state only that the dependency was declared with no same-commit textual reference found — never that it 'was hallucinated' or 'is unused' (todo.md §17.4, §3.G G5/G6).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
     // -- security.rs (Fast Tier security-shaped signals) -------------------
     RuleMetadata {
         id: "unsafe-surface",
@@ -385,6 +433,22 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
         exclusions: "A syntax-only proxy, not a truncation proof: true truncation detection needs the source expression's real type (a type checker), not available at the Fast Tier — the same limitation already documented for `silent-default`/`context-free-propagation` in `crate::slop`'s module doc. Only the cast's written target type is checked (`u8`/`i8`/`u16`/`i16`/`u32`/`i32`/`usize`/`isize`); false-positives on an already-narrow source (e.g. `byte_var as u8`), and false-negatives on a float cast to `u64`/`i64`/`u128`/`i128` (still narrowing, but not covered by this v1 target-type list).",
         allowed_wording: "State only that this is a possible truncation candidate based on the cast's target type — never 'this truncates' or 'this is a bug' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+    },
+    RuleMetadata {
+        id: "panic-in-lib",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
+        exclusions: "Scoped to a function whose own written visibility is `pub` — item-level only, same simplification as `undocumented-public-item` (a `pub fn` inside a private `mod` is still checked as if reachable; a trait default method, with no visibility of its own, is never checked). `.unwrap()`/`.expect(..)`/indexing are name/operator matches, not resolved against a real `Option`/`Result`/`Index` type — a type defining its own non-panicking method or operator of the same name is not distinguished from the standard, panicking one (same accepted imprecision as `swallowed-result`'s `.ok()` match). Does not distinguish a `[lib]` target's public API from a `[[bin]]`-only crate's `pub` items, which are never actually reachable by another crate. `#[test]`-attributed functions are excluded directly; a `#[cfg(test)] mod tests {..}` block is not tracked, but its functions are almost never themselves `pub`.",
+        allowed_wording: "State only that a panic-shaped construct (`.unwrap()`/`.expect(..)`/`panic!(..)`/indexing) exists on a `pub` path — never that it 'will panic', 'crashes', or 'is a bug' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "hardcoded-secret",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
+        exclusions: "Two lanes (`evidence.kind`): `known_pattern` matches a string literal against a small, publicly documented list of secret-provider formats (AWS/GitHub/Slack/Google, PEM headers) anywhere in the file — a provider's own documented example value (e.g. AWS's `AKIAIOSFODNN7EXAMPLE`) matches identically to a live key. `high_entropy_assignment` requires a string literal to be the direct initializer of a `let`/`const`/`static` whose own name contains a suspicious marker, plus a minimum length and Shannon entropy — ordinary high-entropy strings (hashes, UUIDs, encoded blobs) are not flagged unless bound to such a name, but a placeholder/rotated/revoked credential is indistinguishable from a live one either way. `#[test]`-attributed functions and `#[cfg(test)]`-gated items are excluded from both lanes. `evidence` never includes the literal's own text, only its kind/pattern/length.",
+        allowed_wording: "State only that a string literal matches a known secret-provider format, or is bound to a suspiciously-named binding with high entropy — never that it 'is a secret', 'is leaked', or 'is a vulnerability' (todo.md §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
     },
     // -- slop.rs (G1 error-masking, G2 stub/theater-code, G3 lexical) -------
@@ -591,6 +655,30 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: EXTERNAL_MEASUREMENT_WORDING,
         verdict_effect: VerdictEffect::Gating,
     },
+    RuleMetadata {
+        id: "yanked-dependency",
+        evidence_class: EvidenceClass::ExternalMeasurement,
+        preconditions: "Requires `cargo judge deps --check-crates-io` (opt-in network access to the crates.io sparse index). Runs its own full, non-`--no-deps` `cargo metadata` resolve to see actual resolved versions, not just declared requirements — see `crate::slopsquat::analyze_yanked_dependencies`.",
+        exclusions: "Checked against every resolved, non-workspace-member package (direct and transitive), not just directly declared dependencies — distinct from `phantom-version`, which checks whether the declared *requirement* has any non-yanked satisfying version at all. A snapshot at lookup time — a publisher un-yanking a version moments after the check ran is indistinguishable from one that was never yanked.",
+        allowed_wording: EXTERNAL_MEASUREMENT_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "dep-single-maintainer",
+        evidence_class: EvidenceClass::ExternalMeasurement,
+        preconditions: "Requires `cargo judge deps --check-crates-io` (opt-in network access to the crates.io REST owners endpoint).",
+        exclusions: "Checked against directly declared dependencies only, not the full resolved graph (unlike `yanked-dependency`) — a transitive dependency's own maintainer count is not checked. A raw crates.io owner count (`< 2` fires), with no insight into each owner's actual activity — two owners who are both inactive score the same as two active ones; a snapshot at lookup time.",
+        allowed_wording: "State only the owner count and login names crates.io reports — never that the crate is 'abandoned', 'unmaintained', or 'risky' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
+    RuleMetadata {
+        id: "known-vulnerability",
+        evidence_class: EvidenceClass::ExternalMeasurement,
+        preconditions: "Requires `cargo judge deps --audit-json PATH`, an already-generated `cargo audit --json` report (opt-in; judge never runs `cargo-audit` itself). Runs its own full, non-`--no-deps` `cargo metadata` resolve to cross-reference reachability — see `crate::advisories` module docs.",
+        exclusions: "Reachability is a dependency-graph classification (`production`/`dev_only`/`unknown` in `evidence.reachability`), not a call-graph one — RUSTSEC advisories are scoped to crate+version, not specific functions, so there is no function-level target for the Deep Tier `--why-live` engine to check. `production` is `Severity::Fail`; `dev_only`/`unknown` are `Severity::Warn` — never silently dropped, just not asserted with `Fail`-level confidence. A package/version cargo-audit reported that judge's own resolve doesn't find at all (a stale report, or a workspace-root mismatch) is `unknown`, still reported. Only `cargo audit --json`'s format is imported; `cargo deny --format json` is not.",
+        allowed_wording: "State only the advisory id, the reachability classification, and its basis — never that the crate is 'exploited' or 'unsafe to use' beyond what the advisory itself claims (todo.md §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+    },
 ];
 
 /// Looks up one rule's fixed documentation by id. `None` for an id not in
@@ -635,6 +723,9 @@ mod tests {
             crate::api_surface::SEMVER_HAZARD_RULE,
             crate::boundaries::BOUNDARY_VIOLATION_RULE,
             crate::boundaries::DEPENDENCY_CYCLE_RULE,
+            crate::boundaries::MODULE_BOUNDARY_VIOLATION_RULE,
+            crate::boundaries::FEATURE_GRAPH_CYCLE_RULE,
+            crate::boundaries::CHANGE_COUPLING_SIGNAL_RULE,
             crate::coverage::UNTESTED_HOTSPOT_RULE,
             crate::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE,
             crate::dep_graph::MSRV_DRIFT_RULE,
@@ -644,6 +735,7 @@ mod tests {
             crate::deps::HEAVY_DEPENDENCY_RULE,
             crate::deps::UNUSED_FEATURE_FLAG_RULE,
             crate::deps::DEFAULT_FEATURES_UNUSED_RULE,
+            crate::deps::UNUSED_FEATURE_RULE,
             crate::deps::UNUSED_DEPENDENCY_RULE,
             crate::deps::DEP_WITHOUT_REPO_RULE,
             crate::duplication::DUPLICATE_RULE,
@@ -661,8 +753,11 @@ mod tests {
             crate::provenance::PROVENANCE_CHURN_RULE,
             crate::provenance::PROVENANCE_DUPLICATION_RATE_RULE,
             crate::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE,
+            crate::provenance::DEP_ADDED_BY_AGENT_RULE,
             crate::security::UNSAFE_SURFACE_RULE,
             crate::security::INTEGER_CAST_RISK_RULE,
+            crate::security::PANIC_IN_LIB_RULE,
+            crate::security::HARDCODED_SECRET_RULE,
             crate::slop::SWALLOWED_RESULT_RULE,
             crate::slop::EMPTY_ERROR_ARM_RULE,
             crate::slop::CATCH_ALL_ERROR_RULE,
@@ -686,6 +781,9 @@ mod tests {
             crate::slopsquat::PHANTOM_CRATE_RULE,
             crate::slopsquat::PHANTOM_VERSION_RULE,
             crate::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE,
+            crate::slopsquat::YANKED_DEPENDENCY_RULE,
+            crate::slopsquat::DEP_SINGLE_MAINTAINER_RULE,
+            crate::advisories::KNOWN_VULNERABILITY_RULE,
         ];
         for id in ids {
             assert!(
@@ -711,6 +809,7 @@ mod tests {
             crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
             crate::api_surface_deep::INTERNAL_LEAK_RULE,
             crate::api_surface_deep::RE_EXPORT_CHAIN_RULE,
+            crate::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE,
         ];
         for id in ids {
             assert!(

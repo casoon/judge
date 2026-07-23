@@ -65,6 +65,29 @@
 //!   non-default features": telling default from non-default items apart
 //!   needs per-dependency feature-to-symbol knowledge judge does not have.
 //!
+//! ## `unused-feature` (todo.md §A)
+//!
+//! A different direction from the two rules above: not a *dependency's*
+//! feature, but a feature *this crate itself* declares in its own
+//! `[features]` table (read from the same already-parsed manifest
+//! [`read_manifest_toml`] gives `default-features-unused`) with no
+//! `#[cfg(feature = "...")]`/`#[cfg_attr(..., feature = "...")]`/
+//! `cfg!(feature = "...")` reference to it found anywhere in the crate's own
+//! authored source (see [`feature_is_referenced`]) — a plain substring scan
+//! for the two common spacing variants (`feature = "x"`/`feature="x"`), not
+//! a `syn`/token-tree parse of the `cfg` predicate: both attribute and macro
+//! forms use identical text for the part this rule cares about, so a full
+//! parse would add complexity without changing what's detected.
+//!
+//! Two features are always out of scope, not just filtered by evidence: the
+//! well-known `default` (its entire purpose is enabling *other* features, so
+//! not being individually `cfg`-tested is normal, not a defect), and any
+//! feature whose own declared value list is *non-empty* (see
+//! [`declared_features_without_implications`]) — such a feature enables
+//! other features/optional dependencies by existing at all, which is a real
+//! effect even if no code ever tests for it directly with `cfg`; treating
+//! that as "unused" would be a real false-positive class (umbrella/bundle
+//! features like `full = ["foo", "bar"]` are a common, legitimate pattern).
 //! ## Importing rustc's `unused_crate_dependencies` lint
 //!
 //! [`analyze_rustc_unused_dependencies`] runs `cargo check --workspace
@@ -126,6 +149,12 @@ pub const UNUSED_FEATURE_FLAG_RULE_REVISION: u32 = 1;
 pub const DEFAULT_FEATURES_UNUSED_RULE: &str = "default-features-unused";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const DEFAULT_FEATURES_UNUSED_RULE_REVISION: u32 = 1;
+
+/// Rule id used for unused-feature findings (see todo.md §A, module docs
+/// "`unused-feature`").
+pub const UNUSED_FEATURE_RULE: &str = "unused-feature";
+/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
+pub const UNUSED_FEATURE_RULE_REVISION: u32 = 1;
 
 /// Rule id used for unused-dependency findings — imports rustc's stable
 /// `unused_crate_dependencies` lint (see module docs "Importing rustc's
@@ -319,6 +348,14 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
 
             if flagged {
                 findings.push(misplaced_finding(krate, dep));
+            }
+        }
+
+        if let Some(manifest) = &manifest {
+            for feature_name in declared_features_without_implications(manifest) {
+                if !feature_is_referenced(krate, &feature_name) {
+                    findings.push(unused_feature_finding(krate, &feature_name));
+                }
             }
         }
     }
@@ -530,6 +567,72 @@ fn default_features_unused_finding(
         evidence: Some(serde_json::json!({
             "reason": "no other usage of this dependency was found in the examined view, and \
                 the manifest explicitly sets default-features = true",
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+/// This crate's own declared `[features]` names (see module docs
+/// `unused-feature`), excluding `default` and any feature whose own value
+/// list is non-empty (an umbrella/bundle feature — see module docs for why
+/// those are out of scope entirely, not just filtered by usage evidence).
+fn declared_features_without_implications(manifest: &toml::Value) -> Vec<String> {
+    let Some(table) = manifest.get("features").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .filter(|(name, _)| name.as_str() != "default")
+        .filter(|(_, value)| {
+            value
+                .as_array()
+                .is_some_and(|implications| implications.is_empty())
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Whether any of `krate`'s own authored source files textually references
+/// `feature_name` the way `#[cfg(feature = "...")]`/`#[cfg_attr(...,
+/// feature = "...")]`/`cfg!(feature = "...")` all write it — see module docs
+/// `unused-feature` for why this is a substring scan, not a `syn` parse.
+/// Generated files are skipped, matching this module's other rules'
+/// `Authored`-only usage scanning.
+fn feature_is_referenced(krate: &CrateInfo, feature_name: &str) -> bool {
+    let spaced = format!("feature = \"{feature_name}\"");
+    let tight = format!("feature=\"{feature_name}\"");
+    krate
+        .source_files
+        .iter()
+        .filter(|file| file.kind.is_locally_reportable())
+        .any(|file| {
+            std::fs::read_to_string(&file.path)
+                .is_ok_and(|text| text.contains(&spaced) || text.contains(&tight))
+        })
+}
+
+/// Renders an `unused-feature` finding. Its evidence class is `derived_fact`
+/// for the same reason as [`unused_feature_flag_findings`]/
+/// [`default_features_unused_finding`]: the feature's declaration, its empty
+/// implication list, and the absence of a textual reference in the examined
+/// source are all read directly from the declared inputs, not interpreted.
+fn unused_feature_finding(krate: &CrateInfo, feature_name: &str) -> Finding {
+    Finding {
+        id: format!("{UNUSED_FEATURE_RULE}:{}:{feature_name}", krate.name).into(),
+        rule: UNUSED_FEATURE_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: krate.manifest_path.clone(),
+            line: OneBasedLine::FIRST,
+            item_path: feature_name.to_string(),
+        },
+        evidence_class: EvidenceClass::DerivedFact,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "feature": feature_name,
+            "reason": "no `cfg(feature = \"...\")`/`cfg!(feature = \"...\")` reference to this \
+                declared feature was found anywhere in the crate's own authored source",
         })),
         caused_by: Vec::new(),
         causes: Vec::new(),
@@ -2180,5 +2283,166 @@ repository = "https://example.com/hasrepo"
         );
         assert_eq!(report.errors.len(), 1);
         assert!(matches!(report.errors[0], DepsError::RustcCheck(_)));
+    }
+
+    // -- unused-feature --
+
+    /// A single, dependency-free crate — `unused-feature` is entirely about
+    /// a crate's own `[features]` table, so unlike [`write_fixture`] above,
+    /// no path dependency is needed to exercise it.
+    fn write_crate_with_features(
+        dir: &TempDir,
+        features_block: &str,
+        files: &[(&str, &str)],
+    ) -> PathBuf {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n{features_block}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        for (relative, content) in files {
+            let file_path = dir.join(relative);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(file_path, content).unwrap();
+        }
+        dir.join("Cargo.toml")
+    }
+
+    #[test]
+    fn unused_feature_fires_for_a_declared_feature_with_no_cfg_reference() {
+        let dir = TempDir::new("deps-unused-feature-fires");
+        let manifest = write_crate_with_features(
+            &dir,
+            "[features]\nfancy = []\n",
+            &[("src/lib.rs", "pub fn hello() {}\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == UNUSED_FEATURE_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].location.item_path, "fancy");
+        assert_eq!(hits[0].severity, Severity::Warn);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
+        assert!(hits[0].is_gating());
+    }
+
+    #[test]
+    fn unused_feature_does_not_fire_when_a_cfg_attribute_references_it() {
+        let dir = TempDir::new("deps-unused-feature-cfg-attr");
+        let manifest = write_crate_with_features(
+            &dir,
+            "[features]\nfancy = []\n",
+            &[(
+                "src/lib.rs",
+                "#[cfg(feature = \"fancy\")]\npub fn fancy_hello() {}\n",
+            )],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_FEATURE_RULE),
+            "unexpected findings: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn unused_feature_does_not_fire_when_a_cfg_macro_call_references_it() {
+        let dir = TempDir::new("deps-unused-feature-cfg-macro");
+        let manifest = write_crate_with_features(
+            &dir,
+            "[features]\nfancy = []\n",
+            &[(
+                "src/lib.rs",
+                "pub fn hello() {\n    if cfg!(feature = \"fancy\") {}\n}\n",
+            )],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_FEATURE_RULE)
+        );
+    }
+
+    #[test]
+    fn unused_feature_never_fires_for_default() {
+        let dir = TempDir::new("deps-unused-feature-default");
+        let manifest = write_crate_with_features(
+            &dir,
+            "[features]\ndefault = []\n",
+            &[("src/lib.rs", "pub fn hello() {}\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_FEATURE_RULE)
+        );
+    }
+
+    #[test]
+    fn unused_feature_does_not_fire_for_an_umbrella_feature_with_implications() {
+        let dir = TempDir::new("deps-unused-feature-umbrella");
+        let manifest = write_crate_with_features(
+            &dir,
+            "[features]\nfancy = []\nfull = [\"fancy\"]\n",
+            &[("src/lib.rs", "#[cfg(feature = \"fancy\")]\npub fn f() {}\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        // "fancy" is referenced, and "full" is an umbrella (non-empty
+        // implication list) — neither should fire.
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == UNUSED_FEATURE_RULE)
+        );
+    }
+
+    #[test]
+    fn declared_features_without_implications_excludes_default_and_umbrella_features() {
+        let manifest: toml::Value =
+            toml::from_str("[features]\ndefault = []\nfancy = []\nfull = [\"fancy\"]\n").unwrap();
+
+        let names = declared_features_without_implications(&manifest);
+
+        assert_eq!(names, vec!["fancy".to_string()]);
+    }
+
+    #[test]
+    fn declared_features_without_implications_is_empty_without_a_features_table() {
+        let manifest: toml::Value =
+            toml::from_str("[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n").unwrap();
+
+        assert!(declared_features_without_implications(&manifest).is_empty());
     }
 }

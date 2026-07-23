@@ -1,8 +1,13 @@
 //! G5 "Slopsquatting" detectors (see todo.md §14.2 G5): declared
 //! dependencies checked for signs of AI-hallucinated or typosquatted crate
-//! names.
+//! names. Also home to `yanked-dependency` and `dep-single-maintainer` (both
+//! todo.md §F "Security-Candidates") — a different concern (supply-chain
+//! hygiene, not name-squatting), but they reuse this module's exact
+//! crates.io lookup machinery ([`CratesIoIndex`]/[`CratesIoMetadata`] and
+//! now [`CratesIoOwners`]) rather than duplicating an equivalent client
+//! elsewhere for two more rules.
 //!
-//! Four rules live here:
+//! Six rules live here:
 //!
 //! - `name-collision-risk` — fully local, offline, deterministic: a declared
 //!   dependency name is Levenshtein-close to a well-known crate from a
@@ -13,21 +18,35 @@
 //!   version satisfies the declared requirement.
 //! - `fresh-low-reputation-dep` — the crate exists, but is young, has few
 //!   downloads, and has no repository link (crates.io REST API).
+//! - `yanked-dependency` — a dependency's *actually resolved* version (from
+//!   the full, non-`--no-deps` dependency graph — see
+//!   [`analyze_yanked_dependencies`]'s doc) has been yanked by its publisher.
+//!   Distinct from `phantom-version`: a crate can have plenty of non-yanked
+//!   versions satisfying a requirement while `Cargo.lock` still pins a
+//!   *specific* version that was yanked after it was locked — Cargo does not
+//!   auto-upgrade away from a yanked lockfile entry, so this is the more
+//!   common, more directly actionable case.
+//! - `dep-single-maintainer` — a declared dependency has fewer than
+//!   [`MIN_MAINTAINER_COUNT`] owners on crates.io (crates.io's `/owners`
+//!   REST endpoint) — a single compromised or inactive account/team is
+//!   enough to block a security response for the whole crate.
 //!
-//! The last three need real network access (crates.io), which judge only
-//! ever performs when explicitly requested — see `--check-crates-io` on
-//! `cargo judge deps` in `src/main.rs`. Bare `cargo judge`/`audit` never
-//! call out to the network; only `name-collision-risk` runs there.
+//! Every rule but `name-collision-risk` needs real network access
+//! (crates.io), which judge only ever performs when explicitly requested —
+//! see `--check-crates-io` on `cargo judge deps` in `src/main.rs`. Bare
+//! `cargo judge`/`audit` never call out to the network; only
+//! `name-collision-risk` runs there.
 //!
 //! `dep-added-by-agent` (the fifth rule from todo.md's G5 table) is
 //! deliberately not implemented — see the "Bewusst noch nicht umgesetzt"
 //! section of `todo.md`.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use cargo_metadata::MetadataCommand;
 use semver::{Version, VersionReq};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -47,6 +66,19 @@ pub const PHANTOM_VERSION_RULE_REVISION: u32 = 1;
 
 pub const FRESH_LOW_REPUTATION_DEP_RULE: &str = "fresh-low-reputation-dep";
 pub const FRESH_LOW_REPUTATION_DEP_RULE_REVISION: u32 = 1;
+
+pub const YANKED_DEPENDENCY_RULE: &str = "yanked-dependency";
+pub const YANKED_DEPENDENCY_RULE_REVISION: u32 = 1;
+
+pub const DEP_SINGLE_MAINTAINER_RULE: &str = "dep-single-maintainer";
+pub const DEP_SINGLE_MAINTAINER_RULE_REVISION: u32 = 1;
+
+/// Minimum owner count `dep-single-maintainer` requires before it does *not*
+/// fire (see module doc) — first-cut, adjustable threshold, not backed by a
+/// study of what owner count actually predicts a healthy bus factor (a
+/// two-person team can still be a single point of failure in practice; this
+/// only reads crates.io's raw owner count, nothing about their activity).
+const MIN_MAINTAINER_COUNT: usize = 2;
 
 /// Manually curated, offline snapshot of well-known crates.io crate names —
 /// see the header comment in the file itself for the staleness caveat. This
@@ -257,6 +289,23 @@ pub struct CrateMetadata {
 /// different data.
 pub trait CratesIoMetadata {
     fn metadata(&self, crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError>;
+}
+
+/// One crates.io owner — a GitHub user or team (crates.io models a team as
+/// a distinctly-formatted `login`, e.g. `github:org:team`, in the same list;
+/// the REST API does not otherwise distinguish the two). Only `login` is
+/// kept: `dep-single-maintainer` needs a count plus a human-readable
+/// identifier for evidence, nothing more.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrateOwner {
+    pub login: String,
+}
+
+/// Abstracts the crates.io owners lookup, mirroring [`CratesIoMetadata`]'s
+/// shape — a third sibling trait, since this hits yet another API endpoint
+/// (`crates.io/api/v1/crates/{name}/owners`) returning yet different data.
+pub trait CratesIoOwners {
+    fn owners(&self, crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError>;
 }
 
 /// A `raw fetched entry + fetched_at` on-disk cache record (see todo.md §5
@@ -503,6 +552,70 @@ impl CratesIoMetadata for RestMetadataClient {
     }
 }
 
+/// The crates.io owners endpoint's `{"users": [...]}` envelope.
+#[derive(Debug, Deserialize)]
+struct RestOwnersResponse {
+    users: Vec<CrateOwner>,
+}
+
+/// Real [`CratesIoOwners`] implementation: fetches
+/// `https://crates.io/api/v1/crates/{name}/owners` via a short-timeout
+/// `ureq::Agent`. Same connectivity short-circuit behavior as
+/// [`SparseIndexClient`]/[`RestMetadataClient`] — see their docs — but
+/// tracked independently, since this hits yet another endpoint that can
+/// fail on its own.
+pub struct RestOwnersClient {
+    agent: ureq::Agent,
+    cache_root: PathBuf,
+    circuit_open: Cell<bool>,
+}
+
+impl RestOwnersClient {
+    pub fn new(cache_root: PathBuf) -> Self {
+        Self {
+            agent: build_agent(JUDGE_USER_AGENT),
+            cache_root,
+            circuit_open: Cell::new(false),
+        }
+    }
+}
+
+impl CratesIoOwners for RestOwnersClient {
+    fn owners(&self, crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError> {
+        let path = cache_path(&self.cache_root, "owners", crate_name);
+        if let Some(cached) = read_cache::<Option<Vec<CrateOwner>>>(&path) {
+            return Ok(cached);
+        }
+        if self.circuit_open.get() {
+            return Err(SlopsquatError::CircuitOpen);
+        }
+
+        let url = format!("https://crates.io/api/v1/crates/{crate_name}/owners");
+        let mut response = match self.agent.get(&url).call() {
+            Ok(response) => response,
+            Err(ureq::Error::StatusCode(404)) => {
+                write_cache(&path, &None::<Vec<CrateOwner>>);
+                return Ok(None);
+            }
+            Err(err) if is_connection_error(&err) => {
+                self.circuit_open.set(true);
+                return Err(SlopsquatError::Connection(err.into()));
+            }
+            Err(err) => return Err(SlopsquatError::Other(err.into())),
+        };
+
+        let body = response
+            .body_mut()
+            .read_to_string()
+            .map_err(|err| SlopsquatError::Other(err.into()))?;
+        let parsed: RestOwnersResponse =
+            serde_json::from_str(&body).map_err(|err| SlopsquatError::Other(err.into()))?;
+
+        write_cache(&path, &Some(parsed.users.clone()));
+        Ok(Some(parsed.users))
+    }
+}
+
 /// A test-only, fully in-memory [`CratesIoIndex`] — driven from literal
 /// fixture data, never touches the network.
 #[derive(Default)]
@@ -587,6 +700,41 @@ impl FixtureMetadata {
 
 impl CratesIoMetadata for FixtureMetadata {
     fn metadata(&self, crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError> {
+        if let Some(message) = &self.forced_error {
+            return Err(SlopsquatError::Other(message.clone().into()));
+        }
+        Ok(self.crates.get(crate_name).cloned())
+    }
+}
+
+/// A test-only, fully in-memory [`CratesIoOwners`] — mirrors
+/// [`FixtureMetadata`].
+#[derive(Default)]
+pub struct FixtureOwners {
+    crates: HashMap<String, Vec<CrateOwner>>,
+    /// If set, every lookup fails with this error instead of consulting
+    /// `crates` — mirrors [`FixtureIndex::forced_error`].
+    forced_error: Option<String>,
+}
+
+impl FixtureOwners {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_crate(mut self, name: &str, owners: Vec<CrateOwner>) -> Self {
+        self.crates.insert(name.to_string(), owners);
+        self
+    }
+
+    pub fn with_error(mut self, message: &str) -> Self {
+        self.forced_error = Some(message.to_string());
+        self
+    }
+}
+
+impl CratesIoOwners for FixtureOwners {
+    fn owners(&self, crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError> {
         if let Some(message) = &self.forced_error {
             return Err(SlopsquatError::Other(message.clone().into()));
         }
@@ -883,6 +1031,204 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+// ---------------------------------------------------------------------
+// Phase 5: yanked-dependency (todo.md §F)
+// ---------------------------------------------------------------------
+
+/// Runs its own full (non-`--no-deps`) `cargo metadata`, mirroring
+/// [`crate::dep_graph::analyze_workspace`]'s identical need for the
+/// *resolved* graph — `workspace.crates[..].dependencies` (see
+/// `crate::ingest`) only carries declared requirement strings, not resolved
+/// versions. Every detector module that needs the full resolve fetches it
+/// itself rather than sharing one (see e.g. `dead_code.rs`/`deps.rs`'s own
+/// independent `MetadataCommand` calls) — an established precedent in this
+/// codebase, not a new one. A resolve failure is reported as a plain
+/// `String` (via `Display`), matching [`SlopsquatNetworkReport::errors`]'s
+/// shape.
+///
+/// Scoped to every resolved, non-workspace-member package — direct *and*
+/// transitive — not just directly declared dependencies (unlike
+/// `phantom-crate`/`phantom-version` above): a yanked transitive dependency
+/// is exactly as real a supply-chain concern as a yanked direct one, and is
+/// the easier one to miss by hand.
+pub fn analyze_yanked_dependencies(
+    workspace: &Workspace,
+    index: &dyn CratesIoIndex,
+) -> SlopsquatNetworkReport {
+    let mut report = SlopsquatNetworkReport::default();
+    let manifest_path = workspace.root.join("Cargo.toml");
+
+    let metadata = match MetadataCommand::new().manifest_path(&manifest_path).exec() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("failed to resolve dependency graph: {err}"));
+            return report;
+        }
+    };
+
+    let member_ids: HashSet<&cargo_metadata::PackageId> =
+        metadata.workspace_members.iter().collect();
+    let mut connection_error_reported = false;
+
+    for package in metadata
+        .packages
+        .iter()
+        .filter(|package| !member_ids.contains(&package.id))
+    {
+        match index.lookup(&package.name) {
+            Ok(Some(entry)) => {
+                let resolved_version = package.version.to_string();
+                let is_yanked = entry
+                    .versions
+                    .iter()
+                    .any(|v| v.vers == resolved_version && v.yanked);
+                if is_yanked {
+                    report.findings.push(yanked_dependency_finding(
+                        &manifest_path,
+                        &package.name,
+                        &resolved_version,
+                    ));
+                }
+            }
+            // A resolved package crates.io doesn't know about at all is a
+            // different (and, for a registry-resolved graph, essentially
+            // impossible) condition — not this rule's concern.
+            Ok(None) => {}
+            Err(SlopsquatError::CircuitOpen) => {}
+            Err(SlopsquatError::Connection(msg)) => {
+                if !connection_error_reported {
+                    report.errors.push(format!(
+                        "crates.io sparse index unreachable, skipping remaining yanked-dependency checks: {msg}"
+                    ));
+                    connection_error_reported = true;
+                }
+            }
+            Err(SlopsquatError::Other(msg)) => {
+                report
+                    .errors
+                    .push(format!("{}: crates.io lookup failed: {msg}", package.name));
+            }
+        }
+    }
+
+    report
+        .findings
+        .sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    report
+}
+
+/// Builds a `yanked-dependency` finding. Its evidence class is
+/// `external_measurement` (see [`crate::finding::evidence_class_for_rule`]):
+/// a yank is a fact about a concrete crates.io snapshot, not a timeless one —
+/// a publisher can (rarely) un-yank a version later.
+fn yanked_dependency_finding(
+    manifest_path: &Path,
+    crate_name: &str,
+    resolved_version: &str,
+) -> Finding {
+    Finding {
+        id: format!("{YANKED_DEPENDENCY_RULE}:{crate_name}:{resolved_version}").into(),
+        rule: YANKED_DEPENDENCY_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: manifest_path.to_path_buf(),
+            line: OneBasedLine::FIRST,
+            item_path: crate_name.to_string(),
+        },
+        evidence_class: EvidenceClass::ExternalMeasurement,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "lookup": "sparse-index",
+            "resolved_version": resolved_version,
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Phase 6: dep-single-maintainer (todo.md §F)
+// ---------------------------------------------------------------------
+
+/// Runs `dep-single-maintainer` over every declared dependency in
+/// `workspace` (direct only — like `phantom-crate`/`phantom-version`/
+/// `fresh-low-reputation-dep` above, not `yanked-dependency`'s full resolve;
+/// see module doc), via `owners`. One owners-endpoint lookup per dependency.
+pub fn analyze_single_maintainer_dependencies(
+    workspace: &Workspace,
+    owners: &dyn CratesIoOwners,
+) -> SlopsquatNetworkReport {
+    let mut report = SlopsquatNetworkReport::default();
+    let mut connection_error_reported = false;
+
+    for krate in &workspace.crates {
+        for dep in &krate.dependencies {
+            match owners.owners(&dep.name) {
+                Ok(Some(owner_list)) => {
+                    if owner_list.len() < MIN_MAINTAINER_COUNT {
+                        report
+                            .findings
+                            .push(single_maintainer_finding(krate, dep, &owner_list));
+                    }
+                }
+                // A crate crates.io doesn't know about at all is
+                // `phantom-crate`'s concern, not this rule's.
+                Ok(None) => {}
+                Err(SlopsquatError::CircuitOpen) => {}
+                Err(SlopsquatError::Connection(msg)) => {
+                    if !connection_error_reported {
+                        report.errors.push(format!(
+                            "crates.io owners endpoint unreachable, skipping remaining dep-single-maintainer checks: {msg}"
+                        ));
+                        connection_error_reported = true;
+                    }
+                }
+                Err(SlopsquatError::Other(msg)) => {
+                    report.errors.push(format!(
+                        "{}: crates.io owners lookup failed: {msg}",
+                        dep.name
+                    ));
+                }
+            }
+        }
+    }
+
+    report
+}
+
+/// Builds a `dep-single-maintainer` finding. Its evidence class is
+/// `external_measurement` (see [`crate::finding::evidence_class_for_rule`]):
+/// an owner count is a fact about a concrete crates.io snapshot, not a
+/// timeless one — an owner can be added or removed at any time. Owner logins
+/// are public crates.io data (visible to anyone who queries the same
+/// endpoint), not a private detail this finding newly exposes.
+fn single_maintainer_finding(
+    krate: &CrateInfo,
+    dep: &DeclaredDependency,
+    owners: &[CrateOwner],
+) -> Finding {
+    Finding {
+        id: format!("{DEP_SINGLE_MAINTAINER_RULE}:{}:{}", krate.name, dep.name).into(),
+        rule: DEP_SINGLE_MAINTAINER_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: krate.manifest_path.clone(),
+            line: OneBasedLine::FIRST,
+            item_path: dep.name.clone(),
+        },
+        evidence_class: EvidenceClass::ExternalMeasurement,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "owner_count": owners.len(),
+            "owners": owners.iter().map(|o| o.login.clone()).collect::<Vec<_>>(),
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1204,6 +1550,229 @@ edition = "2021"
 
         assert!(report.findings.is_empty());
         assert_eq!(report.errors.len(), 1);
+    }
+
+    // -- yanked-dependency --
+
+    /// A standalone vendored crate at `dir`'s own root, referenced by an
+    /// absolute `path` dependency — the only way to get a *real*, fully
+    /// resolved (non-`--no-deps`) external package into `cargo_metadata`'s
+    /// output without real network/registry access. Mirrors
+    /// `crate::dep_graph`'s test fixtures (same technique, same reason:
+    /// `path` deps resolve fully offline).
+    fn write_vendored_crate(dir: &TempDir, name: &str, version: &str) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"{version}\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn noop() {}\n").unwrap();
+    }
+
+    /// A single-package fixture (not a `[workspace]`) whose one dependency
+    /// is a `path` reference to `vendor` (see [`write_vendored_crate`]) —
+    /// deliberately a sibling `TempDir`, not nested inside `dir`'s own tree
+    /// (same constraint `crate::dep_graph`'s fixtures document: a full
+    /// `cargo metadata` run refuses to resolve a path dependency nested
+    /// inside its own implicit workspace root).
+    fn write_manifest_with_vendored_dep(
+        dir: &TempDir,
+        dep_name: &str,
+        vendor: &TempDir,
+    ) -> PathBuf {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dep_name} = {{ path = {:?} }}\n",
+                vendor.to_path_buf()
+            ),
+        )
+        .unwrap();
+        dir.join("Cargo.toml")
+    }
+
+    #[test]
+    fn yanked_dependency_fires_for_a_resolved_packages_yanked_version() {
+        let vendor = TempDir::new("slopsquat-yanked-vendor");
+        write_vendored_crate(&vendor, "vendored-dep", "1.2.3");
+        let dir = TempDir::new("slopsquat-yanked-fixture");
+        let manifest = write_manifest_with_vendored_dep(&dir, "vendored-dep", &vendor);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let index = FixtureIndex::new().with_crate(
+            "vendored-dep",
+            vec![IndexVersion {
+                vers: "1.2.3".to_string(),
+                yanked: true,
+            }],
+        );
+
+        let report = analyze_yanked_dependencies(&workspace, &index);
+
+        assert!(
+            report.errors.is_empty(),
+            "unexpected errors: {:?}",
+            report.errors
+        );
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, YANKED_DEPENDENCY_RULE);
+        assert_eq!(report.findings[0].location.item_path, "vendored-dep");
+        assert_eq!(
+            report.findings[0].evidence.as_ref().unwrap()["resolved_version"],
+            "1.2.3"
+        );
+    }
+
+    #[test]
+    fn yanked_dependency_does_not_fire_for_a_non_yanked_resolved_version() {
+        let vendor = TempDir::new("slopsquat-not-yanked-vendor");
+        write_vendored_crate(&vendor, "vendored-dep", "1.2.3");
+        let dir = TempDir::new("slopsquat-not-yanked-fixture");
+        let manifest = write_manifest_with_vendored_dep(&dir, "vendored-dep", &vendor);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let index = FixtureIndex::new().with_crate(
+            "vendored-dep",
+            vec![IndexVersion {
+                vers: "1.2.3".to_string(),
+                yanked: false,
+            }],
+        );
+
+        let report = analyze_yanked_dependencies(&workspace, &index);
+
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn yanked_dependency_never_checks_the_workspace_member_itself() {
+        // No external dependency at all: the only resolved package is the
+        // fixture crate itself, which must be excluded regardless of what
+        // the index says about a same-named crate.
+        let dir = TempDir::new("slopsquat-yanked-no-external-deps");
+        let manifest = write_manifest(&dir, &[]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let index = FixtureIndex::new().with_crate(
+            "fixture",
+            vec![IndexVersion {
+                vers: "0.1.0".to_string(),
+                yanked: true,
+            }],
+        );
+
+        let report = analyze_yanked_dependencies(&workspace, &index);
+
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn yanked_dependency_reports_a_connection_error_without_a_finding() {
+        let vendor = TempDir::new("slopsquat-yanked-conn-err-vendor");
+        write_vendored_crate(&vendor, "vendored-dep", "1.2.3");
+        let dir = TempDir::new("slopsquat-yanked-conn-err-fixture");
+        let manifest = write_manifest_with_vendored_dep(&dir, "vendored-dep", &vendor);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let index = FixtureIndex::new().with_connection_error("simulated outage");
+
+        let report = analyze_yanked_dependencies(&workspace, &index);
+
+        assert!(report.findings.is_empty());
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("unreachable"));
+    }
+
+    #[test]
+    fn yanked_dependency_reports_a_metadata_resolve_failure_without_a_finding() {
+        let dir = TempDir::new("slopsquat-yanked-resolve-failure");
+        let workspace = Workspace {
+            root: dir.to_path_buf(),
+            crates: Vec::new(),
+        };
+        let index = FixtureIndex::new();
+
+        let report = analyze_yanked_dependencies(&workspace, &index);
+
+        assert!(report.findings.is_empty());
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("failed to resolve dependency graph"));
+    }
+
+    // -- dep-single-maintainer --
+
+    #[test]
+    fn a_single_owner_crate_is_flagged() {
+        let dir = TempDir::new("slopsquat-single-maintainer-flagged");
+        let manifest = write_manifest(&dir, &[("soloproject", "1.0")]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let owners_source = FixtureOwners::new().with_crate(
+            "soloproject",
+            vec![CrateOwner {
+                login: "solo-dev".to_string(),
+            }],
+        );
+
+        let report = analyze_single_maintainer_dependencies(&workspace, &owners_source);
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, DEP_SINGLE_MAINTAINER_RULE);
+        assert_eq!(report.findings[0].location.item_path, "soloproject");
+        let evidence = report.findings[0].evidence.as_ref().unwrap();
+        assert_eq!(evidence["owner_count"], 1);
+        assert_eq!(evidence["owners"], serde_json::json!(["solo-dev"]));
+    }
+
+    #[test]
+    fn a_multi_owner_crate_is_not_flagged() {
+        let dir = TempDir::new("slopsquat-single-maintainer-ok");
+        let manifest = write_manifest(&dir, &[("teamproject", "1.0")]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let owners_source = FixtureOwners::new().with_crate(
+            "teamproject",
+            vec![
+                CrateOwner {
+                    login: "dev-one".to_string(),
+                },
+                CrateOwner {
+                    login: "dev-two".to_string(),
+                },
+            ],
+        );
+
+        let report = analyze_single_maintainer_dependencies(&workspace, &owners_source);
+
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn a_metadata_lookup_error_surfaces_as_an_error_with_no_findings_and_no_panic_for_owners() {
+        let dir = TempDir::new("slopsquat-single-maintainer-error");
+        let manifest = write_manifest(&dir, &[("brandnewcrate", "1.0")]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let owners_source = FixtureOwners::new().with_error("unparsable response body");
+
+        let report = analyze_single_maintainer_dependencies(&workspace, &owners_source);
+
+        assert!(report.findings.is_empty());
+        assert_eq!(report.errors.len(), 1);
+    }
+
+    #[test]
+    fn a_nonexistent_crate_produces_no_single_maintainer_finding() {
+        // `phantom-crate`'s concern, not this rule's.
+        let dir = TempDir::new("slopsquat-single-maintainer-nonexistent");
+        let manifest = write_manifest(&dir, &[("doesnotexistatall", "1.0")]);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let owners_source = FixtureOwners::new();
+
+        let report = analyze_single_maintainer_dependencies(&workspace, &owners_source);
+
+        assert!(report.findings.is_empty());
+        assert!(report.errors.is_empty());
     }
 
     #[test]

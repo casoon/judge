@@ -1,10 +1,13 @@
 //! Codebase intelligence for Rust workspaces.
 
+pub mod advisories;
 pub mod api_surface;
 #[cfg(feature = "deep")]
 pub mod api_surface_deep;
 pub mod baseline;
 pub mod boundaries;
+#[cfg(feature = "deep")]
+pub mod boundaries_deep;
 pub mod complexity;
 pub mod coverage;
 #[cfg(feature = "deep")]
