@@ -186,7 +186,15 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only a plain, non-glob, non-braced `pub use path::Item;` (optionally renamed) at a file's own module-root level is considered a candidate or an intermediate hop — a `pub use` nested inside an inline `mod { .. }` block in the same file, a glob (`pub use foo::*;`), or a braced group (`pub use foo::{A, B};`) is invisible to this scan (see `crate::api_surface_deep` module docs). A hop count capped at 5 (`RE_EXPORT_CHAIN_MAX_HOPS`) is reported as `evidence.capped: true` rather than an exact count — chosen to bound the walk against a `pub use` cycle, not derived from a study of real-world chain depths. A single direct re-export (hop count 1) is deliberately never flagged — only 2 or more hops are, since curated top-level re-exports, prelude modules, and workspace umbrella crates routinely add exactly one hop and are not themselves a sign of obscured ownership.",
         allowed_wording: "State only that this item's public path resolves through `<hop_count>` `pub use` hops before reaching its defining module `<defining_path>` — when `evidence.capped` is true, phrase `<hop_count>` as 'at least 5', not an exact count; never phrase a chain's existence as 'bad practice' or as 'hiding implementation details' (todo.md §17.4) — re-export facades are a common, legitimate pattern judge cannot tell apart from an unintentional one.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        // Three crates, one re-export hop each — this is what the rule
+        // actually walks (a `pub use` chain across a multi-crate
+        // workspace). The `// crate: <name>` markers are not Rust syntax;
+        // the paired drift-guard test in `api_surface_deep.rs` splits on
+        // them to materialize each section as its own workspace member.
+        example: Some(RuleExample {
+            before: "// crate: gateway_core\npub struct PaymentGateway;\n\n// crate: gateway_facade\npub use gateway_core::PaymentGateway;\n\n// crate: gateway_api\npub use gateway_facade::PaymentGateway;\n",
+            why_it_matters: "A caller importing `PaymentGateway` from `gateway_api` can't tell from that import alone that it's actually implemented two crates away in `gateway_core` — tracing a bug back to its owner means manually unwinding every re-export hop.",
+        }),
     },
     // -- coverage.rs ------------------------------------------------------
     RuleMetadata {
@@ -206,7 +214,12 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Every workspace crate is treated as workspace-internal; a crate whose resolved `publish` field allows publishing gets `unused-pub-api` instead of this rule for the same underlying condition (see `crate::dead_code::publishable_crates`).",
         allowed_wording: "State as 'no reference found in the loaded workspace' — never as 'unused' outright or as clearance for deletion; external ecosystem usage is not_inferable (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        // `publish = false` is what routes a dead item to this rule rather
+        // than `unused-pub-api` — see `crate::dead_code::publishable_crates`.
+        example: Some(RuleExample {
+            before: "pub fn migrate_legacy_user_ids(raw: &str) -> String {\n    raw.trim().to_string()\n}\n",
+            why_it_matters: "A public function nobody in the workspace calls anymore still has to be read, understood, and kept compiling through every future refactor — maintenance cost with no corresponding benefit.",
+        }),
     },
     RuleMetadata {
         id: "unused-pub-api",
@@ -215,7 +228,12 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Same reachability query and same 'every workspace crate is workspace-internal' scope as `unused-pub-workspace`; a published crate's whole purpose is exposing API to consumers outside the loaded workspace, so 'zero internal reference' is the expected normal state for most of a healthy library's public surface, not a defect signal — that is why this is `Heuristic`/advisory rather than `unused-pub-workspace`'s `BoundedSemantic`/gating.",
         allowed_wording: "State as 'no reference found within the examined workspace; this crate is published, so external ecosystem usage is not inferable and expected' — never as 'unused' or as clearance for deletion (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        // No `publish` field set — publishable by default, so this routes
+        // through `unused-pub-api`, not `unused-pub-workspace`.
+        example: Some(RuleExample {
+            before: "pub fn compute_legacy_checksum(data: &[u8]) -> u32 {\n    data.iter().map(|b| *b as u32).sum()\n}\n",
+            why_it_matters: "A published crate's dead public function might still be used by external downstream consumers judge can't see from inside this workspace — but if it truly isn't, every version bump keeps supporting an API surface nobody needs.",
+        }),
     },
     RuleMetadata {
         id: "dead-enum-variant",
@@ -224,7 +242,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Every workspace crate is treated as workspace-internal, same simplification as `unused-pub-workspace`. Only a `pub` enum's variants are checked. Construction-vs-pattern classification is a `syn` re-parse of each file `crate::deep::referencing_files` reports as referencing the variant, looking for `Expr::Path`/`Expr::Call`/`Expr::Struct` occurrences of the variant's trailing path segment; `syn` parses a macro invocation's body as an opaque token stream, so a variant constructed only inside a macro call (e.g. `some_macro!(MyEnum::Variant)`) is invisible to this scan and can be misreported as having no construction site.",
         allowed_wording: "State as 'no construction site found in the examined workspace view' — never 'never constructed' or 'dead' outright (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub enum PaymentStatus {\n    Pending,\n    Settled,\n}\n\npub fn make_payment() -> PaymentStatus {\n    PaymentStatus::Pending\n}\n\npub fn describe(status: PaymentStatus) -> &'static str {\n    match status {\n        PaymentStatus::Pending => \"pending\",\n        PaymentStatus::Settled => \"settled\",\n    }\n}\n",
+            why_it_matters: "An enum variant that's only ever matched against, never constructed, usually means the code path that used to produce it was deleted — but nothing forces the variant itself to be cleaned up too.",
+        }),
     },
     RuleMetadata {
         id: "test-only-pub",
@@ -233,7 +254,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Every workspace crate is treated as workspace-internal, same simplification as `unused-pub-workspace`; does not narrow by a crate's `publish` field the way `unused-pub-api` does. Runs the entry-point reachability query twice per checked item (once production-only, once counting tests) — real, accepted extra Deep Tier query volume.",
         allowed_wording: "State as 'reachable only through #[cfg(test)]/test-target code in the examined workspace view' — never a prescriptive claim like 'should be pub(crate)' (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn reset_test_fixtures() -> bool {\n    true\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn fixtures_reset() {\n        assert!(reset_test_fixtures());\n    }\n}\n",
+            why_it_matters: "A `pub` function reachable only from the crate's own tests isn't really part of the public API — keeping it `pub` invites outside code to depend on something that was only ever meant for internal test setup.",
+        }),
     },
     // -- dep_graph.rs -----------------------------------------------------
     RuleMetadata {
@@ -1008,7 +1032,10 @@ impl OrderPricing {
         exclusions: "Test/bench-attributed functions and methods inside `impl TraitName for SomeType` blocks are excluded from the candidate set entirely, not down-weighted — trait-impl methods are routinely invoked through operator/macro sugar `find_all_refs` can't see (e.g. `Display::fmt`, `Iterator::next`, `Drop::drop`), so they would otherwise look structurally unwired even when used everywhere.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "fn calculate_discount_v1(price: f64) -> f64 {\n    price * 0.9\n}\n\nfn calculate_discount_v2(price: f64) -> f64 {\n    price * 0.9\n}\n",
+            why_it_matters: "When the same logic gets rewritten under two different names instead of reused, a future bug fix only patches one copy, leaving the other silently wrong.",
+        }),
     },
     RuleMetadata {
         id: "connectivity-drop",
@@ -1017,7 +1044,10 @@ impl OrderPricing {
         exclusions: "Test/bench-attributed functions and methods inside `impl TraitName for SomeType` blocks are excluded from the candidate set entirely, not down-weighted — trait-impl methods are routinely invoked through operator/macro sugar `find_all_refs` can't see (e.g. `Display::fmt`, `Iterator::next`, `Drop::drop`), so they would otherwise look structurally unwired even when used everywhere.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "fn compute_shipping_estimate(weight_kg: f64) -> f64 {\n    weight_kg * 2.5\n}\n",
+            why_it_matters: "A function nobody outside its own file ever calls is either dead code that plain reachability analysis missed, or a duplicate implementation nobody wired up — either way it is worth a second look.",
+        }),
     },
     // -- slopsquat.rs (G5) ----------------------------------------------------
     RuleMetadata {

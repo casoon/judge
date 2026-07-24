@@ -1426,4 +1426,61 @@ impl Local {
             re_export_chain_findings_in(&report)
         );
     }
+
+    /// Splits a `// crate: <name>` marked multi-crate source (see the
+    /// `re-export-chain` registry example in `rule_registry.rs`) into
+    /// `(name, source)` pairs, in encounter order. The markers are not Rust
+    /// syntax — this is purely how the drift-guard test below turns one
+    /// registry-curated string back into the multi-crate workspace this
+    /// rule actually needs to trigger.
+    fn split_marked_crates(source: &str) -> Vec<(&str, String)> {
+        let mut result: Vec<(&str, String)> = Vec::new();
+        for line in source.lines() {
+            if let Some(name) = line.strip_prefix("// crate: ") {
+                result.push((name, String::new()));
+            } else if let Some(entry) = result.last_mut() {
+                entry.1.push_str(line);
+                entry.1.push('\n');
+            }
+        }
+        result
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn re_export_chain_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(RE_EXPORT_CHAIN_RULE)
+            .expect("re-export-chain has a registry entry")
+            .example
+            .expect("re-export-chain has a curated example")
+            .before;
+
+        let crates = split_marked_crates(example);
+        assert_eq!(crates.len(), 3, "expected 3 marked crates: {crates:?}");
+        let crate0 = crates[0].0;
+        let crate1 = crates[1].0;
+        let crate2 = crates[2].0;
+        let dep1 = format!("../{crate0}");
+        let dep2 = format!("../{crate1}");
+
+        let dir = TempDir::new("api-surface-deep-reexport-registry-example");
+        write_crate(&dir, crate0, &[], &crates[0].1);
+        write_crate(&dir, crate1, &[(crate0, &dep1)], &crates[1].1);
+        write_crate(&dir, crate2, &[(crate1, &dep2)], &crates[2].1);
+        write_workspace_manifest(&dir, &[crate0, crate1, crate2]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, &[]).unwrap();
+
+        assert_eq!(
+            re_export_chain_findings_in(&report).len(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
 }
