@@ -1261,6 +1261,35 @@ edition = "2021"
         dir.join("Cargo.toml")
     }
 
+    /// Writes a manifest whose `[dependencies]` section is exactly
+    /// `dep_line` — used by the registry-example drift-guard tests below,
+    /// which embed a rule's curated `example.before` (already in the
+    /// `name = "req"` shape [`write_manifest`] would otherwise reformat)
+    /// directly, rather than duplicating it as a second `(name, req)` tuple.
+    fn write_manifest_with_dep_line(dir: &TempDir, dep_line: &str) -> PathBuf {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dep_line}\n"
+            ),
+        )
+        .unwrap();
+        dir.join("Cargo.toml")
+    }
+
+    /// Splits a curated `example.before` dependency line (`name = "req"`)
+    /// into `(name, req)` — so a drift-guard test's supporting fixture (an
+    /// index/metadata/owners entry keyed by crate name) is derived from the
+    /// registry's own literal instead of a second hardcoded copy of it.
+    fn parse_dep_line(dep_line: &str) -> (&str, &str) {
+        let (name, rest) = dep_line
+            .split_once('=')
+            .expect("dep line has `name = \"req\"` shape");
+        (name.trim(), rest.trim().trim_matches('"'))
+    }
+
     // -- name-collision-risk --
 
     #[test]
@@ -1356,6 +1385,28 @@ edition = "2021"
         assert_eq!(evidence["edit_distance"], 1);
     }
 
+    /// The registry's curated `example.before` for `name-collision-risk` (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn name_collision_risk_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(NAME_COLLISION_RISK_RULE)
+            .expect("name-collision-risk has a registry entry")
+            .example
+            .expect("name-collision-risk has a curated example")
+            .before;
+
+        let dir = TempDir::new("slopsquat-collision-registry-example");
+        let manifest = write_manifest_with_dep_line(&dir, example);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let findings = analyze_name_collision(&workspace);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, NAME_COLLISION_RISK_RULE);
+    }
+
     // -- phantom-crate / phantom-version --
 
     #[test]
@@ -1391,6 +1442,29 @@ edition = "2021"
         assert_eq!(report.findings[0].severity, Severity::Fail);
     }
 
+    /// The registry's curated `example.before` for `phantom-crate` (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn phantom_crate_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(PHANTOM_CRATE_RULE)
+            .expect("phantom-crate has a registry entry")
+            .example
+            .expect("phantom-crate has a curated example")
+            .before;
+
+        let dir = TempDir::new("slopsquat-phantom-crate-registry-example");
+        let manifest = write_manifest_with_dep_line(&dir, example);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let index = FixtureIndex::new();
+
+        let report = analyze_phantom_dependencies(&workspace, &index);
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, PHANTOM_CRATE_RULE);
+    }
+
     #[test]
     fn a_requirement_with_no_satisfying_published_version_is_a_phantom_version_finding() {
         let dir = TempDir::new("slopsquat-phantom-version");
@@ -1409,6 +1483,36 @@ edition = "2021"
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].rule, PHANTOM_VERSION_RULE);
         assert_eq!(report.findings[0].severity, Severity::Fail);
+    }
+
+    /// The registry's curated `example.before` for `phantom-version` (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn phantom_version_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(PHANTOM_VERSION_RULE)
+            .expect("phantom-version has a registry entry")
+            .example
+            .expect("phantom-version has a curated example")
+            .before;
+        let (name, _req) = parse_dep_line(example);
+
+        let dir = TempDir::new("slopsquat-phantom-version-registry-example");
+        let manifest = write_manifest_with_dep_line(&dir, example);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let index = FixtureIndex::new().with_crate(
+            name,
+            vec![IndexVersion {
+                vers: "1.2.0".to_string(),
+                yanked: false,
+            }],
+        );
+
+        let report = analyze_phantom_dependencies(&workspace, &index);
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, PHANTOM_VERSION_RULE);
     }
 
     #[test]
@@ -1465,6 +1569,44 @@ edition = "2021"
         let created_at = unix_seconds_to_rfc3339(recent as i64);
         let metadata_source = FixtureMetadata::new().with_crate(
             "brandnewcrate",
+            CrateMetadata {
+                created_at,
+                downloads: 5,
+                repository: None,
+            },
+        );
+        let config = SlopsquatConfig::default();
+
+        let report = analyze_fresh_low_reputation(&workspace, &metadata_source, &config);
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, FRESH_LOW_REPUTATION_DEP_RULE);
+    }
+
+    /// The registry's curated `example.before` for `fresh-low-reputation-dep`
+    /// (see `rule_registry::RULE_REGISTRY`) must itself still trigger the
+    /// rule — this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn fresh_low_reputation_dep_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(FRESH_LOW_REPUTATION_DEP_RULE)
+            .expect("fresh-low-reputation-dep has a registry entry")
+            .example
+            .expect("fresh-low-reputation-dep has a curated example")
+            .before;
+        let (name, _req) = parse_dep_line(example);
+
+        let dir = TempDir::new("slopsquat-fresh-registry-example");
+        let manifest = write_manifest_with_dep_line(&dir, example);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let recent = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 10 * 86_400; // 10 days old
+        let created_at = unix_seconds_to_rfc3339(recent as i64);
+        let metadata_source = FixtureMetadata::new().with_crate(
+            name,
             CrateMetadata {
                 created_at,
                 downloads: 5,
@@ -1626,6 +1768,44 @@ edition = "2021"
         );
     }
 
+    /// The registry's curated `example.before` for `yanked-dependency` (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags. The registry's example
+    /// is an ordinary version-requirement dependency line (the realistic
+    /// shape a human reviews in Cargo.toml); its crate name/version are
+    /// parsed out and re-expressed as a `path` dependency here purely as the
+    /// offline resolution mechanism `yanked-dependency` itself needs (see
+    /// `write_vendored_crate`/`write_manifest_with_vendored_dep` above).
+    #[test]
+    fn yanked_dependency_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(YANKED_DEPENDENCY_RULE)
+            .expect("yanked-dependency has a registry entry")
+            .example
+            .expect("yanked-dependency has a curated example")
+            .before;
+        let (name, version) = parse_dep_line(example);
+
+        let vendor = TempDir::new("slopsquat-yanked-registry-example-vendor");
+        write_vendored_crate(&vendor, name, version);
+        let dir = TempDir::new("slopsquat-yanked-registry-example-fixture");
+        let manifest = write_manifest_with_vendored_dep(&dir, name, &vendor);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let index = FixtureIndex::new().with_crate(
+            name,
+            vec![IndexVersion {
+                vers: version.to_string(),
+                yanked: true,
+            }],
+        );
+
+        let report = analyze_yanked_dependencies(&workspace, &index);
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, YANKED_DEPENDENCY_RULE);
+    }
+
     #[test]
     fn yanked_dependency_does_not_fire_for_a_non_yanked_resolved_version() {
         let vendor = TempDir::new("slopsquat-not-yanked-vendor");
@@ -1724,6 +1904,35 @@ edition = "2021"
         let evidence = report.findings[0].evidence.as_ref().unwrap();
         assert_eq!(evidence["owner_count"], 1);
         assert_eq!(evidence["owners"], serde_json::json!(["solo-dev"]));
+    }
+
+    /// The registry's curated `example.before` for `dep-single-maintainer`
+    /// (see `rule_registry::RULE_REGISTRY`) must itself still trigger the
+    /// rule — this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn dep_single_maintainer_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DEP_SINGLE_MAINTAINER_RULE)
+            .expect("dep-single-maintainer has a registry entry")
+            .example
+            .expect("dep-single-maintainer has a curated example")
+            .before;
+        let (name, _req) = parse_dep_line(example);
+
+        let dir = TempDir::new("slopsquat-single-maintainer-registry-example");
+        let manifest = write_manifest_with_dep_line(&dir, example);
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let owners_source = FixtureOwners::new().with_crate(
+            name,
+            vec![CrateOwner {
+                login: "solo-maintainer".to_string(),
+            }],
+        );
+
+        let report = analyze_single_maintainer_dependencies(&workspace, &owners_source);
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, DEP_SINGLE_MAINTAINER_RULE);
     }
 
     #[test]

@@ -729,7 +729,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Levenshtein-distance match against a manually curated, potentially stale static list of well-known crates (`data/popular_crates.txt`); neither exhaustive nor auto-updated.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "serde_yml = \"1.0\"\n",
+            why_it_matters: "A dependency name that's just one character off from a well-known crate can slip past a quick glance at Cargo.toml and pull in a completely different, unvetted package instead of the one actually intended.",
+        }),
     },
     RuleMetadata {
         id: "phantom-crate",
@@ -738,7 +741,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "A snapshot at lookup time — a crate published moments after the check ran is indistinguishable from one that never existed.",
         allowed_wording: EXTERNAL_MEASUREMENT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "llm-prompt-toolkit = \"0.3\"\n",
+            why_it_matters: "A dependency name that doesn't exist on crates.io today could be registered by an attacker tomorrow, so a later `cargo build` could silently start compiling and running code nobody on the team ever reviewed.",
+        }),
     },
     RuleMetadata {
         id: "phantom-version",
@@ -747,7 +753,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "A snapshot at lookup time — a matching version published or un-yanked moments after the check ran is indistinguishable from one that never existed.",
         allowed_wording: EXTERNAL_MEASUREMENT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "data-pipeline-core = \"4.0\"\n",
+            why_it_matters: "A version requirement that no published release actually satisfies means the dependency can never resolve the way the manifest implies — often a sign the version was guessed rather than checked against what crates.io actually has.",
+        }),
     },
     RuleMetadata {
         id: "fresh-low-reputation-dep",
@@ -756,7 +765,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Download counts and repository-link presence are the crates.io REST API's own signals, not something judge independently verifies; a snapshot at lookup time.",
         allowed_wording: EXTERNAL_MEASUREMENT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "speedy-json-utils = \"0.1\"\n",
+            why_it_matters: "A dependency that's only days old, barely downloaded, and has no linked source repository has had far less community scrutiny than an established crate, making it an easier place to slip in malicious code unnoticed.",
+        }),
     },
     RuleMetadata {
         id: "yanked-dependency",
@@ -765,7 +777,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Checked against every resolved, non-workspace-member package (direct and transitive), not just directly declared dependencies — distinct from `phantom-version`, which checks whether the declared *requirement* has any non-yanked satisfying version at all. A snapshot at lookup time — a publisher un-yanking a version moments after the check ran is indistinguishable from one that was never yanked.",
         allowed_wording: EXTERNAL_MEASUREMENT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "legacy-config-loader = \"2.3.1\"\n",
+            why_it_matters: "Cargo doesn't automatically move a project off a version once it's locked in Cargo.lock, so a build can keep depending on a release its own publisher has since pulled for a security or correctness problem.",
+        }),
     },
     RuleMetadata {
         id: "dep-single-maintainer",
@@ -774,7 +789,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Checked against directly declared dependencies only, not the full resolved graph (unlike `yanked-dependency`) — a transitive dependency's own maintainer count is not checked. A raw crates.io owner count (`< 2` fires), with no insight into each owner's actual activity — two owners who are both inactive score the same as two active ones; a snapshot at lookup time.",
         allowed_wording: "State only the owner count and login names crates.io reports — never that the crate is 'abandoned', 'unmaintained', or 'risky' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "tiny-cli-helper = \"1.0\"\n",
+            why_it_matters: "A crate with only one crates.io owner has no redundancy: if that single account is compromised or simply goes silent, there's no one else positioned to publish a fix or respond to a report.",
+        }),
     },
     RuleMetadata {
         id: "known-vulnerability",
@@ -783,7 +801,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Reachability is a dependency-graph classification (`production`/`dev_only`/`unknown` in `evidence.reachability`), not a call-graph one — RUSTSEC advisories are scoped to crate+version, not specific functions, so there is no function-level target for the Deep Tier `--why-live` engine to check. `production` is `Severity::Fail`; `dev_only`/`unknown` are `Severity::Warn` — never silently dropped, just not asserted with `Fail`-level confidence. A package/version cargo-audit reported that judge's own resolve doesn't find at all (a stale report, or a workspace-root mismatch) is `unknown`, still reported. Only `cargo audit --json`'s format is imported; `cargo deny --format json` is not.",
         allowed_wording: "State only the advisory id, the reachability classification, and its basis — never that the crate is 'exploited' or 'unsafe to use' beyond what the advisory itself claims (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "{\"vulnerabilities\":{\"list\":[{\"advisory\":{\"id\":\"RUSTSEC-2024-0031\",\"title\":\"Improper output sanitization allows script injection via crafted attribute names\",\"url\":\"https://rustsec.org/advisories/RUSTSEC-2024-0031\"},\"package\":{\"name\":\"html-sanitizer-lite\",\"version\":\"1.3.0\"}}]}}",
+            why_it_matters: "A dependency with a published RUSTSEC advisory that's actually reachable from production code means the vulnerable code path ships in the built artifact, not just in tests.",
+        }),
     },
 ];
 
