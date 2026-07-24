@@ -684,6 +684,28 @@ mod tests {
         );
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn undocumented_public_item_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNDOCUMENTED_PUBLIC_ITEM_RULE)
+            .expect("undocumented-public-item has a registry entry")
+            .example
+            .expect("undocumented-public-item has a curated example")
+            .before;
+        let dir = TempDir::new("api-surface-undocumented-public-item-registry-example");
+        let findings = write_and_analyze(&dir, example);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.rule == UNDOCUMENTED_PUBLIC_ITEM_RULE)
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn pub_struct_and_pub_enum_without_doc_comment_are_flagged() {
         let dir = TempDir::new("api-surface-pub-struct-enum");
@@ -963,6 +985,22 @@ pub enum Bar {
             hits[0].evidence_class,
             crate::finding::EvidenceClass::DerivedFact
         );
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn semver_hazard_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(SEMVER_HAZARD_RULE)
+            .expect("semver-hazard has a registry entry")
+            .example
+            .expect("semver-hazard has a curated example")
+            .before;
+        let dir = TempDir::new("api-surface-semver-hazard-registry-example");
+        let findings = write_and_analyze(&dir, example);
+        assert_eq!(semver_hazard_findings(&findings).len(), 1);
     }
 
     #[test]
