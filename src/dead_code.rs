@@ -2287,4 +2287,145 @@ pub fn make() -> Status {
             "Retired only ever appears as a match-arm pattern, never constructed"
         );
     }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn unused_pub_workspace_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNUSED_PUB_WORKSPACE_RULE)
+            .expect("unused-pub-workspace has a registry entry")
+            .example
+            .expect("unused-pub-workspace has a curated example")
+            .before;
+
+        let dir = TempDir::new("dead-code-unused-pub-workspace-registry-example");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), example).unwrap();
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == UNUSED_PUB_WORKSPACE_RULE)
+                .count(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// See `unused_pub_workspace_registry_example_still_triggers_the_rule`'s
+    /// doc comment.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn unused_pub_api_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNUSED_PUB_API_RULE)
+            .expect("unused-pub-api has a registry entry")
+            .example
+            .expect("unused-pub-api has a curated example")
+            .before;
+
+        let dir = TempDir::new("dead-code-unused-pub-api-registry-example");
+        let workspace = load_single_crate_workspace(&dir, example);
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == UNUSED_PUB_API_RULE)
+                .count(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// See `unused_pub_workspace_registry_example_still_triggers_the_rule`'s
+    /// doc comment.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn dead_enum_variant_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DEAD_ENUM_VARIANT_RULE)
+            .expect("dead-enum-variant has a registry entry")
+            .example
+            .expect("dead-enum-variant has a curated example")
+            .before;
+
+        let dir = TempDir::new("dead-code-dead-enum-variant-registry-example");
+        let workspace = load_single_crate_workspace(&dir, example);
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == DEAD_ENUM_VARIANT_RULE)
+                .count(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// See `unused_pub_workspace_registry_example_still_triggers_the_rule`'s
+    /// doc comment.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn test_only_pub_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(TEST_ONLY_PUB_RULE)
+            .expect("test-only-pub has a registry entry")
+            .example
+            .expect("test-only-pub has a curated example")
+            .before;
+
+        let dir = TempDir::new("dead-code-test-only-pub-registry-example");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+publish = false
+"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), example).unwrap();
+        std::fs::write(dir.join("src/bin/tool.rs"), "fn main() {}\n").unwrap();
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == TEST_ONLY_PUB_RULE)
+                .count(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
 }

@@ -1071,4 +1071,105 @@ macros = { path = "../macros" }
              clone_one and the family is flagged — see this test's doc comment"
         );
     }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn connectivity_drop_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(CONNECTIVITY_DROP_RULE)
+            .expect("connectivity-drop has a registry entry")
+            .example
+            .expect("connectivity-drop has a curated example")
+            .before;
+
+        let dir = TempDir::new("connectivity-drop-registry-example");
+        write_crate(&dir, "core", &[], example);
+        write_workspace_manifest(&dir, &["core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let duplication = WorkspaceDuplication::default();
+        let report = analyze_workspace(&workspace, &duplication, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == CONNECTIVITY_DROP_RULE)
+                .count(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// See `connectivity_drop_registry_example_still_triggers_the_rule`'s
+    /// doc comment. Constructs the `WorkspaceDuplication` fixture by hand,
+    /// the same way this module's own canonical positive tests do (see
+    /// `duplicative_reinvention_flags_a_family_with_no_fan_in_on_any_member`)
+    /// — `duplicative-reinvention` takes an already-computed clone report as
+    /// input rather than running the Fast-Tier duplicate detector itself.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn duplicative_reinvention_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DUPLICATIVE_REINVENTION_RULE)
+            .expect("duplicative-reinvention has a registry entry")
+            .example
+            .expect("duplicative-reinvention has a curated example")
+            .before;
+
+        let dir = TempDir::new("duplicative-reinvention-registry-example");
+        write_crate(&dir, "core", &[], example);
+        write_workspace_manifest(&dir, &["core"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let core_lib = dir.join("core/src/lib.rs");
+
+        let member_a = CloneMember {
+            qualified_name: "calculate_discount_v1".to_string(),
+            file: core_lib.clone(),
+            start_line: 1,
+            end_line: 3,
+            start_token: 0,
+            end_token: 0,
+            token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
+        };
+        let member_b = CloneMember {
+            qualified_name: "calculate_discount_v2".to_string(),
+            file: core_lib.clone(),
+            start_line: 5,
+            end_line: 7,
+            start_token: 0,
+            end_token: 0,
+            token_count: 1,
+            mode: DupeMode::Strict,
+            identifier_mapping: Vec::new(),
+            normalized_literal_kinds: Vec::new(),
+        };
+        let duplication = WorkspaceDuplication {
+            families: vec![CloneFamily {
+                members: vec![member_a, member_b],
+            }],
+            errors: Vec::new(),
+            excluded_generated: 0,
+        };
+
+        let report = analyze_workspace(&workspace, &duplication, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == DUPLICATIVE_REINVENTION_RULE)
+                .count(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
 }
