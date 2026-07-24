@@ -1026,6 +1026,32 @@ mod tests {
         assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn complexity_inflation_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(COMPLEXITY_INFLATION_RULE)
+            .expect("complexity-inflation has a registry entry")
+            .example
+            .expect("complexity-inflation has a curated example")
+            .before;
+        let dir = TempDir::new("complexity-inflation-registry-example");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let functions = crate::complexity::analyze_file(&file).unwrap();
+        let findings = complexity_inflation(&functions);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.rule == COMPLEXITY_INFLATION_RULE)
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn legacy_freeze_fires_when_enough_siblings_are_active() {
         let churn = HashMap::from([
@@ -1303,6 +1329,32 @@ impl Wrapper {
         assert!(hits.is_empty());
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn abstraction_inflation_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(ABSTRACTION_INFLATION_RULE)
+            .expect("abstraction-inflation has a registry entry")
+            .example
+            .expect("abstraction-inflation has a curated example")
+            .before;
+        let dir = TempDir::new("abstraction-inflation-registry-example");
+        let file = dir.join("wrapper.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let files = authored([file]);
+        let findings = analyze_workspace_structural(files.iter());
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.rule == ABSTRACTION_INFLATION_RULE)
+                .count(),
+            1
+        );
+    }
+
     /// `abstraction-inflation` / `delegating-wrapper` (todo.md §17.5
     /// candidate 4, wrapper-struct sub-case) — unentscheidbar:
     /// [`FileCollector`] only records inherent methods it sees as literal
@@ -1538,5 +1590,25 @@ fn classify(input: &str, needle: &str) -> &'static str {
         let findings = fragile_substring_classification(files.iter());
 
         assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn fragile_substring_classification_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(FRAGILE_SUBSTRING_CLASSIFICATION_RULE)
+            .expect("fragile-substring-classification has a registry entry")
+            .example
+            .expect("fragile-substring-classification has a curated example")
+            .before;
+        let dir = TempDir::new("fragile-substring-classification-registry-example");
+        let file = dir.join("classify.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let files = authored([file]);
+        let findings = fragile_substring_classification(files.iter());
+        assert_eq!(findings.len(), 1);
     }
 }

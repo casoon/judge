@@ -501,7 +501,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Scoped to `unsafe { .. }` expression blocks only — `unsafe fn`/`unsafe impl`/`unsafe trait` declarations are out of scope (a different existing convention: a `# Safety` doc section). The adjacency check for a `// SAFETY:` comment is a line-range heuristic (immediately preceding line, or the first inner line of the block) over `crate::slop_text`'s raw-source-text comment scan, not a semantic link between the comment and the block — a `SAFETY:` comment placed elsewhere (e.g. at the top of the enclosing function) is not credited.",
         allowed_wording: "State only that no `SAFETY:` comment was found adjacent to this unsafe block — never that the code is 'unsound' or 'a vulnerability' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn first_byte(buf: &[u8]) -> u8 {\n    unsafe { *buf.as_ptr() }\n}\n",
+            why_it_matters: "An unsafe block with no adjoining SAFETY comment leaves the next reader with no record of why dereferencing this raw pointer is actually sound, turning a real safety invariant into unwritten tribal knowledge.",
+        }),
     },
     RuleMetadata {
         id: "integer-cast-risk",
@@ -510,7 +513,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "A syntax-only proxy, not a truncation proof: true truncation detection needs the source expression's real type (a type checker), not available at the Fast Tier — the same limitation already documented for `silent-default`/`context-free-propagation` in `crate::slop`'s module doc. Only the cast's written target type is checked (`u8`/`i8`/`u16`/`i16`/`u32`/`i32`/`usize`/`isize`); false-positives on an already-narrow source (e.g. `byte_var as u8`), and false-negatives on a float cast to `u64`/`i64`/`u128`/`i128` (still narrowing, but not covered by this v1 target-type list).",
         allowed_wording: "State only that this is a possible truncation candidate based on the cast's target type — never 'this truncates' or 'this is a bug' (todo.md §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn scale_score(raw: i64) -> i32 {\n    (raw * 100) as i32\n}\n",
+            why_it_matters: "Casting a widened score computation down to i32 truncates silently the moment the value exceeds i32's range, producing a wrong-but-plausible number instead of an error.",
+        }),
     },
     RuleMetadata {
         id: "panic-in-lib",
@@ -688,7 +694,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Flags a long function with implausibly low branching; does not distinguish a genuinely simple long function (e.g. a large match/data table) from a padded one.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn map_webhook_payload(raw: &RawPayload) -> WebhookEvent {\n    let mut event = WebhookEvent::default();\n    event.id = raw.id.clone();\n    event.event_type = raw.event_type.clone();\n    event.account_id = raw.account_id.clone();\n    event.timestamp = raw.timestamp.clone();\n    event.source_ip = raw.source_ip.clone();\n    event.user_agent = raw.user_agent.clone();\n    event.session_id = raw.session_id.clone();\n    event.request_id = raw.request_id.clone();\n    event.status = raw.status.clone();\n    event.amount = raw.amount.clone();\n    event.currency = raw.currency.clone();\n    event.method = raw.method.clone();\n    event.description = raw.description.clone();\n    event.reference = raw.reference.clone();\n    event.customer_id = raw.customer_id.clone();\n    event.customer_email = raw.customer_email.clone();\n    event.customer_name = raw.customer_name.clone();\n    event.billing_country = raw.billing_country.clone();\n    event.billing_postcode = raw.billing_postcode.clone();\n    event.card_brand = raw.card_brand.clone();\n    event.card_last4 = raw.card_last4.clone();\n    event.risk_score = raw.risk_score.clone();\n    event.gateway = raw.gateway.clone();\n    event.gateway_response = raw.gateway_response.clone();\n    event.metadata = raw.metadata.clone();\n    event.created_at = raw.created_at.clone();\n    event.updated_at = raw.updated_at.clone();\n    event.processed_at = raw.processed_at.clone();\n    event.retry_count = raw.retry_count.clone();\n    event.webhook_version = raw.webhook_version.clone();\n    event.signature = raw.signature.clone();\n    event.idempotency_key = raw.idempotency_key.clone();\n    event.notes = raw.notes.clone();\n    event.tags = raw.tags.clone();\n    event.locale = raw.locale.clone();\n    event.channel = raw.channel.clone();\n    event.environment = raw.environment.clone();\n    event.priority = raw.priority.clone();\n    event.correlation_id = raw.correlation_id.clone();\n    event\n}\n",
+            why_it_matters: "A function that's long only because it repeats the same field-by-field assignment forty times over hides any real logic change in a wall of boilerplate that reviewers stop reading carefully.",
+        }),
     },
     RuleMetadata {
         id: "legacy-freeze",
@@ -706,7 +715,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Covers three sub-patterns (single-impl trait, delegating wrapper, builder for a small struct) via `evidence.kind`; a deliberate abstraction seam kept for testability/future extension looks structurally identical to an unnecessary one.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub struct MetricsStore(HashMap<String, u64>);\n\nimpl MetricsStore {\n    pub fn get(&self, key: &str) -> Option<&u64> {\n        self.0.get(key)\n    }\n}\n",
+            why_it_matters: "A wrapper struct whose every method just forwards to the field it wraps adds a layer of indirection with no behavior of its own, making every caller trace through an extra hop for nothing.",
+        }),
     },
     RuleMetadata {
         id: "fragile-substring-classification",
@@ -715,7 +727,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only if/else-if chains of 2+ conditions are considered, and a condition is only flagged for a missing word-boundary check within that same condition expression; whether the string literal ever actually collides with an unrelated substring in real input is not evaluated — a shape-based hint, not a misclassification proof.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn detect_log_level(line: &str) -> &'static str {\n    if line.contains(\"ERROR\") {\n        \"error\"\n    } else if line.contains(\"WARN\") {\n        \"warn\"\n    } else {\n        \"info\"\n    }\n}\n",
+            why_it_matters: "Classifying a log line by whether it merely contains \"ERROR\" also matches unrelated text like \"ERROR_RATE resolved\", misfiling a routine info line as an error.",
+        }),
     },
     // -- slop_structural_deep.rs (G4 remainder, Deep Tier, `--features deep`)
     RuleMetadata {
