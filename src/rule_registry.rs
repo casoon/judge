@@ -505,8 +505,8 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: "State only that a panic-shaped construct (`.unwrap()`/`.expect(..)`/`panic!(..)`/indexing) exists on a `pub` path — never that it 'will panic', 'crashes', or 'is a bug' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
-            before: "pub fn f(x: Option<i32>) -> i32 {\n    x.unwrap()\n}\n",
-            why_it_matters: "A public function that unwraps its input hands every caller a landmine: one unexpected None and the whole program panics, with no way for the caller to recover.",
+            before: "pub fn read_config(raw: Option<&str>) -> &str {\n    raw.unwrap()\n}\n",
+            why_it_matters: "A public function that unwraps its input hands every caller a landmine: a missing config value doesn't return an error — it takes down the whole program.",
         }),
     },
     RuleMetadata {
@@ -535,8 +535,8 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
-            before: "fn f() {\n    let _ = some_call();\n}\nfn some_call() -> Result<i32, String> {\n    Ok(1)\n}\n",
-            why_it_matters: "Discarding a `Result` with `let _ = ...` throws away the one signal that the operation could fail — a write, a parse, a network call — so the failure never surfaces anywhere.",
+            before: "fn save_settings(path: &std::path::Path, data: &str) {\n    let _ = std::fs::write(path, data);\n}\n",
+            why_it_matters: "Discarding a `Result` with `let _ = ...` throws away the one signal that the operation could fail — a failed disk write here looks exactly like a successful save to every caller downstream.",
         }),
     },
     RuleMetadata {
