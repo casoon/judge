@@ -243,7 +243,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Requires a resolved `Cargo.lock`; runs its own full `cargo_metadata` resolve (not `--no-deps`), separate from the workspace-only ingest used elsewhere.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "# api-gateway/Cargo.toml\nimage-resizer = \"1.4.2\"\n\n# batch-worker/Cargo.toml\nimage-resizer = \"2.0.0\"\n",
+            why_it_matters: "Two workspace crates pinning incompatible major versions of the same dependency both get compiled and linked into the final build, doubling compile time and binary size for code that's supposed to be shared.",
+        }),
     },
     RuleMetadata {
         id: "msrv-drift",
@@ -252,7 +255,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Requires a resolved `Cargo.lock`; runs its own full `cargo_metadata` resolve (not `--no-deps`), separate from the workspace-only ingest used elsewhere.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "[package]\nname = \"image-codec\"\nversion = \"0.4.2\"\nrust-version = \"1.80\"\n",
+            why_it_matters: "A dependency that requires a newer Rust toolchain than the workspace promises silently breaks the build for anyone still on the workspace's stated minimum-supported Rust version.",
+        }),
     },
     RuleMetadata {
         id: "workspace-dep-drift",
@@ -261,7 +267,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Requires a resolved `Cargo.lock`; runs its own full `cargo_metadata` resolve (not `--no-deps`), separate from the workspace-only ingest used elsewhere.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "# api-gateway/Cargo.toml\ntokio = \"1.35\"\n\n# report-worker/Cargo.toml\ntokio = \"1.40\"\n",
+            why_it_matters: "When workspace members pin different version requirements for the same dependency, cargo can end up resolving two separate copies of it, and the two crates silently drift out of sync with each other over time.",
+        }),
     },
     // -- deps.rs ------------------------------------------------------------
     RuleMetadata {
@@ -271,7 +280,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only two unambiguous cases are implemented: a `normal` dependency used exclusively from `Dev`-domain files, and a `build` dependency never referenced from `build.rs`. Directory-convention classification (`tests/`/`examples/`/`benches/`) is heuristic, not module-graph resolution — an unconventionally wired file can be misclassified. A dependency with more than one declared feature is excluded from the `Dev`-domain case, since a longer feature list is itself weak evidence of broader use than identifier scanning can see.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "[dependencies]\nassert-json-diff = \"2.0\"\n",
+            why_it_matters: "A helper crate declared as a normal dependency but only ever called from the test suite still ships inside every consumer's production build, expanding the dependency tree for code that never runs outside tests.",
+        }),
     },
     RuleMetadata {
         id: "unused-dev-dependency",
@@ -280,7 +292,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "No usage found in `Dev`-domain files (`tests/`, `examples/`, `benches/`) or `#[cfg(test)]` modules of the declaring package; doctests are not scanned.",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "[dev-dependencies]\npretty-assertions = \"1.4\"\n",
+            why_it_matters: "A dev-dependency that's declared but never referenced from any test still gets resolved and compiled on every `cargo test` run, adding to CI time for tooling nothing actually exercises.",
+        }),
     },
     RuleMetadata {
         id: "heavy-dependency",
@@ -289,7 +304,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Transitive-count and used-item thresholds are first-cut, adjustable constants, not a calibrated cost model.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "[dependencies]\nimage-resizer = \"1.4\"\n",
+            why_it_matters: "Pulling in a dependency for one small feature still compiles its entire transitive dependency tree into the build, adding compile time and attack surface for functionality the code barely touches.",
+        }),
     },
     RuleMetadata {
         id: "unused-feature-flag",
@@ -298,7 +316,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Does not cover well-known 'bundle' features (e.g. tokio's 'full' feature) when the dependency itself is used — recognizing those needs a per-dependency feature vocabulary judge does not maintain. Only fires for a dependency with zero usage found anywhere in the examined view.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "[dependencies]\nimage-processing = { version = \"3.2\", features = [\"simd-acceleration\"] }\n",
+            why_it_matters: "Turning on a dependency's feature flag activates its extra code paths (and any dependencies that feature pulls in) even though nothing in the codebase calls into the dependency at all.",
+        }),
     },
     RuleMetadata {
         id: "default-features-unused",
@@ -307,7 +328,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Does not cover 'used, but only non-default features' — telling default from non-default usage apart needs per-dependency feature-to-symbol knowledge judge does not have. Only fires when the manifest text explicitly sets `default-features = true` and zero usage was found anywhere in the examined view.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "[dependencies]\nimage-processing = { version = \"3.2\", default-features = true }\n",
+            why_it_matters: "Explicitly keeping a dependency's default features on, for a dependency the code never actually calls, compiles in functionality nobody asked for and hides what the manifest's real feature footprint is.",
+        }),
     },
     RuleMetadata {
         id: "unused-feature",
@@ -316,7 +340,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "About a crate's own declared `[features]` table, not a dependency's features (see `unused-feature-flag`, the opposite direction). Never fires for `default`, or for a feature whose own value list is non-empty (an umbrella/bundle feature enabling other features/deps — a real effect even with no direct `cfg` reference). The same-crate reference check is a plain substring scan for `feature = \"x\"`/`feature=\"x\"` across the crate's own authored source, not a `syn`/token-tree parse of the `cfg` predicate — unusual whitespace around the `=` would be missed.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "[features]\nlegacy-api = []\n",
+            why_it_matters: "A feature flag that's declared but never gated behind a single `#[cfg(feature = ...)]` anywhere gives downstream users a switch that silently does nothing, wasting their time when they try to use it.",
+        }),
     },
     RuleMetadata {
         id: "unused-dependency",
@@ -334,7 +361,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Fires when the dependency's own `repository` field is absent or blank. A missing field is not itself a defect — private/internal crates legitimately omit it, and the finding never claims otherwise (`Severity::Info`).",
         allowed_wording: "State only that no `repository` field was found in the dependency's own manifest — never that the dependency is 'untrustworthy' or 'suspicious' (that framing belongs to the separate `fresh-low-reputation-dep`/`phantom-crate` rules).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "[package]\nname = \"internal-metrics\"\nversion = \"0.3.0\"\n",
+            why_it_matters: "Without a `repository` field in its own manifest, this dependency's source can't be traced or reviewed by anyone auditing the build — including automated supply-chain scanners looking for where the code actually comes from.",
+        }),
     },
     // -- duplication.rs -------------------------------------------------
     RuleMetadata {
