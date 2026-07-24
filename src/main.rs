@@ -5500,7 +5500,7 @@ fn dup_two(x: i32) -> i32 {
         let mut no_example_out = Vec::new();
         run(
             cli_with(Command::ExplainRule(ExplainRuleOptions {
-                id: "catch-all-error".to_string(),
+                id: "crate-boundary-violation".to_string(),
                 format: OutputFormat::Json,
             })),
             &mut no_example_out,
