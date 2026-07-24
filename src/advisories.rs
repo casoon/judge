@@ -511,6 +511,53 @@ mod tests {
         );
     }
 
+    /// The registry's curated `example.before` for `known-vulnerability` (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags. Parsed with the module's
+    /// own [`parse_audit_report`] (not a second hand-written copy), then
+    /// resolved as a production dependency so the reachability
+    /// cross-reference actually finds it.
+    #[test]
+    fn known_vulnerability_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(KNOWN_VULNERABILITY_RULE)
+            .expect("known-vulnerability has a registry entry")
+            .example
+            .expect("known-vulnerability has a curated example")
+            .before;
+        let vulns = parse_audit_report(example);
+        assert_eq!(
+            vulns.len(),
+            1,
+            "curated example must parse to exactly one vulnerability"
+        );
+
+        let prod_vendor = TempDir::new("advisories-registry-example-prod-vendor");
+        write_vendored_crate(
+            &prod_vendor,
+            &vulns[0].package_name,
+            &vulns[0].package_version,
+        );
+        let dev_vendor = TempDir::new("advisories-registry-example-dev-vendor");
+        write_vendored_crate(&dev_vendor, "unused-dev-dep", "1.0.0");
+        let dir = TempDir::new("advisories-registry-example-fixture");
+        let manifest = write_manifest_with_vendored_deps(
+            &dir,
+            (&vulns[0].package_name, &prod_vendor),
+            ("unused-dev-dep", &dev_vendor),
+        );
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        let report = analyze_vulnerabilities(&workspace, &vulns);
+
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].rule, KNOWN_VULNERABILITY_RULE);
+        assert_eq!(
+            report.findings[0].evidence.as_ref().unwrap()["reachability"],
+            "production"
+        );
+    }
+
     #[test]
     fn a_vulnerability_in_a_dev_only_dependency_is_classified_dev_only_and_warns() {
         let prod_vendor = TempDir::new("advisories-prod-vendor-b");
