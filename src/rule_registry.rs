@@ -403,7 +403,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Requires ≥2 `catch-all-error` findings in the same crate plus at least one crate-local typed error definition (independently sourced signals); a single symptom, or symptoms without a typed error already present, produce no candidate. The boundary can be a deliberate compatibility shim rather than a design gap.",
         allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn fetch_user(id: u64) -> Result<User, Box<dyn std::error::Error>> {\n    let raw = http_get(&format!(\"/users/{id}\"))?;\n    Ok(parse_user(&raw)?)\n}\n\npub fn fetch_order(id: u64) -> Result<Order, Box<dyn std::error::Error>> {\n    let raw = http_get(&format!(\"/orders/{id}\"))?;\n    Ok(parse_order(&raw)?)\n}\n\npub enum ApiError {\n    NotFound,\n    Timeout,\n}\n",
+            why_it_matters: "Two boundary functions already erase their errors into `Box<dyn Error>` even though this crate has a typed error ready to use, which forces every caller to match on error text instead of a variant.",
+        }),
     },
     RuleMetadata {
         id: "primitive-domain-value",
@@ -412,7 +415,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Fast-Tier-reachable narrowing of the full todo.md §16.3 rule: only the same (parameter name, type) pair across ≥2 `pub fn` signatures in the same crate, restricted to primitive numeric/`String`/`&str` types (`bool` excluded — see `boolean-state-cluster`), with at least one signature guarding the parameter. No cross-crate reasoning, no non-syntactic evidence. A shared name/type pair can have different meanings across functions despite matching structurally.",
         allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn set_retry_timeout(timeout_ms: u32) {\n    println!(\"timeout set to {timeout_ms}\");\n}\n\npub fn schedule_backoff(timeout_ms: u32) -> Result<(), String> {\n    if timeout_ms > 60_000 {\n        return Err(\"timeout_ms must be at most 60 seconds\".to_string());\n    }\n    Ok(())\n}\n",
+            why_it_matters: "The same `timeout_ms: u32` parameter appears in two public functions, but only one of them checks that the value is sane, so callers can't tell from the type alone which functions expect an already-validated timeout.",
+        }),
     },
     RuleMetadata {
         id: "boolean-state-cluster",
@@ -421,7 +427,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Fast-Tier-reachable narrowing of the full todo.md §16.3 rule, scoped to a single function rather than cross-call-site: needs ≥3 `bool` parameters plus a condition/`match` combining ≥2 of them within the same function body; does not aggregate evidence about how bool parameters are combined across call sites.",
         allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn configure_logger(verbose: bool, json_output: bool, include_timestamps: bool) {\n    if verbose && json_output {\n        enable_debug_json_format();\n    }\n    let _ = include_timestamps;\n}\n\nfn enable_debug_json_format() {}\n",
+            why_it_matters: "Three boolean flags on one function signature already need a combined check to make sense of, and every new flag doubles the number of state combinations callers and maintainers have to reason about.",
+        }),
     },
     RuleMetadata {
         id: "public-invariant-bypass",
@@ -430,7 +439,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Fast-Tier-reachable narrowing of the full todo.md §16.3 rule, deliberately without the full rule's consumer-side analysis: needs a `pub struct` with ≥2 `pub` fields and no `#[non_exhaustive]` attribute, plus at least one crate-local constructor-shaped `pub fn` (return type `Self`/the struct name, optionally `Result`-wrapped) that jointly validates ≥2 of those fields via matching parameter names. No cross-crate reasoning, no consumer call-site analysis.",
         allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub struct PriceRange {\n    pub min_price: u32,\n    pub max_price: u32,\n}\n\nimpl PriceRange {\n    pub fn new(min_price: u32, max_price: u32) -> Result<Self, String> {\n        if min_price >= max_price {\n            return Err(\"min_price must be less than max_price\".to_string());\n        }\n        Ok(Self { min_price, max_price })\n    }\n}\n",
+            why_it_matters: "The constructor enforces that the minimum stays below the maximum, but both fields are `pub`, so any caller can still build a `PriceRange` directly and skip that check entirely.",
+        }),
     },
     RuleMetadata {
         id: "manual-resource-lifecycle",
@@ -439,7 +451,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Fast-Tier-reachable narrowing of the full todo.md §16.3 rule, with no ownership/lifetime analysis: needs one function calling both an acquire-shaped operation and a release-shaped counterpart by call name alone, plus a crate with no `impl Drop for ...` anywhere. Cannot show that ownership and lifetime of the resource are actually bound to a single guard — acquire/release name matches can be coincidental and couple unrelated calls.",
         allowed_wording: "Every claim must be phrased as an observation with checkable evidence locations, never an absolute claim (todo.md §16.7 'Sprachdisziplin'); never state this is 'the best' pattern or that the current structure is definitely wrong (todo.md §17.4). Always pair with a contraindication.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn run_migration(host: &str) {\n    connect(host);\n    disconnect();\n}\n\nfn connect(_host: &str) {}\nfn disconnect() {}\n",
+            why_it_matters: "The connection is opened and closed by explicit function calls instead of a guard whose `Drop` impl closes it automatically, so any early return or panic between the two calls leaks the connection.",
+        }),
     },
     // -- provenance.rs ------------------------------------------------------
     RuleMetadata {

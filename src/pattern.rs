@@ -2682,4 +2682,129 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].pattern, RustPattern::RaiiGuard);
     }
+
+    /// The registry's curated `example.before` for `stringly-error-boundary`
+    /// (see `rule_registry::RULE_REGISTRY`) must itself still trigger the
+    /// rule — this is what keeps a landing-page-facing example from
+    /// silently drifting away from what judge actually flags. This rule
+    /// produces a `PatternCandidate`, not a `Finding` (see this module's own
+    /// doc comment for why the two are deliberately kept separate), so the
+    /// check reruns `analyze_workspace` exactly like
+    /// `two_symptoms_plus_a_typed_error_produce_one_candidate` above and
+    /// asserts on `.pattern` rather than on a `Finding`'s rule id.
+    #[test]
+    fn stringly_error_boundary_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(STRINGLY_ERROR_BOUNDARY_RULE)
+            .expect("stringly-error-boundary has a registry entry")
+            .example
+            .expect("stringly-error-boundary has a curated example")
+            .before;
+
+        let dir = TempDir::new("pattern-registry-example-stringly");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file.clone()]);
+        let findings = vec![
+            catch_all_error_finding(&file, "fetch_user", 1),
+            catch_all_error_finding(&file, "fetch_order", 5),
+        ];
+
+        let candidates = analyze_workspace(&workspace, &findings);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::DomainError);
+    }
+
+    /// The registry's curated `example.before` for `primitive-domain-value`
+    /// must itself still trigger the rule — see the drift-guard doc comment
+    /// on `stringly_error_boundary_registry_example_still_triggers_the_rule`
+    /// above for why this reruns `analyze_workspace` and asserts on
+    /// `.pattern` instead of using a `Finding`-based helper.
+    #[test]
+    fn primitive_domain_value_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(PRIMITIVE_DOMAIN_VALUE_RULE)
+            .expect("primitive-domain-value has a registry entry")
+            .example
+            .expect("primitive-domain-value has a curated example")
+            .before;
+
+        let dir = TempDir::new("pattern-registry-example-primitive");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::ValidatedNewtype);
+    }
+
+    /// The registry's curated `example.before` for `boolean-state-cluster`
+    /// must itself still trigger the rule — see the drift-guard doc comment
+    /// on `stringly_error_boundary_registry_example_still_triggers_the_rule`
+    /// above for why this reruns `analyze_workspace` and asserts on
+    /// `.pattern` instead of using a `Finding`-based helper.
+    #[test]
+    fn boolean_state_cluster_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(BOOLEAN_STATE_CLUSTER_RULE)
+            .expect("boolean-state-cluster has a registry entry")
+            .example
+            .expect("boolean-state-cluster has a curated example")
+            .before;
+
+        let dir = TempDir::new("pattern-registry-example-boolean");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::OptionsStruct);
+    }
+
+    /// The registry's curated `example.before` for `public-invariant-bypass`
+    /// must itself still trigger the rule — see the drift-guard doc comment
+    /// on `stringly_error_boundary_registry_example_still_triggers_the_rule`
+    /// above for why this reruns `analyze_workspace` and asserts on
+    /// `.pattern` instead of using a `Finding`-based helper.
+    #[test]
+    fn public_invariant_bypass_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(PUBLIC_INVARIANT_BYPASS_RULE)
+            .expect("public-invariant-bypass has a registry entry")
+            .example
+            .expect("public-invariant-bypass has a curated example")
+            .before;
+
+        let dir = TempDir::new("pattern-registry-example-invariant");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::SmartConstructor);
+    }
+
+    /// The registry's curated `example.before` for
+    /// `manual-resource-lifecycle` must itself still trigger the rule — see
+    /// the drift-guard doc comment on
+    /// `stringly_error_boundary_registry_example_still_triggers_the_rule`
+    /// above for why this reruns `analyze_workspace` and asserts on
+    /// `.pattern` instead of using a `Finding`-based helper.
+    #[test]
+    fn manual_resource_lifecycle_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(MANUAL_RESOURCE_LIFECYCLE_RULE)
+            .expect("manual-resource-lifecycle has a registry entry")
+            .example
+            .expect("manual-resource-lifecycle has a curated example")
+            .before;
+
+        let dir = TempDir::new("pattern-registry-example-resource");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let candidates = analyze_workspace(&workspace, &[]);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pattern, RustPattern::RaiiGuard);
+    }
 }
