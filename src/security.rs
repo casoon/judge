@@ -34,7 +34,15 @@
 //! Fast Tier — the same limitation already documented for `silent-default`/
 //! `context-free-propagation` in [`crate::slop`]'s module doc, deferred
 //! there to a future Deep Tier. This detector only ever looks at the cast's
-//! written target type.
+//! written target type — with one syntax-only exemption: a cast whose
+//! direct inner expression is itself a call to `clamp`/`min`/`max`/one of
+//! the `saturating_*` methods (see [`is_clamped_immediately`]) is not
+//! flagged, since the value is already bounded to a safe range immediately
+//! before the cast. Added after a 2026-07-24 precision audit against a real
+//! 135k-LOC corpus (`auditmysite`) found this the single largest
+//! false-positive source: 311 of 312 findings, nearly all bounded
+//! scoring/percentage arithmetic already guarded this way (see todo.md §F
+//! "Praxisbeleg", GitHub issue #9).
 //!
 //! ## `panic-in-lib` scope
 //!
@@ -61,6 +69,20 @@
 //! happens to define its own non-panicking method or index operator of the
 //! same name is not distinguished from the standard, panicking one — the
 //! same accepted name-match imprecision `swallowed-result` already carries.
+//! An indexing expression's `evidence.kind` further distinguishes the index
+//! operand's shape (see [`classify_index_kind`]), added after the same
+//! 2026-07-24 precision audit (todo.md §F "Praxisbeleg", GitHub issue #10)
+//! found ~100 of 116 `panic-in-lib` findings in `auditmysite` were
+//! `parsed["key"]`-style string-literal indexing into `serde_json::Value` —
+//! whose `Index<&str>` impl returns `Value::Null` for a missing key or
+//! wrong variant rather than panicking — while the only real bug in that
+//! same audit was a range-slice (`expr[a..b]`), the genuinely dangerous
+//! shape (bounds *and* UTF-8 char-boundary risk). A string-literal index is
+//! reported as `"string_key_indexing"`, a range index as `"range_slice"`,
+//! anything else stays plain `"indexing"` — still three shapes of the same
+//! rule, not three rules, since none of this is proof either way without a
+//! type checker (a `HashMap<String, _>` genuinely panics on a missing key
+//! and looks identical to a `serde_json::Value` at this syntax level).
 //! Also does not distinguish a `[lib]` target's public API surface from a
 //! `[[bin]]`-only crate's `pub` items (which, for a binary, are never
 //! actually reachable by another crate) — judge's Fast Tier has no
@@ -126,9 +148,9 @@ use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, ExprCast, ExprIndex, ExprLit, ExprMacro, ExprMethodCall, ExprUnsafe, ImplItemFn,
-    ItemConst, ItemFn, ItemImpl, ItemMod, ItemStatic, Lit, Local, Pat, TraitItemFn, Type,
-    Visibility,
+    Attribute, Expr, ExprCast, ExprIndex, ExprLit, ExprMacro, ExprMethodCall, ExprUnsafe,
+    ImplItemFn, ItemConst, ItemFn, ItemImpl, ItemMod, ItemStatic, Lit, Local, Pat, TraitItemFn,
+    Type, Visibility,
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
@@ -151,16 +173,19 @@ pub const UNSAFE_SURFACE_RULE_REVISION: u32 = 1;
 /// see the module doc.
 pub const INTEGER_CAST_RISK_RULE: &str = "integer-cast-risk";
 /// Bump when the integer-cast-risk rule's logic changes (see todo.md §5
-/// "Regelversions-Schutz").
-pub const INTEGER_CAST_RISK_RULE_REVISION: u32 = 1;
+/// "Regelversions-Schutz"). v2 (2026-07-24, GitHub issue #9): added the
+/// clamp-guard exemption (see module doc and [`is_clamped_immediately`]).
+pub const INTEGER_CAST_RISK_RULE_REVISION: u32 = 2;
 
 /// Rule id for a panic-shaped construct (`.unwrap()`, `.expect(..)`,
 /// `panic!(..)`, or an indexing expression) on a `pub` path (see todo.md §F,
 /// module doc "`panic-in-lib` scope").
 pub const PANIC_IN_LIB_RULE: &str = "panic-in-lib";
 /// Bump when the panic-in-lib rule's logic changes (see todo.md §5
-/// "Regelversions-Schutz").
-pub const PANIC_IN_LIB_RULE_REVISION: u32 = 1;
+/// "Regelversions-Schutz"). v2 (2026-07-24, GitHub issue #10): split
+/// indexing's `evidence.kind` by index-operand shape (see module doc and
+/// [`classify_index_kind`]).
+pub const PANIC_IN_LIB_RULE_REVISION: u32 = 2;
 
 /// Rule id for a string literal matching a known secret-provider pattern, or
 /// bound to a suspiciously-named `let`/`const`/`static` with high entropy
@@ -206,6 +231,28 @@ const MIN_SECRET_ENTROPY: f64 = 3.5;
 /// this Fast Tier pass doesn't have (see module doc), so v1 stays scoped to
 /// target types that are always a narrowing risk regardless of source.
 const RISKY_CAST_TARGETS: &[&str] = &["u8", "i8", "u16", "i16", "u32", "i32", "usize", "isize"];
+
+/// Method names that, when one of them is the outermost method call of an
+/// `as` cast's direct inner expression, are treated as evidence the value is
+/// already bounded to a safe range immediately before the cast — see
+/// [`is_clamped_immediately`] and the module doc's `integer-cast-risk`
+/// section. Added after a 2026-07-24 precision audit (todo.md §F
+/// "Praxisbeleg", GitHub issue #9) found this the single largest
+/// `integer-cast-risk` false-positive source in a real 135k-LOC corpus:
+/// score/percentage arithmetic normalized to a fixed range before
+/// narrowing.
+const CLAMP_GUARD_METHODS: &[&str] = &[
+    "clamp",
+    "min",
+    "max",
+    "saturating_add",
+    "saturating_sub",
+    "saturating_mul",
+    "saturating_div",
+    "saturating_pow",
+    "saturating_abs",
+    "saturating_neg",
+];
 
 #[derive(Debug)]
 pub enum SecurityError {
@@ -345,6 +392,52 @@ fn has_adjacent_safety_comment(comments: &[CommentSpan], unsafe_start_line: usiz
 /// Whether `ty`'s written name is one of [`RISKY_CAST_TARGETS`].
 fn is_risky_cast_target(ty: &Type) -> bool {
     RISKY_CAST_TARGETS.contains(&type_name(ty).as_str())
+}
+
+/// Whether `expr` — an `as` cast's direct inner expression — is itself a
+/// call to one of [`CLAMP_GUARD_METHODS`], meaning the value has already
+/// been bounded to a safe range immediately before the cast. Deliberately
+/// shallow: only the cast's immediate child is checked (after unwrapping
+/// any enclosing parentheses), not a binary expression's operands or a
+/// deeper nesting — `x.clamp(0, 100) as u32` is recognized, `(a.min(50) +
+/// b.min(50)) as u32` is not (no type information to reason about the sum's
+/// bound). A syntax-only heuristic, same spirit as the rest of this
+/// detector: it narrows false positives, it does not eliminate them (see
+/// module doc).
+fn is_clamped_immediately(expr: &Expr) -> bool {
+    let mut expr = expr;
+    while let Expr::Paren(inner) = expr {
+        expr = &inner.expr;
+    }
+    matches!(
+        expr,
+        Expr::MethodCall(call) if CLAMP_GUARD_METHODS.contains(&call.method.to_string().as_str())
+    )
+}
+
+/// Classifies an indexing expression's `[..]` operand shape into one of
+/// three `panic-in-lib` `evidence.kind` values (see module doc
+/// "`panic-in-lib` scope") — syntax-only, no type resolution:
+///  - a range (`expr[a..b]`, `expr[..b]`, `expr[a..]`) is `"range_slice"`:
+///    real bounds risk, and for a `str` receiver, a char-boundary risk too.
+///  - a string literal (`expr["key"]`) is `"string_key_indexing"`: in
+///    practice almost always a map-like `Index<&str>` receiver
+///    (`serde_json::Value`, `toml::Value`, ...) whose accessor returns a
+///    null/default value for a missing key rather than panicking — still
+///    reported, since a `HashMap`/`BTreeMap<String, _>` genuinely does
+///    panic on a missing key and this Fast Tier cannot tell the two apart,
+///    just under a distinguishable, separately-triageable kind.
+///  - anything else (an integer literal, a variable, an arithmetic
+///    expression, ...) stays `"indexing"`, unchanged: the classic
+///    `Vec`/array/slice out-of-bounds panic risk.
+fn classify_index_kind(index: &Expr) -> &'static str {
+    match index {
+        Expr::Range(_) => "range_slice",
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(_), ..
+        }) => "string_key_indexing",
+        _ => "indexing",
+    }
 }
 
 /// Builds an `unsafe-surface` finding. Its evidence class is `derived_fact`
@@ -500,7 +593,7 @@ struct CastVisitor<'a> {
 
 impl<'ast> Visit<'ast> for CastVisitor<'_> {
     fn visit_expr_cast(&mut self, node: &'ast ExprCast) {
-        if is_risky_cast_target(&node.ty) {
+        if is_risky_cast_target(&node.ty) && !is_clamped_immediately(&node.expr) {
             self.findings.push(integer_cast_risk_finding(
                 self.file,
                 node.span(),
@@ -560,7 +653,7 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
             self.file,
             node.span(),
             self.item_path,
-            "indexing",
+            classify_index_kind(&node.index),
         ));
         visit::visit_expr_index(self, node);
     }
@@ -1036,6 +1129,53 @@ mod tests {
         assert!(rule_findings(&findings, INTEGER_CAST_RISK_RULE).is_empty());
     }
 
+    /// See todo.md §F "Praxisbeleg" (GitHub issue #9): a cast whose direct
+    /// input is already bounded by `.clamp(..)` is not a truncation
+    /// candidate and should not be flagged.
+    #[test]
+    fn cast_of_a_clamped_value_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(x: i64) -> i32 {\n    x.clamp(0, 100) as i32\n}\n",
+            "security-cast-clamped",
+        );
+        assert!(rule_findings(&findings, INTEGER_CAST_RISK_RULE).is_empty());
+    }
+
+    /// Same exemption via `.min`/`.max`/`saturating_sub`, and unwrapped
+    /// through parentheses — mirrors the real-world shapes found in the
+    /// audit (`cv.signal_count.saturating_sub(cv.problem_count) as u32`,
+    /// `score.round().max(1.0) as u32`).
+    #[test]
+    fn cast_of_a_saturating_sub_result_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(a: usize, b: usize) -> u32 {\n    a.saturating_sub(b) as u32\n}\n",
+            "security-cast-saturating-sub",
+        );
+        assert!(rule_findings(&findings, INTEGER_CAST_RISK_RULE).is_empty());
+    }
+
+    #[test]
+    fn cast_of_a_parenthesized_clamped_value_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(x: i64) -> i32 {\n    (x.max(0)) as i32\n}\n",
+            "security-cast-paren-clamped",
+        );
+        assert!(rule_findings(&findings, INTEGER_CAST_RISK_RULE).is_empty());
+    }
+
+    /// The clamp-guard exemption only looks at the cast's immediate child —
+    /// a clamped operand buried inside a binary expression is not
+    /// recognized (documented limitation, see `is_clamped_immediately`), so
+    /// this still fires.
+    #[test]
+    fn cast_of_a_sum_of_clamped_values_is_still_flagged() {
+        let findings = findings_for(
+            "fn f(a: i64, b: i64) -> i32 {\n    (a.max(0) + b.max(0)) as i32\n}\n",
+            "security-cast-sum-of-clamped",
+        );
+        assert_eq!(rule_findings(&findings, INTEGER_CAST_RISK_RULE).len(), 1);
+    }
+
     /// The registry's curated `example.before` for this rule (see
     /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
     /// this is what keeps a landing-page-facing example from silently
@@ -1123,6 +1263,38 @@ mod tests {
         let hits = rule_findings(&findings, PANIC_IN_LIB_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].evidence.as_ref().unwrap()["kind"], "indexing");
+    }
+
+    /// See todo.md §F "Praxisbeleg" (GitHub issue #10): a range index
+    /// (`expr[a..b]`) is the genuinely dangerous shape — real bounds *and*
+    /// UTF-8 char-boundary risk — and gets its own `evidence.kind`.
+    #[test]
+    fn range_indexing_in_a_pub_fn_is_flagged_as_range_slice() {
+        let findings = findings_for(
+            "pub fn f(s: &str, end: usize) -> &str {\n    &s[1..end]\n}\n",
+            "security-panic-indexing-range",
+        );
+        let hits = rule_findings(&findings, PANIC_IN_LIB_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].evidence.as_ref().unwrap()["kind"], "range_slice");
+    }
+
+    /// A string-literal index is almost always a `serde_json::Value`/
+    /// `toml::Value`-style non-panicking accessor in practice — reported
+    /// under a separate, lower-signal `evidence.kind` instead of being
+    /// indistinguishable from classic `Vec`/array indexing.
+    #[test]
+    fn string_key_indexing_in_a_pub_fn_is_flagged_as_string_key_indexing() {
+        let findings = findings_for(
+            "pub fn f(v: &serde_json::Value) -> &serde_json::Value {\n    &v[\"key\"]\n}\n",
+            "security-panic-indexing-string-key",
+        );
+        let hits = rule_findings(&findings, PANIC_IN_LIB_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].evidence.as_ref().unwrap()["kind"],
+            "string_key_indexing"
+        );
     }
 
     #[test]

@@ -65,9 +65,16 @@ pub const EMPTY_ERROR_ARM_RULE: &str = "empty-error-arm";
 pub const EMPTY_ERROR_ARM_RULE_REVISION: u32 = 1;
 
 /// Rule id for a `pub fn` whose error type is erased (`Box<dyn Error>` /
-/// `anyhow::Error`) at a public API boundary (see todo.md §G1).
+/// `anyhow::Error`) at a public API boundary *and* whose body discards the
+/// original error via a wildcard-parameter `.map_err(|_| ..)` (see todo.md
+/// §G1, [`discards_error_via_map_err`]).
 pub const CATCH_ALL_ERROR_RULE: &str = "catch-all-error";
-pub const CATCH_ALL_ERROR_RULE_REVISION: u32 = 1;
+/// Bump when the catch-all-error rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz"). v2 (2026-07-24, GitHub issue #11): added the
+/// `discards_error_via_map_err` body check — a type-erased return type
+/// alone no longer fires; plain `?`/`anyhow!(..)` propagation is idiomatic,
+/// not evidence of discarded error information.
+pub const CATCH_ALL_ERROR_RULE_REVISION: u32 = 2;
 
 /// Rule id for an `#[allow(...)]`/`#[expect(...)]` attribute occurrence — the
 /// "wichtigster Rust-Slop-Marker" per todo.md §G1.
@@ -296,6 +303,7 @@ impl SlopVisitor<'_> {
         &mut self,
         vis: &Visibility,
         sig: &syn::Signature,
+        block: &Block,
         span: proc_macro2::Span,
     ) {
         if !matches!(vis, Visibility::Public(_)) {
@@ -305,6 +313,9 @@ impl SlopVisitor<'_> {
             return;
         };
         if !contains_catch_all_error(ty, self.allow_anyhow_at_boundary) {
+            return;
+        }
+        if !discards_error_via_map_err(block) {
             return;
         }
         let item_path = self.current_item_path();
@@ -517,7 +528,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
             end_line: node.span().end().line,
             item_path: self.current_item_path(),
         });
-        self.check_catch_all_error(&node.vis, &node.sig, node.span());
+        self.check_catch_all_error(&node.vis, &node.sig, &node.block, node.span());
         self.check_empty_impl(&node.attrs, &node.block, node.span());
         self.check_assertion_free_test(node);
         self.check_generic_naming_item_fn(node);
@@ -540,7 +551,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
             end_line: node.span().end().line,
             item_path: self.current_item_path(),
         });
-        self.check_catch_all_error(&node.vis, &node.sig, node.span());
+        self.check_catch_all_error(&node.vis, &node.sig, &node.block, node.span());
         self.check_empty_impl(&node.attrs, &node.block, node.span());
         self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
         let gated = has_feature_cfg(&node.attrs);
@@ -818,6 +829,54 @@ fn is_error_trait_object(trait_object: &syn::TypeTraitObject) -> bool {
             false
         }
     })
+}
+
+/// Whether `block` contains a `.map_err(|_| ..)` call whose closure takes
+/// exactly one wildcard parameter (`_` or `_: T`) — the body-level signal
+/// `check_catch_all_error` requires alongside a type-erased return type
+/// (see todo.md §F "Praxisbeleg", auditmysite 2026-07-24, GitHub issue #11):
+/// a closure that never binds the original error value discards it, rather
+/// than merely converting or propagating it. Plain `?`/`anyhow!(..)`
+/// propagation — which preserves the source error chain
+/// (`std::error::Error::source()`) — does not match this and is not
+/// flagged; that precision audit found 0 of 8 `catch-all-error` findings
+/// real in a codebase that only ever used exactly that idiomatic style
+/// through a type-erased boundary. A syntax-only proxy, not a completeness
+/// proof: a `.map_err` closure that *does* bind its parameter but never
+/// uses it, or some other information-discarding shape (e.g. a `match`
+/// collapsing distinct arms to the same message), is not distinguished
+/// either way.
+fn discards_error_via_map_err(block: &Block) -> bool {
+    struct MapErrDiscardVisitor {
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for MapErrDiscardVisitor {
+        fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+            if node.method == "map_err"
+                && let Some(Expr::Closure(closure)) = node.args.first()
+                && closure.inputs.len() == 1
+                && pat_is_wildcard(&closure.inputs[0])
+            {
+                self.found = true;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+    }
+
+    fn pat_is_wildcard(pat: &Pat) -> bool {
+        match pat {
+            Pat::Wild(_) => true,
+            Pat::Type(pat_type) => pat_is_wildcard(&pat_type.pat),
+            _ => false,
+        }
+    }
+
+    let mut visitor = MapErrDiscardVisitor { found: false };
+    visitor.visit_block(block);
+    visitor.found
 }
 
 /// Whether any attribute in `attrs` is a `#[doc = ...]` (covers both `///`
@@ -1219,12 +1278,36 @@ fn f(r: Result<i32, ()>) {
     #[test]
     fn pub_fn_with_boxed_dyn_error_is_flagged() {
         let findings = findings_for(
-            "pub fn f() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n",
+            "pub fn f() -> Result<(), Box<dyn std::error::Error>> {\n    std::fs::read_to_string(\"x\").map_err(|_| \"failed\".into())?;\n    Ok(())\n}\n",
             "slop-catch-all-boxed",
         );
         let hits = rule_findings(&findings, CATCH_ALL_ERROR_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
+    }
+
+    /// See todo.md §F "Praxisbeleg" (GitHub issue #11): a type-erased return
+    /// type alone is not enough — plain `?` propagation preserves the
+    /// source error chain and is idiomatic `anyhow`/`thiserror` style, not
+    /// evidence of discarded error information.
+    #[test]
+    fn pub_fn_with_boxed_dyn_error_and_plain_propagation_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn f() -> Result<(), Box<dyn std::error::Error>> {\n    std::fs::read_to_string(\"x\")?;\n    Ok(())\n}\n",
+            "slop-catch-all-boxed-plain-propagation",
+        );
+        assert!(rule_findings(&findings, CATCH_ALL_ERROR_RULE).is_empty());
+    }
+
+    /// A `.map_err` closure that binds and uses its parameter converts the
+    /// error but does not discard it — still not flagged.
+    #[test]
+    fn map_err_with_a_bound_parameter_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn f() -> Result<(), Box<dyn std::error::Error>> {\n    std::fs::read_to_string(\"x\").map_err(|e| format!(\"failed: {e}\").into())?;\n    Ok(())\n}\n",
+            "slop-catch-all-boxed-bound-map-err",
+        );
+        assert!(rule_findings(&findings, CATCH_ALL_ERROR_RULE).is_empty());
     }
 
     #[test]
@@ -1248,7 +1331,7 @@ fn f(r: Result<i32, ()>) {
     #[test]
     fn anyhow_result_is_flagged() {
         let findings = findings_for(
-            "pub fn f() -> anyhow::Result<()> { Ok(()) }\n",
+            "pub fn f() -> anyhow::Result<()> {\n    std::fs::read_to_string(\"x\").map_err(|_| anyhow::anyhow!(\"failed\"))?;\n    Ok(())\n}\n",
             "slop-catch-all-anyhow",
         );
         let hits = rule_findings(&findings, CATCH_ALL_ERROR_RULE);
@@ -1258,7 +1341,7 @@ fn f(r: Result<i32, ()>) {
     #[test]
     fn anyhow_result_is_not_flagged_when_allowed_at_boundary() {
         let findings = findings_for_with_config(
-            "pub fn f() -> anyhow::Result<()> { Ok(()) }\n",
+            "pub fn f() -> anyhow::Result<()> {\n    std::fs::read_to_string(\"x\").map_err(|_| anyhow::anyhow!(\"failed\"))?;\n    Ok(())\n}\n",
             "slop-catch-all-anyhow-allowed",
             true,
         );
@@ -1268,7 +1351,7 @@ fn f(r: Result<i32, ()>) {
     #[test]
     fn boxed_dyn_error_is_still_flagged_when_anyhow_allowed_at_boundary() {
         let findings = findings_for_with_config(
-            "pub fn f() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n",
+            "pub fn f() -> Result<(), Box<dyn std::error::Error>> {\n    std::fs::read_to_string(\"x\").map_err(|_| \"failed\".into())?;\n    Ok(())\n}\n",
             "slop-catch-all-boxed-allowed",
             true,
         );
@@ -1288,7 +1371,7 @@ fn f(r: Result<i32, ()>) {
     #[test]
     fn catch_all_error_inside_cfg_gated_pub_fn_still_flagged() {
         let findings = findings_for(
-            "#[cfg(feature = \"not-enabled-by-default\")]\npub fn f() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n",
+            "#[cfg(feature = \"not-enabled-by-default\")]\npub fn f() -> Result<(), Box<dyn std::error::Error>> {\n    std::fs::read_to_string(\"x\").map_err(|_| \"failed\".into())?;\n    Ok(())\n}\n",
             "slop-catch-all-error-cfg-gated",
         );
         let hits = rule_findings(&findings, CATCH_ALL_ERROR_RULE);
