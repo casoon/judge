@@ -989,6 +989,21 @@ mod tests {
         assert_eq!(rule_findings(&findings, UNSAFE_SURFACE_RULE).len(), 1);
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn unsafe_surface_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNSAFE_SURFACE_RULE)
+            .expect("unsafe-surface has a registry entry")
+            .example
+            .expect("unsafe-surface has a curated example")
+            .before;
+        let findings = findings_for(example, "unsafe-surface-registry-example");
+        assert_eq!(rule_findings(&findings, UNSAFE_SURFACE_RULE).len(), 1);
+    }
+
     #[test]
     fn cast_to_narrow_int_type_is_flagged() {
         let findings = findings_for(
@@ -1019,6 +1034,21 @@ mod tests {
             "security-cast-other",
         );
         assert!(rule_findings(&findings, INTEGER_CAST_RISK_RULE).is_empty());
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn integer_cast_risk_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(INTEGER_CAST_RISK_RULE)
+            .expect("integer-cast-risk has a registry entry")
+            .example
+            .expect("integer-cast-risk has a curated example")
+            .before;
+        let findings = findings_for(example, "integer-cast-risk-registry-example");
+        assert_eq!(rule_findings(&findings, INTEGER_CAST_RISK_RULE).len(), 1);
     }
 
     #[test]
