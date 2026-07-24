@@ -546,7 +546,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only an empty `Err(_)`/`Err(..)` match arm, or an `if let Err(_) = ... { }` with no `else`, is matched.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "fn send_notification(payload: &str) -> Result<(), String> {\n    match deliver(payload) {\n        Err(_) => {}\n        Ok(_) => {}\n    }\n    Ok(())\n}\nfn deliver(_payload: &str) -> Result<(), String> {\n    Ok(())\n}\n",
+            why_it_matters: "Swallowing an error in an empty match arm hides a failed delivery from every caller — a failed send looks identical to a successful one until a user notices something never arrived.",
+        }),
     },
     RuleMetadata {
         id: "catch-all-error",
@@ -555,7 +558,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only `pub fn` boundaries whose error type is erased (`Box<dyn Error>` / `anyhow::Error`) are matched; internal (non-`pub`) error erasure is out of scope.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn load_settings(path: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {\n    let raw = std::fs::read_to_string(path)?;\n    Ok(raw)\n}\n",
+            why_it_matters: "Erasing the error type at a public boundary forces every caller to match on a string or downcast blindly instead of handling specific, known failure modes.",
+        }),
     },
     RuleMetadata {
         id: "suppression-debt",
@@ -564,7 +570,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Counts `#[allow(...)]`/`#[expect(...)]` attribute occurrences; does not judge whether any individual suppression is justified.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "#[allow(clippy::too_many_arguments)]\nfn build_report(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32) -> i32 {\n    a + b + c + d + e + f + g\n}\n",
+            why_it_matters: "Each suppressed lint is a small, permanent exception to the project's own quality bar that nobody revisits once the deadline pressure that created it has passed.",
+        }),
     },
     RuleMetadata {
         id: "merged-stub",
@@ -573,7 +582,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only bare `todo!()`/`unimplemented!()` outside a `#[cfg(feature = ...)]`-gated scope; feature-gated stubs are excluded by design.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "fn export_report(_format: &str) -> Vec<u8> {\n    todo!()\n}\n",
+            why_it_matters: "A `todo!()` left in merged code compiles cleanly and looks finished, but panics the moment a caller actually exercises that path in production.",
+        }),
     },
     RuleMetadata {
         id: "empty-impl",
@@ -582,7 +594,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only a function/method/trait-default with a doc comment and a literally empty body is matched; an empty body without a doc comment is not flagged.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "/// Sends the confirmation email to the customer.\nfn send_confirmation_email(_customer_id: u64) {}\n",
+            why_it_matters: "A doc comment describing behavior on a function whose body is empty is a promise the code doesn't keep — anything calling it silently does nothing.",
+        }),
     },
     RuleMetadata {
         id: "assertion-free-test",
@@ -591,7 +606,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only the literal `#[test]` attribute (without `#[should_panic]`) is matched, not third-party test-framework attributes (`#[tokio::test]`, `#[rstest]`, ...). Syntactically assertion-free does not mean the test is ineffective — macros, propagated return errors, and helper functions can still exercise behavior.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "#[test]\nfn loads_default_config() {\n    let _config = Config::default();\n}\n",
+            why_it_matters: "A test with no assertion always passes regardless of whether the code under test actually works — it only proves the function didn't panic.",
+        }),
     },
     RuleMetadata {
         id: "tautological-test",
@@ -600,7 +618,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only the literal `assert!(true)` / `assert_eq!(x, x)` shapes are matched.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "#[test]\nfn retry_count_matches_itself() {\n    let retry_count = 3;\n    assert_eq!(retry_count, retry_count);\n}\n",
+            why_it_matters: "`assert_eq!(x, x)` can never fail, so the test provides zero regression protection while still counting toward the suite's confidence and coverage numbers.",
+        }),
     },
     RuleMetadata {
         id: "ignored-test-accumulation",
@@ -609,7 +630,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only the literal `#[ignore]`/`#[ignore = \"...\"]` attribute is matched, not third-party test-framework equivalents.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "#[test]\n#[ignore = \"flaky in CI\"]\nfn retries_on_timeout() {\n    assert_eq!(1 + 1, 2);\n}\n",
+            why_it_matters: "An ignored test stops running in CI but keeps looking like coverage in the test count, hiding the fact that its behavior is no longer actually checked.",
+        }),
     },
     RuleMetadata {
         id: "conversational-artifact",
@@ -618,7 +642,14 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`, since `syn` discards non-doc comments entirely); `///`/`//!` doc comments are out of scope for this rule.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        // The trigger phrase ("as an AI") lives inside a Rust string literal
+        // here, not a real `//` comment in this file — judge's own raw-text
+        // comment scanner only sees actual `//`/`/* */` tokens, so this
+        // literal cannot self-trigger the rule against rule_registry.rs.
+        example: Some(RuleExample {
+            before: "fn validate_payload(payload: &str) -> bool {\n    // As an AI, I can't verify external formats, so this only checks length.\n    !payload.is_empty()\n}\n",
+            why_it_matters: "A stray AI-assistant disclaimer left in a comment signals the code was pasted from a chat session without review, and means nothing to the next engineer maintaining it.",
+        }),
     },
     RuleMetadata {
         id: "restating-comment",
@@ -627,7 +658,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`); `///`/`//!` doc comments are out of scope for this rule (see `doc-restates-signature`).",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "struct Wallet {\n    wallet_balance_field: i64,\n}\nimpl Wallet {\n    fn deposit(&mut self, given_amount: i64) {\n        // update the wallet balance field to the given amount\n        self.wallet_balance_field = given_amount;\n    }\n}\n",
+            why_it_matters: "A comment that only restates the line below it in English adds reading time without adding information, and goes stale the moment the code changes since nothing forces it to update.",
+        }),
     },
     RuleMetadata {
         id: "step-comment-inflation",
@@ -636,7 +670,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`); requires a chain of three or more `// Step N:`-shaped comments.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "fn process_order(order_id: u64) {\n    // Step 1: validate the order\n    let is_valid = validate(order_id);\n    // Step 2: charge the payment\n    let charged = charge(order_id);\n    // Step 3: send the confirmation\n    notify(order_id);\n}\nfn validate(_order_id: u64) -> bool {\n    true\n}\nfn charge(_order_id: u64) -> bool {\n    true\n}\nfn notify(_order_id: u64) {}\n",
+            why_it_matters: "A `// Step N:` comment for each line restates the control flow the code already makes obvious, and the whole chain has to be renumbered by hand every time a step is added, removed, or reordered.",
+        }),
     },
     RuleMetadata {
         id: "generic-naming",
@@ -645,7 +682,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only an identifier that is exactly a fixed placeholder word (`data`, `temp`, `handler`, ...) is flagged; a poorly named identifier outside that list is not.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn processor(input: &str) -> String {\n    input.to_uppercase()\n}\n",
+            why_it_matters: "A public function named after its category rather than what it actually does forces every caller to open the implementation just to learn what it's for.",
+        }),
     },
     RuleMetadata {
         id: "doc-restates-signature",
@@ -654,7 +694,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only a doc comment that is a pure signature echo is flagged; a doc comment that adds any information beyond the signature is not.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "/// Returns the balance.\npub fn balance() -> f64 {\n    0.0\n}\n",
+            why_it_matters: "A doc comment that only repeats the function's own name and return type gives readers nothing they couldn't already infer from the signature, while looking documented in a coverage report.",
+        }),
     },
     // -- slop_structural.rs (G4, Fast Tier subset) ---------------------------
     RuleMetadata {

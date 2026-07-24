@@ -1895,4 +1895,163 @@ fn f(r: Result<i32, ()>) {
         );
         assert!(rule_findings(&findings, DOC_RESTATES_SIGNATURE_RULE).is_empty());
     }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn empty_error_arm_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(EMPTY_ERROR_ARM_RULE)
+            .expect("empty-error-arm has a registry entry")
+            .example
+            .expect("empty-error-arm has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-empty-error-arm-registry-example");
+        assert_eq!(rule_findings(&findings, EMPTY_ERROR_ARM_RULE).len(), 1);
+    }
+
+    #[test]
+    fn catch_all_error_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(CATCH_ALL_ERROR_RULE)
+            .expect("catch-all-error has a registry entry")
+            .example
+            .expect("catch-all-error has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-catch-all-error-registry-example");
+        assert_eq!(rule_findings(&findings, CATCH_ALL_ERROR_RULE).len(), 1);
+    }
+
+    #[test]
+    fn suppression_debt_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(SUPPRESSION_DEBT_RULE)
+            .expect("suppression-debt has a registry entry")
+            .example
+            .expect("suppression-debt has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-suppression-debt-registry-example");
+        assert_eq!(rule_findings(&findings, SUPPRESSION_DEBT_RULE).len(), 1);
+    }
+
+    #[test]
+    fn merged_stub_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(MERGED_STUB_RULE)
+            .expect("merged-stub has a registry entry")
+            .example
+            .expect("merged-stub has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-merged-stub-registry-example");
+        assert_eq!(rule_findings(&findings, MERGED_STUB_RULE).len(), 1);
+    }
+
+    #[test]
+    fn empty_impl_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(EMPTY_IMPL_RULE)
+            .expect("empty-impl has a registry entry")
+            .example
+            .expect("empty-impl has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-empty-impl-registry-example");
+        assert_eq!(rule_findings(&findings, EMPTY_IMPL_RULE).len(), 1);
+    }
+
+    #[test]
+    fn assertion_free_test_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(ASSERTION_FREE_TEST_RULE)
+            .expect("assertion-free-test has a registry entry")
+            .example
+            .expect("assertion-free-test has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-assertion-free-test-registry-example");
+        assert_eq!(rule_findings(&findings, ASSERTION_FREE_TEST_RULE).len(), 1);
+    }
+
+    #[test]
+    fn tautological_test_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(TAUTOLOGICAL_TEST_RULE)
+            .expect("tautological-test has a registry entry")
+            .example
+            .expect("tautological-test has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-tautological-test-registry-example");
+        assert_eq!(rule_findings(&findings, TAUTOLOGICAL_TEST_RULE).len(), 1);
+    }
+
+    #[test]
+    fn ignored_test_accumulation_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(IGNORED_TEST_ACCUMULATION_RULE)
+            .expect("ignored-test-accumulation has a registry entry")
+            .example
+            .expect("ignored-test-accumulation has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-ignored-test-accumulation-registry-example");
+        assert_eq!(
+            rule_findings(&findings, IGNORED_TEST_ACCUMULATION_RULE).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn conversational_artifact_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(CONVERSATIONAL_ARTIFACT_RULE)
+            .expect("conversational-artifact has a registry entry")
+            .example
+            .expect("conversational-artifact has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-conversational-artifact-registry-example");
+        assert_eq!(
+            rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn restating_comment_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(RESTATING_COMMENT_RULE)
+            .expect("restating-comment has a registry entry")
+            .example
+            .expect("restating-comment has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-restating-comment-registry-example");
+        assert_eq!(rule_findings(&findings, RESTATING_COMMENT_RULE).len(), 1);
+    }
+
+    #[test]
+    fn step_comment_inflation_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(STEP_COMMENT_INFLATION_RULE)
+            .expect("step-comment-inflation has a registry entry")
+            .example
+            .expect("step-comment-inflation has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-step-comment-inflation-registry-example");
+        assert_eq!(
+            rule_findings(&findings, STEP_COMMENT_INFLATION_RULE).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn generic_naming_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(GENERIC_NAMING_RULE)
+            .expect("generic-naming has a registry entry")
+            .example
+            .expect("generic-naming has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-generic-naming-registry-example");
+        assert_eq!(rule_findings(&findings, GENERIC_NAMING_RULE).len(), 1);
+    }
+
+    #[test]
+    fn doc_restates_signature_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DOC_RESTATES_SIGNATURE_RULE)
+            .expect("doc-restates-signature has a registry entry")
+            .example
+            .expect("doc-restates-signature has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-doc-restates-signature-registry-example");
+        assert_eq!(
+            rule_findings(&findings, DOC_RESTATES_SIGNATURE_RULE).len(),
+            1
+        );
+    }
 }
