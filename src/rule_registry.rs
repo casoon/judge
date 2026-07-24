@@ -1153,7 +1153,9 @@ pub fn lookup(rule_id: &str) -> Option<&'static RuleMetadata> {
 /// single self-contained snippet genuinely cannot trigger it (needs
 /// `judge.toml` config, real git commit history, a network-backed
 /// crates.io lookup's own resolved-graph shape, an externally imported
-/// report, or an expensive full-workspace compile).
+/// report, or an expensive full-workspace compile). Only ever read from the
+/// completeness tests below, hence `#[cfg(test)]`.
+#[cfg(test)]
 const NO_EXAMPLE_YET: &[(&str, &str)] = &[
     (
         "crate-boundary-violation",
