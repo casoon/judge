@@ -1047,6 +1047,21 @@ mod tests {
         assert_eq!(hits[0].evidence.as_ref().unwrap()["kind"], "unwrap");
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn panic_in_lib_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(PANIC_IN_LIB_RULE)
+            .expect("panic-in-lib has a registry entry")
+            .example
+            .expect("panic-in-lib has a curated example")
+            .before;
+        let findings = findings_for(example, "security-panic-in-lib-registry-example");
+        assert_eq!(rule_findings(&findings, PANIC_IN_LIB_RULE).len(), 1);
+    }
+
     #[test]
     fn expect_in_a_pub_fn_is_flagged() {
         let findings = findings_for(
@@ -1227,6 +1242,23 @@ mod tests {
         let evidence = hits[0].evidence.as_ref().unwrap();
         assert_eq!(evidence["kind"], "high_entropy_assignment");
         assert!(evidence.get("pattern").is_none());
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags. The registry entry
+    /// deliberately uses the entropy lane, not a real provider key shape —
+    /// see the comment at that call site.
+    #[test]
+    fn hardcoded_secret_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(HARDCODED_SECRET_RULE)
+            .expect("hardcoded-secret has a registry entry")
+            .example
+            .expect("hardcoded-secret has a curated example")
+            .before;
+        let findings = findings_for(example, "security-secret-registry-example");
+        assert_eq!(rule_findings(&findings, HARDCODED_SECRET_RULE).len(), 1);
     }
 
     #[test]

@@ -3330,6 +3330,12 @@ fn run_explain_rule(
 
     match format {
         OutputFormat::Json => {
+            let example = entry.example.map(|example| {
+                serde_json::json!({
+                    "before": example.before,
+                    "why_it_matters": example.why_it_matters,
+                })
+            });
             let json = serde_json::json!({
                 "id": entry.id,
                 "evidence_class": entry.evidence_class,
@@ -3337,6 +3343,7 @@ fn run_explain_rule(
                 "preconditions": entry.preconditions,
                 "exclusions": entry.exclusions,
                 "allowed_wording": entry.allowed_wording,
+                "example": example,
             });
             writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
         }
@@ -3355,6 +3362,13 @@ fn run_explain_rule(
             writeln!(out, "  preconditions: {}", entry.preconditions)?;
             writeln!(out, "  exclusions: {}", entry.exclusions)?;
             writeln!(out, "  allowed wording: {}", entry.allowed_wording)?;
+            if let Some(example) = entry.example {
+                writeln!(out, "  example:")?;
+                for line in example.before.lines() {
+                    writeln!(out, "    {line}")?;
+                }
+                writeln!(out, "  why it matters: {}", example.why_it_matters)?;
+            }
         }
     }
     Ok(CommandOutcome::Clean)
@@ -5439,6 +5453,61 @@ fn dup_two(x: i32) -> i32 {
                 .unwrap_or_default()
                 .is_empty()
         );
+    }
+
+    /// (c) A rule id with a curated registry example renders it in both TTY
+    /// and JSON; a rule id without one (`catch-all-error`, above) omits the
+    /// section/field entirely rather than printing an empty placeholder.
+    #[test]
+    fn explain_rule_with_a_curated_example_renders_it_in_tty_and_json() {
+        let mut tty_out = Vec::new();
+        run(
+            cli_with(Command::ExplainRule(ExplainRuleOptions {
+                id: "swallowed-result".to_string(),
+                format: OutputFormat::Tty,
+            })),
+            &mut tty_out,
+        )
+        .expect("known rule id must not error");
+        let tty_text = String::from_utf8(tty_out).unwrap();
+        assert!(tty_text.contains("  example:"), "{tty_text}");
+        assert!(tty_text.contains("let _ ="), "{tty_text}");
+        assert!(tty_text.contains("why it matters:"), "{tty_text}");
+
+        let mut json_out = Vec::new();
+        run(
+            cli_with(Command::ExplainRule(ExplainRuleOptions {
+                id: "swallowed-result".to_string(),
+                format: OutputFormat::Json,
+            })),
+            &mut json_out,
+        )
+        .expect("known rule id must not error");
+        let json: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+        assert!(
+            json["example"]["before"]
+                .as_str()
+                .unwrap()
+                .contains("let _ =")
+        );
+        assert!(
+            !json["example"]["why_it_matters"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut no_example_out = Vec::new();
+        run(
+            cli_with(Command::ExplainRule(ExplainRuleOptions {
+                id: "catch-all-error".to_string(),
+                format: OutputFormat::Json,
+            })),
+            &mut no_example_out,
+        )
+        .expect("known rule id must not error");
+        let json: serde_json::Value = serde_json::from_slice(&no_example_out).unwrap();
+        assert!(json["example"].is_null());
     }
 
     /// (b) An unknown rule id is a usage error (exit 2), not a findings

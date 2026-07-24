@@ -1065,6 +1065,21 @@ mod tests {
         assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn swallowed_result_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(SWALLOWED_RESULT_RULE)
+            .expect("swallowed-result has a registry entry")
+            .example
+            .expect("swallowed-result has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-swallowed-result-registry-example");
+        assert_eq!(rule_findings(&findings, SWALLOWED_RESULT_RULE).len(), 1);
+    }
+
     #[test]
     fn let_bound_to_a_real_name_is_not_flagged() {
         let findings = findings_for(
