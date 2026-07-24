@@ -272,6 +272,18 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
             why_it_matters: "A `pub` function reachable only from the crate's own tests isn't really part of the public API — keeping it `pub` invites outside code to depend on something that was only ever meant for internal test setup.",
         }),
     },
+    RuleMetadata {
+        id: "unreachable-from-entry",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier). Scoped to non-`pub` items only (private, `pub(crate)`, `pub(super)`, `pub(in path)`) — a `pub` item is checked by `unused-pub-workspace`/`unused-pub-api`/`test-only-pub` instead, never by this rule.",
+        exclusions: "Scoped to non-`pub` items only, so it never runs `check_item`'s cross-crate reference check at all — a non-`pub` item can never be referenced from another crate by Rust's own visibility rules, so that check would be vacuously false here; only entry-point reachability is checked. Inherits every entry-point-detection limitation `crate::reachability`'s module docs describe: a workspace-internal crate's own `pub` API is not itself an automatic root, and registration macros (`inventory::submit!`, `linkme::distributed_slice`, `ctor`, …) are not recognized as entry points at all. Unlike `crate::slop_structural_deep`'s fan-in check, does not exclude trait-impl methods (`FunctionSite::in_trait_impl`) — that exclusion exists there because its literal-reference search can't see calls through operator/macro sugar, but this rule's `incoming_calls`-based call-hierarchy BFS does resolve calls through trait dispatch.",
+        allowed_wording: "State as 'not reachable from any recognized entry point in the examined reachability view' — never as 'unused' or 'dead' outright or as clearance for deletion; usage the analysis can't see (e.g. through an unresolved macro expansion or a registration macro) is not_inferable (todo.md §17.3, §17.4).",
+        verdict_effect: VerdictEffect::Gating,
+        example: Some(RuleExample {
+            before: "fn recalculate_shipping_estimate(distance_km: f64) -> f64 {\n    distance_km * 0.4\n}\n",
+            why_it_matters: "A private function with no caller anywhere in the analyzed reachability view still has to be read, understood, and kept compiling through every future refactor — and unlike a `pub` item, it can't be excused as future external API judge simply can't see.",
+        }),
+    },
     // -- dep_graph.rs -----------------------------------------------------
     RuleMetadata {
         id: "duplicate-crate-versions",
@@ -1398,6 +1410,7 @@ mod tests {
             crate::dead_code::UNUSED_PUB_API_RULE,
             crate::dead_code::DEAD_ENUM_VARIANT_RULE,
             crate::dead_code::TEST_ONLY_PUB_RULE,
+            crate::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
             crate::api_surface_deep::INTERNAL_LEAK_RULE,

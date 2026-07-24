@@ -3654,6 +3654,10 @@ fn run_dead_code_deep(
                 judge::dead_code::TEST_ONLY_PUB_RULE_REVISION,
             ),
             (
+                judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE.to_string(),
+                judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE_REVISION,
+            ),
+            (
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE.to_string(),
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE_REVISION,
             ),
@@ -3726,6 +3730,7 @@ fn run_dead_code_deep(
                 judge::dead_code::UNUSED_PUB_API_RULE,
                 judge::dead_code::DEAD_ENUM_VARIANT_RULE,
                 judge::dead_code::TEST_ONLY_PUB_RULE,
+                judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             ] {

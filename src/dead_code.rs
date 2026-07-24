@@ -7,7 +7,11 @@
 //! top-level structs/enums/traits/consts/statics plus associated
 //! consts/types inside impls ([`walk_type_items`], below); `dead-enum-variant`
 //! for individual enum variants ([`walk_enum_variants`]); `test-only-pub` for
-//! the same items `unused-pub-workspace`/`unused-pub-api` check.
+//! the same items `unused-pub-workspace`/`unused-pub-api` check;
+//! `unreachable-from-entry` for the same [`walk_functions`]/[`walk_type_items`]
+//! items but scoped to non-`pub` visibility instead — `pub` items stay
+//! `unused-pub-workspace`/`unused-pub-api`/`test-only-pub`'s territory (see
+//! [`UNREACHABLE_FROM_ENTRY_RULE`]).
 //!
 //! **Simplification, documented rather than hidden:** every workspace crate
 //! is treated as workspace-internal for `dead-enum-variant` and
@@ -72,6 +76,34 @@ pub const TEST_ONLY_PUB_RULE: &str = "test-only-pub";
 /// Bump when the test-only-pub rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
 pub const TEST_ONLY_PUB_RULE_REVISION: u32 = 1;
+
+/// A non-`pub` item (private, `pub(crate)`, `pub(super)`, `pub(in path)`)
+/// with no path from any recognized entry point in the examined
+/// reachability view (see [`check_unreachable_from_entry`]) — todo.md §3.A's
+/// standalone rule, closing the gap where
+/// [`crate::reachability::is_reachable_from_entry`]'s reverse-BFS previously
+/// only backed `--why-live`'s path search, with no Finding-producing rule of
+/// its own.
+///
+/// Deliberately scoped to non-`pub` items only: a `pub` item's
+/// unreachability is already fully owned by `unused-pub-workspace`/
+/// `unused-pub-api`/`test-only-pub` above — this rule does not duplicate
+/// their cross-crate reference check ([`check_item`]'s `used_externally`) at
+/// all, since a non-`pub` item cannot be referenced from another crate by
+/// Rust's own visibility rules; that check would be vacuously false here.
+/// Unlike [`crate::slop_structural_deep`]'s fan-in check, this does *not*
+/// exclude trait-impl methods (`FunctionSite::in_trait_impl`): that
+/// exclusion exists there because its literal-reference search
+/// ([`crate::deep::referencing_files`]) can't see calls through
+/// operator/macro sugar, but [`crate::reachability::is_reachable_from_entry`]
+/// walks `incoming_calls`, rust-analyzer's semantic call hierarchy, which
+/// does resolve calls through trait dispatch (see
+/// `crate::reachability::classify_call_kind`'s `Dynamic`/`Static`
+/// distinction) — the same blind spot doesn't apply here.
+pub const UNREACHABLE_FROM_ENTRY_RULE: &str = "unreachable-from-entry";
+/// Bump when the unreachable-from-entry rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const UNREACHABLE_FROM_ENTRY_RULE_REVISION: u32 = 1;
 
 #[derive(Debug)]
 pub enum DeadCodeError {
@@ -842,6 +874,80 @@ fn check_test_only_pub(
     });
 }
 
+/// `check_unreachable_from_entry`'s `reason` text (see
+/// [`UNREACHABLE_FROM_ENTRY_RULE`]) — matches `unused-pub-workspace`'s "no
+/// reference found"-style wording pattern, adapted for a reachability-only
+/// claim since this rule never checks cross-crate references at all.
+const UNREACHABLE_FROM_ENTRY_REASON: &str = "not reachable from any recognized entry point \
+    (fn main in a [[bin]] or [[example]] target, a #[test]/#[bench] function, or an \
+    FFI/wasm-bindgen export) in the examined reachability view";
+
+/// Checks one non-`pub` item for `unreachable-from-entry`: no cross-crate
+/// reference check at all — see [`UNREACHABLE_FROM_ENTRY_RULE`]'s doc
+/// comment for why that's sound for a non-`pub` item — just
+/// [`crate::reachability::is_reachable_from_entry`] directly, the same
+/// entry-point BFS [`check_item`] itself calls once its own cross-crate
+/// check clears.
+#[allow(clippy::too_many_arguments)]
+fn check_unreachable_from_entry(
+    analysis: &ra_ap_ide::Analysis,
+    entry_keys: &std::collections::HashSet<(FileId, u32)>,
+    proc_macro_exposed: &HashSet<String>,
+    file: &SourceFile,
+    file_id: FileId,
+    krate_name: &str,
+    qualified_name: &str,
+    offset: u32,
+    line: usize,
+    include_tests: bool,
+    report: &mut WorkspaceDeadCode,
+) {
+    report.checked += 1;
+    let position = ra_ap_ide::FilePosition {
+        file_id,
+        offset: offset.into(),
+    };
+
+    match crate::reachability::is_reachable_from_entry(
+        analysis,
+        entry_keys,
+        position,
+        include_tests,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            let mut evidence = serde_json::json!({
+                "tier": "deep",
+                "root_set_size": entry_keys.len(),
+                "reason": UNREACHABLE_FROM_ENTRY_REASON,
+            });
+            if proc_macro_exposed.contains(krate_name) {
+                evidence["limitations"] = serde_json::json!(["proc_macro_expansion_disabled"]);
+            }
+            report.findings.push(Finding {
+                id: format!(
+                    "{UNREACHABLE_FROM_ENTRY_RULE}:{}:{qualified_name}",
+                    file.path.display()
+                )
+                .into(),
+                rule: UNREACHABLE_FROM_ENTRY_RULE.into(),
+                severity: Severity::Warn,
+                location: Location {
+                    file: file.path.clone(),
+                    line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
+                    item_path: qualified_name.to_string(),
+                },
+                evidence_class: EvidenceClass::BoundedSemantic,
+                origin: Origin::Code,
+                evidence: Some(evidence),
+                caused_by: Vec::new(),
+                causes: Vec::new(),
+            });
+        }
+        Err(err) => report.errors.push(reachability_error(err)),
+    }
+}
+
 /// Finds `pub` functions/methods referenced only from their own defining
 /// crate — or not at all — never from another workspace crate. This is
 /// `unused-pub-workspace`, todo.md §3.A's "Kernregel": exposing something as
@@ -957,53 +1063,105 @@ pub fn analyze_workspace(
             };
 
             walk_functions(&ast, |site| {
-                let Some(syn::Visibility::Public(_)) = site.vis else {
-                    return;
-                };
                 let offset = site.ident_span.byte_range().start as u32;
                 let line = site.ident_span.start().line;
-                check_item(
-                    &analysis,
-                    &crate_of_file,
-                    entry_keys,
-                    &proc_macro_exposed,
-                    file,
-                    file_id,
-                    &krate.name,
-                    &site.qualified_name,
-                    offset,
-                    line,
-                    include_tests,
-                    rule_id,
-                    severity,
-                    evidence_class,
-                    reason,
-                    &mut report,
-                );
-                check_test_only_pub(
-                    &analysis,
-                    &crate_of_file,
-                    &entry_keys_production,
-                    &entry_keys_all,
-                    file,
-                    file_id,
-                    &krate.name,
-                    &site.qualified_name,
-                    offset,
-                    line,
-                    &mut report,
-                );
+                if let Some(syn::Visibility::Public(_)) = site.vis {
+                    check_item(
+                        &analysis,
+                        &crate_of_file,
+                        entry_keys,
+                        &proc_macro_exposed,
+                        file,
+                        file_id,
+                        &krate.name,
+                        &site.qualified_name,
+                        offset,
+                        line,
+                        include_tests,
+                        rule_id,
+                        severity,
+                        evidence_class,
+                        reason,
+                        &mut report,
+                    );
+                    check_test_only_pub(
+                        &analysis,
+                        &crate_of_file,
+                        &entry_keys_production,
+                        &entry_keys_all,
+                        file,
+                        file_id,
+                        &krate.name,
+                        &site.qualified_name,
+                        offset,
+                        line,
+                        &mut report,
+                    );
+                    return;
+                }
+                // `site.vis == None` is a trait's default method, which has
+                // no visibility of its own (see `FunctionSite::vis`'s doc
+                // comment) — ambiguous whether it belongs on the `pub` or
+                // non-`pub` side of this split, so it's left unchecked by
+                // both, same as today.
+                if let Some(syn::Visibility::Inherited | syn::Visibility::Restricted(_)) =
+                    site.vis
+                {
+                    check_unreachable_from_entry(
+                        &analysis,
+                        entry_keys,
+                        &proc_macro_exposed,
+                        file,
+                        file_id,
+                        &krate.name,
+                        &site.qualified_name,
+                        offset,
+                        line,
+                        include_tests,
+                        &mut report,
+                    );
+                }
             });
 
             walk_type_items(&ast, |site| {
-                if !matches!(site.vis, syn::Visibility::Public(_)) {
-                    return;
-                }
                 let offset = site.ident_span.byte_range().start as u32;
                 let line = site.ident_span.start().line;
-                check_item(
+                if matches!(site.vis, syn::Visibility::Public(_)) {
+                    check_item(
+                        &analysis,
+                        &crate_of_file,
+                        entry_keys,
+                        &proc_macro_exposed,
+                        file,
+                        file_id,
+                        &krate.name,
+                        &site.qualified_name,
+                        offset,
+                        line,
+                        include_tests,
+                        rule_id,
+                        severity,
+                        evidence_class,
+                        reason,
+                        &mut report,
+                    );
+                    check_test_only_pub(
+                        &analysis,
+                        &crate_of_file,
+                        &entry_keys_production,
+                        &entry_keys_all,
+                        file,
+                        file_id,
+                        &krate.name,
+                        &site.qualified_name,
+                        offset,
+                        line,
+                        &mut report,
+                    );
+                    return;
+                }
+                check_unreachable_from_entry(
                     &analysis,
-                    &crate_of_file,
                     entry_keys,
                     &proc_macro_exposed,
                     file,
@@ -1013,23 +1171,6 @@ pub fn analyze_workspace(
                     offset,
                     line,
                     include_tests,
-                    rule_id,
-                    severity,
-                    evidence_class,
-                    reason,
-                    &mut report,
-                );
-                check_test_only_pub(
-                    &analysis,
-                    &crate_of_file,
-                    &entry_keys_production,
-                    &entry_keys_all,
-                    file,
-                    file_id,
-                    &krate.name,
-                    &site.qualified_name,
-                    offset,
-                    line,
                     &mut report,
                 );
             });
@@ -1164,7 +1305,11 @@ pub fn never_called() -> i32 {
     }
 
     #[test]
-    fn does_not_flag_a_completely_unused_private_fn() {
+    fn a_completely_unused_private_fn_is_flagged_unreachable_from_entry() {
+        // Before `unreachable-from-entry` existed, `check_item`'s `pub`-only
+        // filter meant a non-`pub` item was never queried at all (see
+        // `UNREACHABLE_FROM_ENTRY_RULE`'s doc comment for why that's now a
+        // separate rule rather than widening `check_item`'s own scope).
         let dir = TempDir::new("dead-code-private-fn");
         let workspace = load_single_crate_workspace(
             &dir,
@@ -1176,8 +1321,160 @@ pub fn never_called() -> i32 {
 
         let report = analyze_workspace(&workspace, true).unwrap();
 
-        assert!(report.findings.is_empty());
-        assert_eq!(report.checked, 0);
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        let finding = &report.findings[0];
+        assert_eq!(finding.rule, UNREACHABLE_FROM_ENTRY_RULE);
+        assert_eq!(finding.severity, Severity::Warn);
+        assert_eq!(finding.evidence_class, EvidenceClass::BoundedSemantic);
+        assert_eq!(finding.location.item_path, "private_and_unused");
+
+        let evidence = finding.evidence.as_ref().expect("evidence must be present");
+        assert_eq!(evidence["tier"], "deep");
+        assert!(evidence["reason"].is_string());
+    }
+
+    #[test]
+    fn a_private_fn_called_from_main_is_not_flagged_unreachable_from_entry() {
+        let dir = TempDir::new("dead-code-private-fn-reachable-from-main");
+        std::fs::create_dir_all(dir.join("src/bin")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            r#"
+[package]
+name = "dead-code-fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            r#"fn private_helper() -> i32 {
+    1
+}
+
+pub fn call_helper() -> i32 {
+    private_helper()
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src/bin/tool.rs"),
+            r#"fn main() {
+    dead_code_fixture::call_helper();
+}
+"#,
+        )
+        .unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.location.item_path == "private_helper"),
+            "private_helper is transitively reachable from main via call_helper — must not be \
+             flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_private_fn_called_from_a_test_is_not_flagged_unreachable_from_entry() {
+        let dir = TempDir::new("dead-code-private-fn-reachable-from-test");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"fn private_helper() -> i32 {
+    1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_test() {
+        assert_eq!(private_helper(), 1);
+    }
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.location.item_path == "private_helper"),
+            "private_helper is reachable from the #[test] fn a_test — must not be flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_test_fn_itself_is_not_flagged_unreachable_from_entry() {
+        let dir = TempDir::new("dead-code-test-fn-itself");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_test() {
+        assert_eq!(1, 1);
+    }
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(report.checked, 1, "a_test itself must still be queried");
+        assert!(
+            report.findings.is_empty(),
+            "a_test is itself a recognized entry point — it is trivially reachable from itself, \
+             not \"unreachable from entry\": {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_pub_item_genuinely_unreachable_is_not_flagged_unreachable_from_entry() {
+        // The non-overlap this rule promises: a `pub` item's unreachability
+        // stays `unused-pub-workspace`/`unused-pub-api`/`test-only-pub`'s
+        // territory (see `UNREACHABLE_FROM_ENTRY_RULE`'s doc comment).
+        let dir = TempDir::new("dead-code-pub-item-not-unreachable-from-entry");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            r#"pub fn never_called() -> i32 {
+    1
+}
+"#,
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        let rules: HashSet<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.location.item_path == "never_called")
+            .map(|f| f.rule.as_str())
+            .collect();
+        assert!(
+            !rules.contains(UNREACHABLE_FROM_ENTRY_RULE),
+            "a pub item's unreachability is unused-pub-workspace/unused-pub-api's territory, not \
+             unreachable-from-entry's: {:?}",
+            report.findings
+        );
+        assert!(
+            rules.contains(UNUSED_PUB_WORKSPACE_RULE) || rules.contains(UNUSED_PUB_API_RULE),
+            "control: never_called must still be flagged by the pub-item rule family: {:?}",
+            report.findings
+        );
     }
 
     #[test]
@@ -1348,14 +1645,19 @@ pub static DEAD_STATIC: i32 = 2;
     }
 
     #[test]
-    fn a_private_struct_is_not_checked() {
+    fn a_private_struct_never_referenced_is_flagged_unreachable_from_entry() {
+        // `check_item` itself still never checks a non-`pub` type item (see
+        // `walk_type_items`'s `Public`-only branch above) — this is now
+        // `unreachable-from-entry`'s territory instead of "unchecked".
         let dir = TempDir::new("dead-code-private-struct");
         let workspace = load_single_crate_workspace(&dir, "struct PrivateStruct;\n");
 
         let report = analyze_workspace(&workspace, true).unwrap();
 
-        assert!(report.findings.is_empty());
-        assert_eq!(report.checked, 0);
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].rule, UNREACHABLE_FROM_ENTRY_RULE);
+        assert_eq!(report.findings[0].location.item_path, "PrivateStruct");
     }
 
     #[test]
@@ -2422,6 +2724,34 @@ publish = false
                 .findings
                 .iter()
                 .filter(|f| f.rule == TEST_ONLY_PUB_RULE)
+                .count(),
+            1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// See `unused_pub_workspace_registry_example_still_triggers_the_rule`'s
+    /// doc comment.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn unreachable_from_entry_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNREACHABLE_FROM_ENTRY_RULE)
+            .expect("unreachable-from-entry has a registry entry")
+            .example
+            .expect("unreachable-from-entry has a curated example")
+            .before;
+
+        let dir = TempDir::new("dead-code-unreachable-from-entry-registry-example");
+        let workspace = load_single_crate_workspace(&dir, example);
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == UNREACHABLE_FROM_ENTRY_RULE)
                 .count(),
             1,
             "{:?}",

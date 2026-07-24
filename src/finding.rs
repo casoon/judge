@@ -133,6 +133,7 @@ pub enum Severity {
 /// | `feature-graph-cycle` | `derived_fact` (a cyclic implication chain within one crate's own, fully self-contained `[features]` table — no partial-view caveat, unlike `dependency-cycle`'s workspace-scoped crate graph — see [`crate::boundaries`] module docs "`feature-graph-cycle`") |
 /// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
 /// | `dead-enum-variant`, `test-only-pub` | `bounded_semantic` (Deep Tier; same "every workspace crate is workspace-internal" simplification as `unused-pub-workspace` — see `crate::dead_code` module docs) |
+/// | `unreachable-from-entry` | `bounded_semantic` (Deep Tier; entry-point reachability only, scoped to non-`pub` items — see `crate::dead_code`'s `UNREACHABLE_FROM_ENTRY_RULE` doc comment) |
 /// | `unused-pub-api` | `heuristic` (Deep Tier; a published crate's public surface is expected to have zero *internal* reference — see `crate::dead_code`'s `UNUSED_PUB_API_RULE` doc comment) |
 /// | `unlinked-file`, `orphan-module` | `bounded_semantic` (proven only within the crate's own resolved `mod` tree / the loaded workspace's cross-file reference scan — see `crate::module_graph`) |
 /// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::boundaries`] module docs "Module-level boundaries") |
@@ -229,7 +230,8 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "unlinked-file"
         | "orphan-module"
         | "dead-enum-variant"
-        | "test-only-pub" => EvidenceClass::BoundedSemantic,
+        | "test-only-pub"
+        | "unreachable-from-entry" => EvidenceClass::BoundedSemantic,
         "phantom-crate"
         | "phantom-version"
         | "fresh-low-reputation-dep"
