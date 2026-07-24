@@ -793,6 +793,89 @@ pub fn lookup(rule_id: &str) -> Option<&'static RuleMetadata> {
     RULE_REGISTRY.iter().find(|entry| entry.id == rule_id)
 }
 
+/// Rule ids with no curated `example` yet, and why — every entry in
+/// [`RULE_REGISTRY`] must either set `example: Some(_)` or be listed here
+/// with a documented reason (see the completeness test below). This is what
+/// keeps a curated example from being an optional afterthought that quietly
+/// never happens: a newly added rule id with neither an example nor an
+/// exemption fails `cargo test`. See
+/// `.claude/skills/curate-rule-example/SKILL.md` for how to add one, and add
+/// a new rule id here — with a real reason, not a placeholder — only when a
+/// single self-contained snippet genuinely cannot trigger it (needs
+/// `judge.toml` config, real git commit history, a network-backed
+/// crates.io lookup's own resolved-graph shape, an externally imported
+/// report, or an expensive full-workspace compile).
+const NO_EXAMPLE_YET: &[(&str, &str)] = &[
+    (
+        "crate-boundary-violation",
+        "needs a multi-crate workspace plus a judge.toml [[boundary]]/[layers] config, not a single source snippet",
+    ),
+    (
+        "dependency-cycle",
+        "needs a multi-crate workspace plus a judge.toml [[boundary]]/[layers] config",
+    ),
+    (
+        "change-coupling-signal",
+        "needs a judge.toml [layers] config plus real git co-change history across commits — not expressible as a single source snippet",
+    ),
+    (
+        "module-boundary-violation",
+        "needs a multi-crate workspace plus a judge.toml [[module_boundary]] config",
+    ),
+    (
+        "internal-leak",
+        "needs --features deep plus a judge.toml internal_crates config plus a multi-crate workspace",
+    ),
+    (
+        "module-boundary-violation-deep",
+        "needs --features deep plus a judge.toml [[module_boundary]] config",
+    ),
+    (
+        "untested-hotspot",
+        "needs an externally generated cargo-llvm-cov LCOV report import — judge never measures coverage itself",
+    ),
+    (
+        "unused-dependency",
+        "opt-in --check-rustc-lints; triggering it for real needs a full `cargo check --workspace --all-targets` compile, too expensive for an illustrative snippet",
+    ),
+    (
+        "hotspot",
+        "needs real git commit history (churn) — not expressible as a single source snippet",
+    ),
+    (
+        "low-bus-factor",
+        "needs real git commit history with at least 2 distinct authors",
+    ),
+    (
+        "ownership-fragmentation",
+        "needs real git blame history across at least 4 authors",
+    ),
+    (
+        "provenance-churn",
+        "needs real git commit history with trailers/metadata",
+    ),
+    (
+        "provenance-duplication-rate",
+        "needs real git commit history with trailers/metadata",
+    ),
+    (
+        "provenance-suppression-debt",
+        "needs real git commit history with trailers/metadata",
+    ),
+    (
+        "dep-added-by-agent",
+        "needs a real git commit (trailer-classified as agent-authored) that also changed Cargo.toml",
+    ),
+    (
+        "churn-hotspot",
+        "needs real git commit history (14-day window)",
+    ),
+    (
+        "legacy-freeze",
+        "needs real git commit history (12-month window)",
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,5 +1029,42 @@ mod tests {
     #[test]
     fn unknown_rule_id_does_not_resolve() {
         assert!(lookup("not-a-real-rule").is_none());
+    }
+
+    /// Every registry entry has a curated `example` or a documented
+    /// exemption in [`NO_EXAMPLE_YET`] — see that constant's doc comment.
+    /// This is the enforcement mechanism: a newly added rule with neither
+    /// fails here, so a curated example can't be silently forgotten.
+    #[test]
+    fn every_registry_entry_has_an_example_or_a_documented_exemption() {
+        for entry in RULE_REGISTRY {
+            if entry.example.is_none() {
+                assert!(
+                    NO_EXAMPLE_YET.iter().any(|(id, _)| *id == entry.id),
+                    "rule `{}` has no curated `example` and no documented exemption in \
+                     NO_EXAMPLE_YET — add a RuleExample (see \
+                     .claude/skills/curate-rule-example/SKILL.md) or add a reasoned \
+                     exemption entry",
+                    entry.id
+                );
+            }
+        }
+    }
+
+    /// Every [`NO_EXAMPLE_YET`] id is a real, still-exampleless registry
+    /// entry — a stale/misspelled exemption would silently stop being
+    /// checked, and a rule that later gains an example should have its
+    /// exemption removed, not left to accumulate.
+    #[test]
+    fn every_exemption_is_a_real_rule_id_still_missing_an_example() {
+        for (id, reason) in NO_EXAMPLE_YET {
+            assert!(!reason.is_empty(), "exemption `{id}` has an empty reason");
+            let entry =
+                lookup(id).unwrap_or_else(|| panic!("exemption `{id}` is not a real rule id"));
+            assert!(
+                entry.example.is_none(),
+                "rule `{id}` is listed in NO_EXAMPLE_YET but already has a curated example — remove the stale exemption"
+            );
+        }
     }
 }
