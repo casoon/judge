@@ -4664,8 +4664,14 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
             dir.join("src/lib.rs"),
-            "pub fn a() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
-             pub fn b() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
+            "pub fn a() -> Result<(), Box<dyn std::error::Error>> {\n\
+             \x20   std::fs::read_to_string(\"x\").map_err(|_| \"failed\".into())?;\n\
+             \x20   Ok(())\n\
+             }\n\
+             pub fn b() -> Result<(), Box<dyn std::error::Error>> {\n\
+             \x20   std::fs::read_to_string(\"y\").map_err(|_| \"failed\".into())?;\n\
+             \x20   Ok(())\n\
+             }\n\
              enum FixtureError { Bad }\n",
         )
         .unwrap();
@@ -4692,8 +4698,14 @@ mod tests {
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(
             dir.join("src/lib.rs"),
-            "pub fn a() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
-             pub fn b() -> Result<(), Box<dyn std::error::Error>> { Ok(()) }\n\
+            "pub fn a() -> Result<(), Box<dyn std::error::Error>> {\n\
+             \x20   std::fs::read_to_string(\"x\").map_err(|_| \"failed\".into())?;\n\
+             \x20   Ok(())\n\
+             }\n\
+             pub fn b() -> Result<(), Box<dyn std::error::Error>> {\n\
+             \x20   std::fs::read_to_string(\"y\").map_err(|_| \"failed\".into())?;\n\
+             \x20   Ok(())\n\
+             }\n\
              enum FixtureError { Bad }\n\
              pub fn set_a(threshold: u32) {}\n\
              pub fn set_b(threshold: u32) -> Result<(), String> {\n\
@@ -5500,7 +5512,7 @@ fn dup_two(x: i32) -> i32 {
         let mut no_example_out = Vec::new();
         run(
             cli_with(Command::ExplainRule(ExplainRuleOptions {
-                id: "catch-all-error".to_string(),
+                id: "crate-boundary-violation".to_string(),
                 format: OutputFormat::Json,
             })),
             &mut no_example_out,
