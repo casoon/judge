@@ -327,6 +327,22 @@ pub struct BoundaryConfig {
     pub provenance: ProvenanceConfig,
     #[serde(default)]
     pub rules: RulesConfig,
+    #[serde(default)]
+    pub feature_matrix: FeatureMatrixConfig,
+}
+
+/// The `judge.toml` `[feature_matrix]` table (see `crate::feature_matrix`,
+/// `feature-gated-dead-code`). Each inner list of `combinations` is one
+/// complete, explicit Cargo feature set to check reachability under — same
+/// "internal_crates empty means no analysis" precedent as
+/// [`BoundaryConfig::internal_crates`]: with `combinations` absent or empty
+/// (the default), `feature-gated-dead-code` performs no analysis at all and
+/// emits zero findings, never to be read as "no feature-gated dead code
+/// found" (todo.md §17 "Kein Raten von Projektabsicht").
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FeatureMatrixConfig {
+    #[serde(default)]
+    pub combinations: Vec<Vec<String>>,
 }
 
 /// The `judge.toml` `[rules.*]` tables — per-rule configuration, keyed by

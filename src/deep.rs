@@ -16,10 +16,11 @@ use std::path::{Path, PathBuf};
 
 use ra_ap_ide::{Analysis, AnalysisHost, FilePosition, FindAllRefsConfig, RaFixtureConfig};
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
-use ra_ap_project_model::{CargoConfig, CargoFeatures};
+use ra_ap_project_model::CargoConfig;
 use ra_ap_vfs::{AbsPathBuf, Vfs, VfsPath};
 
 pub use ra_ap_ide::FileId;
+pub use ra_ap_project_model::CargoFeatures;
 
 #[derive(Debug)]
 pub enum DeepError {
@@ -145,10 +146,25 @@ impl DeepContext {
     /// feature selection as "all", not "default" — see
     /// `AnalysisUniverse::deep`.
     pub fn load(workspace_root: &Path) -> Result<Self, DeepError> {
+        Self::load_with_features(workspace_root, CargoFeatures::All)
+    }
+
+    /// Same as [`load`](Self::load), but with an explicit Cargo feature
+    /// selection instead of the `--all-features`-equivalent `CargoFeatures::All`.
+    /// Used by [`crate::feature_matrix`]'s `feature-gated-dead-code`, which
+    /// needs one fresh, fully re-loaded workspace per user-configured feature
+    /// combination rather than every feature active at once — every other
+    /// fidelity trade-off documented on `load` above (no proc-macro
+    /// expansion, no build-script execution, real `sysroot`, `set_test:
+    /// true`) applies here unchanged.
+    pub fn load_with_features(
+        workspace_root: &Path,
+        features: CargoFeatures,
+    ) -> Result<Self, DeepError> {
         let cargo_config = CargoConfig {
             sysroot: Some(ra_ap_project_model::RustLibSource::Discover),
             set_test: true,
-            features: CargoFeatures::All,
+            features,
             ..CargoConfig::default()
         };
         let load_config = LoadCargoConfig {

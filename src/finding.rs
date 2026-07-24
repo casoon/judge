@@ -134,6 +134,7 @@ pub enum Severity {
 /// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
 /// | `dead-enum-variant`, `test-only-pub` | `bounded_semantic` (Deep Tier; same "every workspace crate is workspace-internal" simplification as `unused-pub-workspace` — see `crate::dead_code` module docs) |
 /// | `unreachable-from-entry` | `bounded_semantic` (Deep Tier; entry-point reachability only, scoped to non-`pub` items — see `crate::dead_code`'s `UNREACHABLE_FROM_ENTRY_RULE` doc comment) |
+/// | `dead-trait-impl` | `bounded_semantic` (Deep Tier; a real `Semantics::resolve_method_call`-backed call-site resolution, scoped to traits defined within the analyzed workspace only — see `crate::dead_trait_impl` module docs) |
 /// | `unused-pub-api` | `heuristic` (Deep Tier; a published crate's public surface is expected to have zero *internal* reference — see `crate::dead_code`'s `UNUSED_PUB_API_RULE` doc comment) |
 /// | `unlinked-file`, `orphan-module` | `bounded_semantic` (proven only within the crate's own resolved `mod` tree / the loaded workspace's cross-file reference scan — see `crate::module_graph`) |
 /// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::boundaries`] module docs "Module-level boundaries") |
@@ -146,6 +147,7 @@ pub enum Severity {
 /// | `untested-hotspot` | `external_measurement` (complexity and churn are `derived_fact`/`heuristic` in isolation, but the imported `cargo-llvm-cov` coverage snapshot is the rarest, least locally-verifiable ingredient in the combination, so it sets the class — see `crate::coverage::untested_hotspots`) |
 /// | `mutation-survivor` | `external_measurement` (an imported `cargo-mutants` `outcomes.json` snapshot — same class as `untested-hotspot`, judge's other external-tool-derived test-strength signal — see `crate::mutants`) |
 /// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt`, `dep-added-by-agent`, `integer-cast-risk`, `fragile-substring-classification`, `size-distribution`, `re-export-chain`, `hardcoded-secret`, `change-coupling-signal` | `heuristic` (reproducible interpretation, not proof) |
+/// | `feature-gated-dead-code` | `heuristic` (Deep Tier; reachability re-checked once per user-configured `judge.toml` `[feature_matrix]` combination, but correctness depends entirely on that matrix being representative of real downstream usage — a combination the config omits is never checked, so this stays advisory rather than `unreachable-from-entry`'s `bounded_semantic` — see `crate::feature_matrix` module docs) |
 /// | `silent-default`, `context-free-propagation`, `debug-format-leak` | `heuristic` (narrow syntax-only proxies for signals that would need real type/taint information for a complete check — see `crate::slop` module docs) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,7 +233,8 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "orphan-module"
         | "dead-enum-variant"
         | "test-only-pub"
-        | "unreachable-from-entry" => EvidenceClass::BoundedSemantic,
+        | "unreachable-from-entry"
+        | "dead-trait-impl" => EvidenceClass::BoundedSemantic,
         "phantom-crate"
         | "phantom-version"
         | "fresh-low-reputation-dep"
@@ -243,6 +246,7 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         "unused-pub-api" => EvidenceClass::Heuristic,
         "size-distribution" => EvidenceClass::Heuristic,
         "re-export-chain" => EvidenceClass::Heuristic,
+        "feature-gated-dead-code" => EvidenceClass::Heuristic,
         "silent-default" | "context-free-propagation" | "debug-format-leak" => {
             EvidenceClass::Heuristic
         }

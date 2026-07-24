@@ -144,18 +144,23 @@ pub struct WorkspaceDeadCode {
 /// type-level counterpart to [`crate::functions::walk_functions`]'s
 /// function-like items. Anonymous consts (`const _: () = ...`) aren't
 /// covered.
-struct TypeItemSite<'ast> {
-    qualified_name: String,
-    ident_span: Span,
-    vis: &'ast syn::Visibility,
+pub(crate) struct TypeItemSite<'ast> {
+    pub(crate) qualified_name: String,
+    pub(crate) ident_span: Span,
+    pub(crate) vis: &'ast syn::Visibility,
 }
 
 /// Visits every top-level `struct`, `enum`, `trait`, `const`, and `static` in
 /// `file`, plus every associated const/type inside an `impl` block, tracking
 /// the enclosing `mod`/`impl`/`trait` path the same way
 /// [`crate::functions::walk_functions`] does, so the two produce consistent
-/// qualified names.
-fn walk_type_items<'ast>(file: &'ast syn::File, on_item: impl FnMut(TypeItemSite<'ast>)) {
+/// qualified names. `pub(crate)` so [`crate::feature_matrix`] can reuse the
+/// same candidate-item walk for `feature-gated-dead-code` instead of
+/// reimplementing it.
+pub(crate) fn walk_type_items<'ast>(
+    file: &'ast syn::File,
+    on_item: impl FnMut(TypeItemSite<'ast>),
+) {
     struct Walker<F> {
         path: Vec<String>,
         on_item: F,
@@ -639,8 +644,10 @@ const UNUSED_PUB_API_REASON: &str = "no reference found within the examined work
 
 /// Converts a [`crate::reachability::ReachabilityError`] into the closest
 /// matching [`DeadCodeError`] variant, so the two modules' errors can share
-/// one `errors` list.
-fn reachability_error(err: crate::reachability::ReachabilityError) -> DeadCodeError {
+/// one `errors` list. `pub(crate)` so [`crate::feature_matrix`] can reuse it
+/// for `feature-gated-dead-code`'s own `errors` list instead of duplicating
+/// the mapping.
+pub(crate) fn reachability_error(err: crate::reachability::ReachabilityError) -> DeadCodeError {
     use crate::reachability::ReachabilityError;
     match err {
         ReachabilityError::Deep(deep_err) => DeadCodeError::Deep(deep_err),

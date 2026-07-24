@@ -13,10 +13,14 @@ pub mod coverage;
 #[cfg(feature = "deep")]
 pub mod dead_code;
 #[cfg(feature = "deep")]
+pub mod dead_trait_impl;
+#[cfg(feature = "deep")]
 pub mod deep;
 pub mod dep_graph;
 pub mod deps;
 pub mod duplication;
+#[cfg(feature = "deep")]
+pub mod feature_matrix;
 pub mod finding;
 mod functions;
 pub mod gate;

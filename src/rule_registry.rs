@@ -284,6 +284,29 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
             why_it_matters: "A private function with no caller anywhere in the analyzed reachability view still has to be read, understood, and kept compiling through every future refactor — and unlike a `pub` item, it can't be excused as future external API judge simply can't see.",
         }),
     },
+    // -- feature_matrix.rs (Deep Tier, `--features deep`) -------------------
+    RuleMetadata {
+        id: "feature-gated-dead-code",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code`, plus a `judge.toml` with a non-empty `[feature_matrix] combinations` list (see `crate::boundaries::FeatureMatrixConfig`). With `combinations` absent or empty (the default), this rule performs no analysis at all and emits zero findings — that must never be read as 'no feature-gated dead code found', only that none were checked for (todo.md §17 'Kein Raten von Projektabsicht'). Re-loads the whole workspace once per configured combination (a real, accepted extra cost per combination — seconds to minutes each, same order as any other Deep Tier load) via `CargoFeatures::Selected { .., no_default_features: true }`, so a large configured matrix is a real, up-front performance trade-off the user opts into by listing more combinations.",
+        exclusions: "Correctness depends entirely on the configured matrix being representative of real downstream usage: a feature combination not listed in `combinations` is never checked at all, and an item reachable only under an unconfigured combination is indistinguishable from genuinely dead code to this rule — this is why it is `Heuristic`/advisory rather than `unreachable-from-entry`'s `bounded_semantic`/gating classification, even though both share the same underlying entry-point BFS. Scoped to both `pub` and non-`pub` items alike (unlike `unreachable-from-entry`'s pub/non-pub split, which exists only to avoid duplicating `unused-pub-workspace`'s cross-crate reference check — a different concern this rule doesn't have). Inherits every entry-point-detection limitation `crate::reachability`'s module docs describe (registration macros like `inventory::submit!`/`ctor` are not recognized entry points).",
+        allowed_wording: "State as 'not reachable from any recognized entry point under any of the configured [feature_matrix] combinations, in the examined reachability view' — never as 'unused', 'dead', or 'unreachable under all feature combinations' outright; a combination the config omits was never checked (todo.md §17.3, §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
+    },
+    // -- dead_trait_impl.rs (Deep Tier, `--features deep`) -------------------
+    RuleMetadata {
+        id: "dead-trait-impl",
+        evidence_class: EvidenceClass::BoundedSemantic,
+        preconditions: "Requires `--features deep` (Deep Tier; attributing a `.method()` call site to the specific impl it dispatches to needs real semantic resolution). Scoped to `impl Trait for Type` blocks where `Type` is a concrete named type and `Trait` is itself defined within the analyzed workspace's own source — never a trait from `std`/`core`/`alloc` or an external dependency crate (see `crate::dead_trait_impl` module docs for why this scoping is a deliberate, permanent cut, not a gap to fill later).",
+        exclusions: "Scoped only to traits defined within the analyzed workspace — impls of std/external-crate traits (`Drop`, the `std::ops::*` operator traits, `Display`/`Debug`, `Default`/`From`, `Hash`, `Iterator`, serde's `Serialize`/`Deserialize`, …) are never checked by this rule at all; this is an intentional, permanent scope boundary, not a gap to fill later, because those traits are invoked through compiler/operator/macro sugar this rule's plain `.method()` call-site scan cannot see. Inherits the same generic-dispatch blind spot `crate::reachability::classify_call_kind` documents: a call through a generic type bound (`fn foo<T: Trait>(x: T) { x.bar() }`) is not concretely dispatched at the call site, so it never marks a candidate impl as used. Blanket impls (`impl<T: Trait> Trait for T`) are excluded entirely, as is any impl gated by `#[cfg(test)]` (on itself or an enclosing item), and an impl overriding none of the trait's methods (relying entirely on default method bodies) — it has no assoc items of its own for a call site to resolve to, so it is never a candidate.",
+        allowed_wording: BOUNDED_SEMANTIC_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+        example: Some(RuleExample {
+            before: "trait Notifier {\n    fn notify(&self, message: &str);\n}\n\nstruct EmailNotifier;\n\nimpl Notifier for EmailNotifier {\n    fn notify(&self, message: &str) {\n        println!(\"email: {message}\");\n    }\n}\n",
+            why_it_matters: "EmailNotifier's Notifier impl is never invoked through `.notify(..)` anywhere in the workspace — the compiler keeps compiling and dispatching through it, but no real call path exercises it, so it's read and kept compiling for a trait conformance nobody actually uses.",
+        }),
+    },
     // -- dep_graph.rs -----------------------------------------------------
     RuleMetadata {
         id: "duplicate-crate-versions",
@@ -1243,6 +1266,10 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
         "needs --features deep plus a judge.toml [[module_boundary]] config",
     ),
     (
+        "feature-gated-dead-code",
+        "needs --features deep plus a judge.toml [feature_matrix] combinations config and a real multi-load reachability run per combination — not expressible as a single source snippet",
+    ),
+    (
         "untested-hotspot",
         "needs an externally generated cargo-llvm-cov LCOV report import — judge never measures coverage itself",
     ),
@@ -1411,6 +1438,8 @@ mod tests {
             crate::dead_code::DEAD_ENUM_VARIANT_RULE,
             crate::dead_code::TEST_ONLY_PUB_RULE,
             crate::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
+            crate::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
+            crate::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
             crate::api_surface_deep::INTERNAL_LEAK_RULE,

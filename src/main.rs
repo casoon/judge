@@ -3597,6 +3597,18 @@ fn run_dead_code_deep(
 
     let dead_code_report = judge::dead_code::analyze_workspace(&workspace, include_tests)?;
 
+    // `feature-gated-dead-code` is opt-in via `judge.toml` `[feature_matrix]`
+    // — with `combinations` absent or empty (the default), this performs no
+    // analysis at all (see `judge::feature_matrix` module docs).
+    let feature_matrix_config = load_judge_toml(&workspace.root)?.feature_matrix;
+    let feature_matrix_report = judge::feature_matrix::analyze_workspace(
+        &workspace,
+        &feature_matrix_config.combinations,
+        include_tests,
+    )?;
+
+    let dead_trait_impl_report = judge::dead_trait_impl::analyze_workspace(&workspace)?;
+
     // `duplicative-reinvention` needs clone-family membership — cheap,
     // Fast Tier, same defaults `cargo judge health`/`dupes` already use.
     let dupes_source_files = workspace
@@ -3621,6 +3633,8 @@ fn run_dead_code_deep(
         judge::slop_structural_deep::analyze_workspace(&workspace, &dupes, include_tests)?;
 
     let mut findings = dead_code_report.findings;
+    findings.extend(feature_matrix_report.findings);
+    findings.extend(dead_trait_impl_report.findings);
     findings.extend(structural_report.findings);
 
     let mut analysis_errors: Vec<String> = dead_code_report
@@ -3628,6 +3642,8 @@ fn run_dead_code_deep(
         .iter()
         .map(ToString::to_string)
         .collect();
+    analysis_errors.extend(feature_matrix_report.errors.iter().map(ToString::to_string));
+    analysis_errors.extend(dead_trait_impl_report.errors.iter().map(ToString::to_string));
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     analysis_errors.extend(structural_report.errors.iter().map(ToString::to_string));
 
@@ -3656,6 +3672,14 @@ fn run_dead_code_deep(
             (
                 judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE.to_string(),
                 judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE_REVISION,
+            ),
+            (
+                judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE.to_string(),
+                judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE_REVISION,
+            ),
+            (
+                judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE.to_string(),
+                judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE_REVISION,
             ),
             (
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE.to_string(),
@@ -3731,6 +3755,8 @@ fn run_dead_code_deep(
                 judge::dead_code::DEAD_ENUM_VARIANT_RULE,
                 judge::dead_code::TEST_ONLY_PUB_RULE,
                 judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
+                judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
+                judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             ] {
