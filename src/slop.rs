@@ -1703,6 +1703,18 @@ fn f(r: Result<i32, ()>) {
     }
 
     #[test]
+    fn conversational_artifact_tier2_phrase_is_not_flagged_inside_an_unrelated_word() {
+        // Two of CONVERSATIONAL_TIER2's short entries are a raw substring of
+        // this sentence's opening word — a plain `.contains()` would
+        // misclassify ordinary prose as AI-assistant leakage.
+        let findings = findings_for(
+            "fn f() {\n    // There is no other way to express this invariant.\n}\n",
+            "slop-conversational-artifact-tier2-word-boundary",
+        );
+        assert!(rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    #[test]
     fn step_comment_inflation_three_step_chain_is_flagged() {
         let findings = findings_for(
             "fn f() {\n    // Step 1: initialize\n    let x = 1;\n    // Step 2: compute\n    let y = x + 1;\n    // Step 3: finish\n    let _ = y;\n}\n",

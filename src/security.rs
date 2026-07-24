@@ -1178,10 +1178,19 @@ mod tests {
 
     #[test]
     fn google_api_key_pattern_is_flagged() {
-        let findings = findings_for(
-            "const KEY: &str = \"AIzaSyD1234567890abcdefghijklmnopqrstuv\";\n",
-            "security-secret-google-key",
+        // The literal is assembled at test-runtime from two halves rather
+        // than written out contiguously — a real Google API key has no
+        // checksum, so any 39-char `AIza`-prefixed alphanumeric string
+        // written verbatim here would also trip GitHub's own secret
+        // scanning on this file. Assembling it keeps the fixture source
+        // (what `findings_for` actually parses) byte-identical to the
+        // literal case, without the full pattern ever appearing contiguous
+        // in `security.rs` itself.
+        let source = format!(
+            "const KEY: &str = \"{}{}\";\n",
+            "AIzaSyD1234567890abcdefg", "hijklmnopqrstuv"
         );
+        let findings = findings_for(&source, "security-secret-google-key");
         let hits = rule_findings(&findings, HARDCODED_SECRET_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(

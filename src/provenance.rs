@@ -448,6 +448,37 @@ fn match_label<'a>(
     })
 }
 
+/// Whether `needle` occurs in `haystack` bounded by non-alphanumeric
+/// characters (or the string's own start/end) — a plain `.contains()` would
+/// also fire on e.g. `"Talbot"` for the needle `"bot"` (see
+/// `fragile-substring-classification`, todo.md §G K1).
+fn is_word_boundary(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(offset) = haystack[start..].find(needle) {
+        let match_start = start + offset;
+        let match_end = match_start + needle.len();
+        let before_ok = !haystack[..match_start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = !haystack[match_end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = match_start + 1;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
 /// Trailer/marker classification (see todo.md §3.G G6): a `Co-authored-by`
 /// trailer naming a known agent, or Claude Code's `Generated with [...]`
 /// commit-footer marker (free body text, not a git trailer). Checked in
@@ -458,13 +489,13 @@ fn classify_trailer_or_marker(commit: &CommitInfo) -> Option<Classification> {
             continue;
         }
         let lower = value.to_lowercase();
-        let class = if lower.contains("claude") {
+        let class = if is_word_boundary(&lower, "claude") {
             AuthorClass::Agent("claude".to_string())
-        } else if lower.contains("copilot") {
+        } else if is_word_boundary(&lower, "copilot") {
             AuthorClass::Agent("copilot".to_string())
-        } else if lower.contains("cursor") {
+        } else if is_word_boundary(&lower, "cursor") {
             AuthorClass::Agent("cursor".to_string())
-        } else if lower.contains("bot") || lower.contains("ai-assistant") {
+        } else if is_word_boundary(&lower, "bot") || is_word_boundary(&lower, "ai-assistant") {
             AuthorClass::Agent("bot".to_string())
         } else {
             continue;
@@ -1039,6 +1070,22 @@ mod tests {
         let signals = evidence["signals"].as_array().unwrap();
         assert!(signals.iter().any(|s| s == "commit_size_outlier"));
         assert!(signals.iter().any(|s| s == "message_style"));
+    }
+
+    #[test]
+    fn a_co_authored_by_name_containing_bot_as_a_substring_does_not_classify_as_agent_bot() {
+        // "Talbot" contains "bot" as a substring but is not itself the word
+        // "bot" — a plain `.contains("bot")` would misclassify this as an
+        // agent (see `fragile-substring-classification`, todo.md §G K1).
+        let mut commit = commit_info("c1", "someone@example.com", 1_000);
+        commit.trailers = vec![(
+            "Co-authored-by".to_string(),
+            "Jamie Talbot <jamie.talbot@example.com>".to_string(),
+        )];
+
+        let classes = classify_commits(&[commit], &[]);
+        let (class, _, _) = &classes["c1"];
+        assert_eq!(*class, AuthorClass::Unknown);
     }
 
     #[test]

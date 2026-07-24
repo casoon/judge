@@ -262,6 +262,35 @@ fn word_index_at(text: &str, pos: usize) -> usize {
     text[..pos].split_whitespace().count()
 }
 
+/// The byte offset of the first occurrence of `phrase` in `haystack` that is
+/// bounded by non-alphanumeric characters (or the string's own start/end) on
+/// both sides — a plain substring search would also match `"here is"`/
+/// `"here's"` inside the common words `"there is"`/`"there's"`/`"where is"`
+/// (see `conversational-artifact`, todo.md §3.G G3).
+fn phrase_at_word_boundary(haystack: &str, phrase: &str) -> Option<usize> {
+    let mut start = 0;
+    while let Some(offset) = haystack[start..].find(phrase) {
+        let match_start = start + offset;
+        let match_end = match_start + phrase.len();
+        let before_ok = !haystack[..match_start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = !haystack[match_end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return Some(match_start);
+        }
+        start = match_start + 1;
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    None
+}
+
 /// `conversational-artifact` (see todo.md §3.G): AI-assistant phrase leakage
 /// into a plain comment. Only non-doc [`CommentSpan`]s are checked —
 /// legitimate stub-limitation prose like "in a real implementation you would
@@ -284,7 +313,7 @@ fn conversational_artifact_findings(
 
         if CONVERSATIONAL_TIER1
             .iter()
-            .any(|phrase| lower.contains(phrase))
+            .any(|phrase| phrase_at_word_boundary(&lower, phrase).is_some())
         {
             findings.push(build_finding(
                 crate::slop::CONVERSATIONAL_ARTIFACT_RULE,
@@ -298,8 +327,7 @@ fn conversational_artifact_findings(
         }
 
         let hit = CONVERSATIONAL_TIER2.iter().any(|phrase| {
-            lower
-                .find(phrase)
+            phrase_at_word_boundary(&lower, phrase)
                 .is_some_and(|pos| word_index_at(&lower, pos) < 8)
         });
         if hit {
