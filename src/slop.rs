@@ -1,16 +1,40 @@
 //! Fast-tier AI-slop signal detection (see todo.md §G "AI-Slop-Signale", §G1
-//! "Error-Masking", §G2 "Stub- und Theater-Code"). The four `G1` rules and
+//! "Error-Masking", §G2 "Stub- und Theater-Code"). The six `G1` rules and
 //! five of the six `G2` rules that are detectable from syntax alone via
-//! `syn` are implemented here — `silent-default` and
-//! `context-free-propagation` (G1) need real type information (is this
-//! expression's type actually a `Result`? does this `?` really cross a
-//! meaningful module boundary?) that isn't available without a type checker
-//! (Deep Tier, not built yet), so they are intentionally not attempted.
+//! `syn` are implemented here.
+//!
+//! `silent-default` and `context-free-propagation` (G1) were originally
+//! deferred: a *complete* version of either needs real type information (is
+//! this expression's type actually a `Result`? does this opaque error type
+//! really erase a meaningful distinction?) that isn't available without a
+//! type checker (Deep Tier, not built yet). Both are implemented here anyway,
+//! each as a narrow, high-precision special case that sidesteps needing a
+//! type checker rather than attempting the general problem — the same
+//! "proxy, not proof" precedent as `integer-cast-risk`/`panic-in-lib` (see
+//! `crate::security`): `silent-default` only matches the two call shapes
+//! (`.unwrap_or_default()`/`.unwrap_or_else(|_| ..default())`) that are
+//! inherently `Option<T>`/`Result<T, E>`-only methods in std, so no receiver
+//! type check is needed; `context-free-propagation` only matches a function's
+//! own *written* return type against a fixed list of syntactically
+//! recognizable opaque-error idioms (`anyhow::Error`/`anyhow::Result`,
+//! `eyre::Report`/`eyre::Result`, `Box<dyn std::error::Error ..>`), never a
+//! type-checker-resolved type. See [`SILENT_DEFAULT_RULE`] and
+//! [`CONTEXT_FREE_PROPAGATION_RULE`] for the exact matched shapes.
+//!
 //! `mock-of-sut` (G2) is intentionally skipped too, for a different reason:
 //! there is no structural signal in Rust that identifies "the system under
 //! test" for a given test function, so this isn't solvable syntactically —
 //! and it isn't solvable with type information either, since it requires
 //! knowing test *intent*, not types.
+//!
+//! `debug-format-leak` (§K2) was also originally deferred as needing a
+//! general "Sink-Tainting-Heuristik" (cross-function value-flow tracking,
+//! which this crate has no module for). It doesn't actually need one: a
+//! manual `impl std::fmt::Display for T` block *is* the sink, by Rust's own
+//! type-class convention (`Display`/`{}`/`.to_string()` is the user-facing
+//! representation; `Debug`/`{:?}` is the diagnostic one) — so the sink is
+//! identified by the `impl Display` block boundary alone, not by tracing a
+//! value's flow into it. See [`DEBUG_FORMAT_LEAK_RULE`].
 //!
 //! Per todo.md §12 "Entscheidungen": "Der Slop-Block ist Teil von `health`,
 //! kein eigener Sub-Command" — this module has no CLI command of its own;
@@ -130,6 +154,29 @@ pub const GENERIC_NAMING_RULE_REVISION: u32 = 1;
 pub const DOC_RESTATES_SIGNATURE_RULE: &str = "doc-restates-signature";
 pub const DOC_RESTATES_SIGNATURE_RULE_REVISION: u32 = 1;
 
+/// Rule id for `.unwrap_or_default()` / `.unwrap_or_else(|_| ..default())`
+/// on a function whose body has no error-observing call anywhere (see
+/// todo.md §G1). A narrow syntax-only proxy, not a taint proof — see
+/// [`check_silent_default`] and the module doc comment above.
+pub const SILENT_DEFAULT_RULE: &str = "silent-default";
+pub const SILENT_DEFAULT_RULE_REVISION: u32 = 1;
+
+/// Rule id for a function whose written return type is a recognized opaque
+/// error idiom (`anyhow::Error`/`anyhow::Result`, `eyre::Report`/
+/// `eyre::Result`, `Box<dyn std::error::Error ..>`) and whose body has 2+
+/// distinct `?`-sites but zero `.context(`/`.with_context(` calls (see
+/// todo.md §G1). See [`check_context_free_propagation`] and the module doc
+/// comment above.
+pub const CONTEXT_FREE_PROPAGATION_RULE: &str = "context-free-propagation";
+pub const CONTEXT_FREE_PROPAGATION_RULE_REVISION: u32 = 1;
+
+/// Rule id for a `{:?}`/`{:#?}` placeholder inside a `write!`/`format!` call
+/// within a manual `impl std::fmt::Display for T` block's body (see todo.md
+/// §K2). See [`SlopVisitor::visit_item_impl`] and the module doc comment
+/// above.
+pub const DEBUG_FORMAT_LEAK_RULE: &str = "debug-format-leak";
+pub const DEBUG_FORMAT_LEAK_RULE_REVISION: u32 = 1;
+
 #[derive(Debug)]
 pub enum SlopError {
     Io(PathBuf, std::io::Error),
@@ -175,6 +222,7 @@ pub fn analyze_file(
         feature_gated_depth: 0,
         item_spans: Vec::new(),
         allow_anyhow_at_boundary,
+        display_impl_type_stack: Vec::new(),
     };
     visitor.visit_file(&ast);
     let mut findings = visitor.findings;
@@ -241,6 +289,13 @@ struct SlopVisitor<'a> {
     /// Whether `catch-all-error` exempts `anyhow::Result`/`anyhow::Error`
     /// return types (see [`contains_catch_all_error`], GitHub issue #5).
     allow_anyhow_at_boundary: bool,
+    /// The `T` in `impl std::fmt::Display for T`, pushed while walking such
+    /// an impl block's body — `debug-format-leak` consults the top of this
+    /// stack from `visit_macro` (see todo.md §K2). A trait impl only ever
+    /// contains that trait's own items, so any `write!`/`format!` call
+    /// inside a `Display` impl block is inside its `fmt` method by
+    /// construction; no separate "are we inside `fmt`" tracking is needed.
+    display_impl_type_stack: Vec<String>,
 }
 
 impl SlopVisitor<'_> {
@@ -468,6 +523,82 @@ impl SlopVisitor<'_> {
             self.record(DOC_RESTATES_SIGNATURE_RULE, span, Severity::Info, item_path);
         }
     }
+
+    /// `.unwrap_or_default()` / `.unwrap_or_else(|_| ..default())` calls
+    /// (see [`SilentDefaultVisitor`]), corroborated by a function-wide
+    /// absence of any error-observing call (see [`error_observation_present`]
+    /// — see todo.md §G1 `silent-default`). Both signals are required: the
+    /// structural call shape alone doesn't distinguish "the error was never
+    /// worth observing" from "it's observed elsewhere in this function, just
+    /// not at this call site" — the absence check is function-granularity,
+    /// not proof this specific call site is unobserved (see
+    /// [`SILENT_DEFAULT_RULE`]'s registry `exclusions`).
+    fn check_silent_default(&mut self, block: &Block) {
+        let mut collector = SilentDefaultVisitor { sites: Vec::new() };
+        collector.visit_block(block);
+        if collector.sites.is_empty() || error_observation_present(block) {
+            return;
+        }
+        let item_path = self.current_item_path();
+        for (span, method) in collector.sites {
+            self.record_with_evidence(
+                SILENT_DEFAULT_RULE,
+                span,
+                Severity::Warn,
+                item_path.clone(),
+                Some(serde_json::json!({
+                    "file": self.file.display().to_string(),
+                    "line": span.start().line,
+                    "method": method,
+                })),
+            );
+        }
+    }
+
+    /// A function whose written return type is a recognized opaque-error
+    /// idiom, with 2+ distinct `?`-sites and zero `.context(`/
+    /// `.with_context(` calls anywhere in its body (see todo.md §G1
+    /// `context-free-propagation`, [`is_opaque_error_return_type`]). Fires
+    /// only when this function's own body contains not a single
+    /// `.context(`/`.with_context(` call — a function that already uses
+    /// `.context()` for *some* of its `?`-sites but not all of them is not
+    /// flagged, since the author is clearly already following that practice
+    /// in this function (see [`CONTEXT_FREE_PROPAGATION_RULE`]'s registry
+    /// `exclusions` for the precise semantics chosen here).
+    fn check_context_free_propagation(
+        &mut self,
+        sig: &syn::Signature,
+        block: &Block,
+        span: proc_macro2::Span,
+    ) {
+        let ReturnType::Type(_, ty) = &sig.output else {
+            return;
+        };
+        if !is_opaque_error_return_type(ty) {
+            return;
+        }
+        let mut scanner = TrySiteScanner {
+            try_site_keys: std::collections::HashSet::new(),
+            has_context_call: false,
+        };
+        scanner.visit_block(block);
+        if scanner.try_site_keys.len() < 2 || scanner.has_context_call {
+            return;
+        }
+        let item_path = self.current_item_path();
+        self.record_with_evidence(
+            CONTEXT_FREE_PROPAGATION_RULE,
+            span,
+            Severity::Warn,
+            item_path,
+            Some(serde_json::json!({
+                "file": self.file.display().to_string(),
+                "function": sig.ident.to_string(),
+                "line": span.start().line,
+                "try_site_count": scanner.try_site_keys.len(),
+            })),
+        );
+    }
 }
 
 impl<'ast> Visit<'ast> for SlopVisitor<'_> {
@@ -493,8 +624,16 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         if gated {
             self.feature_gated_depth += 1;
         }
-        self.path.push(type_name(&node.self_ty));
+        let type_ident = type_name(&node.self_ty);
+        self.path.push(type_ident.clone());
+        let is_display_impl = is_display_trait_impl(node);
+        if is_display_impl {
+            self.display_impl_type_stack.push(type_ident);
+        }
         visit::visit_item_impl(self, node);
+        if is_display_impl {
+            self.display_impl_type_stack.pop();
+        }
         self.path.pop();
         if gated {
             self.feature_gated_depth -= 1;
@@ -533,6 +672,8 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         self.check_assertion_free_test(node);
         self.check_generic_naming_item_fn(node);
         self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
+        self.check_silent_default(&node.block);
+        self.check_context_free_propagation(&node.sig, &node.block, node.span());
         let gated = has_feature_cfg(&node.attrs);
         if gated {
             self.feature_gated_depth += 1;
@@ -554,6 +695,8 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         self.check_catch_all_error(&node.vis, &node.sig, &node.block, node.span());
         self.check_empty_impl(&node.attrs, &node.block, node.span());
         self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
+        self.check_silent_default(&node.block);
+        self.check_context_free_propagation(&node.sig, &node.block, node.span());
         let gated = has_feature_cfg(&node.attrs);
         if gated {
             self.feature_gated_depth += 1;
@@ -731,6 +874,22 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 Severity::Warn,
                 item_path,
             );
+        } else if (mac.path.is_ident("write") || mac.path.is_ident("format"))
+            && let Some(type_name) = self.display_impl_type_stack.last()
+            && macro_format_string_has_debug_placeholder(mac)
+        {
+            let item_path = self.current_item_path();
+            self.record_with_evidence(
+                DEBUG_FORMAT_LEAK_RULE,
+                mac.span(),
+                Severity::Warn,
+                item_path,
+                Some(serde_json::json!({
+                    "file": self.file.display().to_string(),
+                    "type_name": type_name,
+                    "line": mac.span().start().line,
+                })),
+            );
         }
         visit::visit_macro(self, mac);
     }
@@ -866,17 +1025,281 @@ fn discards_error_via_map_err(block: &Block) -> bool {
         fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
     }
 
-    fn pat_is_wildcard(pat: &Pat) -> bool {
-        match pat {
-            Pat::Wild(_) => true,
-            Pat::Type(pat_type) => pat_is_wildcard(&pat_type.pat),
-            _ => false,
-        }
-    }
-
     let mut visitor = MapErrDiscardVisitor { found: false };
     visitor.visit_block(block);
     visitor.found
+}
+
+/// Whether `pat` is a wildcard (`_`) or a type-ascribed wildcard (`_: T`) —
+/// shared by [`discards_error_via_map_err`]'s `.map_err(|_| ..)` match and
+/// [`SilentDefaultVisitor`]'s `.unwrap_or_else(|_| ..)` match: both need "the
+/// closure never binds the original error value" as their signal.
+fn pat_is_wildcard(pat: &Pat) -> bool {
+    match pat {
+        Pat::Wild(_) => true,
+        Pat::Type(pat_type) => pat_is_wildcard(&pat_type.pat),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is (optionally through a single-tail-expression block) a
+/// call to `Default::default()` or `<SomeType>::default()` with zero
+/// arguments — the fallback shape [`SilentDefaultVisitor`] requires for
+/// `.unwrap_or_else(|_| ..)` to count as `silent-default` (see todo.md §G1).
+fn is_default_call(expr: &Expr) -> bool {
+    let expr = match expr {
+        Expr::Block(block) if block.block.stmts.len() == 1 => match &block.block.stmts[0] {
+            Stmt::Expr(inner, None) => inner,
+            _ => return false,
+        },
+        other => other,
+    };
+    let Expr::Call(call) = expr else {
+        return false;
+    };
+    if !call.args.is_empty() {
+        return false;
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "default")
+}
+
+/// Collects every `.unwrap_or_default()` / `.unwrap_or_else(|_| ..default())`
+/// call site in a function body (see todo.md §G1 `silent-default`,
+/// [`SlopVisitor::check_silent_default`]). Does not descend into nested `fn`
+/// items — same scoping as [`discards_error_via_map_err`]'s
+/// `MapErrDiscardVisitor`.
+struct SilentDefaultVisitor {
+    /// `(call span, matched method name)` per call site.
+    sites: Vec<(proc_macro2::Span, &'static str)>,
+}
+
+impl<'ast> Visit<'ast> for SilentDefaultVisitor {
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        if node.method == "unwrap_or_default" && node.args.is_empty() {
+            self.sites.push((node.span(), "unwrap_or_default"));
+        } else if node.method == "unwrap_or_else"
+            && let Some(Expr::Closure(closure)) = node.args.first()
+            && closure.inputs.len() == 1
+            && pat_is_wildcard(&closure.inputs[0])
+            && is_default_call(&closure.body)
+        {
+            self.sites.push((node.span(), "unwrap_or_else"));
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+/// Whether `block` contains, anywhere, a call shape that observes/surfaces an
+/// error — the corroborating absence signal for `silent-default` (see
+/// [`SlopVisitor::check_silent_default`], todo.md §G1). A function-wide
+/// check, not scoped to any one call site: `.inspect_err(`, a `log::`/
+/// `tracing::`-qualified macro or path call, an unqualified `eprintln!`/
+/// `warn!`/`error!` macro call, or an `if let Err(..) = ..` pattern. Does not
+/// descend into nested `fn` items.
+fn error_observation_present(block: &Block) -> bool {
+    struct ErrorObservationScanner {
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for ErrorObservationScanner {
+        fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+            if node.method == "inspect_err" {
+                self.found = true;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_macro(&mut self, mac: &'ast Macro) {
+            let first_segment = mac.path.segments.first().map(|s| s.ident.to_string());
+            let last_segment = mac.path.segments.last().map(|s| s.ident.to_string());
+            let is_log_or_tracing_qualified =
+                matches!(first_segment.as_deref(), Some("log") | Some("tracing"))
+                    && mac.path.segments.len() >= 2;
+            let is_direct_observation_macro = matches!(
+                last_segment.as_deref(),
+                Some("eprintln") | Some("warn") | Some("error")
+            );
+            if is_log_or_tracing_qualified || is_direct_observation_macro {
+                self.found = true;
+            }
+            visit::visit_macro(self, mac);
+        }
+
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let Expr::If(if_expr) = expr
+                && let Expr::Let(let_expr) = if_expr.cond.as_ref()
+                && is_err_pat(&let_expr.pat)
+            {
+                self.found = true;
+            }
+            visit::visit_expr(self, expr);
+        }
+
+        fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+    }
+
+    let mut scanner = ErrorObservationScanner { found: false };
+    scanner.visit_block(block);
+    scanner.found
+}
+
+/// Whether `pat` is `Err(..)` with any inner pattern — broader than
+/// [`is_err_wildcard_pat`] (which requires a wildcard/rest inner pattern):
+/// [`error_observation_present`] counts an `if let Err(e) = ..` that binds
+/// and uses the error as an observation attempt too, not just the
+/// `empty-error-arm`-shaped wildcard case.
+fn is_err_pat(pat: &Pat) -> bool {
+    match pat {
+        Pat::TupleStruct(tuple_struct) => tuple_struct
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Err"),
+        _ => false,
+    }
+}
+
+/// Whether `ty`, written syntactically, is a recognized opaque-error return
+/// type — `anyhow::Result<_>`/`eyre::Result<_>` sugar, or `Result<_, E>`
+/// where `E` is `anyhow::Error`, `eyre::Report`, or `Box<dyn
+/// std::error::Error ..>` (see todo.md §G1 `context-free-propagation`,
+/// [`SlopVisitor::check_context_free_propagation`]). A syntax-only match
+/// against the function's own written return type, never a type-checker-
+/// resolved type — a type alias that resolves to one of these shapes without
+/// spelling it out is not recognized.
+fn is_opaque_error_return_type(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    let segments = &type_path.path.segments;
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    if last.ident != "Result" {
+        return false;
+    }
+    if segments.len() >= 2 {
+        let prev = &segments[segments.len() - 2];
+        if prev.ident == "anyhow" || prev.ident == "eyre" {
+            return true;
+        }
+    }
+    let PathArguments::AngleBracketed(args) = &last.arguments else {
+        return false;
+    };
+    args.args
+        .iter()
+        .filter_map(|arg| match arg {
+            GenericArgument::Type(inner) => Some(inner),
+            _ => None,
+        })
+        .nth(1)
+        .is_some_and(is_opaque_error_type)
+}
+
+/// Whether `ty` is `anyhow::Error`, `eyre::Report`, or `Box<dyn
+/// std::error::Error ..>` — the `E` shapes [`is_opaque_error_return_type`]
+/// recognizes inside `Result<_, E>`.
+fn is_opaque_error_type(ty: &Type) -> bool {
+    match ty {
+        Type::TraitObject(trait_object) => is_error_trait_object(trait_object),
+        Type::Path(type_path) => {
+            let segments = &type_path.path.segments;
+            let Some(last) = segments.last() else {
+                return false;
+            };
+            if last.ident == "Box" {
+                let PathArguments::AngleBracketed(args) = &last.arguments else {
+                    return false;
+                };
+                return args.args.iter().any(|arg| match arg {
+                    GenericArgument::Type(Type::TraitObject(trait_object)) => {
+                        is_error_trait_object(trait_object)
+                    }
+                    _ => false,
+                });
+            }
+            if segments.len() >= 2 {
+                let prev = &segments[segments.len() - 2];
+                return (prev.ident == "anyhow" && last.ident == "Error")
+                    || (prev.ident == "eyre" && last.ident == "Report");
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Collects every distinct `?`-site's dedup key (the underlying expression's
+/// token string — same idiom as `tautological-test`'s
+/// `quote!(#lhs).to_string()` comparison above) and whether `.context(`/
+/// `.with_context(` is called anywhere in the block (see todo.md §G1
+/// `context-free-propagation`, [`SlopVisitor::check_context_free_propagation`]).
+/// Does not descend into nested `fn` items.
+struct TrySiteScanner {
+    try_site_keys: std::collections::HashSet<String>,
+    has_context_call: bool,
+}
+
+impl<'ast> Visit<'ast> for TrySiteScanner {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        if let Expr::Try(try_expr) = expr {
+            self.try_site_keys.insert(quote!(#try_expr).to_string());
+        }
+        visit::visit_expr(self, expr);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        if node.method == "context" || node.method == "with_context" {
+            self.has_context_call = true;
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+/// Whether `node` is a manual `impl std::fmt::Display for T` block (matched
+/// on the trait path's last segment, so both `impl Display for T` and `impl
+/// std::fmt::Display for T` match; `impl Debug for T` never does) — see
+/// todo.md §K2 `debug-format-leak`.
+fn is_display_trait_impl(node: &ItemImpl) -> bool {
+    node.trait_.as_ref().is_some_and(|(bang, path, _)| {
+        bang.is_none()
+            && path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "Display")
+    })
+}
+
+/// Whether `mac`'s first string-literal argument (the format string, for
+/// both `write!(f, "..")` and `format!("..")`) contains a `{:?}`/`{:#?}`
+/// placeholder — a plain substring match, per todo.md §K2
+/// `debug-format-leak`: a captured/positional debug placeholder written as
+/// `{value:?}`/`{0:?}` is not recognized, only the literal `{:?}`/`{:#?}`
+/// tokens are.
+fn macro_format_string_has_debug_placeholder(mac: &Macro) -> bool {
+    let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) else {
+        return false;
+    };
+    args.iter()
+        .find_map(|arg| match arg {
+            Expr::Lit(ExprLit {
+                lit: Lit::Str(text),
+                ..
+            }) => Some(text.value()),
+            _ => None,
+        })
+        .is_some_and(|text| text.contains("{:?}") || text.contains("{:#?}"))
 }
 
 /// Whether any attribute in `attrs` is a `#[doc = ...]` (covers both `///`
@@ -2136,5 +2559,200 @@ fn f(r: Result<i32, ()>) {
             rule_findings(&findings, DOC_RESTATES_SIGNATURE_RULE).len(),
             1
         );
+    }
+
+    #[test]
+    fn unwrap_or_default_without_error_observation_is_flagged() {
+        let findings = findings_for(
+            "fn f(input: Option<i32>) -> i32 {\n    input.unwrap_or_default()\n}\n",
+            "slop-silent-default-unwrap-or-default",
+        );
+        let hits = rule_findings(&findings, SILENT_DEFAULT_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Warn);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::Heuristic);
+        assert_eq!(
+            hits[0].evidence.as_ref().unwrap()["method"],
+            "unwrap_or_default"
+        );
+    }
+
+    #[test]
+    fn unwrap_or_else_default_closure_without_error_observation_is_flagged() {
+        let findings = findings_for(
+            "fn f(input: Result<i32, String>) -> i32 {\n    input.unwrap_or_else(|_| Default::default())\n}\n",
+            "slop-silent-default-unwrap-or-else",
+        );
+        let hits = rule_findings(&findings, SILENT_DEFAULT_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].evidence.as_ref().unwrap()["method"],
+            "unwrap_or_else"
+        );
+    }
+
+    #[test]
+    fn unwrap_or_else_non_default_closure_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(input: Result<i32, String>) -> i32 {\n    input.unwrap_or_else(|_| 0)\n}\n",
+            "slop-silent-default-unwrap-or-else-non-default",
+        );
+        assert!(rule_findings(&findings, SILENT_DEFAULT_RULE).is_empty());
+    }
+
+    /// The absence signal is function-granularity: an error-observation call
+    /// anywhere in the function suppresses `silent-default` even though it
+    /// doesn't observe *this* call's error (see the rule's registry
+    /// `exclusions`).
+    #[test]
+    fn unwrap_or_default_with_error_observation_elsewhere_in_function_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(input: Option<i32>, other: Result<i32, String>) -> i32 {\n    if let Err(e) = other {\n        tracing::warn!(\"failed: {:?}\", e);\n    }\n    input.unwrap_or_default()\n}\n",
+            "slop-silent-default-observed-elsewhere",
+        );
+        assert!(rule_findings(&findings, SILENT_DEFAULT_RULE).is_empty());
+    }
+
+    #[test]
+    fn silent_default_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(SILENT_DEFAULT_RULE)
+            .expect("silent-default has a registry entry")
+            .example
+            .expect("silent-default has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-silent-default-registry-example");
+        assert_eq!(rule_findings(&findings, SILENT_DEFAULT_RULE).len(), 1);
+    }
+
+    #[test]
+    fn two_distinct_try_sites_with_no_context_calls_on_anyhow_result_is_flagged() {
+        let findings = findings_for(
+            "pub fn load(path: &str) -> anyhow::Result<String> {\n    let raw = std::fs::read_to_string(path)?;\n    let parsed = raw.parse::<i32>()?;\n    Ok(parsed.to_string())\n}\n",
+            "slop-context-free-propagation-anyhow",
+        );
+        let hits = rule_findings(&findings, CONTEXT_FREE_PROPAGATION_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Warn);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::Heuristic);
+        assert_eq!(hits[0].evidence.as_ref().unwrap()["try_site_count"], 2);
+    }
+
+    #[test]
+    fn single_try_site_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn load(path: &str) -> anyhow::Result<String> {\n    let raw = std::fs::read_to_string(path)?;\n    Ok(raw)\n}\n",
+            "slop-context-free-propagation-single-site",
+        );
+        assert!(rule_findings(&findings, CONTEXT_FREE_PROPAGATION_RULE).is_empty());
+    }
+
+    /// The "zero `.context()`/`.with_context()` calls anywhere in the
+    /// function" semantics chosen for this rule: a function that already
+    /// calls `.context()` for *some* of its `?`-sites but not all of them is
+    /// not flagged, since the author is clearly already following that
+    /// practice in this function (see the rule's registry `exclusions`).
+    #[test]
+    fn two_distinct_try_sites_with_a_context_call_on_only_one_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn load(path: &str) -> anyhow::Result<String> {\n    let raw = std::fs::read_to_string(path).context(\"failed to read\")?;\n    let parsed = raw.parse::<i32>()?;\n    Ok(parsed.to_string())\n}\n",
+            "slop-context-free-propagation-partial-context",
+        );
+        assert!(rule_findings(&findings, CONTEXT_FREE_PROPAGATION_RULE).is_empty());
+    }
+
+    /// Dedup key is the underlying call's token text: the exact same call
+    /// written twice counts as one distinct `?`-site, not two.
+    #[test]
+    fn same_call_site_twice_counts_as_one_distinct_try_site_and_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn load(path: &str) -> anyhow::Result<String> {\n    let a = std::fs::read_to_string(path)?;\n    let b = std::fs::read_to_string(path)?;\n    Ok(a + &b)\n}\n",
+            "slop-context-free-propagation-duplicate-call",
+        );
+        assert!(rule_findings(&findings, CONTEXT_FREE_PROPAGATION_RULE).is_empty());
+    }
+
+    #[test]
+    fn two_distinct_try_sites_on_boxed_dyn_error_return_is_flagged() {
+        let findings = findings_for(
+            "fn load(path: &str) -> Result<String, Box<dyn std::error::Error>> {\n    let raw = std::fs::read_to_string(path)?;\n    let parsed = raw.parse::<i32>()?;\n    Ok(parsed.to_string())\n}\n",
+            "slop-context-free-propagation-boxed",
+        );
+        let hits = rule_findings(&findings, CONTEXT_FREE_PROPAGATION_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn two_distinct_try_sites_on_concrete_error_return_is_not_flagged() {
+        let findings = findings_for(
+            "struct MyError;\nfn load(path: &str) -> Result<String, MyError> {\n    let raw = std::fs::read_to_string(path)?;\n    let parsed = raw.parse::<i32>()?;\n    Ok(parsed.to_string())\n}\n",
+            "slop-context-free-propagation-concrete",
+        );
+        assert!(rule_findings(&findings, CONTEXT_FREE_PROPAGATION_RULE).is_empty());
+    }
+
+    #[test]
+    fn context_free_propagation_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(CONTEXT_FREE_PROPAGATION_RULE)
+            .expect("context-free-propagation has a registry entry")
+            .example
+            .expect("context-free-propagation has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-context-free-propagation-registry-example");
+        assert_eq!(
+            rule_findings(&findings, CONTEXT_FREE_PROPAGATION_RULE).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn debug_placeholder_inside_display_write_is_flagged() {
+        let findings = findings_for(
+            "struct Money(i64);\nimpl std::fmt::Display for Money {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"{:?}\", self.0)\n    }\n}\n",
+            "slop-debug-format-leak-write",
+        );
+        let hits = rule_findings(&findings, DEBUG_FORMAT_LEAK_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Warn);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::Heuristic);
+        assert_eq!(hits[0].evidence.as_ref().unwrap()["type_name"], "Money");
+    }
+
+    #[test]
+    fn debug_placeholder_inside_display_format_macro_is_flagged() {
+        let findings = findings_for(
+            "struct Money(i64);\nimpl std::fmt::Display for Money {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        f.write_str(&format!(\"{:#?}\", self.0))\n    }\n}\n",
+            "slop-debug-format-leak-format-macro",
+        );
+        let hits = rule_findings(&findings, DEBUG_FORMAT_LEAK_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn debug_placeholder_inside_debug_impl_is_not_flagged() {
+        let findings = findings_for(
+            "struct Money(i64);\nimpl std::fmt::Debug for Money {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"{:?}\", self.0)\n    }\n}\n",
+            "slop-debug-format-leak-debug-impl",
+        );
+        assert!(rule_findings(&findings, DEBUG_FORMAT_LEAK_RULE).is_empty());
+    }
+
+    #[test]
+    fn display_impl_without_debug_placeholder_is_not_flagged() {
+        let findings = findings_for(
+            "struct Money(i64);\nimpl std::fmt::Display for Money {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"{}\", self.0)\n    }\n}\n",
+            "slop-debug-format-leak-no-placeholder",
+        );
+        assert!(rule_findings(&findings, DEBUG_FORMAT_LEAK_RULE).is_empty());
+    }
+
+    #[test]
+    fn debug_format_leak_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DEBUG_FORMAT_LEAK_RULE)
+            .expect("debug-format-leak has a registry entry")
+            .example
+            .expect("debug-format-leak has a curated example")
+            .before;
+        let findings = findings_for(example, "slop-debug-format-leak-registry-example");
+        assert_eq!(rule_findings(&findings, DEBUG_FORMAT_LEAK_RULE).len(), 1);
     }
 }

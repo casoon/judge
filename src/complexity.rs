@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use syn::visit::{self, Visit};
-use syn::{Expr, ItemFn};
+use syn::{BinOp, Expr, ExprIf, ItemFn};
 
 use crate::functions::walk_functions;
 use crate::ingest::SourceFile;
@@ -16,6 +16,11 @@ pub struct FunctionInfo {
     pub file: PathBuf,
     pub line: usize,
     pub cyclomatic: u32,
+    /// Cognitive Complexity (see [`CognitiveComplexityVisitor`]) — a
+    /// best-effort approximation of SonarSource's metric, distinct from
+    /// `cyclomatic`: it weights nesting depth instead of counting every
+    /// branch point equally.
+    pub cognitive: u32,
     pub lines_of_code: usize,
     /// Maximum nesting depth of branching/looping/closure constructs (see
     /// todo.md §3.C "Nesting Depth").
@@ -72,6 +77,12 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
         };
         complexity.visit_block(site.block);
 
+        let mut cognitive = CognitiveComplexityVisitor {
+            cognitive: 0,
+            nesting: 0,
+        };
+        cognitive.visit_block(site.block);
+
         let start_line = site.span.start().line;
         let end_line = site.span.end().line.max(start_line);
 
@@ -80,6 +91,7 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
             file: path.to_path_buf(),
             line: start_line,
             cyclomatic: complexity.complexity,
+            cognitive: cognitive.cognitive,
             lines_of_code: end_line - start_line + 1,
             nesting_depth: complexity.nesting_depth,
             match_arm_count: complexity.match_arm_count,
@@ -174,6 +186,179 @@ impl<'ast> Visit<'ast> for ComplexityVisitor {
         visit::visit_expr(self, expr);
         if nests {
             self.current_depth -= 1;
+        }
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+/// Approximates SonarSource's Cognitive Complexity metric
+/// (<https://www.sonarsource.com/resources/cognitive-complexity/>) over the
+/// `syn` AST, as a second, separate pass per function from
+/// [`ComplexityVisitor`] rather than folding the two together — this keeps
+/// the well-tested cyclomatic walk unentangled from this newer, approximate
+/// metric.
+///
+/// This is a best-effort syntactic approximation, not the canonical spec.
+/// Known simplifications:
+/// - `if`/`else if`/`else`, `match`, `for`, `while`, `loop`, and labeled
+///   `break`/`continue` are all treated as nesting-weighted structural
+///   increments (`1 + current nesting level`). The canonical algorithm
+///   scores jumps to a label (`break 'label`/`continue 'label`) as a flat
+///   `+1` with no nesting weight; this implementation does not special-case
+///   that distinction.
+/// - Unlabeled `break`/`continue` do not increment complexity at all — only
+///   the structural nesting they sit inside of matters.
+/// - A run of `&&`/`||` in one boolean expression scores `+1` for the run,
+///   plus another `+1` each time the operator changes from the previous one
+///   in that same run (flat, not nesting-weighted), mirroring how
+///   [`ComplexityVisitor`] already walks binary `And`/`Or` nodes but
+///   counting operator-run transitions instead of every occurrence.
+/// - Recursion is not special-cased (the canonical spec adds a flat `+1` for
+///   a function calling itself).
+struct CognitiveComplexityVisitor {
+    cognitive: u32,
+    /// Running nesting depth at the current point of the walk, incremented
+    /// on entry to an `if`/`match`/`for`/`while`/`loop`/closure body and
+    /// decremented on exit.
+    nesting: u32,
+}
+
+impl CognitiveComplexityVisitor {
+    fn add_structural(&mut self) {
+        self.cognitive += 1 + self.nesting;
+    }
+
+    /// Walks an `if`/`else if`/`else` chain. Every link (the `if`, each
+    /// `else if`, and a final `else`) is charged its own structural
+    /// increment at `chain_level` — an `else if`/`else` does not add an
+    /// extra nesting level over its originating `if` — while each link's
+    /// own body is visited one nesting level deeper than `chain_level`.
+    fn visit_if_chain(&mut self, node: &ExprIf, chain_level: u32) {
+        self.nesting = chain_level;
+        self.add_structural();
+        self.visit_expr(&node.cond);
+
+        self.nesting = chain_level + 1;
+        self.visit_block(&node.then_branch);
+
+        if let Some((_, else_expr)) = &node.else_branch {
+            match else_expr.as_ref() {
+                Expr::If(else_if) => self.visit_if_chain(else_if, chain_level),
+                other => {
+                    self.nesting = chain_level;
+                    self.add_structural();
+                    self.nesting = chain_level + 1;
+                    self.visit_expr(other);
+                }
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum BoolOp {
+    And,
+    Or,
+}
+
+/// Flattens a chain of `&&`/`||` [`Expr::Binary`] nodes — transparently
+/// unwrapping [`Expr::Paren`] — into its left-to-right operators and leaf
+/// operands, so [`CognitiveComplexityVisitor`] can score operator-run
+/// transitions across the whole chain at once instead of per-node.
+fn flatten_bool_chain<'ast>(expr: &'ast Expr, ops: &mut Vec<BoolOp>, leaves: &mut Vec<&'ast Expr>) {
+    match expr {
+        Expr::Paren(node) => flatten_bool_chain(&node.expr, ops, leaves),
+        Expr::Binary(node) if matches!(node.op, BinOp::And(_) | BinOp::Or(_)) => {
+            flatten_bool_chain(&node.left, ops, leaves);
+            ops.push(match node.op {
+                BinOp::And(_) => BoolOp::And,
+                BinOp::Or(_) => BoolOp::Or,
+                _ => unreachable!("guarded by the match arm above"),
+            });
+            flatten_bool_chain(&node.right, ops, leaves);
+        }
+        other => leaves.push(other),
+    }
+}
+
+impl<'ast> Visit<'ast> for CognitiveComplexityVisitor {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        match expr {
+            Expr::If(node) => {
+                let saved = self.nesting;
+                self.visit_if_chain(node, saved);
+                self.nesting = saved;
+            }
+            Expr::Match(node) => {
+                let saved = self.nesting;
+                self.add_structural();
+                self.nesting = saved + 1;
+                for arm in &node.arms {
+                    if let Some((_, guard)) = &arm.guard {
+                        self.visit_expr(guard);
+                    }
+                    self.visit_expr(&arm.body);
+                }
+                self.nesting = saved;
+            }
+            Expr::ForLoop(node) => {
+                let saved = self.nesting;
+                self.add_structural();
+                self.visit_expr(&node.expr);
+                self.nesting = saved + 1;
+                self.visit_block(&node.body);
+                self.nesting = saved;
+            }
+            Expr::While(node) => {
+                let saved = self.nesting;
+                self.add_structural();
+                self.visit_expr(&node.cond);
+                self.nesting = saved + 1;
+                self.visit_block(&node.body);
+                self.nesting = saved;
+            }
+            Expr::Loop(node) => {
+                let saved = self.nesting;
+                self.add_structural();
+                self.nesting = saved + 1;
+                self.visit_block(&node.body);
+                self.nesting = saved;
+            }
+            Expr::Closure(node) => {
+                let saved = self.nesting;
+                self.nesting = saved + 1;
+                self.visit_expr(&node.body);
+                self.nesting = saved;
+            }
+            Expr::Break(node) if node.label.is_some() => {
+                self.add_structural();
+                if let Some(value) = &node.expr {
+                    self.visit_expr(value);
+                }
+            }
+            Expr::Continue(node) if node.label.is_some() => {
+                self.add_structural();
+            }
+            Expr::Binary(node) if matches!(node.op, BinOp::And(_) | BinOp::Or(_)) => {
+                let mut ops = Vec::new();
+                let mut leaves = Vec::new();
+                flatten_bool_chain(expr, &mut ops, &mut leaves);
+                if let Some(&first) = ops.first() {
+                    self.cognitive += 1;
+                    let mut prev = first;
+                    for &op in &ops[1..] {
+                        if op != prev {
+                            self.cognitive += 1;
+                        }
+                        prev = op;
+                    }
+                }
+                for leaf in leaves {
+                    self.visit_expr(leaf);
+                }
+            }
+            _ => visit::visit_expr(self, expr),
         }
     }
 
@@ -312,6 +497,62 @@ fn closure_only() {
         assert_eq!(match_arm_count("match_arms"), 4);
         assert_eq!(match_arm_count("mixed_nesting"), 2);
         assert_eq!(match_arm_count("closure_only"), 0);
+    }
+
+    #[test]
+    fn cognitive_complexity_matches_hand_calculation() {
+        let dir = TempDir::new("complexity-cognitive");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn straight_line() {
+    let _ = 1 + 1;
+}
+
+fn single_if(x: i32) {
+    if x > 0 {
+        let _ = x;
+    }
+}
+
+fn nested_if_in_for(x: i32) {
+    for i in 0..x {
+        if i % 2 == 0 {
+            let _ = i;
+        }
+    }
+}
+
+fn bool_chain_uniform(a: bool, b: bool, c: bool) -> bool {
+    a && b && c
+}
+
+fn bool_chain_mixed(a: bool, b: bool, c: bool) -> bool {
+    a && b || c
+}
+"#,
+        )
+        .unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let cognitive = |name: &str| {
+            functions
+                .iter()
+                .find(|f| f.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing function {name}"))
+                .cognitive
+        };
+
+        assert_eq!(cognitive("straight_line"), 0);
+        assert_eq!(cognitive("single_if"), 1);
+        // `for` (+1 at nesting 0) plus a nested `if` (+1 for the `if`, +1 for
+        // being one level deep) = 1 + 2 = 3.
+        assert_eq!(cognitive("nested_if_in_for"), 3);
+        // A single run of the same operator scores once for the whole run.
+        assert_eq!(cognitive("bool_chain_uniform"), 1);
+        // The operator changes once (`&&` -> `||`), so the run scores twice.
+        assert_eq!(cognitive("bool_chain_mixed"), 2);
     }
 
     #[test]

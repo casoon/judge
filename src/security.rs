@@ -31,12 +31,14 @@
 //! `integer-cast-risk` is an honestly-labeled proxy, not a truncation proof:
 //! knowing whether a cast can really lose precision needs the *source*
 //! expression's real type (a type checker), which isn't available at the
-//! Fast Tier — the same limitation already documented for `silent-default`/
-//! `context-free-propagation` in [`crate::slop`]'s module doc, deferred
-//! there to a future Deep Tier. This detector only ever looks at the cast's
-//! written target type — with one syntax-only exemption: a cast whose
-//! direct inner expression is itself a call to `clamp`/`min`/`max`/one of
-//! the `saturating_*` methods (see [`is_clamped_immediately`]) is not
+//! Fast Tier — the same underlying limitation `silent-default`/
+//! `context-free-propagation` document in [`crate::slop`]'s module doc,
+//! where each is narrowed to a syntax-only special case instead, rather than
+//! attempting the general (Deep-Tier) problem. This detector only ever looks
+//! at the cast's written target type — with one syntax-only exemption: a
+//! cast whose direct inner expression is itself a call to
+//! `clamp`/`min`/`max`/one of the `saturating_*` methods (see
+//! [`is_clamped_immediately`]) is not
 //! flagged, since the value is already bounded to a safe range immediately
 //! before the cast. Added after a 2026-07-24 precision audit against a real
 //! 135k-LOC corpus (`auditmysite`) found this the single largest

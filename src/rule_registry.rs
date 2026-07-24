@@ -206,6 +206,19 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         verdict_effect: VerdictEffect::Gating,
         example: None,
     },
+    // -- mutants.rs ---------------------------------------------------------
+    RuleMetadata {
+        id: "mutation-survivor",
+        evidence_class: EvidenceClass::ExternalMeasurement,
+        preconditions: "Requires `cargo judge coverage --mutants-json PATH`, an already-generated `cargo-mutants` `outcomes.json` report (opt-in; judge never runs `cargo-mutants` itself). Same evidence class and verdict effect as `untested-hotspot` — both are external-tool-derived test-strength signals.",
+        exclusions: "A mutant that is semantically identical to the original code (an 'equivalent mutant') can never be caught by any test, however thorough — there is no observable behavior difference to assert on. This is a well-known, unavoidable limitation of mutation testing itself, not a defect in this rule; a finding here is never proof that a test is missing, only that no test in the imported run distinguished the mutated behavior from the original. The parsed `\"MissedMutant\"` count is cross-checked against the report's own top-level `missed` field; a mismatch (e.g. a stale or partially malformed report) is recorded as a non-fatal error rather than dropping findings — see `crate::mutants` module docs.",
+        allowed_wording: "State only that this mutant was not caught by a failing test in the imported cargo-mutants run — never that the mutated code is 'untested' or 'broken' (todo.md §17.4); an equivalent mutant would survive no matter how thorough the tests are.",
+        verdict_effect: VerdictEffect::Gating,
+        example: Some(RuleExample {
+            before: "{\"outcomes\":[{\"scenario\":{\"Mutant\":{\"name\":\"src/discount.rs:8:5: replace apply_discount -> f64 with 0.0\",\"package\":\"shop-core\",\"file\":\"src/discount.rs\",\"function\":{\"function_name\":\"apply_discount\",\"return_type\":\"-> f64\",\"span\":{\"start\":{\"line\":6,\"column\":1},\"end\":{\"line\":10,\"column\":1}}},\"span\":{\"start\":{\"line\":8,\"column\":5},\"end\":{\"line\":8,\"column\":30}},\"replacement\":\"0.0\",\"genre\":\"FnValue\"}},\"summary\":\"MissedMutant\",\"log_path\":\"mutants.out/log/discount.rs-line8.log\",\"diff_path\":\"mutants.out/diff/discount.rs-line8.diff\",\"phase_results\":[]}],\"total_mutants\":1,\"missed\":1,\"caught\":0,\"timeout\":0,\"unviable\":0,\"success\":0,\"start_time\":\"2026-01-01T00:00:00Z\",\"end_time\":\"2026-01-01T00:05:00Z\",\"cargo_mutants_version\":\"25.0.0\"}",
+            why_it_matters: "A mutant that replaces a function's real return value with a dummy constant and still passes the entire test suite means no test actually asserts on that function's output — the coverage tooling may still call this line \"covered\", but nothing checks whether it computed the right thing.",
+        }),
+    },
     // -- dead_code.rs (Deep Tier, `--features deep`) -----------------------
     RuleMetadata {
         id: "unused-pub-workspace",
@@ -969,6 +982,42 @@ impl OrderPricing {
             why_it_matters: "A doc comment that only repeats the function's own name and return type gives readers nothing they couldn't already infer from the signature, while looking documented in a coverage report.",
         }),
     },
+    RuleMetadata {
+        id: "silent-default",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
+        exclusions: "A syntax-only proxy, not a taint proof: a complete check would need to confirm the observed error is really the same one being defaulted away, which needs real value-flow tracking not available at the Fast Tier — the same limitation `context-free-propagation`/`debug-format-leak` document, deliberately sidestepped here instead of solved. Only two call shapes match: `.unwrap_or_default()`, and `.unwrap_or_else(|_| ..)` where the closure takes a single wildcard/unused parameter and its body is exactly a `Default::default()`/`<Type>::default()` call — both are inherently `Option<T>`/`Result<T, E>`-only methods in std, so no receiver-type check is needed. The corroborating signal (\"no error-observing call anywhere in this function\": no `.inspect_err(`, no `log::`/`tracing::`-qualified call, no unqualified `eprintln!`/`warn!`/`error!` macro, no `if let Err(..)`) is function-granularity, not call-site granularity — a function that observes a *different* fallible call's error elsewhere still suppresses a finding on this one, since judge cannot tell the two apart without real data-flow analysis.",
+        allowed_wording: HEURISTIC_WORDING,
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: Some(RuleExample {
+            before: "fn parse_retry_count(raw: Option<&str>) -> u32 {\n    raw.and_then(|s| s.parse().ok()).unwrap_or_default()\n}\n",
+            why_it_matters: "An invalid or missing retry count silently becomes 0 instead of surfacing anywhere, so a misconfigured value looks identical to a deliberately disabled retry.",
+        }),
+    },
+    RuleMetadata {
+        id: "context-free-propagation",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
+        exclusions: "A syntax-only proxy: only matches a function's own *written* return type against a fixed list of syntactically recognizable opaque-error idioms (`anyhow::Result<_>`/`anyhow::Error`, `eyre::Result<_>`/`eyre::Report`, `Box<dyn std::error::Error ..>`) — a type alias that resolves to one of these shapes without spelling it out is not recognized, since that needs a type checker, not available at the Fast Tier. Only fires with 2 or more `?`-sites on distinct underlying calls (deduped by token text, so the exact same call written twice counts once) — a function with a single fallible call needs no context to disambiguate which operation failed, so it is never flagged. Fires only when the function's body contains *zero* `.context(`/`.with_context(` calls anywhere — a function that already calls `.context()` for some of its `?`-sites but not all of them is not flagged, since the author is clearly already following that practice in this function; this is a deliberate, coarser-than-call-site choice, not an oversight.",
+        allowed_wording: HEURISTIC_WORDING,
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: Some(RuleExample {
+            before: "pub fn load_user_profile(path: &str) -> anyhow::Result<String> {\n    let raw = std::fs::read_to_string(path)?;\n    let parsed = raw.parse::<i32>()?;\n    Ok(parsed.to_string())\n}\n",
+            why_it_matters: "When either the file read or the parse fails, the caller only ever sees the bare underlying error (a plain `io::Error` or `ParseIntError`) with no indication of which of the two operations — or which file/value — actually failed.",
+        }),
+    },
+    RuleMetadata {
+        id: "debug-format-leak",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
+        exclusions: "The sink is identified by the `impl std::fmt::Display for T` block boundary itself — Rust's own convention that `Display`/`{}`/`.to_string()` is the user-facing representation and `Debug`/`{:?}` is the diagnostic one — not by tracing a value's flow into it, so this does not need the general cross-function taint tracking `silent-default`/`context-free-propagation` also don't have. Only a `write!(f, ..)`/`format!(..)` call whose first string-literal argument contains the literal substring `{:?}`/`{:#?}` is matched; a captured/positional debug placeholder written as `{value:?}`/`{0:?}` is not recognized. A `format!`/`write!` invocation nested inside another macro's own argument tokens (e.g. `write!(f, \"{}\", format!(\"{:?}\", x))`) is invisible to this rule — `syn` does not parse into a macro's argument tokens as part of the file-level AST, only this rule's own explicit top-level macro visits are checked, same macro-opacity limitation already documented for `merged-stub`/`suppression-debt` elsewhere in this file.",
+        allowed_wording: HEURISTIC_WORDING,
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: Some(RuleExample {
+            before: "struct OrderId(u64);\n\nimpl std::fmt::Display for OrderId {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"{:?}\", self.0)\n    }\n}\n",
+            why_it_matters: "Every user-facing rendering of `OrderId` (`{}`, `.to_string()`, anywhere it's shown in a report or error message) now goes through `Debug` formatting instead of a deliberate display representation, so the moment the field's own type changes its `Debug` output, customer-visible text silently changes with it.",
+        }),
+    },
     // -- slop_structural.rs (G4, Fast Tier subset) ---------------------------
     RuleMetadata {
         id: "churn-hotspot",
@@ -983,7 +1032,7 @@ impl OrderPricing {
         id: "complexity-inflation",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Flags a long function with implausibly low branching; does not distinguish a genuinely simple long function (e.g. a large match/data table) from a padded one.",
+        exclusions: "Flags a long function that either has implausibly low branching (cyclomatic complexity) or is deeply nested/hard to follow relative to its length (Cognitive Complexity, SonarSource's approximated metric, threshold 15); does not distinguish a genuinely simple long function (e.g. a large match/data table) from a padded one, and does not distinguish deliberately layered control flow from code that would benefit from flattening.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
         example: Some(RuleExample {
@@ -1283,6 +1332,7 @@ mod tests {
             crate::git::SIZE_DISTRIBUTION_RULE,
             crate::module_graph::UNLINKED_FILE_RULE,
             crate::module_graph::ORPHAN_MODULE_RULE,
+            crate::mutants::MUTATION_SURVIVOR_RULE,
             crate::ownership::LOW_BUS_FACTOR_RULE,
             crate::ownership::OWNERSHIP_FRAGMENTATION_RULE,
             crate::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
@@ -1312,6 +1362,9 @@ mod tests {
             crate::slop::STEP_COMMENT_INFLATION_RULE,
             crate::slop::GENERIC_NAMING_RULE,
             crate::slop::DOC_RESTATES_SIGNATURE_RULE,
+            crate::slop::SILENT_DEFAULT_RULE,
+            crate::slop::CONTEXT_FREE_PROPAGATION_RULE,
+            crate::slop::DEBUG_FORMAT_LEAK_RULE,
             crate::slop_structural::CHURN_HOTSPOT_RULE,
             crate::slop_structural::COMPLEXITY_INFLATION_RULE,
             crate::slop_structural::LEGACY_FREEZE_RULE,

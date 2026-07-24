@@ -143,7 +143,9 @@ pub enum Severity {
 /// | `phantom-crate`, `phantom-version`, `fresh-low-reputation-dep`, `yanked-dependency`, `dep-single-maintainer` | `external_measurement` (a crates.io lookup snapshot) |
 /// | `known-vulnerability` | `external_measurement` (an imported `cargo audit --json` snapshot — see `crate::advisories`) |
 /// | `untested-hotspot` | `external_measurement` (complexity and churn are `derived_fact`/`heuristic` in isolation, but the imported `cargo-llvm-cov` coverage snapshot is the rarest, least locally-verifiable ingredient in the combination, so it sets the class — see `crate::coverage::untested_hotspots`) |
+/// | `mutation-survivor` | `external_measurement` (an imported `cargo-mutants` `outcomes.json` snapshot — same class as `untested-hotspot`, judge's other external-tool-derived test-strength signal — see `crate::mutants`) |
 /// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `legacy-freeze`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt`, `dep-added-by-agent`, `integer-cast-risk`, `fragile-substring-classification`, `size-distribution`, `re-export-chain`, `hardcoded-secret`, `change-coupling-signal` | `heuristic` (reproducible interpretation, not proof) |
+/// | `silent-default`, `context-free-propagation`, `debug-format-leak` | `heuristic` (narrow syntax-only proxies for signals that would need real type/taint information for a complete check — see `crate::slop` module docs) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceClass {
@@ -234,10 +236,14 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "yanked-dependency"
         | "dep-single-maintainer"
         | "known-vulnerability"
-        | "untested-hotspot" => EvidenceClass::ExternalMeasurement,
+        | "untested-hotspot"
+        | "mutation-survivor" => EvidenceClass::ExternalMeasurement,
         "unused-pub-api" => EvidenceClass::Heuristic,
         "size-distribution" => EvidenceClass::Heuristic,
         "re-export-chain" => EvidenceClass::Heuristic,
+        "silent-default" | "context-free-propagation" | "debug-format-leak" => {
+            EvidenceClass::Heuristic
+        }
         _ => EvidenceClass::Heuristic,
     }
 }
@@ -1094,6 +1100,46 @@ mod tests {
         assert_eq!(json["counts"]["gating"], 0);
         assert_eq!(json["counts"]["advisory"], 1);
         assert_eq!(json["errors"], serde_json::json!([]));
+    }
+
+    /// Full-shape drift guard for the top-level JSON envelope (todo.md
+    /// "Stabiles JSON-Schema mit Semver-Garantie"): unlike the field-by-field
+    /// checks above, this compares the entire serialized `Report` against a
+    /// literal fixture, so an accidental new/renamed/removed field at any
+    /// level — not just the ones already asserted — fails the test.
+    #[test]
+    fn report_serializes_to_the_full_expected_json_shape() {
+        let report = Report::new(vec![finding("a")]);
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "schema_version": SCHEMA_VERSION,
+                "counts": {
+                    "gating": 0,
+                    "advisory": 1,
+                },
+                "findings": [
+                    {
+                        "id": "a",
+                        "rule": "test-rule",
+                        "severity": "warn",
+                        "location": {
+                            "file": "src/lib.rs",
+                            "line": 1,
+                            "item_path": "crate::lib",
+                        },
+                        "evidence_class": "heuristic",
+                        "origin": "code",
+                        "evidence": null,
+                        "caused_by": [],
+                        "causes": [],
+                    },
+                ],
+                "errors": [],
+            })
+        );
     }
 
     #[test]

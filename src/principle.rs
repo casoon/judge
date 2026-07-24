@@ -25,21 +25,26 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus four real detectors —
+//! sixteen table entries), plus six real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
 //! (see [`functional_core_imperative_shell_candidates`]),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
 //! [`interface_segregation_candidates`]),
 //! [`DependencyInversion`](DesignPrinciple::DependencyInversion) (see
-//! [`dependency_inversion_candidates`]), and
-//! [`Cohesion`](DesignPrinciple::Cohesion) (see [`cohesion_candidates`]). The
-//! remaining `DesignPrinciple` variants are unused for now; they document the
-//! target space rather than being implemented.
+//! [`dependency_inversion_candidates`]),
+//! [`Cohesion`](DesignPrinciple::Cohesion) (see [`cohesion_candidates`]),
+//! [`LawOfDemeter`](DesignPrinciple::LawOfDemeter) (see
+//! [`law_of_demeter_candidates`]), and
+//! [`BoundedResources`](DesignPrinciple::BoundedResources) (see
+//! [`bounded_resources_candidates`]). The remaining `DesignPrinciple`
+//! variants are unused for now; they document the target space rather than
+//! being implemented.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 use crate::boundaries::{
@@ -71,6 +76,14 @@ pub const INTERFACE_SEGREGATION_METHOD_THRESHOLD: usize = 5;
 /// items in one file" (signal 1) — chosen to mean more than the one or two
 /// items a small, single-purpose file typically declares.
 pub const COHESION_ITEM_THRESHOLD: usize = 3;
+
+/// Minimum number of chained method calls in one unbroken expression
+/// [`law_of_demeter_candidates`] treats as "a long reach through an
+/// intermediate object's own interface" (signal 1) — chosen to mean more
+/// than a single extra hop (`a.b().c()`, two calls, is unremarkable) while
+/// still being cheap to reach by adding one more call to an
+/// already-two-call chain.
+pub const LAW_OF_DEMETER_CHAIN_THRESHOLD: usize = 3;
 
 /// A prüffähiges Designprinzip from todo.md §16.7's table. All sixteen table
 /// entries are represented so the enum documents the full target space, even
@@ -255,6 +268,8 @@ pub fn analyze_workspace(
     heuristics.extend(interface_segregation_candidates(workspace));
     heuristics.extend(dependency_inversion_candidates(workspace, boundary_config)?);
     heuristics.extend(cohesion_candidates(workspace, complexity));
+    heuristics.extend(law_of_demeter_candidates(workspace));
+    heuristics.extend(bounded_resources_candidates(workspace));
     Ok(heuristics)
 }
 
@@ -1486,6 +1501,889 @@ fn build_cohesion_heuristic(
     }
 }
 
+/// One method-chain expression [`law_of_demeter_candidates`] flags: its
+/// length (number of chained `.method()` calls in the single unbroken
+/// expression), the rendered source text of the whole chain, and the
+/// rendered source text of each intermediate partial result strictly
+/// between the full chain and its base receiver (used for signal 2 — see
+/// that function's doc comment).
+struct ChainHit {
+    length: usize,
+    rendered: String,
+    intermediates: Vec<String>,
+}
+
+/// Whether `expr` (after unwrapping any leading `&`/`&mut`/parens) is the
+/// kind of chain base [`law_of_demeter_candidates`] excludes before either
+/// of its signals is even checked: a bare `self`, a one-level-deep
+/// `self.field` access, an associated call on `Self::...`, or a
+/// constructor-shaped associated call (`Type::new(...)`,
+/// `Type::default(...)`, `Type::builder(...)`). `self.foo.bar()`-shaped
+/// chains are ordinary Rust idiom, and a builder chain on a freshly
+/// constructed local is a well-known, deliberate pattern — neither is a
+/// Demeter concern.
+fn chain_base_is_excluded(expr: &syn::Expr) -> bool {
+    let mut cursor = expr;
+    loop {
+        match cursor {
+            syn::Expr::Reference(reference) => cursor = reference.expr.as_ref(),
+            syn::Expr::Paren(paren) => cursor = paren.expr.as_ref(),
+            _ => break,
+        }
+    }
+    match cursor {
+        syn::Expr::Path(path) => path.path.is_ident("self"),
+        syn::Expr::Field(field) => {
+            matches!(field.base.as_ref(), syn::Expr::Path(base) if base.path.is_ident("self"))
+        }
+        syn::Expr::Call(call) => {
+            let syn::Expr::Path(func_path) = call.func.as_ref() else {
+                return false;
+            };
+            let segments: Vec<String> = func_path
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.to_string())
+                .collect();
+            if segments.first().map(String::as_str) == Some("Self") {
+                return true;
+            }
+            segments.len() >= 2
+                && matches!(
+                    segments.last().map(String::as_str),
+                    Some("new" | "default" | "builder")
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Whether `block`'s own statements (not nested blocks) include a `let`
+/// binding whose initializer renders to the same token text as one of
+/// `intermediates` — signal 2 for [`law_of_demeter_candidates`]: a chain
+/// whose intermediate results are already bound elsewhere in the same block
+/// was made readable/broken up deliberately, which is not this heuristic's
+/// concern.
+fn has_intermediate_let(block: &syn::Block, intermediates: &[String]) -> bool {
+    use quote::ToTokens;
+    block.stmts.iter().any(|stmt| {
+        if let syn::Stmt::Local(local) = stmt
+            && let Some(init) = &local.init
+        {
+            intermediates.contains(&init.expr.to_token_stream().to_string())
+        } else {
+            false
+        }
+    })
+}
+
+/// Method-chain expressions in `block` matching [`law_of_demeter_candidates`]:
+/// [`LAW_OF_DEMETER_CHAIN_THRESHOLD`] or more chained calls in one unbroken
+/// expression, not starting from an excluded base
+/// ([`chain_base_is_excluded`]), with no sibling `let` in the enclosing
+/// block capturing an intermediate step ([`has_intermediate_let`]). Tracks
+/// already-consumed inner `Expr::MethodCall` nodes by pointer identity so a
+/// maximal chain is only reported once, at its outermost call — the same
+/// "consumed" bookkeeping `slop_structural.rs`'s if/else-if chain walk uses
+/// for the same reason (avoid re-evaluating an inner node of an already
+/// reported chain as its own, shorter chain head).
+fn law_of_demeter_chain_hits(block: &syn::Block) -> Vec<ChainHit> {
+    use quote::ToTokens;
+
+    struct Finder<'ast> {
+        consumed: std::collections::HashSet<*const syn::ExprMethodCall>,
+        block_stack: Vec<&'ast syn::Block>,
+        hits: Vec<ChainHit>,
+    }
+    impl<'ast> Visit<'ast> for Finder<'ast> {
+        fn visit_block(&mut self, node: &'ast syn::Block) {
+            self.block_stack.push(node);
+            syn::visit::visit_block(self, node);
+            self.block_stack.pop();
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if self
+                .consumed
+                .contains(&(node as *const syn::ExprMethodCall))
+            {
+                syn::visit::visit_expr_method_call(self, node);
+                return;
+            }
+
+            let mut length = 1;
+            let mut intermediates = Vec::new();
+            let mut cursor: &syn::Expr = node.receiver.as_ref();
+            while let syn::Expr::MethodCall(inner) = cursor {
+                self.consumed.insert(inner as *const syn::ExprMethodCall);
+                length += 1;
+                intermediates.push(cursor.to_token_stream().to_string());
+                cursor = inner.receiver.as_ref();
+            }
+
+            if length >= LAW_OF_DEMETER_CHAIN_THRESHOLD
+                && !chain_base_is_excluded(cursor)
+                && !self
+                    .block_stack
+                    .last()
+                    .is_some_and(|block| has_intermediate_let(block, &intermediates))
+            {
+                self.hits.push(ChainHit {
+                    length,
+                    rendered: node.to_token_stream().to_string(),
+                    intermediates,
+                });
+            }
+
+            syn::visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+    }
+
+    let mut finder = Finder {
+        consumed: std::collections::HashSet::new(),
+        block_stack: Vec::new(),
+        hits: Vec::new(),
+    };
+    finder.visit_block(block);
+    finder.hits
+}
+
+/// Law of Demeter (todo.md §16.7's table): "Methodenkette über mehrere
+/// Objektgrenzen (`a.b().c().d()`), kein `let` dazwischen" → "Tell-Don't-
+/// Ask/Fassade statt tiefer Kettennavigation prüfen".
+///
+/// Two independent signals, both required on the same chain expression:
+///
+/// 1. **Structural (chain length)** — at least
+///    [`LAW_OF_DEMETER_CHAIN_THRESHOLD`] chained `.method()` calls in one
+///    unbroken expression, counted by walking nested `Expr::MethodCall`
+///    receivers ([`law_of_demeter_chain_hits`]).
+/// 2. **Corroborating (no readable breakdown already exists)** — no sibling
+///    `let` binding in the same block captures the rendered text of any
+///    intermediate step of the chain ([`has_intermediate_let`]). A chain
+///    whose intermediate results are already bound elsewhere in the block is
+///    evidence the steps were made readable/intentional, not a Demeter
+///    concern.
+///
+/// Chains whose base receiver is `self`, `&self`/`&mut self`, a one-level
+/// `self.field` access, an associated call on `Self::...`, or a
+/// constructor-shaped associated call (`Type::new(...)`,
+/// `Type::default(...)`, `Type::builder(...)`) are excluded before either
+/// signal is even checked (see [`chain_base_is_excluded`]).
+///
+/// At most one heuristic per matching chain expression — a function may
+/// contribute more than one if it contains several qualifying chains.
+fn law_of_demeter_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            walk_functions(&ast, |site| {
+                for hit in law_of_demeter_chain_hits(site.block) {
+                    heuristics.push(build_law_of_demeter_heuristic(
+                        krate,
+                        &source.path,
+                        &site.qualified_name,
+                        &hit,
+                    ));
+                }
+            });
+        }
+    }
+    heuristics
+}
+
+fn build_law_of_demeter_heuristic(
+    krate: &CrateInfo,
+    file: &Path,
+    item_path: &str,
+    hit: &ChainHit,
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![item_path.to_string()],
+    };
+    let location = EvidenceLocation {
+        file: file.to_path_buf(),
+        item_path: Some(item_path.to_string()),
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{item_path}` contains a method chain with {} chained calls in one unbroken \
+             expression, at or above the {LAW_OF_DEMETER_CHAIN_THRESHOLD}-call threshold this \
+             heuristic treats as a long reach: `{}`.",
+            hit.length, hit.rendered
+        ),
+        locations: vec![location.clone()],
+    };
+    let corroborating = Evidence {
+        description: if hit.intermediates.is_empty() {
+            "This chain has no intermediate step besides its base receiver to look for in a \
+             sibling `let` binding."
+                .to_string()
+        } else {
+            format!(
+                "No sibling `let` binding elsewhere in the same block captures any of this \
+                 chain's intermediate results ({}) — the chain was not already broken into \
+                 readable steps.",
+                hit.intermediates.join(", ")
+            )
+        },
+        locations: vec![location],
+    };
+
+    let evidence_identities = vec![item_path.to_string(), hit.rendered.clone()];
+    let id =
+        PrincipleHeuristicId::compute(DesignPrinciple::LawOfDemeter, &scope, &evidence_identities);
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::LawOfDemeter,
+        scope,
+        evidence: vec![structural, corroborating],
+        interpretation: format!(
+            "In the examined function, this expression reaches through {} chained method calls \
+             in a single unbroken step, without an intermediate binding that would suggest the \
+             steps were deliberately made readable. That may indicate the caller depends on \
+             more of an intermediate object's own interface than its immediate collaborator.",
+            hit.length
+        ),
+        contraindications: vec![
+            Contraindication {
+                description: "A chain over a well-known, stable interface designed for chaining \
+                    (iterator adaptors, string/path builders) is idiomatic Rust and not itself \
+                    evidence of reaching through unrelated internals."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "If every type in the chain belongs to the same module or is a \
+                    thin wrapper around the previous step's own concern, the chain may not cross \
+                    any real object boundary."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether the intermediate types in the chain belong to unrelated \
+                ownership boundaries (the actual Demeter concern) or are closely related \
+                collaborators is not checked here — only that the chain is long and unbroken."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the expression as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Introduce intermediate `let` bindings, or a method on the \
+                    immediate collaborator that performs the deeper step internally (Tell, \
+                    Don't Ask), so the caller depends on one interface instead of several \
+                    chained ones."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
+/// One `loop { ... }` [`bounded_resources_loop_candidates`] flags: the
+/// source line its `loop` keyword starts on.
+struct LoopHit {
+    line: usize,
+}
+
+/// Whether `path`'s segments contain the consecutive pair `process`, `exit`
+/// anywhere — the same accepted-limitation, path-suffix matching
+/// [`path_matches_io_prefix`] uses, applied to `std::process::exit`
+/// specifically (also matches a `use`-imported bare `process::exit`).
+fn path_matches_process_exit(path: &syn::Path) -> bool {
+    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    segments
+        .windows(2)
+        .any(|pair| pair[0] == "process" && pair[1] == "exit")
+}
+
+/// Whether `body` (a `loop { ... }`'s own block) contains, anywhere within
+/// its own lexical scope, a `break`, `return`, `?`, `panic!`, or
+/// `std::process::exit(...)` call. Does not descend into a nested closure or
+/// a locally defined `fn` item — a `break`/`return`/`?` inside either
+/// targets that inner scope, not this loop. Still descends into a nested
+/// `loop`/`while`/`for`, so an unlabeled `break` belonging only to an inner
+/// loop is (conservatively) still counted as an exit for the outer loop —
+/// see [`bounded_resources_loop_candidates`]'s `missing_evidence` for this
+/// accepted limitation.
+fn loop_has_any_exit(body: &syn::Block) -> bool {
+    struct Finder {
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+            self.found = true;
+            syn::visit::visit_expr_break(self, node);
+        }
+
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            self.found = true;
+            syn::visit::visit_expr_return(self, node);
+        }
+
+        fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+            self.found = true;
+            syn::visit::visit_expr_try(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if node.path.is_ident("panic") {
+                self.found = true;
+            }
+            syn::visit::visit_macro(self, node);
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = node.func.as_ref()
+                && path_matches_process_exit(&path.path)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+
+        fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
+
+        fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+    }
+    let mut finder = Finder { found: false };
+    finder.visit_block(body);
+    finder.found
+}
+
+/// `loop { ... }` expressions in `block` with no visible exit at all in
+/// their own lexical body ([`loop_has_any_exit`]) — see
+/// [`bounded_resources_loop_candidates`] for why "no exit at all", not just
+/// "no `break`", is required.
+fn bounded_resources_loop_hits(block: &syn::Block) -> Vec<LoopHit> {
+    struct Finder {
+        hits: Vec<LoopHit>,
+    }
+    impl<'ast> Visit<'ast> for Finder {
+        fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+            if !loop_has_any_exit(&node.body) {
+                self.hits.push(LoopHit {
+                    line: node.loop_token.span().start().line,
+                });
+            }
+            syn::visit::visit_expr_loop(self, node);
+        }
+
+        fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+    }
+    let mut finder = Finder { hits: Vec::new() };
+    finder.visit_block(block);
+    finder.hits
+}
+
+fn bounded_resources_loop_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            walk_functions(&ast, |site| {
+                for hit in bounded_resources_loop_hits(site.block) {
+                    heuristics.push(build_bounded_resources_loop_heuristic(
+                        krate,
+                        &source.path,
+                        &site.qualified_name,
+                        &hit,
+                    ));
+                }
+            });
+        }
+    }
+    heuristics
+}
+
+fn build_bounded_resources_loop_heuristic(
+    krate: &CrateInfo,
+    file: &Path,
+    item_path: &str,
+    hit: &LoopHit,
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![item_path.to_string()],
+    };
+    let location = EvidenceLocation {
+        file: file.to_path_buf(),
+        item_path: Some(item_path.to_string()),
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{item_path}` has a `loop {{ ... }}` at line {} with no `break` anywhere in its \
+             own lexical body (not counting a nested closure or a locally defined nested `fn`).",
+            hit.line
+        ),
+        locations: vec![location.clone()],
+    };
+    let corroborating = Evidence {
+        description: "The same loop also has no `return`, `?`, `panic!`, or \
+            `std::process::exit` anywhere in its own lexical body — no visible exit path at \
+            all, not just an absent `break`."
+            .to_string(),
+        locations: vec![location],
+    };
+
+    let evidence_identities = vec![item_path.to_string(), hit.line.to_string()];
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::BoundedResources,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::BoundedResources,
+        scope,
+        evidence: vec![structural, corroborating],
+        interpretation: "In the examined function, this `loop` has no visible exit — no \
+            `break`, `return`, `?`, `panic!`, or `std::process::exit` — anywhere in its own \
+            lexical body. That may indicate the loop's termination depends on something this \
+            per-function, syntax-only check cannot see, or that the loop is genuinely \
+            unbounded."
+            .to_string(),
+        contraindications: vec![
+            Contraindication {
+                description: "A loop meant to run for the process's entire lifetime (an event \
+                    loop, a server accept loop) is deliberately unbounded — that's its job, not \
+                    a defect."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "This is a Fast-Tier syntax proxy, not a termination proof: an \
+                    exit driven by a called function's own control flow (e.g. a helper that \
+                    itself calls `std::process::exit`) would not be seen here."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether this loop is an intentional long-running loop versus a \
+                genuine bug is not distinguished here — that depends on non-observable intent. \
+                A `break` reached only via a labeled block/loop from further out, or an \
+                unlabeled `break` belonging only to a nested inner loop (still conservatively \
+                counted as this loop's own exit), would not be recognized correctly by this \
+                check."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the loop as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Make the loop's bound or termination condition explicit — a \
+                    `while`/`for` with a visible bound, an explicit `break` condition, or a \
+                    documented comment explaining why the loop is intentionally unbounded."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
+/// One directly self-recursive function
+/// [`bounded_resources_recursion_candidates`] flags: how many call sites
+/// call the function by its own name, the rendered text and line of the
+/// first one, and the function's own parameter names (used to phrase signal
+/// 2's evidence — see that function's doc comment).
+struct RecursionHit {
+    call_count: usize,
+    first_call_rendered: String,
+    first_call_line: usize,
+    param_names: Vec<String>,
+}
+
+/// Whether `expr` references any identifier in `names` anywhere within it —
+/// duplicated from `crate::pattern::expr_references_ident` (generalized to a
+/// name list) for the same reason this module's other helpers duplicate
+/// `pattern.rs`/`boundaries.rs` internals rather than making them `pub`.
+fn expr_references_any(expr: &syn::Expr, names: &[String]) -> bool {
+    struct Finder<'a> {
+        names: &'a [String],
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if let Some(ident) = node.path.get_ident() {
+                let name = ident.to_string();
+                if self.names.contains(&name) {
+                    self.found = true;
+                }
+            }
+            syn::visit::visit_expr_path(self, node);
+        }
+    }
+    let mut finder = Finder {
+        names,
+        found: false,
+    };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+/// Every call site in `block` that calls the function named `name` by its
+/// own name — either a free/associated call (`name(...)`, `Self::name(...)`,
+/// `Type::name(...)`) or a method call (`x.name(...)`) — paired with the
+/// call's source line, sorted in source order. Ignores indirect/mutual
+/// recursion (a function calling a *different* function that calls back
+/// into this one) — too expensive to detect with pure per-file AST, and out
+/// of scope for this Fast-Tier proxy. Does not descend into a locally
+/// defined nested `fn` of the same name (that would be a shadowing,
+/// unrelated function).
+fn direct_recursive_calls(block: &syn::Block, name: &str) -> Vec<(usize, String)> {
+    use quote::ToTokens;
+
+    struct Finder<'a> {
+        name: &'a str,
+        hits: Vec<(usize, String)>,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = node.func.as_ref()
+                && path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident == self.name)
+            {
+                self.hits
+                    .push((node.span().start().line, node.to_token_stream().to_string()));
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            if node.method == self.name {
+                self.hits
+                    .push((node.span().start().line, node.to_token_stream().to_string()));
+            }
+            syn::visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+    }
+    let mut finder = Finder {
+        name,
+        hits: Vec::new(),
+    };
+    finder.visit_block(block);
+    finder.hits.sort_by_key(|(line, _)| *line);
+    finder.hits
+}
+
+/// Parameter identifiers of `sig` — simple `Pat::Ident` patterns only
+/// (destructuring patterns are skipped, an accepted limitation), excluding
+/// the receiver.
+fn param_names(sig: &syn::Signature) -> Vec<String> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
+                syn::Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
+                _ => None,
+            },
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect()
+}
+
+/// Whether `block` contains an `if`/`match` whose condition/scrutinee
+/// references any of `params`, at a line strictly before `before_line` —
+/// signal 2 for [`bounded_resources_recursion_candidates`]'s recursion
+/// case. Does not descend into a locally defined nested `fn` item, the same
+/// exclusion [`direct_recursive_calls`] uses.
+fn has_parameter_guard_before(block: &syn::Block, params: &[String], before_line: usize) -> bool {
+    struct Finder<'a> {
+        params: &'a [String],
+        before_line: usize,
+        found: bool,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            if node.if_token.span().start().line < self.before_line
+                && expr_references_any(&node.cond, self.params)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_if(self, node);
+        }
+
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            if node.match_token.span().start().line < self.before_line
+                && expr_references_any(&node.expr, self.params)
+            {
+                self.found = true;
+            }
+            syn::visit::visit_expr_match(self, node);
+        }
+
+        fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+    }
+    let mut finder = Finder {
+        params,
+        before_line,
+        found: false,
+    };
+    finder.visit_block(block);
+    finder.found
+}
+
+/// Builds a [`RecursionHit`] for one function named `name` if it directly
+/// calls itself ([`direct_recursive_calls`]) with no parameter-referencing
+/// `if`/`match` visible before the first such call
+/// ([`has_parameter_guard_before`]) — the two independent signals
+/// [`bounded_resources_recursion_candidates`]'s recursion case requires.
+fn bounded_resources_recursion_hit(
+    name: &str,
+    sig: &syn::Signature,
+    block: &syn::Block,
+) -> Option<RecursionHit> {
+    let calls = direct_recursive_calls(block, name);
+    let (first_call_line, first_call_rendered) = calls.first()?.clone();
+    let params = param_names(sig);
+    if has_parameter_guard_before(block, &params, first_call_line) {
+        return None;
+    }
+    Some(RecursionHit {
+        call_count: calls.len(),
+        first_call_rendered,
+        first_call_line,
+        param_names: params,
+    })
+}
+
+/// Walks a crate's parsed files for [`bounded_resources_recursion_candidates`],
+/// tracking the enclosing `mod`/`impl` path for a qualified item name — the
+/// same path-tracking shape `SignatureCollector` uses, reimplemented here
+/// because that helper doesn't run [`bounded_resources_recursion_hit`]'s
+/// check.
+struct RecursionCollector {
+    path: Vec<String>,
+    hits: Vec<(String, RecursionHit)>,
+}
+
+impl RecursionCollector {
+    fn qualified(&self, name: &str) -> String {
+        if self.path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{name}", self.path.join("::"))
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for RecursionCollector {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if node.content.is_some() {
+            self.path.push(node.ident.to_string());
+            syn::visit::visit_item_mod(self, node);
+            self.path.pop();
+        } else {
+            syn::visit::visit_item_mod(self, node);
+        }
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        self.path.push(crate::functions::type_name(&node.self_ty));
+        syn::visit::visit_item_impl(self, node);
+        self.path.pop();
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        let item_path = self.qualified(&node.sig.ident.to_string());
+        if let Some(hit) =
+            bounded_resources_recursion_hit(&node.sig.ident.to_string(), &node.sig, &node.block)
+        {
+            self.hits.push((item_path, hit));
+        }
+        syn::visit::visit_item_fn(self, node);
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        let item_path = self.qualified(&node.sig.ident.to_string());
+        if let Some(hit) =
+            bounded_resources_recursion_hit(&node.sig.ident.to_string(), &node.sig, &node.block)
+        {
+            self.hits.push((item_path, hit));
+        }
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+}
+
+fn bounded_resources_recursion_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            let mut collector = RecursionCollector {
+                path: Vec::new(),
+                hits: Vec::new(),
+            };
+            collector.visit_file(&ast);
+            for (item_path, hit) in collector.hits {
+                heuristics.push(build_bounded_resources_recursion_heuristic(
+                    krate,
+                    &source.path,
+                    &item_path,
+                    &hit,
+                ));
+            }
+        }
+    }
+    heuristics
+}
+
+fn build_bounded_resources_recursion_heuristic(
+    krate: &CrateInfo,
+    file: &Path,
+    item_path: &str,
+    hit: &RecursionHit,
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![item_path.to_string()],
+    };
+    let location = EvidenceLocation {
+        file: file.to_path_buf(),
+        item_path: Some(item_path.to_string()),
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{item_path}` calls itself directly by name at least once (line {}: `{}`, {} \
+             recursive call site(s) total).",
+            hit.first_call_line, hit.first_call_rendered, hit.call_count
+        ),
+        locations: vec![location.clone()],
+    };
+    let corroborating = Evidence {
+        description: if hit.param_names.is_empty() {
+            format!(
+                "`{item_path}` takes no parameters, so no parameter-derived guard is possible \
+                 before the recursive call at line {}.",
+                hit.first_call_line
+            )
+        } else {
+            format!(
+                "No `if`/`match` in `{item_path}` references one of its own parameters ({}) at \
+                 a line before the recursive call at line {} — no visible parameter-derived \
+                 guard precedes it.",
+                hit.param_names.join(", "),
+                hit.first_call_line
+            )
+        },
+        locations: vec![location],
+    };
+
+    let evidence_identities = vec![item_path.to_string()];
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::BoundedResources,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::BoundedResources,
+        scope,
+        evidence: vec![structural, corroborating],
+        interpretation: "In the examined function, direct self-recursion occurs with no \
+            parameter-referencing `if`/`match` visible before the recursive call. That may \
+            indicate the recursion has no syntactically visible base case, though this \
+            per-function, syntax-only check cannot rule out a guard expressed another way."
+            .to_string(),
+        contraindications: vec![
+            Contraindication {
+                description: "A base case guarded by a helper function's return value, a field \
+                    access reached indirectly rather than a bare parameter reference, or a \
+                    guard expressed via an early `?`/error return would not be recognized by \
+                    this check."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "Mutual/indirect recursion through another function is out of \
+                    scope for this per-file, name-based check — a real base case reached that \
+                    way looks identical to no base case at all here."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether the recursion is actually bounded by something this check \
+                can't see (a helper's return value, a field access rather than a bare \
+                parameter reference, or an externally enforced call-depth limit) is not \
+                checked here — only that no parameter-referencing conditional textually \
+                precedes the first recursive call."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the function as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Add an explicit guard on a parameter (or a value derived from \
+                    one) before the recursive call, or convert the recursion to an explicitly \
+                    bounded iterative loop."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
+/// Bounded Resources (todo.md §16.7's table): "unbegrenzte Iteration/
+/// Rekursion ohne erkennbare Terminierungsbedingung" → "Terminierungs-
+/// /Bound-Beweis nachrüsten".
+///
+/// A Fast-Tier **syntax-only proxy**, not a whole-program termination proof
+/// (that would need Deep Tier dataflow, out of scope here) — the same
+/// "proxy, not proof" framing `integer-cast-risk`/`unsafe-surface` use for
+/// their own Fast-Tier signals. Two structurally different shapes, each
+/// requiring two independent signals on the same site:
+///
+/// 1. **An unconditional `loop { ... }` with no visible exit at all** — see
+///    [`bounded_resources_loop_candidates`]. A `while`/`for` loop already
+///    has a syntactic bound expression, so only `loop` is considered.
+/// 2. **A directly self-recursive function with no visible parameter guard**
+///    — see [`bounded_resources_recursion_candidates`]. Only direct
+///    self-recursion (a function calling itself by name) is considered;
+///    mutual/indirect recursion is out of scope for a per-file AST check.
+///
+/// Both shapes are intentionally narrow and will miss real unbounded loops/
+/// recursion and flag some fine code — see each builder function's
+/// `contraindications`/`missing_evidence` for exactly what's out of scope. A
+/// low-frequency, high-precision result is the expected, correct outcome
+/// here, not a bug to loosen the signals over.
+fn bounded_resources_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = bounded_resources_loop_candidates(workspace);
+    heuristics.extend(bounded_resources_recursion_candidates(workspace));
+    heuristics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2632,6 +3530,223 @@ mod tests {
             heuristics
                 .iter()
                 .all(|h| h.principle != DesignPrinciple::Cohesion)
+        );
+    }
+
+    /// (a) An unbroken 3-call method chain on a non-`self` base ⇒ exactly
+    /// one `LawOfDemeter` heuristic, with both evidence slots populated.
+    #[test]
+    fn law_of_demeter_unbroken_three_call_chain_produces_one_heuristic() {
+        let dir = TempDir::new("principle-demeter-chain");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn reach(collector: &Collector) -> i32 {\n\
+             \x20   collector.repository().connection().timeout()\n\
+             }\n\
+             pub struct Collector;\n\
+             pub struct Repository;\n\
+             pub struct Connection;\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let demeter: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::LawOfDemeter)
+            .collect();
+
+        assert_eq!(demeter.len(), 1);
+        let heuristic = demeter[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) The same chain, but one of its intermediate results is already
+    /// bound to a sibling `let` in the same block ⇒ no heuristic (signal 1
+    /// present, signal 2 absent).
+    #[test]
+    fn law_of_demeter_chain_with_sibling_intermediate_let_produces_no_heuristic() {
+        let dir = TempDir::new("principle-demeter-chain-let");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn reach(collector: &Collector) -> i32 {\n\
+             \x20   let _cached = collector.repository().connection();\n\
+             \x20   collector.repository().connection().timeout()\n\
+             }\n\
+             pub struct Collector;\n\
+             pub struct Repository;\n\
+             pub struct Connection;\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::LawOfDemeter)
+        );
+    }
+
+    /// (c) A chain starting from a one-level-deep `self.field` access ⇒ no
+    /// heuristic — excluded before either signal is checked, even though
+    /// the chain itself is 3 calls long and unbroken.
+    #[test]
+    fn law_of_demeter_chain_starting_from_self_field_produces_no_heuristic() {
+        let dir = TempDir::new("principle-demeter-chain-self");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Widget {\n\
+             \x20   inner: Inner,\n\
+             }\n\
+             impl Widget {\n\
+             \x20   pub fn reach(&self) -> i32 {\n\
+             \x20\x20\x20   self.inner.repository().connection().timeout()\n\
+             \x20   }\n\
+             }\n\
+             pub struct Inner;\n\
+             pub struct Repository;\n\
+             pub struct Connection;\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::LawOfDemeter)
+        );
+    }
+
+    /// (a) A `loop { ... }` with no `break`/`return`/`?`/`panic!`/
+    /// `std::process::exit` anywhere in its own body ⇒ exactly one
+    /// `BoundedResources` heuristic, with both evidence slots populated.
+    #[test]
+    fn bounded_resources_loop_without_any_exit_produces_one_heuristic() {
+        let dir = TempDir::new("principle-bounded-resources-loop");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn spin(counter: &mut i32) {\n\
+             \x20   loop {\n\
+             \x20\x20\x20   *counter += 1;\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let bounded: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::BoundedResources)
+            .collect();
+
+        assert_eq!(bounded.len(), 1);
+        let heuristic = bounded[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) The same shape, but the loop has a `break` ⇒ no heuristic.
+    #[test]
+    fn bounded_resources_loop_with_break_produces_no_heuristic() {
+        let dir = TempDir::new("principle-bounded-resources-loop-break");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn spin(counter: &mut i32) -> i32 {\n\
+             \x20   loop {\n\
+             \x20\x20\x20   *counter += 1;\n\
+             \x20\x20\x20   if *counter > 3 {\n\
+             \x20\x20\x20\x20\x20   break;\n\
+             \x20\x20\x20   }\n\
+             \x20   }\n\
+             \x20   *counter\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::BoundedResources)
+        );
+    }
+
+    /// (c) A directly self-recursive function with no parameter-referencing
+    /// guard before the recursive call ⇒ exactly one `BoundedResources`
+    /// heuristic, with both evidence slots populated.
+    #[test]
+    fn bounded_resources_direct_recursion_without_guard_produces_one_heuristic() {
+        let dir = TempDir::new("principle-bounded-resources-recursion");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn countdown(n: i32) -> i32 {\n\
+             \x20   countdown(n - 1)\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let bounded: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::BoundedResources)
+            .collect();
+
+        assert_eq!(bounded.len(), 1);
+        let heuristic = bounded[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (d) The same shape, but a `if` on the parameter guards the recursive
+    /// call with a non-recursive return path ⇒ no heuristic.
+    #[test]
+    fn bounded_resources_direct_recursion_with_parameter_guard_produces_no_heuristic() {
+        let dir = TempDir::new("principle-bounded-resources-recursion-guard");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn countdown(n: i32) -> i32 {\n\
+             \x20   if n <= 0 {\n\
+             \x20\x20\x20   return 0;\n\
+             \x20   }\n\
+             \x20   countdown(n - 1)\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::BoundedResources)
         );
     }
 }

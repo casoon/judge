@@ -50,7 +50,7 @@ pub const CHURN_HOTSPOT_RULE_REVISION: u32 = 1;
 /// Rule id for a long function with implausibly low branching (see todo.md
 /// §3.G).
 pub const COMPLEXITY_INFLATION_RULE: &str = "complexity-inflation";
-pub const COMPLEXITY_INFLATION_RULE_REVISION: u32 = 1;
+pub const COMPLEXITY_INFLATION_RULE_REVISION: u32 = 2;
 
 /// Rule id for a file untouched for a year while its neighbors keep
 /// changing (see todo.md §3.G).
@@ -130,16 +130,29 @@ const MIN_LOC_FOR_INFLATION: usize = 40;
 /// Maximum cyclomatic complexity a function this long may have and still
 /// count as boilerplate rather than real branching logic.
 const MAX_COMPLEXITY_FOR_INFLATION: u32 = 3;
+/// Cognitive Complexity above which a function this long is flagged
+/// regardless of its cyclomatic complexity — 15 is SonarSource's widely-used
+/// default function-level threshold for the metric (see
+/// <https://www.sonarsource.com/resources/cognitive-complexity/> and
+/// [`crate::complexity::FunctionInfo::cognitive`]'s doc for how judge
+/// approximates it). Unlike [`MAX_COMPLEXITY_FOR_INFLATION`], this catches
+/// deeply nested, hard-to-follow logic rather than boilerplate padding — a
+/// different shape of "long function that's more costly to read than its
+/// length alone suggests".
+const MAX_COGNITIVE_FOR_INFLATION: u32 = 15;
 
-/// Flags functions that are long but barely branch — a shape more typical
-/// of copy-pasted/boilerplate-heavy code than of hand-written logic (see
+/// Flags long functions that are either boilerplate-shaped (barely branch,
+/// more typical of copy-pasted/repetitive code than hand-written logic) or
+/// deeply nested/hard to follow relative to their length, per
+/// [`MAX_COMPLEXITY_FOR_INFLATION`]/[`MAX_COGNITIVE_FOR_INFLATION`] (see
 /// todo.md §3.G).
 pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
     functions
         .iter()
         .filter(|function| {
             function.lines_of_code >= MIN_LOC_FOR_INFLATION
-                && function.cyclomatic <= MAX_COMPLEXITY_FOR_INFLATION
+                && (function.cyclomatic <= MAX_COMPLEXITY_FOR_INFLATION
+                    || function.cognitive > MAX_COGNITIVE_FOR_INFLATION)
         })
         .map(|function| Finding {
             id: format!(
@@ -160,6 +173,7 @@ pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
             evidence: Some(json!({
                 "lines_of_code": function.lines_of_code,
                 "cyclomatic": function.cyclomatic,
+                "cognitive": function.cognitive,
             })),
             caused_by: Vec::new(),
             causes: Vec::new(),
@@ -955,11 +969,20 @@ mod tests {
     }
 
     fn function_info(lines_of_code: usize, cyclomatic: u32) -> FunctionInfo {
+        function_info_with_cognitive(lines_of_code, cyclomatic, 0)
+    }
+
+    fn function_info_with_cognitive(
+        lines_of_code: usize,
+        cyclomatic: u32,
+        cognitive: u32,
+    ) -> FunctionInfo {
         FunctionInfo {
             qualified_name: "f".to_string(),
             file: PathBuf::from("src/lib.rs"),
             line: 1,
             cyclomatic,
+            cognitive,
             lines_of_code,
             nesting_depth: 0,
             match_arm_count: 0,
@@ -981,7 +1004,27 @@ mod tests {
         assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
         assert_eq!(
             findings[0].evidence,
-            Some(json!({"lines_of_code": 50, "cyclomatic": 2}))
+            Some(json!({"lines_of_code": 50, "cyclomatic": 2, "cognitive": 0}))
+        );
+    }
+
+    /// A function whose cyclomatic complexity already clears the old
+    /// boilerplate-only threshold (so the pre-cognitive rule would not have
+    /// fired) but whose Cognitive Complexity exceeds
+    /// [`MAX_COGNITIVE_FOR_INFLATION`] due to deep nesting — proves the
+    /// `cognitive` branch of the `OR` gate fires findings the cyclomatic
+    /// check alone would miss.
+    #[test]
+    fn complexity_inflation_fires_for_deeply_nested_functions_via_cognitive() {
+        let functions = vec![function_info_with_cognitive(50, 7, 21)];
+
+        let findings = complexity_inflation(&functions);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
+        assert_eq!(
+            findings[0].evidence,
+            Some(json!({"lines_of_code": 50, "cyclomatic": 7, "cognitive": 21}))
         );
     }
 

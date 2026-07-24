@@ -118,6 +118,10 @@ enum Command {
     /// Shows one pattern candidate's full evidence, preconditions,
     /// contraindications, and migration plan (see todo.md §16.5).
     ExplainPattern(ExplainPatternOptions),
+    /// Shows one design-principle heuristic's full evidence, interpretation,
+    /// contraindications, missing evidence, and alternatives (see todo.md
+    /// §16.7), analogous to `explain-pattern`.
+    ExplainPrinciple(ExplainPrincipleOptions),
     /// Shows only a pattern candidate's migration plan and affected call
     /// sites — deliberately no patch (see todo.md §16.5).
     FixPreview(FixPreviewOptions),
@@ -304,6 +308,13 @@ struct CoverageOptions {
     /// measures coverage itself, only imports an already-generated snapshot.
     #[arg(long, value_name = "PATH")]
     lcov: PathBuf,
+    /// Opt-in: also import an externally generated `cargo-mutants`
+    /// `outcomes.json` report and flag `mutation-survivor` findings (see
+    /// `judge::mutants` module docs). judge never runs `cargo-mutants`
+    /// itself — generate the report with `cargo mutants` first (writes
+    /// `mutants.out/outcomes.json`), then pass that path here.
+    #[arg(long, value_name = "PATH")]
+    mutants_json: Option<PathBuf>,
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
     format: OutputFormat,
@@ -385,6 +396,15 @@ struct PrinciplesOptions {
 #[derive(Debug, Args)]
 struct ExplainPatternOptions {
     /// The pattern candidate id (see `cargo judge patterns`).
+    id: String,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ExplainPrincipleOptions {
+    /// The principle heuristic id (see `cargo judge principles`).
     id: String,
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
@@ -608,6 +628,12 @@ impl From<judge::advisories::AuditImportError> for CliError {
     }
 }
 
+impl From<judge::mutants::MutantsImportError> for CliError {
+    fn from(err: judge::mutants::MutantsImportError) -> Self {
+        Self::Config(err.to_string())
+    }
+}
+
 impl From<judge::suppression::SuppressionError> for CliError {
     fn from(err: judge::suppression::SuppressionError) -> Self {
         Self::Config(err.to_string())
@@ -709,6 +735,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         Some(Command::Patterns(options)) => run_patterns(options, out),
         Some(Command::Principles(options)) => run_principles(options, out),
         Some(Command::ExplainPattern(options)) => run_explain_pattern(options, out),
+        Some(Command::ExplainPrinciple(options)) => run_explain_principle(options, out),
         Some(Command::FixPreview(options)) => run_fix_preview(options, out),
         Some(Command::ExplainRule(options)) => run_explain_rule(options, out),
         Some(Command::ApiSurface(options)) => run_api_surface(options, out),
@@ -2123,6 +2150,7 @@ fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome,
 fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
     let CoverageOptions {
         lcov,
+        mutants_json,
         format,
         save_baseline,
         baseline,
@@ -2159,12 +2187,27 @@ fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<Command
         }
     };
 
-    let findings = judge::coverage::untested_hotspots(
+    let mut findings = judge::coverage::untested_hotspots(
         &complexity_report.functions,
         &churn,
         &coverage,
         &workspace.root,
     );
+
+    let mut rule_revisions = std::collections::HashMap::from([(
+        judge::coverage::UNTESTED_HOTSPOT_RULE.to_string(),
+        judge::coverage::UNTESTED_HOTSPOT_RULE_REVISION,
+    )]);
+
+    if let Some(mutants_json_path) = mutants_json {
+        let mutants_report = judge::mutants::read_mutants_report(&mutants_json_path)?;
+        findings.extend(mutants_report.findings);
+        analysis_errors.extend(mutants_report.errors);
+        rule_revisions.insert(
+            judge::mutants::MUTATION_SURVIVOR_RULE.to_string(),
+            judge::mutants::MUTATION_SURVIVOR_RULE_REVISION,
+        );
+    }
 
     let no_coverage_data_source_files = workspace
         .crates
@@ -2178,10 +2221,6 @@ fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<Command
     let test_ratios = judge::coverage::test_ratios(&workspace);
 
     if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([(
-            judge::coverage::UNTESTED_HOTSPOT_RULE.to_string(),
-            judge::coverage::UNTESTED_HOTSPOT_RULE_REVISION,
-        )]);
         return handle_baseline(
             &workspace.root,
             &findings,
@@ -3099,6 +3138,28 @@ fn run_patterns(options: PatternsOptions, out: &mut dyn Write) -> Result<Command
     Ok(CommandOutcome::Clean)
 }
 
+/// Loads the workspace's complexity metrics (same complexity pass
+/// `run_health` uses) and `judge.toml` boundary config, then runs the
+/// principle-heuristic aggregator (`judge::principle`) over them. Shared by
+/// `principles` and `explain-principle`, mirroring how
+/// [`collect_pattern_candidates`] is shared by `patterns`/`explain-
+/// pattern`/`fix-preview`.
+fn collect_principle_heuristics(
+    workspace: &judge::ingest::Workspace,
+) -> Result<Vec<judge::principle::PrincipleHeuristic>, CliError> {
+    let boundary_config = load_judge_toml(&workspace.root)?;
+    let source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let complexity = judge::complexity::analyze_workspace(source_files, false);
+    Ok(judge::principle::analyze_workspace(
+        workspace,
+        &complexity,
+        Some(&boundary_config),
+    )?)
+}
+
 /// `cargo judge principles` (todo.md §16.7): heuristic abstract-design-
 /// principle interpretations aggregated from at least two independent
 /// evidence classes per finding. Always `CommandOutcome::Clean` — a
@@ -3117,14 +3178,7 @@ fn run_principles(
         return Err(unsupported_format("`principles`", format, "tty, json"));
     }
     let workspace = judge::ingest::load(None)?;
-    let boundary_config = load_judge_toml(&workspace.root)?;
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let complexity = judge::complexity::analyze_workspace(source_files, false);
-    let heuristics =
-        judge::principle::analyze_workspace(&workspace, &complexity, Some(&boundary_config))?;
+    let heuristics = collect_principle_heuristics(&workspace)?;
 
     match format {
         OutputFormat::Json => {
@@ -3168,6 +3222,20 @@ fn find_pattern_candidate(
         .into_iter()
         .find(|candidate| candidate.id.as_str() == id)
         .ok_or_else(|| CliError::Analyzer(format!("unknown pattern candidate id: {id}")))
+}
+
+/// Finds the principle heuristic `id` refers to, re-running the same
+/// analysis [`collect_principle_heuristics`] does. Unknown id ⇒
+/// [`CliError::Analyzer`] (exit 2) — a usage error, not a findings verdict,
+/// mirroring [`find_pattern_candidate`]'s convention.
+fn find_principle_heuristic(
+    workspace: &judge::ingest::Workspace,
+    id: &str,
+) -> Result<judge::principle::PrincipleHeuristic, CliError> {
+    collect_principle_heuristics(workspace)?
+        .into_iter()
+        .find(|heuristic| heuristic.id.as_str() == id)
+        .ok_or_else(|| CliError::Analyzer(format!("unknown principle heuristic id: {id}")))
 }
 
 /// One [`judge::pattern::Evidence`] entry, TTY-rendered under `label`.
@@ -3252,6 +3320,78 @@ fn run_explain_pattern(
             unreachable!("rejected above before loading the workspace")
         }
         OutputFormat::Tty => print_pattern_candidate_tty(out, &candidate)?,
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// Full TTY rendering of one principle heuristic: scope, evidence,
+/// interpretation, contraindications, missing evidence, alternatives, and
+/// related findings — mirrors [`print_pattern_candidate_tty`], adapted for
+/// [`judge::principle::PrincipleHeuristic`]'s fields (no preconditions or
+/// migration plan; those are `PatternCandidate`-only).
+fn print_principle_heuristic_tty(
+    out: &mut dyn Write,
+    heuristic: &judge::principle::PrincipleHeuristic,
+) -> std::io::Result<()> {
+    writeln!(out, "principle heuristic: {}", heuristic.id)?;
+    writeln!(out, "  principle: {}", heuristic.principle)?;
+    writeln!(out, "  scope: crate `{}`", heuristic.scope.krate)?;
+    if !heuristic.scope.modules.is_empty() {
+        writeln!(out, "    modules:")?;
+        for module in &heuristic.scope.modules {
+            writeln!(out, "      - {module}")?;
+        }
+    }
+    for (index, evidence) in heuristic.evidence.iter().enumerate() {
+        print_evidence_tty(out, &(index + 1).to_string(), evidence)?;
+    }
+    writeln!(out, "  interpretation: {}", heuristic.interpretation)?;
+    writeln!(out, "  contraindications:")?;
+    for contraindication in &heuristic.contraindications {
+        writeln!(out, "    - {}", contraindication.description)?;
+    }
+    writeln!(out, "  missing evidence:")?;
+    for missing in &heuristic.missing_evidence {
+        writeln!(out, "    - {}", missing.description)?;
+    }
+    writeln!(out, "  alternatives:")?;
+    for alternative in &heuristic.alternatives {
+        writeln!(out, "    - {}", alternative.description)?;
+    }
+    writeln!(out, "  related findings:")?;
+    for finding_id in &heuristic.related_findings {
+        writeln!(out, "    - {finding_id}")?;
+    }
+    Ok(())
+}
+
+/// `cargo judge explain-principle <id>` (todo.md §16.7, analogous to
+/// `explain-pattern` todo.md §16.5/§16.6): the full evidence, interpretation,
+/// contraindications, missing evidence, and alternatives behind one
+/// principle heuristic.
+fn run_explain_principle(
+    options: ExplainPrincipleOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let ExplainPrincipleOptions { id, format } = options;
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format(
+            "`explain-principle`",
+            format,
+            "tty, json",
+        ));
+    }
+    let workspace = judge::ingest::load(None)?;
+    let heuristic = find_principle_heuristic(&workspace, &id)?;
+
+    match format {
+        OutputFormat::Json => {
+            writeln!(out, "{}", serde_json::to_string_pretty(&heuristic).unwrap())?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected above before loading the workspace")
+        }
+        OutputFormat::Tty => print_principle_heuristic_tty(out, &heuristic)?,
     }
     Ok(CommandOutcome::Clean)
 }
@@ -5405,6 +5545,90 @@ fn dup_two(x: i32) -> i32 {
             }
             other => panic!("expected CliError::Analyzer, got {other:?}"),
         }
+    }
+
+    /// (e) `explain-principle` with an unknown id is a usage error (exit 2),
+    /// not a findings verdict — same convention as `explain-pattern`.
+    #[test]
+    fn explain_principle_unknown_id_is_an_analyzer_error() {
+        let dir = TempDir::new("explain-principle-unknown");
+        write_principle_heuristic_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let err = run_in_dir(
+            &dir,
+            cli_with(Command::ExplainPrinciple(ExplainPrincipleOptions {
+                id: "principle:cohesion:doesnotexist".to_string(),
+                format: OutputFormat::Tty,
+            })),
+            &mut out,
+        )
+        .expect_err("unknown principle heuristic id must be an error");
+        match err {
+            CliError::Analyzer(message) => {
+                assert!(
+                    message.contains("unknown principle heuristic id"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected CliError::Analyzer, got {other:?}"),
+        }
+    }
+
+    /// (e) `explain-principle` on a known id returns the same heuristic
+    /// `principles` reports, rendered with its full evidence and
+    /// interpretation.
+    #[test]
+    fn explain_principle_known_id_matches_principles_output() {
+        let dir = TempDir::new("explain-principle-known");
+        write_principle_heuristic_fixture_crate(&dir);
+
+        let mut json_out = Vec::new();
+        run_in_dir(
+            &dir,
+            cli_with(Command::Principles(PrinciplesOptions {
+                format: OutputFormat::Json,
+            })),
+            &mut json_out,
+        )
+        .expect("`principles` must not error");
+        let json: serde_json::Value = serde_json::from_slice(&json_out).unwrap();
+        let id = json["heuristics"][0]["id"]
+            .as_str()
+            .expect("heuristic id")
+            .to_string();
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::ExplainPrinciple(ExplainPrincipleOptions {
+                id: id.clone(),
+                format: OutputFormat::Json,
+            })),
+            &mut out,
+        )
+        .expect("`explain-principle` must not error for a known id");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["id"].as_str(), Some(id.as_str()));
+        assert_eq!(
+            json["principle"].as_str(),
+            Some("functional_core_imperative_shell")
+        );
+
+        let mut tty_out = Vec::new();
+        run_in_dir(
+            &dir,
+            cli_with(Command::ExplainPrinciple(ExplainPrincipleOptions {
+                id,
+                format: OutputFormat::Tty,
+            })),
+            &mut tty_out,
+        )
+        .expect("`explain-principle` must not error for a known id");
+        let text = String::from_utf8(tty_out).unwrap();
+        assert!(text.contains("principle heuristic:"), "output: {text}");
+        assert!(text.contains("interpretation:"), "output: {text}");
     }
 
     /// `explain-rule` is a pure static lookup — no workspace/cwd needed, so

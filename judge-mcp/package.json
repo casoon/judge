@@ -2,11 +2,20 @@
   "name": "judge-mcp",
   "version": "0.1.0",
   "description": "MCP adapter for the cargo-judge CLI (translation layer only, computes no findings itself)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/casoon/judge.git",
+    "directory": "judge-mcp"
+  },
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "judge-mcp": "dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

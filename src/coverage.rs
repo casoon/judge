@@ -676,6 +676,7 @@ end_of_record
             file,
             line,
             cyclomatic,
+            cognitive: 0,
             lines_of_code,
             nesting_depth: 0,
             match_arm_count: 0,
@@ -947,7 +948,10 @@ end_of_record
             &dir,
             "with-tests-dir",
             &[
-                ("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n"),
+                (
+                    "src/lib.rs",
+                    "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+                ),
                 (
                     "tests/it.rs",
                     "#[test]\nfn it_adds() {\n    assert_eq!(1 + 1, 2);\n}\n",
@@ -1000,7 +1004,10 @@ mod tests {
         let workspace = workspace_with_files(
             &dir,
             "no-tests",
-            &[("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n")],
+            &[(
+                "src/lib.rs",
+                "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+            )],
         );
 
         let ratios = test_ratios(&workspace);

@@ -1130,6 +1130,7 @@ mod tests {
             file,
             line: 1,
             cyclomatic,
+            cognitive: 0,
             lines_of_code: 1,
             nesting_depth: 0,
             match_arm_count: 0,
