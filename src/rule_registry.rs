@@ -94,7 +94,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Checks only whether the item itself is written `pub`, not the full visibility chain up through enclosing modules — a `pub fn` inside a private `mod` is not actually reachable from outside the crate but is still checked (see `crate::api_surface` module docs). Scoped to free `fn`/`struct`/`enum`/`trait`/`const`/`static`/`type` at module level plus inherent-impl methods; methods inside `impl Trait for Type` are exempt (typically inherit the trait's own documentation), as are `#[test]`-attributed functions and anything gated by `#[cfg(test)]`.",
         allowed_wording: "State only that no doc comment was found on this `pub` item — never that its documentation is 'bad' or 'incomplete' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn calculate_shipping_cost(weight_kg: f64, distance_km: f64) -> f64 {\n    weight_kg * distance_km * 0.12\n}\n",
+            why_it_matters: "A public function with no doc comment forces every downstream caller to read its implementation just to find out what it does, and generated docs render an empty description for it.",
+        }),
     },
     RuleMetadata {
         id: "semver-hazard",
@@ -103,7 +106,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Covers two of the three todo.md §I sub-cases via `evidence.kind`: a `pub enum` with at least two variants and no `#[non_exhaustive]` attribute (`missing_non_exhaustive_enum`; a single-variant enum is exempt), and a `pub struct` with at least one `pub` field and no `#[non_exhaustive]` attribute (`missing_non_exhaustive_struct_fields`; a unit struct or one with only private fields is exempt). The third sub-case — a dependency's type leaking through a public signature — needs type resolution across crate boundaries the Fast Tier doesn't have and is not implemented. Same `#[cfg(test)]`/generated-code exemptions as `undocumented-public-item`.",
         allowed_wording: "State only the exact syntax fact (attribute absence plus variant/field count) — never that the type is 'badly designed'; adding a variant/field is a known Rust API-evolvability fact, not this crate's opinion (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "/// Supported export formats for a report.\npub enum ExportFormat {\n    Json,\n    Csv,\n}\n",
+            why_it_matters: "Adding a third export format later is a breaking change for every downstream `match` on this enum, but nothing here warns callers that more variants may arrive.",
+        }),
     },
     // -- boundaries.rs --------------------------------------------------
     RuleMetadata {
@@ -131,7 +137,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Reuses `dependency-cycle`'s own cycle-finding algorithm over a different graph: nodes are one crate's own declared feature names, edges are implication-list entries that exactly match another feature of the same package. A `dep:foo`/`pkg/feat`/`pkg?/feat` entry (a dependency activation, not a sibling feature) is excluded. Cargo tolerates a cyclic feature graph at resolution time — this is a structural-hygiene signal, not a claim the build is broken.",
         allowed_wording: "State only that this cyclic chain of feature implications exists — never that the crate 'fails to build' or that the cycle is 'a bug' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "[features]\nasync-runtime = [\"tokio-support\"]\ntokio-support = [\"async-runtime\"]\n",
+            why_it_matters: "A cyclic feature-implication chain means enabling one feature silently pulls in another that implies the first right back, making it impossible to reason about what turning on a single feature actually activates.",
+        }),
     },
     RuleMetadata {
         id: "change-coupling-signal",
@@ -335,7 +344,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "This entry reflects the default `Strict`/`Mild` classification. `Weak` mode normalizes literal values to placeholders; `Semantic` mode additionally normalizes local variable/parameter identifiers — both are overridden to `Heuristic` at the finding-creation site (see `crate::duplication::CloneMember::to_finding`), not `derived_fact`.",
         allowed_wording: "For `Strict`/`Mild` matches: state as an exact token-equality fact (todo.md §17.3). For `Weak`/`Semantic` matches: phrase as a possible/similar match, never an exact duplicate — those modes normalize literals and/or identifiers, so the underlying code is not byte-identical.",
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "fn calculate_shipping_cost(weight_kg: f64, distance_km: f64) -> f64 {\n    let base_rate = 2.5;\n    let mut cost = base_rate;\n    for _ in 0..(distance_km as i32) {\n        cost += weight_kg * 0.01;\n    }\n    cost\n}\n\nfn calculate_freight_cost(weight_kg: f64, distance_km: f64) -> f64 {\n    let base_rate = 2.5;\n    let mut cost = base_rate;\n    for _ in 0..(distance_km as i32) {\n        cost += weight_kg * 0.01;\n    }\n    cost\n}\n",
+            why_it_matters: "Two functions with the same logic under different names mean every future bug fix has to be remembered and applied twice — and it usually isn't.",
+        }),
     },
     // -- git.rs -----------------------------------------------------------
     RuleMetadata {
@@ -354,7 +366,184 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "First-cut, adjustable Gini threshold (`SIZE_DISTRIBUTION_GINI_THRESHOLD`, 0.6, mirrors `crate::duplication::DEFAULT_MIN_TOKENS`'s style); only fires when a file's LOC is in its crate's top decile *and* the crate's own file-size Gini coefficient exceeds the threshold — a large, concentrated file (e.g. a CLI dispatch table or an enum-heavy config module) is routinely legitimate, not a defect. A crate with only one authored file always has Gini `0.0` by construction and never fires.",
         allowed_wording: "State only the file's LOC, the crate's file count, and the crate's Gini coefficient against the threshold — never that the file 'is too big' or 'needs refactoring' (todo.md §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
+        // A single outlier file's real content, shown against a crate whose
+        // other files are much smaller (see the paired drift-guard test in
+        // `crate::git` for the companion files that make this Gini-exceed).
+        example: Some(RuleExample {
+            before: r#"//! Fee and discount calculations for order processing. This file has grown
+//! organically as new pricing rules were added over several years.
+
+pub struct OrderPricing;
+
+impl OrderPricing {
+    pub fn apply_new_customer_discount(&self, total: f64) -> f64 {
+        total * 0.95
+    }
+
+    pub fn apply_loyalty_discount(&self, total: f64) -> f64 {
+        total * 0.9
+    }
+
+    pub fn apply_bulk_order_discount(&self, total: f64, quantity: u32) -> f64 {
+        if quantity > 100 {
+            total * 0.85
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_seasonal_discount(&self, total: f64, month: u32) -> f64 {
+        if month == 11 || month == 12 {
+            total * 0.92
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_membership_discount(&self, total: f64, tier: u8) -> f64 {
+        match tier {
+            1 => total * 0.98,
+            2 => total * 0.95,
+            3 => total * 0.9,
+            _ => total,
+        }
+    }
+
+    pub fn apply_shipping_surcharge(&self, total: f64, weight_kg: f64) -> f64 {
+        if weight_kg > 20.0 {
+            total + 15.0
+        } else {
+            total + 5.0
+        }
+    }
+
+    pub fn apply_fragile_handling_fee(&self, total: f64, fragile: bool) -> f64 {
+        if fragile {
+            total + 8.0
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_rush_delivery_fee(&self, total: f64, rush: bool) -> f64 {
+        if rush {
+            total * 1.25
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_gift_wrap_fee(&self, total: f64, gift_wrap: bool) -> f64 {
+        if gift_wrap {
+            total + 3.5
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_regional_tax(&self, total: f64, region: &str) -> f64 {
+        match region {
+            "CA" => total * 1.0725,
+            "NY" => total * 1.08,
+            "TX" => total * 1.0625,
+            _ => total,
+        }
+    }
+
+    pub fn apply_import_duty(&self, total: f64, imported: bool) -> f64 {
+        if imported {
+            total * 1.15
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_restocking_fee(&self, total: f64, returned: bool) -> f64 {
+        if returned {
+            total * 0.9
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_price_match_adjustment(&self, total: f64, competitor_price: Option<f64>) -> f64 {
+        match competitor_price {
+            Some(price) if price < total => price,
+            _ => total,
+        }
+    }
+
+    pub fn apply_currency_conversion(&self, total: f64, rate: f64) -> f64 {
+        total * rate
+    }
+
+    pub fn apply_coupon_code(&self, total: f64, coupon_value: f64) -> f64 {
+        (total - coupon_value).max(0.0)
+    }
+
+    pub fn apply_installment_fee(&self, total: f64, installments: u32) -> f64 {
+        if installments > 1 {
+            total * 1.03
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_warranty_fee(&self, total: f64, warranty_months: u32) -> f64 {
+        total + (warranty_months as f64) * 1.5
+    }
+
+    pub fn apply_insurance_fee(&self, total: f64, insured: bool) -> f64 {
+        if insured {
+            total + 6.0
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_charity_roundup(&self, total: f64) -> f64 {
+        total.ceil()
+    }
+
+    pub fn apply_employee_discount(&self, total: f64, is_employee: bool) -> f64 {
+        if is_employee {
+            total * 0.8
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_referral_credit(&self, total: f64, credit: f64) -> f64 {
+        (total - credit).max(0.0)
+    }
+
+    pub fn apply_subscription_discount(&self, total: f64, subscriber: bool) -> f64 {
+        if subscriber {
+            total * 0.93
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_holiday_surcharge(&self, total: f64, is_holiday: bool) -> f64 {
+        if is_holiday {
+            total * 1.1
+        } else {
+            total
+        }
+    }
+
+    pub fn apply_minimum_order_fee(&self, total: f64) -> f64 {
+        if total < 10.0 {
+            total + 2.0
+        } else {
+            total
+        }
+    }
+}
+"#,
+            why_it_matters: "A single file that's grown to dominate its crate's size is a sign the module boundary hasn't kept up with the code — accumulated logic in one place is harder to navigate, review, and safely change than the same logic split along its natural seams.",
+        }),
     },
     // -- module_graph.rs ------------------------------------------------
     RuleMetadata {
@@ -364,7 +553,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Resolves `mod` declarations (including `#[path = \"...\"]`) from every recognized Cargo target root (`lib`, `bin`, `test`, `example`, `bench`, `build.rs`); a file spliced in only via `include!(...)` has no `mod` declaration and is invisible to this scan, so it is misreported as unlinked (see module docs 'Known blind spot: include!'). Generated files are excluded by default (see `crate::ingest::SourceKind`).",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn parse_legacy_config(raw: &str) -> Vec<(String, String)> {\n    raw.lines()\n        .filter_map(|line| line.split_once('='))\n        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))\n        .collect()\n}\n",
+            why_it_matters: "A source file that exists on disk but is never `mod`-declared silently drops out of the build — its code never compiles or runs, and nobody notices until they go looking for it.",
+        }),
     },
     RuleMetadata {
         id: "orphan-module",
@@ -373,7 +565,10 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         exclusions: "Only resolves `crate::`/`super::`/`<crate-name>::`-qualified references, plus the narrow same-file `mod foo; use foo::...;` bare-reference exception (see module docs); any other bare/self-relative reference is not resolved, so a module referenced only that way can be misreported as orphaned. Modules containing a recognized entry point (`fn main`, a `#[test]`-like function) are exempt. Scoped to file-backed (`mod foo;`) module nodes; inline `mod foo { .. }` blocks have no file of their own and are not checked.",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
-        example: None,
+        example: Some(RuleExample {
+            before: "pub fn normalize_whitespace(input: &str) -> String {\n    input.split_whitespace().collect::<Vec<_>>().join(\" \")\n}\n\npub fn trim_and_normalize(input: &str) -> String {\n    normalize_whitespace(input.trim())\n}\n",
+            why_it_matters: "A module that's declared but never referenced from outside its own file is dead weight in the module tree — nothing else can reach it, yet it still gets compiled, reviewed, and maintained.",
+        }),
     },
     // -- ownership.rs -------------------------------------------------------
     RuleMetadata {

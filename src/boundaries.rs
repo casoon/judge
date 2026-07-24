@@ -1987,6 +1987,26 @@ mod tests {
         assert_eq!(cycle, serde_json::json!(["a", "b", "a"]));
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn feature_graph_cycle_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(FEATURE_GRAPH_CYCLE_RULE)
+            .expect("feature-graph-cycle has a registry entry")
+            .example
+            .expect("feature-graph-cycle has a curated example")
+            .before;
+        let dir = TempDir::new("boundaries-feature-cycle-registry-example");
+        let manifest = write_crate_with_features(&dir, example);
+
+        let findings = feature_graph_cycles(Some(&manifest)).unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, FEATURE_GRAPH_CYCLE_RULE);
+    }
+
     #[test]
     fn feature_graph_cycles_returns_empty_for_an_acyclic_feature_graph() {
         let dir = TempDir::new("boundaries-feature-cycle-acyclic");

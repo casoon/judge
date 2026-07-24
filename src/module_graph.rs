@@ -798,6 +798,29 @@ mod tests {
         assert_eq!(hits[0].evidence_class, EvidenceClass::BoundedSemantic);
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn unlinked_file_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNLINKED_FILE_RULE)
+            .expect("unlinked-file has a registry entry")
+            .example
+            .expect("unlinked-file has a curated example")
+            .before;
+        let dir = TempDir::new("module-graph-unlinked-file-registry-example");
+        write_single_crate_manifest(&dir, "fixture");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(dir.join("src/legacy_config.rs"), example).unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true);
+
+        assert_eq!(rule_findings(&report.findings, UNLINKED_FILE_RULE).len(), 1);
+    }
+
     // (b) The same file, linked via `mod foo;` in `lib.rs` — no finding.
     #[test]
     fn a_file_linked_via_a_conventional_mod_declaration_is_not_unlinked() {
@@ -948,6 +971,29 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].location.item_path, "fixture::foo");
         assert_eq!(hits[0].evidence_class, EvidenceClass::BoundedSemantic);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn orphan_module_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(ORPHAN_MODULE_RULE)
+            .expect("orphan-module has a registry entry")
+            .example
+            .expect("orphan-module has a curated example")
+            .before;
+        let dir = TempDir::new("module-graph-orphan-module-registry-example");
+        write_single_crate_manifest(&dir, "fixture");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "mod text_utils;\n").unwrap();
+        std::fs::write(dir.join("src/text_utils.rs"), example).unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true);
+
+        assert_eq!(rule_findings(&report.findings, ORPHAN_MODULE_RULE).len(), 1);
     }
 
     // (f) A module referenced by another file via `crate::foo::bar()` — no

@@ -1468,6 +1468,59 @@ mod tests {
         assert!(outliers[0].crate_gini > SIZE_DISTRIBUTION_GINI_THRESHOLD);
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags. The registry's example
+    /// is only the single outlier file's own content (a realistic "god
+    /// file"); the small companion files that make the crate's Gini
+    /// coefficient exceed the threshold are supplied here, same shape as
+    /// `size_distribution_flags_the_top_decile_file_of_a_concentrated_crate`
+    /// above.
+    #[test]
+    fn size_distribution_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(SIZE_DISTRIBUTION_RULE)
+            .expect("size-distribution has a registry entry")
+            .example
+            .expect("size-distribution has a curated example")
+            .before;
+        let dir = TempDir::new("size-distribution-registry-example");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/order_pricing.rs"), example).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            std::fs::write(
+                dir.join(format!("src/{name}.rs")),
+                "pub fn helper() -> u8 {\n    1\n}\n",
+            )
+            .unwrap();
+        }
+
+        let workspace = Workspace {
+            root: dir.to_path_buf(),
+            crates: vec![crate::ingest::CrateInfo {
+                name: "fixture".to_string(),
+                version: "0.1.0".to_string(),
+                manifest_path: dir.join("Cargo.toml"),
+                root: dir.to_path_buf(),
+                source_files: ["order_pricing", "a", "b", "c", "d"]
+                    .iter()
+                    .map(|name| crate::ingest::SourceFile {
+                        path: dir.join(format!("src/{name}.rs")),
+                        kind: crate::ingest::SourceKind::Authored,
+                    })
+                    .collect(),
+                entry_points: Vec::new(),
+                dependencies: Vec::new(),
+            }],
+        };
+
+        let outliers = size_distribution(&workspace);
+
+        assert_eq!(outliers.len(), 1);
+        assert!(outliers[0].file.ends_with("order_pricing.rs"));
+        assert!(outliers[0].crate_gini > SIZE_DISTRIBUTION_GINI_THRESHOLD);
+    }
+
     #[test]
     fn size_distribution_does_not_fire_for_uniformly_sized_files() {
         let dir = TempDir::new("size-distribution-uniform");

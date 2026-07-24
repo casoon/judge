@@ -1458,6 +1458,34 @@ fn dup_one(x: i32) -> i32 {
         assert_eq!(ids.len(), 2, "each member must get a distinct id");
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags. A clone family has (at
+    /// least) two members, so — same as
+    /// `to_findings_emits_one_warn_finding_per_member` above — the expected
+    /// finding count is 2, not 1.
+    #[test]
+    fn duplicate_code_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DUPLICATE_RULE)
+            .expect("duplicate-code has a registry entry")
+            .example
+            .expect("duplicate-code has a curated example")
+            .before;
+        let dir = TempDir::new("dup-registry-example");
+        let file = dir.join("shipping.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+        let findings = report.to_findings();
+
+        assert_eq!(
+            findings.iter().filter(|f| f.rule == DUPLICATE_RULE).count(),
+            2
+        );
+    }
+
     #[test]
     fn generated_files_are_excluded_unless_included() {
         let dir = TempDir::new("dup-generated");
