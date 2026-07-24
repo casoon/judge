@@ -2445,4 +2445,326 @@ repository = "https://example.com/hasrepo"
 
         assert!(declared_features_without_implications(&manifest).is_empty());
     }
+
+    // -- registry example drift guards --
+    //
+    // Each test below reads the curated `example.before` for its rule
+    // straight out of `rule_registry::RULE_REGISTRY` (never a second copy of
+    // the literal) and rebuilds just enough of a fixture around it to prove
+    // the snippet still triggers the rule -- see
+    // `.claude/skills/curate-rule-example/SKILL.md`.
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn misplaced_dependency_kind_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(MISPLACED_DEPENDENCY_KIND_RULE)
+            .expect("misplaced-dependency-kind has a registry entry")
+            .example
+            .expect("misplaced-dependency-kind has a curated example")
+            .before;
+        let manifest: toml::Value = toml::from_str(example).unwrap();
+        let dep_name = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.keys().next())
+            .expect("example declares a dependency")
+            .clone();
+        let code_identifier = dep_name.replace('-', "_");
+
+        let dir = TempDir::new("deps-misplaced-dependency-kind-registry-example");
+        let usage = format!("fn t() {{ {code_identifier}::noop(); }}\n");
+        let manifest_path = write_fixture(
+            &dir,
+            "[dependencies]",
+            &dep_name,
+            None,
+            &[],
+            &[("tests/it.rs", usage.as_str())],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest_path)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == MISPLACED_DEPENDENCY_KIND_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn unused_dev_dependency_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNUSED_DEV_DEPENDENCY_RULE)
+            .expect("unused-dev-dependency has a registry entry")
+            .example
+            .expect("unused-dev-dependency has a curated example")
+            .before;
+        let manifest: toml::Value = toml::from_str(example).unwrap();
+        let dep_name = manifest
+            .get("dev-dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.keys().next())
+            .expect("example declares a dev-dependency")
+            .clone();
+
+        let dir = TempDir::new("deps-unused-dev-dependency-registry-example");
+        let manifest_path = write_fixture(&dir, "[dev-dependencies]", &dep_name, None, &[], &[]);
+
+        let workspace = crate::ingest::load(Some(&manifest_path)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == UNUSED_DEV_DEPENDENCY_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags. `heavy-dependency`
+    /// needs a real dependency with more than
+    /// [`HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD`] transitive dependencies of
+    /// its own, so this builds the curated dependency name as a small crate
+    /// with that many local, no-op leaf path-dependencies -- fully offline.
+    #[test]
+    fn heavy_dependency_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(HEAVY_DEPENDENCY_RULE)
+            .expect("heavy-dependency has a registry entry")
+            .example
+            .expect("heavy-dependency has a curated example")
+            .before;
+        let manifest: toml::Value = toml::from_str(example).unwrap();
+        let dep_name = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.keys().next())
+            .expect("example declares a dependency")
+            .clone();
+
+        let dir = TempDir::new("deps-heavy-dependency-registry-example");
+        std::fs::create_dir_all(dir.join("main/src")).unwrap();
+        std::fs::write(
+            dir.join("main/Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dep_name} = {{ path = \"../{dep_name}\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main/src/lib.rs"), "pub fn hello() {}\n").unwrap();
+
+        let leaf_count = HEAVY_DEPENDENCY_TRANSITIVE_THRESHOLD + 1;
+        let mut leaf_deps_toml = String::new();
+        for i in 0..leaf_count {
+            let leaf_name = format!("{dep_name}-leaf-{i}");
+            std::fs::create_dir_all(dir.join(&leaf_name).join("src")).unwrap();
+            std::fs::write(
+                dir.join(&leaf_name).join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{leaf_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join(&leaf_name).join("src/lib.rs"),
+                "pub fn noop() {}\n",
+            )
+            .unwrap();
+            leaf_deps_toml.push_str(&format!("{leaf_name} = {{ path = \"../{leaf_name}\" }}\n"));
+        }
+        std::fs::create_dir_all(dir.join(&dep_name).join("src")).unwrap();
+        std::fs::write(
+            dir.join(&dep_name).join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{dep_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{leaf_deps_toml}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join(&dep_name).join("src/lib.rs"), "pub fn noop() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("main/Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == HEAVY_DEPENDENCY_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn unused_feature_flag_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNUSED_FEATURE_FLAG_RULE)
+            .expect("unused-feature-flag has a registry entry")
+            .example
+            .expect("unused-feature-flag has a curated example")
+            .before;
+        let manifest: toml::Value = toml::from_str(example).unwrap();
+        let deps_table = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .expect("example declares a dependencies table");
+        let (dep_name, dep_value) = deps_table
+            .iter()
+            .next()
+            .expect("example declares a dependency");
+        let feature = dep_value
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .and_then(|features| features.first())
+            .and_then(toml::Value::as_str)
+            .expect("example declares a feature")
+            .to_string();
+
+        let dir = TempDir::new("deps-unused-feature-flag-registry-example");
+        let manifest_path = write_fixture(&dir, "[dependencies]", dep_name, None, &[&feature], &[]);
+
+        let workspace = crate::ingest::load(Some(&manifest_path)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == UNUSED_FEATURE_FLAG_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn default_features_unused_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DEFAULT_FEATURES_UNUSED_RULE)
+            .expect("default-features-unused has a registry entry")
+            .example
+            .expect("default-features-unused has a curated example")
+            .before;
+        let manifest: toml::Value = toml::from_str(example).unwrap();
+        let dep_name = manifest
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.keys().next())
+            .expect("example declares a dependency")
+            .clone();
+
+        let dir = TempDir::new("deps-default-features-unused-registry-example");
+        std::fs::create_dir_all(dir.join("main/src")).unwrap();
+        std::fs::create_dir_all(dir.join("dep_crate/src")).unwrap();
+        std::fs::write(
+            dir.join("main/Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dep_name} = {{ path = \"../dep_crate\", default-features = true }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main/src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("dep_crate/Cargo.toml"),
+            format!("[package]\nname = \"{dep_name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep_crate/src/lib.rs"), "pub fn noop() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("main/Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == DEFAULT_FEATURES_UNUSED_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn unused_feature_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNUSED_FEATURE_RULE)
+            .expect("unused-feature has a registry entry")
+            .example
+            .expect("unused-feature has a curated example")
+            .before;
+
+        let dir = TempDir::new("deps-unused-feature-registry-example");
+        let manifest =
+            write_crate_with_features(&dir, example, &[("src/lib.rs", "pub fn hello() {}\n")]);
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == UNUSED_FEATURE_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn dep_without_repo_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DEP_WITHOUT_REPO_RULE)
+            .expect("dep-without-repo has a registry entry")
+            .example
+            .expect("dep-without-repo has a curated example")
+            .before;
+        let manifest: toml::Value = toml::from_str(example).unwrap();
+        let dep_name = manifest
+            .get("package")
+            .and_then(|package| package.get("name"))
+            .and_then(toml::Value::as_str)
+            .expect("example declares a package name")
+            .to_string();
+
+        let dir = TempDir::new("deps-dep-without-repo-registry-example");
+        std::fs::create_dir_all(dir.join("main/src")).unwrap();
+        std::fs::create_dir_all(dir.join("dep_crate/src")).unwrap();
+        std::fs::write(
+            dir.join("main/Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{dep_name} = {{ path = \"../dep_crate\" }}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("main/src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("dep_crate/Cargo.toml"),
+            format!("{example}edition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("dep_crate/src/lib.rs"), "pub fn noop() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("main/Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == DEP_WITHOUT_REPO_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
 }

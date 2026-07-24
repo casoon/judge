@@ -800,6 +800,179 @@ edition = "2021"
         );
     }
 
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn duplicate_crate_versions_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(DUPLICATE_CRATE_VERSIONS_RULE)
+            .expect("duplicate-crate-versions has a registry entry")
+            .example
+            .expect("duplicate-crate-versions has a curated example")
+            .before;
+        let mut declarations = example.lines().filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (name, version) = line.split_once('=')?;
+            Some((
+                name.trim().to_string(),
+                version.trim().trim_matches('"').to_string(),
+            ))
+        });
+        let (dep_name, first_version) = declarations
+            .next()
+            .expect("example declares a first version");
+        let (_, second_version) = declarations
+            .next()
+            .expect("example declares a second version");
+
+        let dir = TempDir::new("dep-graph-dupe-registry-example");
+        write_workspace_root(&dir, &["a"], "");
+        let vendor = TempDir::new("dep-graph-dupe-registry-example-vendor");
+        write_vendored_crate(&vendor, &dep_name, &first_version, None);
+        write_member(&dir, "a", &path_dep(&dep_name, &vendor));
+
+        let manifest = dir.join("Cargo.toml");
+        let metadata = MetadataCommand::new()
+            .manifest_path(&manifest)
+            .exec()
+            .unwrap();
+        let mut value = serde_json::to_value(&metadata).unwrap();
+        add_synthetic_duplicate(&mut value, &dep_name, &second_version);
+        let metadata: Metadata = serde_json::from_value(value).unwrap();
+
+        let findings = duplicate_crate_versions(&metadata, &dir);
+
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule == DUPLICATE_CRATE_VERSIONS_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn msrv_drift_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(MSRV_DRIFT_RULE)
+            .expect("msrv-drift has a registry entry")
+            .example
+            .expect("msrv-drift has a curated example")
+            .before;
+        let manifest: toml::Value = toml::from_str(example).unwrap();
+        let package = manifest.get("package").expect("example declares a package");
+        let dep_name = package
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .expect("example declares a package name")
+            .to_string();
+        let dep_version = package
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .expect("example declares a package version")
+            .to_string();
+        let dep_rust_version = package
+            .get("rust-version")
+            .and_then(toml::Value::as_str)
+            .expect("example declares a rust-version")
+            .to_string();
+
+        let dir = TempDir::new("dep-graph-msrv-drift-registry-example");
+        write_workspace_root(
+            &dir,
+            &["a"],
+            "[workspace.package]\nrust-version = \"1.50\"\n",
+        );
+        let vendor = TempDir::new("dep-graph-msrv-drift-registry-example-vendor");
+        write_vendored_crate(&vendor, &dep_name, &dep_version, Some(&dep_rust_version));
+        write_member(&dir, "a", &path_dep(&dep_name, &vendor));
+
+        let manifest_path = dir.join("Cargo.toml");
+        let workspace = crate::ingest::load(Some(&manifest_path)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let hits: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.rule == MSRV_DRIFT_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn workspace_dep_drift_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(WORKSPACE_DEP_DRIFT_RULE)
+            .expect("workspace-dep-drift has a registry entry")
+            .example
+            .expect("workspace-dep-drift has a curated example")
+            .before;
+        let mut declarations = example.lines().filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (name, req) = line.split_once('=')?;
+            Some((
+                name.trim().to_string(),
+                req.trim().trim_matches('"').to_string(),
+            ))
+        });
+        let (dep_name, req_a) = declarations
+            .next()
+            .expect("example declares a first requirement");
+        let (_, req_b) = declarations
+            .next()
+            .expect("example declares a second requirement");
+
+        let dir = TempDir::new("dep-graph-workspace-dep-drift-registry-example");
+        write_workspace_root(&dir, &["a", "b"], "");
+        let vendor = TempDir::new("dep-graph-workspace-dep-drift-registry-example-vendor");
+        write_vendored_crate(&vendor, &dep_name, "0.1.0", None);
+        write_member(&dir, "a", &path_dep(&dep_name, &vendor));
+        write_member(&dir, "b", &path_dep(&dep_name, &vendor));
+
+        let manifest = dir.join("Cargo.toml");
+        let metadata = MetadataCommand::new()
+            .manifest_path(&manifest)
+            .no_deps()
+            .exec()
+            .unwrap();
+        let mut value = serde_json::to_value(&metadata).unwrap();
+        for package in value["packages"].as_array_mut().unwrap() {
+            let member_name = package["name"].as_str().unwrap().to_string();
+            let requirement = match member_name.as_str() {
+                "a" => req_a.as_str(),
+                "b" => req_b.as_str(),
+                _ => continue,
+            };
+            for dep in package["dependencies"].as_array_mut().unwrap() {
+                if dep["name"] == dep_name {
+                    dep["path"] = serde_json::Value::Null;
+                    dep["req"] = serde_json::Value::String(requirement.to_string());
+                }
+            }
+        }
+        let metadata: Metadata = serde_json::from_value(value).unwrap();
+
+        let findings = workspace_dep_drift(&metadata, &dir);
+
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.rule == WORKSPACE_DEP_DRIFT_RULE)
+            .collect();
+        assert_eq!(hits.len(), 1);
+    }
+
     #[test]
     fn compat_bucket_groups_by_cargo_caret_compatibility() {
         assert_eq!(
