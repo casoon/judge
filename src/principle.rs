@@ -25,7 +25,7 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus eight real detectors —
+//! sixteen table entries), plus nine real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
 //! (see [`functional_core_imperative_shell_candidates`]),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
@@ -38,9 +38,11 @@
 //! [`BoundedResources`](DesignPrinciple::BoundedResources) (see
 //! [`bounded_resources_candidates`]),
 //! [`ParseDontValidate`](DesignPrinciple::ParseDontValidate) (see
-//! [`parse_dont_validate_candidates`]), and
+//! [`parse_dont_validate_candidates`]),
 //! [`ApiEvolvability`](DesignPrinciple::ApiEvolvability) (see
-//! [`api_evolvability_candidates`]). The remaining `DesignPrinciple`
+//! [`api_evolvability_candidates`]), and
+//! [`UnsafeContainment`](DesignPrinciple::UnsafeContainment) (see
+//! [`unsafe_containment_candidates`]). The remaining `DesignPrinciple`
 //! variants are unused for now; they document the target space rather than
 //! being implemented.
 
@@ -59,6 +61,7 @@ use crate::finding::{Finding, FindingId};
 use crate::functions::walk_functions;
 use crate::ingest::{CrateInfo, Workspace};
 use crate::pattern::{CodeScope, Contraindication, Evidence, EvidenceLocation};
+use crate::slop_text::{CommentSpan, extract_comments};
 
 /// Cyclomatic-complexity threshold [`functional_core_imperative_shell_candidates`]
 /// uses as "non-trivial branching" (signal 2). Chosen to mean more than a
@@ -284,6 +287,7 @@ pub fn analyze_workspace(
     heuristics.extend(bounded_resources_candidates(workspace));
     heuristics.extend(parse_dont_validate_candidates(workspace));
     heuristics.extend(api_evolvability_candidates(workspace));
+    heuristics.extend(unsafe_containment_candidates(workspace));
     Ok(heuristics)
 }
 
@@ -3096,6 +3100,322 @@ fn build_api_evolvability_heuristic(
     }
 }
 
+/// One `pub unsafe fn` found while scanning a file for
+/// [`unsafe_containment_candidates`]'s signal 1 (a structural contrast, not
+/// a threshold) and signal 2 (its own doc-attribute text).
+struct PubUnsafeFnSite {
+    qualified_name: String,
+    location: EvidenceLocation,
+    line: usize,
+    has_safety_doc_section: bool,
+}
+
+/// One function elsewhere in the same file whose body already wraps an
+/// `unsafe { .. }` block in an adjacent `// SAFETY:` comment —
+/// [`unsafe_containment_candidates`]'s signal 1 contrast evidence: proof the
+/// module already knows how to write a documented, encapsulated internal
+/// wrapper.
+struct SafetyWrapperSite {
+    qualified_name: String,
+    location: EvidenceLocation,
+    line: usize,
+}
+
+/// Whether any comment in `comments` containing the literal substring
+/// `SAFETY:` sits immediately adjacent to an unsafe block starting at
+/// `unsafe_start_line` — the exact adjacency rule `crate::security`'s
+/// `unsafe-surface` rule uses for its own private `has_adjacent_safety_
+/// comment` helper. Duplicated here rather than imported: that helper is
+/// private to `security.rs`, and this module must not modify `security.rs`
+/// (see [`unsafe_containment_candidates`]'s doc comment for why this
+/// detector is independent of `unsafe-surface`/`unsafe-density` in the first
+/// place).
+fn has_adjacent_safety_comment(comments: &[CommentSpan], unsafe_start_line: usize) -> bool {
+    comments.iter().any(|comment| {
+        comment.text.contains("SAFETY:")
+            && (comment.end_line + 1 == unsafe_start_line
+                || comment.start_line == unsafe_start_line
+                || comment.start_line == unsafe_start_line + 1)
+    })
+}
+
+/// Finds the first `unsafe { .. }` block in a visited body with an adjacent
+/// `// SAFETY:` comment ([`has_adjacent_safety_comment`]), used by
+/// [`unsafe_containment_file_sites`] to recognize a [`SafetyWrapperSite`].
+/// Stops recording after the first match but keeps descending, the same
+/// "small, scope-specific `Visit` impl" approach this module already uses
+/// elsewhere (e.g. `EvolvableStructCollector`, `StructConstructionCollector`).
+struct SafetyCommentedUnsafeBlockFinder<'a> {
+    comments: &'a [CommentSpan],
+    first_line: Option<usize>,
+}
+
+impl<'ast> Visit<'ast> for SafetyCommentedUnsafeBlockFinder<'_> {
+    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+        if self.first_line.is_none() {
+            let start_line = node.span().start().line;
+            if has_adjacent_safety_comment(self.comments, start_line) {
+                self.first_line = Some(start_line);
+            }
+        }
+        syn::visit::visit_expr_unsafe(self, node);
+    }
+}
+
+/// Whether `attrs` contains a `#[doc = "..."]` attribute (covering both
+/// `///` doc comments and an explicit `#[doc]` attribute, which `syn`
+/// desugars the same way) whose joined text contains a `# Safety` rustdoc
+/// heading — the standard convention for documenting an `unsafe fn`'s
+/// caller-side invariants. Reuses the same `Meta::NameValue`/`Lit::Str`
+/// doc-attribute extraction idiom `crate::api_surface`'s `undocumented-
+/// public-item` rule (`has_doc_comment`) and `crate::slop`'s
+/// `doc_comment_text` already use, duplicated locally since both are
+/// private to their own modules.
+fn has_safety_doc_section(attrs: &[syn::Attribute]) -> bool {
+    let joined: Vec<String> = attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("doc"))
+        .filter_map(|attr| match &attr.meta {
+            syn::Meta::NameValue(name_value) => match &name_value.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(text),
+                    ..
+                }) => Some(text.value()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    joined.join(" ").contains("# Safety")
+}
+
+/// Scans one already-parsed file for [`unsafe_containment_candidates`]'s two
+/// site kinds: every `pub unsafe fn` ([`PubUnsafeFnSite`]) and every other
+/// function whose body already wraps an unsafe block in a `// SAFETY:`
+/// comment ([`SafetyWrapperSite`]). A `pub unsafe fn` is never itself
+/// counted as a safety wrapper (returns early), so a candidate can never
+/// corroborate itself.
+fn unsafe_containment_file_sites(
+    file: &Path,
+    ast: &syn::File,
+    comments: &[CommentSpan],
+) -> (Vec<PubUnsafeFnSite>, Vec<SafetyWrapperSite>) {
+    let mut pub_unsafe_fns = Vec::new();
+    let mut safety_wrappers = Vec::new();
+    walk_functions(ast, |site| {
+        if matches!(site.vis, Some(syn::Visibility::Public(_))) && site.sig.unsafety.is_some() {
+            pub_unsafe_fns.push(PubUnsafeFnSite {
+                qualified_name: site.qualified_name.clone(),
+                location: EvidenceLocation {
+                    file: file.to_path_buf(),
+                    item_path: Some(site.qualified_name.clone()),
+                },
+                line: site.span.start().line,
+                has_safety_doc_section: has_safety_doc_section(site.attrs),
+            });
+            return;
+        }
+        let mut finder = SafetyCommentedUnsafeBlockFinder {
+            comments,
+            first_line: None,
+        };
+        finder.visit_block(site.block);
+        if let Some(line) = finder.first_line {
+            safety_wrappers.push(SafetyWrapperSite {
+                qualified_name: site.qualified_name.clone(),
+                location: EvidenceLocation {
+                    file: file.to_path_buf(),
+                    item_path: Some(site.qualified_name.clone()),
+                },
+                line,
+            });
+        }
+    });
+    (pub_unsafe_fns, safety_wrappers)
+}
+
+/// Unsafe Containment (todo.md §16.7's table): "unsafe an vielen Stellen
+/// verstreut statt gekapselt" → "Unsafe hinter enger, geprüfter Schnittstelle
+/// bündeln".
+///
+/// This is a containment/encapsulation question, not a presence/density
+/// question, and is deliberately independent of two existing `Finding`
+/// rules in `crate::security`:
+///
+/// - `unsafe-surface` flags one `unsafe { .. }` expression block, per site,
+///   missing an adjacent `// SAFETY:` comment — a documentation-completeness
+///   fact about a single block.
+/// - `unsafe-density` aggregates every `unsafe { .. }` block in a file into
+///   how much of the file, and how large its single biggest block, is
+///   unsafe — a whole-file volume/size fact.
+///
+/// Neither asks whether unsafe code is *encapsulated*. A file can pass both
+/// existing rules — every block `SAFETY:`-commented, density and max block
+/// size both low — while still exposing a raw `pub unsafe fn` that pushes
+/// the safety burden onto every external caller instead of the crate
+/// upholding it internally behind a narrow, safe wrapper. That is the
+/// question this heuristic asks instead.
+///
+/// Two independent signals, both required on the same `pub unsafe fn`:
+///
+/// 1. **Structural contrast (AST)** — the function is itself `pub unsafe
+///    fn` (definitionally not contained: the crate is telling the *caller*
+///    to uphold safety invariants, rather than upholding them itself), found
+///    in a file that *also* contains at least one other function (any
+///    visibility) whose body wraps an `unsafe { .. }` block in an adjacent
+///    `// SAFETY:` comment ([`SafetyCommentedUnsafeBlockFinder`], reusing
+///    the same source-text comment scan `crate::security`'s `unsafe-surface`
+///    rule uses via [`crate::slop_text::extract_comments`]). That contrast —
+///    the module already has the discipline to write a documented internal
+///    wrapper, yet exposes this capability raw instead — is the containment
+///    failure signal, not a bare threshold.
+/// 2. **Doc-attribute (independent, corroborating)** — the `pub unsafe
+///    fn`'s own doc comment contains no `# Safety` rustdoc heading
+///    ([`has_safety_doc_section`]). Not only is the burden pushed onto the
+///    caller (signal 1), the caller is not even told what invariant to
+///    uphold.
+///
+/// Scoped per source file (this module's "module" unit, the same file-level
+/// scope [`cohesion_candidates`] uses): the contrast in signal 1 is about
+/// what *this* file already demonstrates it knows how to do, not the crate
+/// as a whole. At most one heuristic per qualifying `pub unsafe fn`,
+/// corroborated by the first safety-commented wrapper function found in the
+/// same file.
+fn unsafe_containment_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            let comments = extract_comments(&text);
+            let (pub_unsafe_fns, safety_wrappers) =
+                unsafe_containment_file_sites(&source.path, &ast, &comments);
+            if safety_wrappers.is_empty() {
+                continue;
+            }
+            for candidate in &pub_unsafe_fns {
+                if candidate.has_safety_doc_section {
+                    continue;
+                }
+                let Some(wrapper) = safety_wrappers.first() else {
+                    continue;
+                };
+                heuristics.push(build_unsafe_containment_heuristic(
+                    krate,
+                    &source.path,
+                    candidate,
+                    wrapper,
+                ));
+            }
+        }
+    }
+    heuristics
+}
+
+fn build_unsafe_containment_heuristic(
+    krate: &CrateInfo,
+    file: &Path,
+    candidate: &PubUnsafeFnSite,
+    wrapper: &SafetyWrapperSite,
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![candidate.qualified_name.clone()],
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{}` is declared `pub unsafe fn` at {}:{}, pushing its safety invariants onto \
+             every external caller instead of the crate upholding them internally behind a safe \
+             wrapper.",
+            candidate.qualified_name,
+            file.display(),
+            candidate.line,
+        ),
+        locations: vec![candidate.location.clone()],
+    };
+    let contrast = Evidence {
+        description: format!(
+            "The same file already wraps an `unsafe {{ .. }}` block in a `// SAFETY:` comment \
+             inside `{}` at {}:{} — the module demonstrably knows how to encapsulate unsafe code \
+             behind a documented internal wrapper, yet `{}` exposes raw unsafe capability \
+             instead.",
+            wrapper.qualified_name,
+            file.display(),
+            wrapper.line,
+            candidate.qualified_name,
+        ),
+        locations: vec![wrapper.location.clone()],
+    };
+
+    let evidence_identities = vec![
+        candidate.qualified_name.clone(),
+        candidate.line.to_string(),
+        wrapper.qualified_name.clone(),
+        wrapper.line.to_string(),
+    ];
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::UnsafeContainment,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::UnsafeContainment,
+        scope,
+        evidence: vec![structural, contrast],
+        interpretation: format!(
+            "`{}` is `pub unsafe fn` with no `# Safety` section in its own doc comment, so \
+             callers are asked to uphold invariants that are never written down — while the \
+             same file already shows, in `{}`, that the module can encapsulate unsafe code \
+             behind a `// SAFETY:`-documented internal wrapper instead of exposing it at the \
+             public boundary.",
+            candidate.qualified_name, wrapper.qualified_name,
+        ),
+        contraindications: vec![
+            Contraindication {
+                description: "A low-level primitive whose whole purpose is to expose an unsafe \
+                    capability (an FFI binding, a `no_std` allocator entry point, a SIMD \
+                    intrinsic wrapper) may have no safe encapsulation to offer — the caller \
+                    genuinely must uphold the invariant themselves."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "If every caller of this function is internal to the crate (never \
+                    part of its external public API), the party upholding the invariant may \
+                    already be the same team that wrote it, with the invariant understood out of \
+                    band rather than documented in rustdoc."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether the safety invariant is documented somewhere other than a `# \
+                Safety` doc-comment section (a module-level doc, an external design doc, a plain \
+                code comment above the declaration) is not checked here — only the `pub unsafe \
+                fn`'s own doc attribute."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the function `pub unsafe fn` as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Wrap the unsafe capability behind a safe `pub fn` that upholds the \
+                    invariant internally, the way the file's existing `// SAFETY:`-commented \
+                    wrapper already does elsewhere, or add a `# Safety` section documenting \
+                    exactly what the caller must guarantee."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4701,6 +5021,103 @@ mod tests {
             heuristics
                 .iter()
                 .all(|h| h.principle != DesignPrinciple::ApiEvolvability)
+        );
+    }
+
+    /// (a) A `pub unsafe fn` with no `# Safety` doc section, in a module
+    /// that also has a properly `// SAFETY:`-commented internal unsafe
+    /// block elsewhere ⇒ exactly one `UnsafeContainment` heuristic, with
+    /// both evidence slots populated.
+    #[test]
+    fn undocumented_pub_unsafe_fn_with_safety_wrapper_produces_one_heuristic() {
+        let dir = TempDir::new("principle-unsafe-containment-undocumented");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub unsafe fn raw_read(ptr: *const u8) -> u8 {\n\
+             \x20   unsafe { *ptr }\n\
+             }\n\
+             \n\
+             pub fn safe_read(ptr: *const u8) -> u8 {\n\
+             \x20   // SAFETY: caller guarantees ptr is valid and aligned\n\
+             \x20   unsafe { *ptr }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let unsafe_containment: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::UnsafeContainment)
+            .collect();
+
+        assert_eq!(unsafe_containment.len(), 1);
+        let heuristic = unsafe_containment[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) The same shape, but the `pub unsafe fn` has a `# Safety` doc
+    /// section ⇒ no heuristic — proves signal 2 gates.
+    #[test]
+    fn documented_pub_unsafe_fn_with_safety_wrapper_produces_no_heuristic() {
+        let dir = TempDir::new("principle-unsafe-containment-documented");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "/// Reads a raw pointer.\n\
+             ///\n\
+             /// # Safety\n\
+             ///\n\
+             /// `ptr` must be valid and aligned.\n\
+             pub unsafe fn raw_read(ptr: *const u8) -> u8 {\n\
+             \x20   unsafe { *ptr }\n\
+             }\n\
+             \n\
+             pub fn safe_read(ptr: *const u8) -> u8 {\n\
+             \x20   // SAFETY: caller guarantees ptr is valid and aligned\n\
+             \x20   unsafe { *ptr }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::UnsafeContainment)
+        );
+    }
+
+    /// (c) A `pub unsafe fn` with no `# Safety` doc section, but no other
+    /// `// SAFETY:`-commented unsafe block anywhere in the module (the
+    /// module never demonstrates it knows how to write a safe wrapper) ⇒ no
+    /// heuristic — proves signal 1's contrast-based framing gates.
+    #[test]
+    fn undocumented_pub_unsafe_fn_without_safety_wrapper_produces_no_heuristic() {
+        let dir = TempDir::new("principle-unsafe-containment-no-wrapper");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub unsafe fn raw_read(ptr: *const u8) -> u8 {\n\
+             \x20   unsafe { *ptr }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::UnsafeContainment)
         );
     }
 }
