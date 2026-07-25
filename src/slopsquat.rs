@@ -198,6 +198,7 @@ fn name_collision_finding(
             "nearest_popular_crate": nearest_popular_crate,
             "edit_distance": edit_distance,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -810,6 +811,7 @@ fn phantom_crate_finding(krate: &CrateInfo, dep: &DeclaredDependency) -> Finding
             "lookup": "sparse-index",
             "result": "not_found",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -850,6 +852,7 @@ fn phantom_version_finding(
             "requirement": dep.version_req,
             "nearest_published_versions": nearest_versions(&published, 3),
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     })
@@ -995,6 +998,7 @@ fn fresh_low_reputation_finding(
             "downloads": metadata.downloads,
             "repository": metadata.repository,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1145,6 +1149,7 @@ fn yanked_dependency_finding(
             "lookup": "sparse-index",
             "resolved_version": resolved_version,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1226,6 +1231,7 @@ fn single_maintainer_finding(
             "owner_count": owners.len(),
             "owners": owners.iter().map(|o| o.login.clone()).collect::<Vec<_>>(),
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

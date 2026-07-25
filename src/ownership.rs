@@ -131,6 +131,7 @@ impl FileOwnership {
             evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: None,
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         })
@@ -181,6 +182,7 @@ impl FileOwnership {
                 "total_lines": self.total_lines,
                 "shares": shares,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         })

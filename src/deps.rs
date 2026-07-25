@@ -464,6 +464,7 @@ fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency)
         evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: None,
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -497,6 +498,7 @@ fn unused_dev_dependency_finding(
             "reason": "no use found in the examined view (tests/examples/benches of this \
                 package, and #[cfg(test)] modules in its src files; doctests are not scanned)",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -535,6 +537,7 @@ fn unused_feature_flag_findings(
                 "feature": feature,
                 "reason": "no other usage of this dependency was found in the examined view",
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         })
@@ -568,6 +571,7 @@ fn default_features_unused_finding(
             "reason": "no other usage of this dependency was found in the examined view, and \
                 the manifest explicitly sets default-features = true",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -634,6 +638,7 @@ fn unused_feature_finding(krate: &CrateInfo, feature_name: &str) -> Finding {
             "reason": "no `cfg(feature = \"...\")`/`cfg!(feature = \"...\")` reference to this \
                 declared feature was found anywhere in the crate's own authored source",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -736,6 +741,7 @@ fn heavy_dependency_finding(
             "used_items": used_items.len(),
             "examples": examples,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -760,6 +766,7 @@ fn dep_without_repo_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDepe
         evidence: Some(serde_json::json!({
             "reason": "no `repository` field found in this dependency's own manifest",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1085,6 +1092,7 @@ fn unused_dependency_finding(
             "reason": "no use found by rustc's unused_crate_dependencies lint \
                 across all targets of this package",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

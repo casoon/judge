@@ -340,6 +340,14 @@ pub struct Finding {
     /// `evidence_class` (see todo.md §7). `None` where a detector doesn't
     /// yet populate it; not every rule does.
     pub evidence: Option<serde_json::Value>,
+    /// Known, structural gaps in what this specific finding's analysis could
+    /// observe — e.g. `["proc_macro_expansion_disabled"]` when the Deep Tier
+    /// ran without proc-macro expansion, so some references may be invisible
+    /// to it. Distinct from `evidence`, which carries the finding's own
+    /// supporting data rather than a caveat about that data's completeness.
+    /// `None` where a detector has no such gap to disclose.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limitations: Option<Vec<String>>,
     /// Findings that caused this one to appear (the root-cause direction).
     /// Derived from [`FindingGraph`]'s edge set on export — `pub(crate)` so
     /// the public API cannot set it independently of `causes` (todo.md
@@ -371,6 +379,7 @@ impl Finding {
             evidence_class,
             origin,
             evidence,
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }

@@ -538,6 +538,7 @@ impl Hotspot {
             evidence_class: EvidenceClass::Heuristic,
             origin: Origin::Code,
             evidence: None,
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -659,6 +660,7 @@ impl SizeDistributionOutlier {
                     self.loc, self.crate_name, self.crate_file_count, self.crate_gini
                 ),
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -772,6 +774,7 @@ impl ComplexityConcentrationOutlier {
                     self.file_total_cyclomatic, self.crate_name, self.crate_file_count, self.crate_gini
                 ),
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -902,6 +905,7 @@ impl CrossFileConnectivityOutlier {
                     self.co_touch_count, self.ratio
                 ),
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }

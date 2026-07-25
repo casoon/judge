@@ -492,6 +492,7 @@ fn unlinked_file_finding(krate: &CrateInfo, file: &SourceFile, tree: &CrateModul
             "reason": "not reached by resolving `mod` declarations (including #[path] \
                 overrides) from any of this crate's own Cargo target roots",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -758,6 +759,7 @@ fn orphan_module_finding(krate: &CrateInfo, node: &ModuleNode, files_scanned: us
                 `crate::<module_path>` or `<crate-name>::<module_path>` from outside the \
                 module's own files",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

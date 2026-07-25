@@ -189,6 +189,7 @@ fn missed_mutant_finding(mutant: &MissedMutant) -> Finding {
             "replacement": mutant.replacement,
             "name": mutant.name,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

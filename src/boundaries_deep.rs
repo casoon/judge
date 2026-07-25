@@ -237,6 +237,7 @@ fn module_boundary_violation_deep_finding(
             "witness_file": witness_file.display().to_string(),
             "basis": "deep_symbol_reference",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

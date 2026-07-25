@@ -255,6 +255,7 @@ fn duplicate_crate_versions(metadata: &Metadata, workspace_root: &Path) -> Vec<F
                 "versions": versions,
                 "copies": copies,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });
@@ -351,6 +352,7 @@ fn msrv_drift(
                     "dependency_msrv": dep_msrv.to_string(),
                     "workspace_msrv": workspace_msrv.to_string(),
                 })),
+                limitations: None,
                 caused_by: Vec::new(),
                 causes: Vec::new(),
             })
@@ -419,6 +421,7 @@ fn workspace_dep_drift(metadata: &Metadata, workspace_root: &Path) -> Vec<Findin
                 "dependency": dep_name,
                 "requirements": requirements,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });

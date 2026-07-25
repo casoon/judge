@@ -338,6 +338,7 @@ fn known_vulnerability_finding(
             "url": vuln.url,
             "reachability": reachability.label(),
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

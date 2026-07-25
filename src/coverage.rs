@@ -346,6 +346,7 @@ pub fn untested_hotspots(
                     "lines_covered_pct": file_coverage.covered_pct(),
                     "uncovered_line_count": uncovered_in_function,
                 })),
+                limitations: None,
                 caused_by: Vec::new(),
                 causes: Vec::new(),
             })

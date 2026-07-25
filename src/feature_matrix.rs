@@ -164,6 +164,7 @@ fn finding_for(candidate: &Candidate, combinations: &[Vec<String>]) -> Finding {
         evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: Some(evidence),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

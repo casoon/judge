@@ -727,16 +727,16 @@ fn check_item(
         Ok(false) => {
             let searched_crates: std::collections::HashSet<&str> =
                 crate_of_file.values().copied().collect();
-            let mut evidence = serde_json::json!({
+            let evidence = serde_json::json!({
                 "tier": "deep",
                 "searched_crates": searched_crates.len(),
                 "references_found": referencing.len(),
                 "root_set_size": entry_keys.len(),
                 "reason": reason,
             });
-            if proc_macro_exposed.contains(krate_name) {
-                evidence["limitations"] = serde_json::json!(["proc_macro_expansion_disabled"]);
-            }
+            let limitations = proc_macro_exposed
+                .contains(krate_name)
+                .then(|| vec!["proc_macro_expansion_disabled".to_string()]);
             report.findings.push(Finding {
                 id: format!("{rule_id}:{}:{qualified_name}", file.path.display()).into(),
                 rule: rule_id.into(),
@@ -749,6 +749,7 @@ fn check_item(
                 evidence_class,
                 origin: Origin::Code,
                 evidence: Some(evidence),
+                limitations,
                 caused_by: Vec::new(),
                 causes: Vec::new(),
             });
@@ -884,6 +885,7 @@ fn check_enum_variant(
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: Some(evidence),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     });
@@ -1006,6 +1008,7 @@ fn check_test_only_pub(
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: Some(evidence),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     });
@@ -1053,14 +1056,14 @@ fn check_unreachable_from_entry(
     ) {
         Ok(true) => {}
         Ok(false) => {
-            let mut evidence = serde_json::json!({
+            let evidence = serde_json::json!({
                 "tier": "deep",
                 "root_set_size": entry_keys.len(),
                 "reason": UNREACHABLE_FROM_ENTRY_REASON,
             });
-            if proc_macro_exposed.contains(krate_name) {
-                evidence["limitations"] = serde_json::json!(["proc_macro_expansion_disabled"]);
-            }
+            let limitations = proc_macro_exposed
+                .contains(krate_name)
+                .then(|| vec!["proc_macro_expansion_disabled".to_string()]);
             report.findings.push(Finding {
                 id: format!(
                     "{UNREACHABLE_FROM_ENTRY_RULE}:{}:{qualified_name}",
@@ -1077,6 +1080,7 @@ fn check_unreachable_from_entry(
                 evidence_class: EvidenceClass::BoundedSemantic,
                 origin: Origin::Code,
                 evidence: Some(evidence),
+                limitations,
                 caused_by: Vec::new(),
                 causes: Vec::new(),
             });
@@ -1432,6 +1436,7 @@ fn crate_coupling_findings(
                     .map(|set| set.iter().copied().collect::<Vec<_>>())
                     .unwrap_or_default(),
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });
@@ -1521,6 +1526,7 @@ fn module_coupling_findings(
                     .map(|set| set.iter().copied().collect::<Vec<_>>())
                     .unwrap_or_default(),
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });
@@ -2243,9 +2249,9 @@ pub extern "C" fn exported_b() -> i32 {
     /// **Partial mitigation:** [`proc_macro_exposed_crates`] can't eliminate
     /// this false positive (that needs real proc-macro expansion), but since
     /// `core` here has a direct proc-macro dependency, the finding for
-    /// `helper` now carries `"limitations": ["proc_macro_expansion_disabled"]`
-    /// in its evidence — the uncertainty is surfaced instead of hidden behind
-    /// an unqualified `unused-pub-workspace` warning.
+    /// `helper` now carries `limitations: ["proc_macro_expansion_disabled"]`
+    /// — the uncertainty is surfaced instead of hidden behind an unqualified
+    /// `unused-pub-workspace` warning.
     #[test]
     fn a_pub_fn_reachable_only_through_an_unexpanded_proc_macro_derive_is_falsely_flagged_dead() {
         let dir = TempDir::new("dead-code-proc-macro-blind-spot");
@@ -2323,16 +2329,13 @@ pub fn truly_dead() -> i32 {
             .iter()
             .find(|f| f.location.item_path == "helper")
             .expect("helper must be flagged, per the assertion above");
-        let evidence = helper_finding
-            .evidence
-            .as_ref()
-            .expect("evidence must be present");
         assert_eq!(
-            evidence["limitations"],
-            serde_json::json!(["proc_macro_expansion_disabled"]),
+            helper_finding.limitations,
+            Some(vec!["proc_macro_expansion_disabled".to_string()]),
             "`core` has a direct proc-macro dependency (`macros`), so the finding must disclose \
              that proc-macro expansion was disabled instead of presenting `helper` as an \
-             unqualified dead-code finding: {evidence:?}"
+             unqualified dead-code finding: {:?}",
+            helper_finding.limitations
         );
     }
 
@@ -2390,13 +2393,13 @@ pub fn noop(_input: TokenStream) -> TokenStream {
             .iter()
             .find(|f| f.location.item_path == "never_called")
             .expect("never_called must be flagged dead");
-        let evidence = finding.evidence.as_ref().expect("evidence must be present");
         assert_eq!(
-            evidence["limitations"],
-            serde_json::json!(["proc_macro_expansion_disabled"]),
+            finding.limitations,
+            Some(vec!["proc_macro_expansion_disabled".to_string()]),
             "`core` directly depends on the proc-macro crate `macros`, so the finding must \
              disclose that proc-macro expansion was disabled, even though this particular dead \
-             item is unrelated to the derive: {evidence:?}"
+             item is unrelated to the derive: {:?}",
+            finding.limitations
         );
     }
 
@@ -2422,11 +2425,11 @@ pub fn noop(_input: TokenStream) -> TokenStream {
             .iter()
             .find(|f| f.location.item_path == "never_called")
             .expect("never_called must be flagged dead");
-        let evidence = finding.evidence.as_ref().expect("evidence must be present");
         assert!(
-            evidence.get("limitations").is_none(),
+            finding.limitations.is_none(),
             "no proc-macro dependency anywhere in this workspace — the finding must not carry a \
-             `limitations` field: {evidence:?}"
+             `limitations` field: {:?}",
+            finding.limitations
         );
     }
 

@@ -567,6 +567,7 @@ pub fn signature_complexity(functions: &[FunctionInfo]) -> Vec<Finding> {
                 "lifetime_param_count": function.lifetime_param_count,
                 "trait_bound_count": function.trait_bound_count,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         })
@@ -919,6 +920,7 @@ pub fn maintainability_index(functions: &[FunctionInfo]) -> Vec<Finding> {
                 "cyclomatic_complexity_sum": file_totals.cyclomatic,
                 "lines_of_code_sum": file_totals.lines_of_code,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });

@@ -573,6 +573,7 @@ mod tests {
             evidence_class: crate::finding::EvidenceClass::DerivedFact,
             origin: Origin::Code,
             evidence: None,
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }

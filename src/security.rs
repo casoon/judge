@@ -526,6 +526,7 @@ fn unsafe_surface_finding(file: &Path, span: proc_macro2::Span, item_path: &str)
         evidence: Some(serde_json::json!({
             "reason": "no `SAFETY:` comment found adjacent to this unsafe block",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -567,6 +568,7 @@ fn integer_cast_risk_finding(
                 source expression's real type is not resolved at the Fast Tier, so this is a \
                 syntax-only proxy, not a truncation proof",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -607,6 +609,7 @@ fn panic_in_lib_finding(
             "reason": "a panicking construct reachable from a `pub` path; not a claim that it \
                 will panic at runtime",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -716,6 +719,7 @@ fn unsafe_density_finding_for_file(path: &Path, ast: &syn::File, source: &str) -
             "max_unsafe_block_size": max_unsafe_block_size,
             "unsafe_block_count": visitor.block_line_counts.len(),
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     })
@@ -976,6 +980,7 @@ fn hardcoded_secret_finding(
         evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: Some(evidence),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

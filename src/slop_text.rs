@@ -188,6 +188,7 @@ fn build_finding(
         evidence_class,
         origin: Origin::Code,
         evidence,
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

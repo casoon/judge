@@ -108,6 +108,7 @@ pub fn churn_hotspots(churn: &HashMap<PathBuf, u32>) -> Vec<Finding> {
                 "commits_in_window": count,
                 "window_days": CHURN_HOTSPOT_WINDOW_DAYS,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         })
@@ -191,6 +192,7 @@ pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
                 "async_nesting_depth": function.async_nesting_depth,
                 "max_expression_width": function.max_expression_width,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         })
@@ -429,6 +431,7 @@ fn abstraction_finding(
         evidence_class: EvidenceClass::Heuristic,
         origin: Origin::Code,
         evidence: Some(evidence),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -741,6 +744,7 @@ fn fragile_substring_classification_finding(
                 literal with no word-boundary check found in the condition — this can \
                 misclassify if the string appears as a substring of something unrelated",
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

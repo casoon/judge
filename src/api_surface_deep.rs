@@ -479,6 +479,7 @@ fn re_export_chain_finding(file: &Path, line: OneBasedLine, chain: &ReExportChai
             "hop_count": chain.hop_count,
             "capped": chain.hop_count == RE_EXPORT_CHAIN_MAX_HOPS,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -693,6 +694,7 @@ fn leak_finding(candidate: &PubFnCandidate, site: &str, leak: &LeakedType) -> Fi
             "defining_crate": leak.defining_crate,
             "site": site,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -777,6 +779,7 @@ fn internal_leak_finding(candidate: &PubFnCandidate, site: &str, leak: &LeakedTy
             "defining_crate": leak.defining_crate,
             "site": site,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

@@ -302,6 +302,7 @@ fn connectivity_drop_findings(records: &[FunctionFanIn]) -> Vec<Finding> {
                 "tier": "deep",
                 "cross_file_references": 0,
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         })
@@ -391,6 +392,7 @@ fn duplicative_reinvention_findings(
                     .map(|member| member.file.display().to_string())
                     .collect::<Vec<_>>(),
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });
@@ -532,6 +534,7 @@ fn orphaned_code_findings(
                 "dominant_author": dominant_author,
                 "active_authors_count": active_authors.len(),
             })),
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         });
@@ -630,6 +633,7 @@ fn monomorphization_load_findings(
                     "cross_file_call_sites": cross_file_call_sites,
                     "monomorphization_load_score": monomorphization_load_score,
                 })),
+                limitations: None,
                 caused_by: Vec::new(),
                 causes: Vec::new(),
             })

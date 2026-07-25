@@ -977,6 +977,7 @@ fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) ->
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: None,
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1004,6 +1005,7 @@ fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) 
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: None,
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1023,6 +1025,7 @@ fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: None,
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1288,6 +1291,7 @@ fn module_boundary_finding(
         evidence: Some(serde_json::json!({
             "module_path_resolution": "directory-convention heuristic, not module-graph resolution — e.g. #[path = \"...\"] attributes are not recognized"
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1420,6 +1424,7 @@ fn feature_graph_cycle_finding(
             "package": package_name,
             "cycle": cycle,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1554,6 +1559,7 @@ fn change_coupling_signal_finding(
             "co_change_commits": co_change_count,
             "ratio": ratio,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

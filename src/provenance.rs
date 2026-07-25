@@ -371,6 +371,7 @@ fn metric_finding(
             "classification_confidence": classification_confidence,
             "caveat": PROVENANCE_CAVEAT,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -907,6 +908,7 @@ fn dep_added_by_agent_finding(
             "reason": "declared in this commit's manifest diff; no other file this commit touched textually references it",
             "caveat": PROVENANCE_CAVEAT,
         })),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1431,6 +1433,7 @@ mod tests {
             evidence_class: EvidenceClass::DerivedFact,
             origin: Origin::Code,
             evidence: None,
+            limitations: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         };

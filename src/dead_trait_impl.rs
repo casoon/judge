@@ -345,6 +345,7 @@ fn finding_for(candidate: &ImplCandidate) -> Finding {
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: Some(evidence),
+        limitations: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
