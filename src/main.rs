@@ -890,6 +890,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
         ),
         (
+            judge::ownership::KNOWLEDGE_LOSS_RISK_RULE.to_string(),
+            judge::ownership::KNOWLEDGE_LOSS_RISK_RULE_REVISION,
+        ),
+        (
             judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
             judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
         ),
@@ -2530,6 +2534,10 @@ fn run_distribution(
                 judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
             ),
             (
+                judge::ownership::KNOWLEDGE_LOSS_RISK_RULE.to_string(),
+                judge::ownership::KNOWLEDGE_LOSS_RISK_RULE_REVISION,
+            ),
+            (
                 judge::ownership::OWNERSHIP_FRAGMENTATION_RULE.to_string(),
                 judge::ownership::OWNERSHIP_FRAGMENTATION_RULE_REVISION,
             ),
@@ -2578,9 +2586,12 @@ fn run_distribution(
                 writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
 
-            let (bus_factor, fragmentation): (Vec<&Finding>, Vec<&Finding>) = findings
+            let (bus_factor, rest): (Vec<&Finding>, Vec<&Finding>) = findings
                 .iter()
                 .partition(|finding| finding.rule == judge::ownership::LOW_BUS_FACTOR_RULE);
+            let (knowledge_loss_risk, fragmentation): (Vec<&Finding>, Vec<&Finding>) = rest
+                .into_iter()
+                .partition(|finding| finding.rule == judge::ownership::KNOWLEDGE_LOSS_RISK_RULE);
 
             writeln!(out)?;
             writeln!(out, "low-bus-factor findings: {}", bus_factor.len())?;
@@ -2588,6 +2599,22 @@ fn run_distribution(
                 writeln!(
                     out,
                     "  [{}] {}  primary author: {}",
+                    severity_label(finding.severity),
+                    finding.location.file.display(),
+                    finding.location.item_path
+                )?;
+            }
+
+            writeln!(out)?;
+            writeln!(
+                out,
+                "knowledge-loss-risk findings: {}",
+                knowledge_loss_risk.len()
+            )?;
+            for finding in &knowledge_loss_risk {
+                writeln!(
+                    out,
+                    "  [{}] {}  {}",
                     severity_label(finding.severity),
                     finding.location.file.display(),
                     finding.location.item_path
@@ -3643,15 +3670,41 @@ fn run_dead_code_deep(
         false,
     );
 
-    // `connectivity-drop`/`duplicative-reinvention` load their own
-    // second `DeepContext` here rather than sharing `dead_code`'s —
-    // `dead_code::analyze_workspace` doesn't expose the `RootDatabase`
-    // it loads internally, and threading one through would widen that
-    // module's public API for a performance-only concern. Accepted,
-    // documented extra cost (a second full workspace load; see
+    // `orphaned-code` needs a file's dominant blame author and the repo's
+    // active-author set — same Fast Tier, git-blame-based data
+    // `low-bus-factor`/`knowledge-loss-risk` already compute (see
+    // `judge::ownership` module docs). Only `.files` is used here; the
+    // low-bus-factor/knowledge-loss-risk/ownership-fragmentation findings
+    // this also computes belong to `cargo judge distribution`, not this
+    // command, so they're discarded.
+    let window_days = judge::git::DEFAULT_WINDOW_DAYS;
+    let active_authors = judge::git::active_authors_since(&workspace.root, window_days)?;
+    let ownership_report = judge::ownership::analyze_workspace(&workspace, window_days)?;
+    let dominant_author_by_file: std::collections::HashMap<std::path::PathBuf, String> =
+        ownership_report
+            .files
+            .iter()
+            .filter_map(|file| {
+                file.authors
+                    .first()
+                    .map(|author| (file.file.clone(), author.email.clone()))
+            })
+            .collect();
+
+    // `connectivity-drop`/`duplicative-reinvention`/`orphaned-code` load
+    // their own second `DeepContext` here rather than sharing
+    // `dead_code`'s — `dead_code::analyze_workspace` doesn't expose the
+    // `RootDatabase` it loads internally, and threading one through would
+    // widen that module's public API for a performance-only concern.
+    // Accepted, documented extra cost (a second full workspace load; see
     // `judge::deep`'s own cost note), not a correctness one.
-    let structural_report =
-        judge::slop_structural_deep::analyze_workspace(&workspace, &dupes, include_tests)?;
+    let structural_report = judge::slop_structural_deep::analyze_workspace(
+        &workspace,
+        &dupes,
+        include_tests,
+        &dominant_author_by_file,
+        &active_authors,
+    )?;
 
     let mut findings = dead_code_report.findings;
     findings.extend(feature_matrix_report.findings);
@@ -3666,6 +3719,7 @@ fn run_dead_code_deep(
     analysis_errors.extend(feature_matrix_report.errors.iter().map(ToString::to_string));
     analysis_errors.extend(dead_trait_impl_report.errors.iter().map(ToString::to_string));
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
+    analysis_errors.extend(ownership_report.errors.iter().map(ToString::to_string));
     analysis_errors.extend(structural_report.errors.iter().map(ToString::to_string));
 
     // Inline `judge-ignore` suppression (todo.md §5).
@@ -3713,6 +3767,10 @@ fn run_dead_code_deep(
             (
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE.to_string(),
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE_REVISION,
+            ),
+            (
+                judge::slop_structural_deep::ORPHANED_CODE_RULE.to_string(),
+                judge::slop_structural_deep::ORPHANED_CODE_RULE_REVISION,
             ),
         ]);
         return handle_baseline(
@@ -3785,6 +3843,7 @@ fn run_dead_code_deep(
                 judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
+                judge::slop_structural_deep::ORPHANED_CODE_RULE,
             ] {
                 let rule_findings: Vec<&Finding> = findings
                     .iter()

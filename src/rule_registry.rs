@@ -778,6 +778,15 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         example: None,
     },
     RuleMetadata {
+        id: "knowledge-loss-risk",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`, `audit`, and `cargo judge distribution`).",
+        exclusions: "Only fires when the repository has at least 2 distinct authors active within the analysis window, same gate as `low-bus-factor` (see that entry). Fires when more than half of a file's blamed lines belong to authors no longer active anywhere in the repo — the general, share-weighted form of `low-bus-factor`'s single-dominant-author special case (that rule only ever looks at bus-factor-1 files). A bus-factor-1 file with an inactive sole author trivially also has a near-100% inactive share, so the two rules are expected to co-fire often; that overlap is intentional, not double-counting. Blame is not a knowledge measurement.",
+        allowed_wording: "State the inactive line share and author count as facts from the analyzed window; keep any 'knowledge risk' reading separate and explicitly a heuristic interpretation. Per todo.md §17.4: never state 'knowledge is lost' as a fact.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
+    },
+    RuleMetadata {
         id: "ownership-fragmentation",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`, `audit`, and `cargo judge distribution`).",
@@ -1228,6 +1237,15 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
             why_it_matters: "A function nobody outside its own file ever calls is either dead code that plain reachability analysis missed, or a duplicate implementation nobody wired up — either way it is worth a second look.",
         }),
     },
+    RuleMetadata {
+        id: "orphaned-code",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; needs `find_all_refs` cross-file reference data and entry-point reachability BFS), plus git history — same repo-level active-author gate as `low-bus-factor`/`knowledge-loss-risk` (only evaluated when the repository has at least `LOW_BUS_FACTOR_MIN_REPO_AUTHORS` (2) distinct active authors, see those entries).",
+        exclusions: "Fires only when three independent signals hold at once: zero cross-file fan-in (see `connectivity-drop`'s `is_reliably_checkable_for_fan_in` — test/bench-attributed functions and methods inside `impl TraitName for SomeType` blocks are excluded from the candidate set entirely, same as that rule), not reachable from any test-only entry point (a `#[test]`/`#[bench]` function; production entry points like `fn main`/FFI/wasm-bindgen exports don't count for this leg), and the file's dominant blame author (`FileOwnership.authors[0]`) not active within the analysis window. The author leg is a deliberate, documented file-level proxy for the item's own author — true per-function blame isn't computed, only the file's dominant author, on the reasoning that a file's dominant author is usually representative of any single item within it, especially for smaller files; this is an approximation, not item-precise attribution. Inherits every entry-point-detection limitation `crate::reachability`'s module docs describe (registration macros like `inventory::submit!`/`ctor` are not recognized as entry points, so an item wired up only through one of those can incorrectly look test-path-free).",
+        allowed_wording: HEURISTIC_WORDING,
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
+    },
     // -- slopsquat.rs (G5) ----------------------------------------------------
     RuleMetadata {
         id: "name-collision-risk",
@@ -1381,6 +1399,14 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
         "needs real git commit history with at least 2 distinct authors",
     ),
     (
+        "knowledge-loss-risk",
+        "needs real git commit history with at least 2 distinct authors, some inactive within the analysis window",
+    ),
+    (
+        "orphaned-code",
+        "needs both a real Deep Tier load (for the fan-in and test-path-reachability legs) and real git commit history with an inactive dominant author (for the third leg) at once — the hardest combination to express as a single illustrative source snippet so far",
+    ),
+    (
         "ownership-fragmentation",
         "needs real git blame history across at least 4 authors",
     ),
@@ -1474,6 +1500,7 @@ mod tests {
             crate::module_graph::ORPHAN_MODULE_RULE,
             crate::mutants::MUTATION_SURVIVOR_RULE,
             crate::ownership::LOW_BUS_FACTOR_RULE,
+            crate::ownership::KNOWLEDGE_LOSS_RISK_RULE,
             crate::ownership::OWNERSHIP_FRAGMENTATION_RULE,
             crate::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
             crate::pattern::PRIMITIVE_DOMAIN_VALUE_RULE,
@@ -1544,6 +1571,7 @@ mod tests {
             crate::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
+            crate::slop_structural_deep::ORPHANED_CODE_RULE,
             crate::api_surface_deep::INTERNAL_LEAK_RULE,
             crate::api_surface_deep::RE_EXPORT_CHAIN_RULE,
             crate::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE,
