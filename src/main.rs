@@ -18,6 +18,7 @@ const DEFAULT_BASELINE_PROVENANCE: &str = ".judge/baseline-provenance.json";
 const DEFAULT_BASELINE_COVERAGE: &str = ".judge/baseline-coverage.json";
 const DEFAULT_BASELINE_API_SURFACE: &str = ".judge/baseline-api-surface.json";
 const DEFAULT_BASELINE_MODULE_GRAPH: &str = ".judge/baseline-module-graph.json";
+const DEFAULT_PATTERN_BASELINE: &str = ".judge/baseline-patterns.json";
 #[cfg(feature = "deep")]
 const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
 
@@ -394,6 +395,16 @@ struct PatternsOptions {
     /// module docs).
     #[arg(long, value_name = "PATH")]
     clippy_json: Option<PathBuf>,
+    /// Save the current pattern candidates as a pattern baseline — a
+    /// separate, simpler mechanism from `Finding` baselines (see
+    /// `judge::pattern_baseline`: pattern candidates never gate, so their
+    /// baseline carries no rule revisions, LOC, or score context).
+    #[arg(long)]
+    save_pattern_baseline: bool,
+    /// Compare pattern candidates against a previously saved pattern
+    /// baseline.
+    #[arg(long, value_name = "PATH")]
+    pattern_baseline: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -616,6 +627,12 @@ impl From<judge::health_score::LocError> for CliError {
 
 impl From<judge::baseline::BaselineError> for CliError {
     fn from(err: judge::baseline::BaselineError) -> Self {
+        Self::Config(err.to_string())
+    }
+}
+
+impl From<judge::pattern_baseline::PatternBaselineError> for CliError {
+    fn from(err: judge::pattern_baseline::PatternBaselineError) -> Self {
         Self::Config(err.to_string())
     }
 }
@@ -1490,6 +1507,35 @@ fn print_delta(
             finding.rule,
             finding.location.file.display(),
             finding.location.line
+        )?;
+    }
+    Ok(())
+}
+
+/// TTY rendering of a [`judge::pattern_baseline::PatternDelta`] — the
+/// pattern-candidate analog of [`print_delta`], but without a verdict line
+/// (pattern candidates never gate — see `judge::pattern_baseline`'s module
+/// docs) and without the `code_introduced`/`rule_introduced` split (patterns
+/// use a flat new/resolved/unchanged classification instead).
+fn print_pattern_delta_tty(
+    out: &mut dyn Write,
+    delta: &judge::pattern_baseline::PatternDelta,
+) -> std::io::Result<()> {
+    writeln!(out, "unchanged: {}", delta.unchanged_count)?;
+    writeln!(out, "resolved: {}", delta.resolved.len())?;
+    for candidate in &delta.resolved {
+        writeln!(
+            out,
+            "  [{}] {}  crate: {}",
+            candidate.id, candidate.pattern, candidate.krate
+        )?;
+    }
+    writeln!(out, "new: {}", delta.new.len())?;
+    for candidate in &delta.new {
+        writeln!(
+            out,
+            "  [{}] {}  crate: {}",
+            candidate.id, candidate.pattern, candidate.scope.krate
         )?;
     }
     Ok(())
@@ -3147,12 +3193,43 @@ fn run_patterns(options: PatternsOptions, out: &mut dyn Write) -> Result<Command
     let PatternsOptions {
         format,
         clippy_json,
+        save_pattern_baseline,
+        pattern_baseline,
     } = options;
     if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
         return Err(unsupported_format("`patterns`", format, "tty, json"));
     }
     let workspace = judge::ingest::load(None)?;
     let candidates = collect_pattern_candidates(&workspace, clippy_json.as_deref())?;
+
+    if save_pattern_baseline {
+        let baseline = judge::pattern_baseline::PatternBaseline::new(&candidates);
+        let save_path = workspace.root.join(DEFAULT_PATTERN_BASELINE);
+        judge::pattern_baseline::save(&save_path, &baseline)?;
+        writeln!(
+            out,
+            "pattern baseline saved: {} ({} candidates)",
+            save_path.display(),
+            candidates.len()
+        )?;
+        return Ok(CommandOutcome::Clean);
+    }
+
+    if let Some(path) = &pattern_baseline {
+        let baseline = judge::pattern_baseline::load(path)?;
+        let delta = judge::pattern_baseline::diff_patterns(&candidates, &baseline);
+        match format {
+            OutputFormat::Json => {
+                let json = serde_json::json!({ "delta": delta });
+                writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+            }
+            OutputFormat::Sarif | OutputFormat::Markdown => {
+                unreachable!("rejected above before loading the workspace")
+            }
+            OutputFormat::Tty => print_pattern_delta_tty(out, &delta)?,
+        }
+        return Ok(CommandOutcome::Clean);
+    }
 
     match format {
         OutputFormat::Json => {
@@ -5548,6 +5625,8 @@ fn dup_two(x: i32) -> i32 {
             cli_with(Command::Patterns(PatternsOptions {
                 format: OutputFormat::Json,
                 clippy_json: None,
+                save_pattern_baseline: false,
+                pattern_baseline: None,
             })),
             &mut out,
         )
@@ -5577,6 +5656,8 @@ fn dup_two(x: i32) -> i32 {
             cli_with(Command::Patterns(PatternsOptions {
                 format: OutputFormat::Json,
                 clippy_json: None,
+                save_pattern_baseline: false,
+                pattern_baseline: None,
             })),
             &mut out,
         )
@@ -5605,6 +5686,65 @@ fn dup_two(x: i32) -> i32 {
             ]),
             "expected candidates from five different rules: {json}"
         );
+    }
+
+    /// (d.3) `--save-pattern-baseline` writes a `PatternBaseline` JSON file
+    /// — a separate mechanism from `Finding` baselines (see
+    /// `judge::pattern_baseline`) — and `--pattern-baseline` reads it back,
+    /// classifying candidates into new/resolved/unchanged with no verdict
+    /// (pattern candidates never gate).
+    #[test]
+    fn pattern_baseline_flags_save_and_diff_candidates() {
+        let dir = TempDir::new("patterns-baseline-flags");
+        write_pattern_candidate_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::Patterns(PatternsOptions {
+                format: OutputFormat::Tty,
+                clippy_json: None,
+                save_pattern_baseline: true,
+                pattern_baseline: None,
+            })),
+            &mut out,
+        )
+        .expect("saving a pattern baseline must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("pattern baseline saved:") && text.contains("(1 candidates)"),
+            "unexpected output: {text}"
+        );
+        assert!(
+            dir.join(DEFAULT_PATTERN_BASELINE).exists(),
+            "expected {} to exist",
+            DEFAULT_PATTERN_BASELINE
+        );
+
+        // The multi-rule fixture keeps `fn a`/`fn b`/`FixtureError` verbatim
+        // (see its doc comment) and adds four more pattern-triggering
+        // shapes, so the `domain-error` candidate saved above keeps the same
+        // id (unchanged) while the other four are new.
+        write_multi_rule_pattern_candidate_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::Patterns(PatternsOptions {
+                format: OutputFormat::Tty,
+                clippy_json: None,
+                save_pattern_baseline: false,
+                pattern_baseline: Some(PathBuf::from(DEFAULT_PATTERN_BASELINE)),
+            })),
+            &mut out,
+        )
+        .expect("comparing against a pattern baseline must not error");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("unchanged: 1"), "unexpected output: {text}");
+        assert!(text.contains("resolved: 0"), "unexpected output: {text}");
+        assert!(text.contains("new: 4"), "unexpected output: {text}");
     }
 
     /// (e) `principles` reports the corroborated `functional-core-
@@ -5901,6 +6041,8 @@ fn dup_two(x: i32) -> i32 {
             cli_with(Command::Patterns(PatternsOptions {
                 format: OutputFormat::Json,
                 clippy_json: None,
+                save_pattern_baseline: false,
+                pattern_baseline: None,
             })),
             &mut json_out,
         )

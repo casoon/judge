@@ -33,6 +33,7 @@ pub mod module_graph;
 pub mod mutants;
 pub mod ownership;
 pub mod pattern;
+pub mod pattern_baseline;
 pub mod principle;
 pub mod provenance;
 #[cfg(feature = "deep")]

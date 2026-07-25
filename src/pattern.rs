@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
@@ -54,7 +54,11 @@ pub const MANUAL_RESOURCE_LIFECYCLE_RULE: &str = "manual-resource-lifecycle";
 
 /// A recommended Rust design pattern (todo.md §16.2, §16.3). Exactly the enum
 /// from the todo.md sketch — no additional variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` is derived alongside `Serialize` so a
+/// [`crate::pattern_baseline::PatternBaseline`] JSON file can be loaded back,
+/// not just saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RustPattern {
     ValidatedNewtype,
@@ -186,7 +190,11 @@ pub struct MigrationStep {
 /// either blake3 or `std::hash::DefaultHasher` (whose algorithm is
 /// explicitly not guaranteed stable across Rust releases — unsuitable for an
 /// id meant to stay stable across judge upgrades).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+///
+/// `Deserialize` is derived alongside `Serialize` so a
+/// [`crate::pattern_baseline::PatternBaseline`] JSON file can be loaded back,
+/// not just saved.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PatternCandidateId(String);
 
