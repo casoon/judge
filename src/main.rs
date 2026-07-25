@@ -778,6 +778,14 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::git::SIZE_DISTRIBUTION_RULE_REVISION,
         ),
         (
+            judge::git::COMPLEXITY_CONCENTRATION_RULE.to_string(),
+            judge::git::COMPLEXITY_CONCENTRATION_RULE_REVISION,
+        ),
+        (
+            judge::git::COMMIT_SIZE_DISTRIBUTION_RULE.to_string(),
+            judge::git::COMMIT_SIZE_DISTRIBUTION_RULE_REVISION,
+        ),
+        (
             judge::duplication::DUPLICATE_RULE.to_string(),
             judge::duplication::DUPLICATE_RULE_REVISION,
         ),
@@ -947,6 +955,19 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             .iter()
             .map(judge::git::SizeDistributionOutlier::to_finding),
     );
+    findings.extend(
+        judge::git::complexity_concentration(workspace, &complexity.functions)
+            .iter()
+            .map(judge::git::ComplexityConcentrationOutlier::to_finding),
+    );
+    match judge::git::commit_size_distribution(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
+        Ok(outliers) => findings.extend(
+            outliers
+                .iter()
+                .map(judge::git::CommitSizeDistributionOutlier::to_finding),
+        ),
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
     findings.extend(judge::slop_structural::complexity_inflation(
         &complexity.functions,
     ));
@@ -3674,6 +3695,10 @@ fn run_dead_code_deep(
                 judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE_REVISION,
             ),
             (
+                judge::dead_code::CRATE_COUPLING_RULE.to_string(),
+                judge::dead_code::CRATE_COUPLING_RULE_REVISION,
+            ),
+            (
                 judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE.to_string(),
                 judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE_REVISION,
             ),
@@ -3755,6 +3780,7 @@ fn run_dead_code_deep(
                 judge::dead_code::DEAD_ENUM_VARIANT_RULE,
                 judge::dead_code::TEST_ONLY_PUB_RULE,
                 judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
+                judge::dead_code::CRATE_COUPLING_RULE,
                 judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
                 judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,

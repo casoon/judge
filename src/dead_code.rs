@@ -22,7 +22,7 @@
 //! two rules don't yet narrow their scope by a crate's `publish` field
 //! either.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use cargo_metadata::MetadataCommand;
@@ -104,6 +104,28 @@ pub const UNREACHABLE_FROM_ENTRY_RULE: &str = "unreachable-from-entry";
 /// Bump when the unreachable-from-entry rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
 pub const UNREACHABLE_FROM_ENTRY_RULE_REVISION: u32 = 1;
+
+/// A workspace crate's cross-crate coupling, expressed as Robert C. Martin's
+/// Instability metric `I = Ce / (Ca + Ce)` from *Agile Software Development:
+/// Principles, Patterns, and Practices* — the same named-formula posture
+/// `crate::git`'s Gini-based `size-distribution`/`complexity-concentration`
+/// already take. `Ce` (efferent coupling) is the number of distinct other
+/// workspace crates this crate references code from; `Ca` (afferent
+/// coupling) is the number of distinct other workspace crates that reference
+/// code from this crate. Both counts fall directly out of [`check_item`]'s
+/// existing [`crate::deep::referencing_files`] call — this rule adds no new
+/// Deep-Tier query of its own, only a side-aggregation over the full
+/// `referencing` set that call already computes for every `pub` item in the
+/// workspace (see `edge_counts` in [`analyze_workspace`]). A crate with
+/// `Ca + Ce == 0` (no cross-crate coupling observed at all) is skipped, not
+/// flagged — there is nothing to report. `I` itself is never interpreted as
+/// good or bad: a shared core crate is *expected* to have high afferent
+/// coupling, so this is a purely descriptive, distributional signal (see
+/// `crate::rule_registry`'s entry for this rule).
+pub const CRATE_COUPLING_RULE: &str = "crate-coupling";
+/// Bump when the crate-coupling rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const CRATE_COUPLING_RULE_REVISION: u32 = 1;
 
 #[derive(Debug)]
 pub enum DeadCodeError {
@@ -563,6 +585,7 @@ fn check_item(
     severity: Severity,
     evidence_class: EvidenceClass,
     reason: &str,
+    edge_counts: &mut HashMap<(String, String), u32>,
     report: &mut WorkspaceDeadCode,
 ) {
     report.checked += 1;
@@ -578,6 +601,21 @@ fn check_item(
             return;
         }
     };
+    // `crate-coupling`'s edge accumulation (see [`CRATE_COUPLING_RULE`]):
+    // done here, over the *full* `referencing` set and before the
+    // `used_externally` early exit below, so no cross-crate reference is
+    // silently dropped just because this particular item also happens to be
+    // used_externally == false (unused-pub-workspace/unused-pub-api still
+    // want it flagged) or == true (which returns early, right after this).
+    for referencing_file in &referencing {
+        if let Some(&referencing_crate) = crate_of_file.get(referencing_file) {
+            if referencing_crate != krate_name {
+                *edge_counts
+                    .entry((krate_name.to_string(), referencing_crate.to_string()))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
     let used_externally = referencing.iter().any(|referencing_file| {
         crate_of_file
             .get(referencing_file)
@@ -1004,6 +1042,13 @@ pub fn analyze_workspace(
 
     let mut report = WorkspaceDeadCode::default();
 
+    // `crate-coupling`'s edge-count accumulator (see [`CRATE_COUPLING_RULE`])
+    // — `(owner_crate_of_referenced_item, referencing_crate) -> count`,
+    // filled in as a side effect of `check_item`'s existing per-pub-item
+    // `referencing_files` query below, then folded into per-crate Ce/Ca
+    // findings after the crate loop.
+    let mut edge_counts: HashMap<(String, String), u32> = HashMap::new();
+
     let proc_macro_exposed = match proc_macro_exposed_crates(&workspace.root) {
         Ok(exposed) => exposed,
         Err(err) => {
@@ -1089,6 +1134,7 @@ pub fn analyze_workspace(
                         severity,
                         evidence_class,
                         reason,
+                        &mut edge_counts,
                         &mut report,
                     );
                     check_test_only_pub(
@@ -1150,6 +1196,7 @@ pub fn analyze_workspace(
                         severity,
                         evidence_class,
                         reason,
+                        &mut edge_counts,
                         &mut report,
                     );
                     check_test_only_pub(
@@ -1202,7 +1249,78 @@ pub fn analyze_workspace(
         }
     }
 
+    report
+        .findings
+        .extend(crate_coupling_findings(workspace, &edge_counts));
+
     Ok(report)
+}
+
+/// Folds [`analyze_workspace`]'s accumulated `edge_counts` into one
+/// `crate-coupling` [`Finding`] per crate with at least one observed
+/// cross-crate coupling edge (`Ca + Ce > 0`, Robert C. Martin's efferent/
+/// afferent coupling counts — see [`CRATE_COUPLING_RULE`]). A crate with no
+/// cross-crate coupling at all is skipped, not flagged — there is nothing to
+/// report for it.
+fn crate_coupling_findings(
+    workspace: &Workspace,
+    edge_counts: &HashMap<(String, String), u32>,
+) -> Vec<Finding> {
+    // owner -> distinct crates referencing it (Ca); referencer -> distinct
+    // crates it references (Ce). `BTreeSet` for deterministic, sorted,
+    // deduped evidence lists.
+    let mut afferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    let mut efferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    for (owner, referencer) in edge_counts.keys() {
+        afferent
+            .entry(owner.as_str())
+            .or_default()
+            .insert(referencer.as_str());
+        efferent
+            .entry(referencer.as_str())
+            .or_default()
+            .insert(owner.as_str());
+    }
+
+    let mut findings = Vec::new();
+    for krate in &workspace.crates {
+        let afferent_crates = afferent.get(krate.name.as_str());
+        let efferent_crates = efferent.get(krate.name.as_str());
+        let ca = afferent_crates.map_or(0, BTreeSet::len);
+        let ce = efferent_crates.map_or(0, BTreeSet::len);
+        if ca + ce == 0 {
+            continue;
+        }
+        let instability = ce as f64 / (ca + ce) as f64;
+        findings.push(Finding {
+            id: format!("{CRATE_COUPLING_RULE}:{}", krate.name).into(),
+            rule: CRATE_COUPLING_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: krate.manifest_path.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: krate.name.clone(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "tier": "deep",
+                "krate": krate.name,
+                "efferent_coupling": ce,
+                "afferent_coupling": ca,
+                "instability": instability,
+                "efferent_crates": efferent_crates
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                "afferent_crates": afferent_crates
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        });
+    }
+    findings
 }
 
 #[cfg(test)]
@@ -1850,6 +1968,7 @@ pub extern "C" fn exported_b() -> i32 {
 
         let mut report = WorkspaceDeadCode::default();
         let proc_macro_exposed = HashSet::new();
+        let mut edge_counts = HashMap::new();
         check_item(
             &analysis,
             &crate_of_file,
@@ -1866,6 +1985,7 @@ pub extern "C" fn exported_b() -> i32 {
             Severity::Warn,
             EvidenceClass::BoundedSemantic,
             UNUSED_PUB_WORKSPACE_REASON,
+            &mut edge_counts,
             &mut report,
         );
 
@@ -2761,6 +2881,181 @@ publish = false
                 .filter(|f| f.rule == UNREACHABLE_FROM_ENTRY_RULE)
                 .count(),
             1,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// `crate-coupling`'s Ca/Ce shape: `core` is called by both `app` and
+    /// `plugin`, so `core` should get `Ca=2` (two distinct crates reference
+    /// it), `Ce=0` (it references nothing cross-crate), and an Instability
+    /// near 0.0 — the low-instability shape expected of a shared, stable
+    /// core crate. `app` and `plugin` each call into `core`, so each should
+    /// get `Ce>=1`.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn crate_coupling_reports_ca_ce_for_a_shared_core_crate() {
+        let dir = TempDir::new("dead-code-crate-coupling-core");
+        write_crate(
+            &dir,
+            "core",
+            &[],
+            r#"pub fn shared_helper() -> i32 {
+    1
+}
+"#,
+        );
+        write_crate(
+            &dir,
+            "app",
+            &[("core", "../core")],
+            r#"pub fn run() -> i32 {
+    core::shared_helper()
+}
+"#,
+        );
+        write_crate(
+            &dir,
+            "plugin",
+            &[("core", "../core")],
+            r#"pub fn run() -> i32 {
+    core::shared_helper()
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["core", "app", "plugin"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        let core_finding = report
+            .findings
+            .iter()
+            .find(|f| f.rule == CRATE_COUPLING_RULE && f.location.item_path == "core")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no crate-coupling finding for `core`: {:?}",
+                    report.findings
+                )
+            });
+        let evidence = core_finding
+            .evidence
+            .as_ref()
+            .expect("evidence must be present");
+        assert_eq!(evidence["afferent_coupling"], serde_json::json!(2));
+        assert_eq!(evidence["efferent_coupling"], serde_json::json!(0));
+        assert_eq!(evidence["instability"], serde_json::json!(0.0));
+        assert_eq!(
+            evidence["afferent_crates"],
+            serde_json::json!(["app", "plugin"])
+        );
+
+        for consumer in ["app", "plugin"] {
+            let consumer_finding = report
+                .findings
+                .iter()
+                .find(|f| f.rule == CRATE_COUPLING_RULE && f.location.item_path == consumer)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no crate-coupling finding for `{consumer}`: {:?}",
+                        report.findings
+                    )
+                });
+            let evidence = consumer_finding
+                .evidence
+                .as_ref()
+                .expect("evidence must be present");
+            assert!(
+                evidence["efferent_coupling"].as_u64().unwrap() >= 1,
+                "`{consumer}` calls into `core` — must have Ce >= 1: {evidence:?}"
+            );
+        }
+    }
+
+    /// A crate with zero cross-crate coupling (nothing calls it, it calls
+    /// nothing) must not be flagged — there is nothing to report.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn crate_coupling_skips_a_fully_isolated_crate() {
+        let dir = TempDir::new("dead-code-crate-coupling-isolated");
+        write_crate(
+            &dir,
+            "isolated",
+            &[],
+            r#"pub fn never_referenced_elsewhere() -> i32 {
+    1
+}
+"#,
+        );
+        write_workspace_manifest(&dir, &["isolated"]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == CRATE_COUPLING_RULE),
+            "a crate with no cross-crate coupling at all must not be flagged: {:?}",
+            report.findings
+        );
+    }
+
+    /// Splits a `// crate: <name>` marked multi-crate source (see the
+    /// `crate-coupling` registry example in `rule_registry.rs`, and
+    /// `api_surface_deep.rs`'s identical convention for `re-export-chain`)
+    /// into `(name, source)` pairs, in encounter order.
+    #[cfg(feature = "deep")]
+    fn split_marked_crates(source: &str) -> Vec<(&str, String)> {
+        let mut result: Vec<(&str, String)> = Vec::new();
+        for line in source.lines() {
+            if let Some(name) = line.strip_prefix("// crate: ") {
+                result.push((name, String::new()));
+            } else if let Some(entry) = result.last_mut() {
+                entry.1.push_str(line);
+                entry.1.push('\n');
+            }
+        }
+        result
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn crate_coupling_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(CRATE_COUPLING_RULE)
+            .expect("crate-coupling has a registry entry")
+            .example
+            .expect("crate-coupling has a curated example")
+            .before;
+
+        let crates = split_marked_crates(example);
+        assert_eq!(crates.len(), 3, "expected 3 marked crates: {crates:?}");
+        let crate0 = crates[0].0;
+        let crate1 = crates[1].0;
+        let crate2 = crates[2].0;
+        let dep = format!("../{crate0}");
+
+        let dir = TempDir::new("dead-code-crate-coupling-registry-example");
+        write_crate(&dir, crate0, &[], &crates[0].1);
+        write_crate(&dir, crate1, &[(crate0, &dep)], &crates[1].1);
+        write_crate(&dir, crate2, &[(crate0, &dep)], &crates[2].1);
+        write_workspace_manifest(&dir, &[crate0, crate1, crate2]);
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == CRATE_COUPLING_RULE)
+                .count(),
+            3,
             "{:?}",
             report.findings
         );

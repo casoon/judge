@@ -284,6 +284,21 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
             why_it_matters: "A private function with no caller anywhere in the analyzed reachability view still has to be read, understood, and kept compiling through every future refactor — and unlike a `pub` item, it can't be excused as future external API judge simply can't see.",
         }),
     },
+    RuleMetadata {
+        id: "crate-coupling",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier). No `judge.toml` config needed — runs unconditionally, folded into the same per-pub-item `referencing_files` query `unused-pub-workspace`/`unused-pub-api` already run (`check_item`'s `referencing` set), not a second workspace pass.",
+        exclusions: "Only counts workspace-internal crate-to-crate coupling — an external dependency's coupling is a different, already-solved concern (see `heavy-dependency`, todo.md §B 'Dependency Hygiene'). Same 'every workspace crate is workspace-internal' scope and the same `crate::deep::referencing_files` resolution limitations as `unused-pub-workspace` (e.g. a reference only visible through proc-macro expansion is invisible to this scan). A crate with zero observed cross-crate coupling (`Ca + Ce == 0`) is skipped, not flagged — there is nothing to report for it.",
+        allowed_wording: "State only the exact `Ce`/`Ca` counts and the resulting Instability ratio for this crate within the examined workspace (e.g. 'Ce=2 distinct crates referenced, Ca=1 distinct crate references back, Instability=0.67') — never that the crate is 'too coupled', 'badly designed', or 'violates the architecture' (todo.md §17.4); high afferent coupling is often the expected, healthy shape for a shared core crate, not a defect.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        // `core` is referenced by both `app` and `plugin` (Ca=2) and
+        // references nothing cross-crate itself (Ce=0) — Instability 0.0,
+        // the shape expected of a shared, stable core crate.
+        example: Some(RuleExample {
+            before: "// crate: core\npub fn shared_helper() -> i32 {\n    1\n}\n\n// crate: app\npub fn run() -> i32 {\n    core::shared_helper()\n}\n\n// crate: plugin\npub fn run() -> i32 {\n    core::shared_helper()\n}\n",
+            why_it_matters: "core is called from two other crates but calls into none of them itself — the low-instability shape a shared foundation crate is expected to have, worth knowing before adding a new outward dependency to it.",
+        }),
+    },
     // -- feature_matrix.rs (Deep Tier, `--features deep`) -------------------
     RuleMetadata {
         id: "feature-gated-dead-code",
@@ -646,6 +661,86 @@ impl OrderPricing {
 "#,
             why_it_matters: "A single file that's grown to dominate its crate's size is a sign the module boundary hasn't kept up with the code — accumulated logic in one place is harder to navigate, review, and safely change than the same logic split along its natural seams.",
         }),
+    },
+    RuleMetadata {
+        id: "complexity-concentration",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge` and `audit`) — reuses the same `Vec<FunctionInfo>` `complexity-inflation` and `hotspot` already compute over the loaded workspace, no extra parse pass.",
+        exclusions: "First-cut, adjustable Gini threshold (`COMPLEXITY_CONCENTRATION_GINI_THRESHOLD`, 0.6, same value as `size-distribution`'s for consistency between the two same-shaped distributional signals); only fires when a file's total cyclomatic complexity is in its crate's top decile *and* the crate's own per-file complexity Gini coefficient exceeds the threshold — a large, concentrated-complexity file (e.g. a state machine or a CLI dispatch table) is routinely legitimate, not a defect. A crate with only one authored file always has Gini `0.0` by construction and never fires. A file with no functions (or that failed to parse) contributes `0` complexity rather than being excluded.",
+        allowed_wording: "State only the file's total cyclomatic complexity, the crate's file count, and the crate's Gini coefficient against the threshold — never that the file 'is too complex' or 'needs refactoring' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        // A single outlier file's real content, shown against a crate whose
+        // other files are trivial (see the paired drift-guard test in
+        // `crate::git` for the companion files that make this Gini-exceed).
+        example: Some(RuleExample {
+            before: r#"//! Order status transitions and validation for the fulfillment pipeline.
+
+pub enum OrderStatus {
+    Pending,
+    Paid,
+    Packed,
+    Shipped,
+    Delivered,
+    Cancelled,
+    Refunded,
+}
+
+pub fn validate_transition(
+    from: &OrderStatus,
+    to: &OrderStatus,
+    has_stock: bool,
+    is_prepaid: bool,
+) -> bool {
+    match (from, to) {
+        (OrderStatus::Pending, OrderStatus::Paid) => is_prepaid,
+        (OrderStatus::Pending, OrderStatus::Cancelled) => true,
+        (OrderStatus::Paid, OrderStatus::Packed) => has_stock,
+        (OrderStatus::Paid, OrderStatus::Cancelled) => true,
+        (OrderStatus::Packed, OrderStatus::Shipped) => true,
+        (OrderStatus::Packed, OrderStatus::Cancelled) => has_stock,
+        (OrderStatus::Shipped, OrderStatus::Delivered) => true,
+        (OrderStatus::Delivered, OrderStatus::Refunded) => true,
+        (OrderStatus::Cancelled, OrderStatus::Refunded) => is_prepaid,
+        _ => false,
+    }
+}
+
+pub fn required_notice(status: &OrderStatus, is_international: bool, is_expedited: bool) -> &'static str {
+    match status {
+        OrderStatus::Pending => "awaiting payment",
+        OrderStatus::Paid if is_expedited && is_international => "customs prep, expedited",
+        OrderStatus::Paid if is_international => "customs prep",
+        OrderStatus::Paid => "queued for packing",
+        OrderStatus::Packed if is_international => "export docs pending",
+        OrderStatus::Packed => "ready to ship",
+        OrderStatus::Shipped if is_expedited => "in transit, expedited",
+        OrderStatus::Shipped => "in transit",
+        OrderStatus::Delivered => "complete",
+        OrderStatus::Cancelled => "cancelled",
+        OrderStatus::Refunded => "refunded",
+    }
+}
+
+pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
+    match status {
+        OrderStatus::Pending | OrderStatus::Paid => true,
+        OrderStatus::Packed => !refund_issued,
+        OrderStatus::Shipped | OrderStatus::Delivered => false,
+        OrderStatus::Cancelled | OrderStatus::Refunded => false,
+    }
+}
+"#,
+            why_it_matters: "A single file that concentrates most of its crate's branching logic is harder to reason about test coverage for and riskier to change than the same logic split along its natural seams — the same intuition `size-distribution` applies to line count, just measured by branch count instead.",
+        }),
+    },
+    RuleMetadata {
+        id: "commit-size-distribution",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier, needs real git history over `DEFAULT_WINDOW_DAYS` (365) days; part of bare `cargo judge` and `audit`).",
+        exclusions: "First-cut, adjustable Gini threshold (`COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD`, 0.6, same value as `size-distribution`'s/`complexity-concentration`'s for consistency between the three same-shaped distributional signals); only fires when a commit's lines-changed count is in the window's top decile *and* the window's own per-commit size Gini coefficient exceeds the threshold — a large, concentrated commit (e.g. a big refactor, a vendored-file drop, a rename) is routinely legitimate, not a defect. A window with only one commit always has Gini `0.0` by construction and never fires.",
+        allowed_wording: "State only the commit's lines changed, files changed, the window's commit count, and the window's Gini coefficient against the threshold — never that the commit 'is bad', 'should be split', or 'needs review' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
     },
     // -- module_graph.rs ------------------------------------------------
     RuleMetadata {
@@ -1310,6 +1405,10 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
         "needs real git commit history (14-day window)",
     ),
     (
+        "commit-size-distribution",
+        "needs real git commit history (window-scoped commit-size distribution) — not expressible as a single source snippet",
+    ),
+    (
         "legacy-freeze",
         "needs real git commit history (12-month window)",
     ),
@@ -1369,6 +1468,8 @@ mod tests {
             crate::duplication::DUPLICATE_RULE,
             crate::git::HOTSPOT_RULE,
             crate::git::SIZE_DISTRIBUTION_RULE,
+            crate::git::COMPLEXITY_CONCENTRATION_RULE,
+            crate::git::COMMIT_SIZE_DISTRIBUTION_RULE,
             crate::module_graph::UNLINKED_FILE_RULE,
             crate::module_graph::ORPHAN_MODULE_RULE,
             crate::mutants::MUTATION_SURVIVOR_RULE,
@@ -1438,6 +1539,7 @@ mod tests {
             crate::dead_code::DEAD_ENUM_VARIANT_RULE,
             crate::dead_code::TEST_ONLY_PUB_RULE,
             crate::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
+            crate::dead_code::CRATE_COUPLING_RULE,
             crate::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
             crate::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,

@@ -47,6 +47,41 @@ pub const SIZE_DISTRIBUTION_RULE_REVISION: u32 = 1;
 /// style).
 pub const SIZE_DISTRIBUTION_GINI_THRESHOLD: f64 = 0.6;
 
+/// Rule id used for [`complexity_concentration`] findings (see todo.md §E
+/// "Verteilungs-Audits: ... `complexity-concentration` (Gini über
+/// Datei-Komplexität)").
+pub const COMPLEXITY_CONCENTRATION_RULE: &str = "complexity-concentration";
+/// Bump when the complexity-concentration rule's logic changes (see todo.md
+/// §5 "Regelversions-Schutz").
+pub const COMPLEXITY_CONCENTRATION_RULE_REVISION: u32 = 1;
+
+/// Minimum population Gini coefficient (see [`gini`]) over a crate's
+/// per-file total cyclomatic complexity distribution for that crate's
+/// top-decile files to be flagged as concentrated (see
+/// [`complexity_concentration`]). Same value as
+/// [`SIZE_DISTRIBUTION_GINI_THRESHOLD`] — both are the same statistical
+/// shape ("this crate's size/complexity is unusually concentrated in a few
+/// files"), so they share a threshold for consistency until a distribution
+/// study justifies diverging.
+pub const COMPLEXITY_CONCENTRATION_GINI_THRESHOLD: f64 = 0.6;
+
+/// Rule id used for [`commit_size_distribution`] findings (see todo.md §E
+/// "Verteilungs-Audits: ... `commit-size-distribution`").
+pub const COMMIT_SIZE_DISTRIBUTION_RULE: &str = "commit-size-distribution";
+/// Bump when the commit-size-distribution rule's logic changes (see todo.md
+/// §5 "Regelversions-Schutz").
+pub const COMMIT_SIZE_DISTRIBUTION_RULE_REVISION: u32 = 1;
+
+/// Minimum population Gini coefficient (see [`gini`]) over a window's
+/// per-commit lines-changed distribution for that window's top-decile
+/// commits to be flagged as concentrated (see [`commit_size_distribution`]).
+/// Same value as [`SIZE_DISTRIBUTION_GINI_THRESHOLD`]/
+/// [`COMPLEXITY_CONCENTRATION_GINI_THRESHOLD`] — same statistical shape
+/// ("this window's commit sizes are unusually concentrated in a few
+/// commits"), so it shares a threshold for consistency until a distribution
+/// study justifies diverging.
+pub const COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD: f64 = 0.6;
+
 #[derive(Debug)]
 pub enum GitError {
     Open(Box<gix::open::Error>),
@@ -244,6 +279,13 @@ pub struct CommitInfo {
     pub message_title: String,
     pub message_body: String,
     pub files_changed: Vec<PathBuf>,
+    /// Total inserted + removed lines across every change in this commit's
+    /// first-parent tree diff (see [`commit_size_distribution`]), computed
+    /// from the exact same diff that produces `files_changed`. `None` for
+    /// binary files is treated as a `0` contribution, mirroring
+    /// [`blob_text_at`]'s tolerance for non-UTF8 content elsewhere in this
+    /// module.
+    pub lines_changed: u64,
 }
 
 /// Walks commits reachable from `HEAD` within `window_days` of now, in the
@@ -286,6 +328,10 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
         };
 
         let mut files_changed = Vec::new();
+        let mut lines_changed: u64 = 0;
+        let mut resource_cache = repo
+            .diff_resource_cache_for_tree_diff()
+            .map_err(|err| GitError::Walk(err.into()))?;
         parent_tree
             .changes()
             .map_err(|err| GitError::Walk(err.into()))?
@@ -293,6 +339,15 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
                 if let Some(path) = path_of(&change) {
                     files_changed.push(path);
                 }
+                if let Some(counts) = change
+                    .diff(&mut resource_cache)
+                    .ok()
+                    .and_then(|mut platform| platform.line_counts().ok())
+                    .flatten()
+                {
+                    lines_changed += u64::from(counts.insertions) + u64::from(counts.removals);
+                }
+                resource_cache.clear_resource_cache_keep_allocation();
                 Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
             })
             .map_err(|err| GitError::Walk(err.into()))?;
@@ -326,6 +381,7 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
             message_title,
             message_body,
             files_changed,
+            lines_changed,
         });
     }
 
@@ -685,6 +741,248 @@ pub fn size_distribution(workspace: &Workspace) -> Vec<SizeDistributionOutlier> 
     outliers
 }
 
+/// A file whose total cyclomatic complexity lands in its crate's top decile
+/// while that crate's own per-file complexity distribution is concentrated
+/// (Gini coefficient above [`COMPLEXITY_CONCENTRATION_GINI_THRESHOLD`]) —
+/// see [`complexity_concentration`].
+#[derive(Debug, Clone)]
+pub struct ComplexityConcentrationOutlier {
+    pub file: PathBuf,
+    pub file_total_cyclomatic: u64,
+    pub crate_name: String,
+    pub crate_gini: f64,
+    pub crate_file_count: usize,
+}
+
+impl ComplexityConcentrationOutlier {
+    /// Renders this outlier as a [`Finding`], mirroring
+    /// [`SizeDistributionOutlier::to_finding`]: `Severity::Info`, evidence
+    /// class `Heuristic`. High complexity concentrated in one file is
+    /// routinely legitimate (a parser's state machine, a CLI dispatch
+    /// table), so this must never gate. The wording states only the file's
+    /// total cyclomatic complexity, crate, file count, and Gini
+    /// coefficient — never that the file "is too complex" or "needs
+    /// refactoring" (todo.md §17.4).
+    pub fn to_finding(&self) -> Finding {
+        Finding {
+            id: format!("{COMPLEXITY_CONCENTRATION_RULE}:{}", self.file.display()).into(),
+            rule: COMPLEXITY_CONCENTRATION_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: self.file.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: self.file.display().to_string(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "file_total_cyclomatic": self.file_total_cyclomatic,
+                "crate": self.crate_name,
+                "crate_file_count": self.crate_file_count,
+                "crate_gini": self.crate_gini,
+                "gini_threshold": COMPLEXITY_CONCENTRATION_GINI_THRESHOLD,
+                "reason": format!(
+                    "this file has a total cyclomatic complexity of {}, in the top decile for crate `{}` ({} authored files), whose complexity distribution has a Gini coefficient of {:.2} (threshold: {COMPLEXITY_CONCENTRATION_GINI_THRESHOLD})",
+                    self.file_total_cyclomatic, self.crate_name, self.crate_file_count, self.crate_gini
+                ),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+}
+
+/// Per workspace crate, flags authored files whose total cyclomatic
+/// complexity (the sum of [`FunctionInfo::cyclomatic`] across every function
+/// in the file) lands in that crate's top decile (top ~10% by file count,
+/// see [`top_decile_count`]) when the crate's own per-file complexity
+/// distribution is concentrated — Gini coefficient (see [`gini`]) above
+/// [`COMPLEXITY_CONCENTRATION_GINI_THRESHOLD`]. Both conditions are
+/// required, mirroring [`size_distribution`]: a bare large-complexity number
+/// alone says nothing about concentration, and the crate-level Gini gate is
+/// what makes this a distribution claim rather than an arbitrary complexity
+/// cutoff.
+///
+/// `functions` is expected to be the same `Vec<FunctionInfo>` produced by
+/// [`crate::complexity::analyze_workspace`] over `workspace` — this function
+/// does no parsing of its own. A file with no functions (or that failed to
+/// parse) contributes `0` to the distribution, the same tolerance
+/// [`size_distribution`] applies to an unreadable file.
+///
+/// A crate with only one authored file always has Gini `0.0` (the `n <= 1`
+/// edge case in [`gini`]), so it never fires.
+pub fn complexity_concentration(
+    workspace: &Workspace,
+    functions: &[FunctionInfo],
+) -> Vec<ComplexityConcentrationOutlier> {
+    let mut file_cyclomatic: HashMap<PathBuf, u64> = HashMap::new();
+    for function in functions {
+        *file_cyclomatic.entry(function.file.clone()).or_insert(0) +=
+            u64::from(function.cyclomatic);
+    }
+
+    let mut outliers = Vec::new();
+
+    for krate in &workspace.crates {
+        let mut file_complexities: Vec<(PathBuf, u64)> = krate
+            .source_files
+            .iter()
+            .filter(|file| file.kind.is_locally_reportable())
+            .map(|file| {
+                let total = file_cyclomatic.get(&file.path).copied().unwrap_or(0);
+                (file.path.clone(), total)
+            })
+            .collect();
+        if file_complexities.is_empty() {
+            continue;
+        }
+
+        let complexity_values: Vec<u64> = file_complexities.iter().map(|(_, c)| *c).collect();
+        let crate_gini = gini(&complexity_values);
+        if crate_gini <= COMPLEXITY_CONCENTRATION_GINI_THRESHOLD {
+            continue;
+        }
+
+        file_complexities.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        let crate_file_count = file_complexities.len();
+        let flagged_count = top_decile_count(crate_file_count);
+
+        outliers.extend(file_complexities.into_iter().take(flagged_count).map(
+            |(file, file_total_cyclomatic)| ComplexityConcentrationOutlier {
+                file,
+                file_total_cyclomatic,
+                crate_name: krate.name.clone(),
+                crate_gini,
+                crate_file_count,
+            },
+        ));
+    }
+
+    outliers
+}
+
+/// A commit whose lines-changed count lands in its window's top decile while
+/// the window's own per-commit size distribution is concentrated (Gini
+/// coefficient above [`COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD`]) — see
+/// [`commit_size_distribution`].
+#[derive(Debug, Clone)]
+pub struct CommitSizeDistributionOutlier {
+    pub commit_id: String,
+    pub lines_changed: u64,
+    pub files_changed_count: usize,
+    pub window_gini: f64,
+    pub window_commit_count: usize,
+    /// First file touched by this commit's tree diff, in diff order — an
+    /// arbitrary representative location, not a claim that this file is what
+    /// makes the commit large (see [`CommitSizeDistributionOutlier::to_finding`]).
+    pub representative_file: PathBuf,
+    /// Commit message title, if non-empty; otherwise the commit hash — used
+    /// as [`Location::item_path`].
+    pub item_path: String,
+}
+
+impl CommitSizeDistributionOutlier {
+    /// Renders this outlier as a [`Finding`], mirroring
+    /// [`SizeDistributionOutlier::to_finding`]: `Severity::Info`, evidence
+    /// class `Heuristic`. A large commit is routinely legitimate (a big
+    /// refactor, a vendored-file drop, a rename), so this must never gate.
+    /// The wording states only the commit's lines changed, file count,
+    /// commit count, and Gini coefficient — never that the commit "is too
+    /// big", "should be split", or "needs review" (todo.md §17.4).
+    ///
+    /// `Location.file` is this commit's first changed file in tree-diff
+    /// order (or the workspace root manifest, for the pathological case of
+    /// an empty diff) — a simple, defensible anchor, not a claim about which
+    /// file drove the commit's size, since [`CommitInfo::lines_changed`] is
+    /// deliberately only an aggregate per-commit total, not a per-file
+    /// breakdown.
+    pub fn to_finding(&self) -> Finding {
+        Finding {
+            id: format!("{COMMIT_SIZE_DISTRIBUTION_RULE}:{}", self.commit_id).into(),
+            rule: COMMIT_SIZE_DISTRIBUTION_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: self.representative_file.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: self.item_path.clone(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "commit_hash": self.commit_id,
+                "lines_changed": self.lines_changed,
+                "files_changed_count": self.files_changed_count,
+                "window_gini": self.window_gini,
+                "window_commit_count": self.window_commit_count,
+                "gini_threshold": COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD,
+                "reason": format!(
+                    "this commit changed {} lines across {} files, in the top decile for this {}-commit window, whose commit-size distribution has a Gini coefficient of {:.2} (threshold: {COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD})",
+                    self.lines_changed, self.files_changed_count, self.window_commit_count, self.window_gini
+                ),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+}
+
+/// Within the commit history reachable from `HEAD` inside `window_days`,
+/// flags commits whose lines-changed count (see [`CommitInfo::lines_changed`])
+/// lands in the window's top decile (top ~10% by commit count, see
+/// [`top_decile_count`]) when the window's own per-commit size distribution
+/// is concentrated — Gini coefficient (see [`gini`]) above
+/// [`COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD`]. Both conditions are
+/// required, mirroring [`size_distribution`]/[`complexity_concentration`]: a
+/// bare large lines-changed number alone says nothing about concentration,
+/// and the window-level Gini gate is what makes this a distribution claim
+/// rather than an arbitrary commit-size cutoff.
+///
+/// A window with only one commit always has Gini `0.0` (the `n <= 1` edge
+/// case in [`gini`]), so it never fires.
+pub fn commit_size_distribution(
+    repo_root: &Path,
+    window_days: i64,
+) -> Result<Vec<CommitSizeDistributionOutlier>, GitError> {
+    let commits = walk_commits(repo_root, window_days)?;
+
+    let sizes: Vec<u64> = commits.iter().map(|commit| commit.lines_changed).collect();
+    let window_gini = gini(&sizes);
+    if window_gini <= COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD {
+        return Ok(Vec::new());
+    }
+
+    let mut sorted_commits = commits;
+    sorted_commits.sort_by_key(|commit| std::cmp::Reverse(commit.lines_changed));
+    let window_commit_count = sorted_commits.len();
+    let flagged_count = top_decile_count(window_commit_count);
+
+    Ok(sorted_commits
+        .into_iter()
+        .take(flagged_count)
+        .map(|commit| {
+            let representative_file = commit
+                .files_changed
+                .first()
+                .cloned()
+                .unwrap_or_else(|| repo_root.join("Cargo.toml"));
+            let item_path = if commit.message_title.is_empty() {
+                commit.id.clone()
+            } else {
+                commit.message_title.clone()
+            };
+            CommitSizeDistributionOutlier {
+                commit_id: commit.id,
+                lines_changed: commit.lines_changed,
+                files_changed_count: commit.files_changed.len(),
+                window_gini,
+                window_commit_count,
+                representative_file,
+                item_path,
+            }
+        })
+        .collect())
+}
+
 /// The current `HEAD` commit as a full hex object id (see todo.md §5,
 /// `first_seen_commit`).
 pub fn head_commit(repo_root: &Path) -> Result<String, GitError> {
@@ -1029,6 +1327,32 @@ mod tests {
 
         let commits = walk_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
         assert!(commits.is_empty());
+    }
+
+    #[test]
+    fn walk_commits_computes_lines_changed_for_a_simple_diff() {
+        let dir = TempDir::new("git-walk-commits-lines-changed");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add a"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\nfn b2() {}\nfn c2() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "modify a"]);
+
+        let commits = walk_commits(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(commits.len(), 2);
+        // walk_commits yields newest-first (see the `sorting` call above).
+        assert_eq!(commits[0].message_title, "modify a");
+        assert_eq!(commits[1].message_title, "add a");
+        assert_eq!(commits[1].lines_changed, 3, "add a 3-line file");
+        assert_eq!(
+            commits[0].lines_changed, 4,
+            "2 lines removed + 2 lines inserted"
+        );
     }
 
     #[test]
@@ -1583,6 +1907,217 @@ mod tests {
         assert_eq!(evidence["lines_of_code"], 2000);
         assert_eq!(evidence["crate"], "judge");
         assert_eq!(evidence["crate_file_count"], 12);
+    }
+
+    #[test]
+    fn complexity_concentration_flags_the_top_decile_file_of_a_concentrated_crate() {
+        let dir = TempDir::new("complexity-concentration-concentrated");
+        let workspace = workspace_with_sized_files(
+            &dir,
+            "concentrated",
+            &[
+                ("src/huge.rs", 1),
+                ("src/small_a.rs", 1),
+                ("src/small_b.rs", 1),
+                ("src/small_c.rs", 1),
+                ("src/small_d.rs", 1),
+            ],
+        );
+        let huge_path = dir.join("src/huge.rs");
+        let functions = vec![
+            function_info(huge_path.clone(), 50),
+            function_info(dir.join("src/small_a.rs"), 1),
+            function_info(dir.join("src/small_b.rs"), 1),
+            function_info(dir.join("src/small_c.rs"), 1),
+            function_info(dir.join("src/small_d.rs"), 1),
+        ];
+
+        let outliers = complexity_concentration(&workspace, &functions);
+
+        assert_eq!(outliers.len(), 1);
+        assert_eq!(outliers[0].file, huge_path);
+        assert_eq!(outliers[0].file_total_cyclomatic, 50);
+        assert_eq!(outliers[0].crate_name, "concentrated");
+        assert_eq!(outliers[0].crate_file_count, 5);
+        assert!(outliers[0].crate_gini > COMPLEXITY_CONCENTRATION_GINI_THRESHOLD);
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule,
+    /// run through the real `complexity::analyze_workspace` pass exactly as
+    /// `main.rs` does — this is what keeps a landing-page-facing example
+    /// from silently drifting away from what judge actually flags. Same
+    /// shape as `size_distribution_registry_example_still_triggers_the_rule`:
+    /// the outlier file's own content is the curated example, paired with
+    /// trivial companion files that make the crate's Gini coefficient
+    /// exceed the threshold.
+    #[test]
+    fn complexity_concentration_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(COMPLEXITY_CONCENTRATION_RULE)
+            .expect("complexity-concentration has a registry entry")
+            .example
+            .expect("complexity-concentration has a curated example")
+            .before;
+        let dir = TempDir::new("complexity-concentration-registry-example");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/order_state_machine.rs"), example).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            std::fs::write(
+                dir.join(format!("src/{name}.rs")),
+                "pub fn helper() -> u8 {\n    1\n}\n",
+            )
+            .unwrap();
+        }
+
+        let workspace = Workspace {
+            root: dir.to_path_buf(),
+            crates: vec![crate::ingest::CrateInfo {
+                name: "fixture".to_string(),
+                version: "0.1.0".to_string(),
+                manifest_path: dir.join("Cargo.toml"),
+                root: dir.to_path_buf(),
+                source_files: ["order_state_machine", "a", "b", "c", "d"]
+                    .iter()
+                    .map(|name| crate::ingest::SourceFile {
+                        path: dir.join(format!("src/{name}.rs")),
+                        kind: crate::ingest::SourceKind::Authored,
+                    })
+                    .collect(),
+                entry_points: Vec::new(),
+                dependencies: Vec::new(),
+            }],
+        };
+
+        let complexity =
+            crate::complexity::analyze_workspace(workspace.crates[0].source_files.iter(), false);
+        let outliers = complexity_concentration(&workspace, &complexity.functions);
+
+        assert_eq!(outliers.len(), 1);
+        assert!(outliers[0].file.ends_with("order_state_machine.rs"));
+        assert!(outliers[0].crate_gini > COMPLEXITY_CONCENTRATION_GINI_THRESHOLD);
+    }
+
+    #[test]
+    fn complexity_concentration_does_not_fire_for_evenly_distributed_complexity() {
+        let dir = TempDir::new("complexity-concentration-uniform");
+        let workspace = workspace_with_sized_files(
+            &dir,
+            "uniform",
+            &[
+                ("src/a.rs", 1),
+                ("src/b.rs", 1),
+                ("src/c.rs", 1),
+                ("src/d.rs", 1),
+            ],
+        );
+        let functions = vec![
+            function_info(dir.join("src/a.rs"), 10),
+            function_info(dir.join("src/b.rs"), 10),
+            function_info(dir.join("src/c.rs"), 10),
+            function_info(dir.join("src/d.rs"), 11),
+        ];
+
+        let outliers = complexity_concentration(&workspace, &functions);
+
+        assert!(
+            outliers.is_empty(),
+            "expected no outliers for a near-uniform crate, got {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn complexity_concentration_never_fires_for_a_single_file_crate() {
+        let dir = TempDir::new("complexity-concentration-single-file");
+        let workspace = workspace_with_sized_files(&dir, "solo", &[("src/lib.rs", 1)]);
+        let functions = vec![function_info(dir.join("src/lib.rs"), 500)];
+
+        let outliers = complexity_concentration(&workspace, &functions);
+
+        assert!(outliers.is_empty());
+    }
+
+    #[test]
+    fn complexity_concentration_handles_a_crate_with_no_authored_files() {
+        let dir = TempDir::new("complexity-concentration-no-files");
+        let workspace = workspace_with_sized_files(&dir, "empty", &[]);
+
+        let outliers = complexity_concentration(&workspace, &[]);
+
+        assert!(outliers.is_empty());
+    }
+
+    #[test]
+    fn complexity_concentration_to_finding_states_facts_not_a_verdict() {
+        let outlier = ComplexityConcentrationOutlier {
+            file: PathBuf::from("src/main.rs"),
+            file_total_cyclomatic: 120,
+            crate_name: "judge".to_string(),
+            crate_gini: 0.72,
+            crate_file_count: 12,
+        };
+        let finding = outlier.to_finding();
+
+        assert_eq!(finding.rule, COMPLEXITY_CONCENTRATION_RULE);
+        assert_eq!(finding.severity, Severity::Info);
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
+        assert_eq!(finding.location.file, PathBuf::from("src/main.rs"));
+        let evidence = finding.evidence.expect("evidence must be populated");
+        assert_eq!(evidence["file_total_cyclomatic"], 120);
+        assert_eq!(evidence["crate"], "judge");
+        assert_eq!(evidence["crate_file_count"], 12);
+    }
+
+    #[test]
+    fn commit_size_distribution_flags_a_disproportionately_large_commit() {
+        let dir = TempDir::new("commit-size-distribution-outlier");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("small.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "small 1"]);
+        for i in 0..6 {
+            std::fs::write(dir.join("small.rs"), format!("fn a() {{ {i} }}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", &format!("small {}", i + 2)]);
+        }
+
+        let huge_content: String = (0..250).map(|i| format!("fn f{i}() {{}}\n")).collect();
+        std::fs::write(dir.join("huge.rs"), huge_content).unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add huge file"]);
+        let huge_sha = commit_sha(&dir, "HEAD");
+
+        let outliers = commit_size_distribution(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(
+            outliers.len(),
+            1,
+            "only the huge commit should be flagged, got {outliers:?}"
+        );
+        assert_eq!(outliers[0].commit_id, huge_sha);
+    }
+
+    #[test]
+    fn commit_size_distribution_does_not_fire_for_uniformly_sized_commits() {
+        let dir = TempDir::new("commit-size-distribution-uniform");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        for i in 0..5 {
+            std::fs::write(dir.join("a.rs"), format!("fn a() {{ {i} }}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", &format!("touch {i}")]);
+        }
+
+        let outliers = commit_size_distribution(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(
+            outliers.is_empty(),
+            "expected no outliers for uniform commit sizes, got {outliers:?}"
+        );
     }
 
     fn commit_sha(dir: &Path, rev: &str) -> String {
