@@ -324,6 +324,22 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
             why_it_matters: "core is called from two other crates but calls into none of them itself — the low-instability shape a shared foundation crate is expected to have, worth knowing before adding a new outward dependency to it.",
         }),
     },
+    RuleMetadata {
+        id: "module-coupling",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier). No `judge.toml` config needed — runs unconditionally, folded into the same per-pub-item `referencing_files` query `unused-pub-workspace`/`unused-pub-api`/`crate-coupling` already run (`check_item`'s `referencing` set), not a second workspace pass.",
+        exclusions: "`crate-coupling` generalized down to *top-level module* granularity: a module is `krate_name::first_module_segment` (e.g. `mycrate::parser`), not the full nested module path — an item several levels deep is folded into its crate's top-level bucket, and an item declared directly at a crate's root (not inside any named module) gets its own `krate_name::<root>` bucket. Broader scope than `crate-coupling`: a reference from module A to module B counts whether A and B are in the same crate or two different workspace crates, not only across a crate boundary. A module's identity is resolved from the file it's declared in via the same directory/`mod.rs` convention `module-boundary-violation`/`module-boundary-violation-deep` already use, not a full `mod`-graph walk — a source file outside `src/` (e.g. `build.rs`) has no resolvable module and is simply excluded. Same `crate::deep::referencing_files` resolution limitations as `unused-pub-workspace` (e.g. a reference only visible through proc-macro expansion is invisible to this scan). A module with zero observed coupling (`Ca + Ce == 0`) is skipped, not flagged — there is nothing to report for it.",
+        allowed_wording: "State only the exact `Ce`/`Ca` counts and the resulting Instability ratio for this module within the examined workspace (e.g. 'Ce=2 distinct modules referenced, Ca=1 distinct module references back, Instability=0.67') — never that the module is 'too coupled', 'badly designed', or 'violates the architecture' (todo.md §17.4); high afferent coupling is often the expected, healthy shape for a shared core module, not a defect.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        // Single crate, three top-level modules: `core` is referenced by
+        // both `consumer_a` and `consumer_b` (Ca=2) and references nothing
+        // itself (Ce=0) — Instability 0.0, the shape expected of a shared,
+        // stable core module.
+        example: Some(RuleExample {
+            before: "// file: core.rs\npub fn shared_helper() -> i32 {\n    1\n}\n\n// file: consumer_a.rs\npub fn run() -> i32 {\n    crate::core::shared_helper()\n}\n\n// file: consumer_b.rs\npub fn run() -> i32 {\n    crate::core::shared_helper()\n}\n",
+            why_it_matters: "core is called from two other modules in the same crate but calls into none of them itself — the low-instability shape a shared foundation module is expected to have, worth knowing before adding a new outward dependency to it.",
+        }),
+    },
     // -- feature_matrix.rs (Deep Tier, `--features deep`) -------------------
     RuleMetadata {
         id: "feature-gated-dead-code",
@@ -1650,6 +1666,7 @@ mod tests {
             crate::dead_code::TEST_ONLY_PUB_RULE,
             crate::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
             crate::dead_code::CRATE_COUPLING_RULE,
+            crate::dead_code::MODULE_COUPLING_RULE,
             crate::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
             crate::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,

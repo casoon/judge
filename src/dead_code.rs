@@ -29,6 +29,7 @@ use cargo_metadata::MetadataCommand;
 use proc_macro2::Span;
 use syn::visit::{self, Visit};
 
+use crate::boundaries::module_path_for_file;
 use crate::deep::{DeepContext, DeepError, FileId};
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::{type_name, walk_functions};
@@ -126,6 +127,60 @@ pub const CRATE_COUPLING_RULE: &str = "crate-coupling";
 /// Bump when the crate-coupling rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
 pub const CRATE_COUPLING_RULE_REVISION: u32 = 1;
+
+/// [`CRATE_COUPLING_RULE`], generalized down from crate granularity to
+/// *top-level module* granularity — the other half of todo.md §C's "Fan-in/
+/// Fan-out auf Modul-/Crate-Ebene" item (the crate-level half is
+/// `crate-coupling`, above). Same Martin's Instability `I = Ce / (Ca + Ce)`
+/// computation, same `edge_counts`-style side-aggregation over
+/// [`check_item`]'s existing per-`pub`-item [`crate::deep::referencing_files`]
+/// call (no second Deep-Tier pass), same "skip if `Ca + Ce == 0`" gate, and
+/// the same never-good-or-bad, purely descriptive posture as
+/// `crate-coupling` (see that rule's doc comment).
+///
+/// **Grouping: top-level module within each crate, not the full nested
+/// module path.** A module here means `krate_name::first_module_segment`
+/// (e.g. `mycrate::parser`, `mycrate::codegen`) — an item several levels
+/// deep (`mycrate::parser::ast::visitor`) is folded into its crate's
+/// `parser` bucket, not kept as its own bucket. A full arbitrarily-deep
+/// grouping would fragment into too many tiny, low-signal buckets on a
+/// large codebase, the same "keep it bounded" concern this module's other
+/// coupling rule already addresses via its skip-if-zero gate. An item
+/// declared directly at a crate's root (`src/lib.rs`, `src/main.rs`, or a
+/// `src/bin/*.rs` target — not inside any named module at all) gets its own
+/// `krate_name::<root>` bucket rather than being silently dropped or merged
+/// into an arbitrary sibling.
+///
+/// **Module identity comes from [`crate::boundaries::module_path_for_file`],
+/// not a fresh per-item AST walk.** An item's own module is resolved from
+/// the *file* it's declared in — the same directory/`mod.rs` convention
+/// resolver `module-boundary-violation`/`module-boundary-violation-deep`
+/// already rely on for exactly this "which module is this file in"
+/// question — rather than tracking `mod { .. }` nesting from scratch:
+/// [`crate::functions::walk_functions`]'s/[`walk_type_items`]'s own
+/// `path`-tracking only records *inline* `mod` blocks written within the
+/// same file being walked (each walk starts a fresh, empty path per file);
+/// it has no notion of the file-to-file `mod foo;` linkage that gives most
+/// real-world crates their `mycrate::parser`/`mycrate::codegen`-shaped
+/// module tree in the first place. Reusing that per-file tracking alone
+/// would misclassify nearly every item in a typical multi-file crate
+/// (including this workspace's own) as crate-root, which would defeat the
+/// rule's purpose entirely — `module_path_for_file`'s existing, precedented
+/// file-based resolution is the correct fit.
+///
+/// **Broader scope than `crate-coupling`: same-crate cross-module coupling
+/// counts too, not just cross-crate.** Unlike `crate-coupling` (which only
+/// has cross-crate references to look at — [`crate::deep::referencing_files`]
+/// resolving to a *different* workspace crate is the only kind of edge that
+/// rule's `edge_counts` accumulates), a reference from a file in module A to
+/// an item defined in module B counts here whether A and B live in the same
+/// crate or in two different workspace crates — module coupling is a
+/// meaningful signal within a single large crate, not only across a crate
+/// boundary.
+pub const MODULE_COUPLING_RULE: &str = "module-coupling";
+/// Bump when the module-coupling rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const MODULE_COUPLING_RULE_REVISION: u32 = 1;
 
 #[derive(Debug)]
 pub enum DeadCodeError {
@@ -549,6 +604,27 @@ fn publishable_crates(workspace_root: &Path) -> Result<HashSet<String>, cargo_me
         .collect())
 }
 
+/// The `module-coupling` bucket a file's items belong to (see
+/// [`MODULE_COUPLING_RULE`]): `krate_name::first_module_segment`, or
+/// `krate_name::<root>` for a file at the crate root (`src/lib.rs`,
+/// `src/main.rs`, or a `src/bin/*.rs` target — [`module_path_for_file`]'s own
+/// `Some(String::new())` case). `None` if `module_path_for_file` itself
+/// returns `None` (a source file outside `src/`, e.g. `build.rs`) — such a
+/// file's items are simply excluded from `module-coupling`'s accumulation,
+/// the same "not inferable, so omit" stance the rest of this module takes.
+fn top_level_module_bucket(
+    crate_root: &Path,
+    file_path: &Path,
+    krate_name: &str,
+) -> Option<String> {
+    let module_path = module_path_for_file(crate_root, file_path)?;
+    if module_path.is_empty() {
+        return Some(format!("{krate_name}::<root>"));
+    }
+    let top_level_segment = module_path.split("::").next().unwrap_or(&module_path);
+    Some(format!("{krate_name}::{top_level_segment}"))
+}
+
 /// Checks one `pub` item for cross-crate usage and records a finding if
 /// neither that nor entry-point reachability found it live — the shared
 /// logic both [`walk_functions`]'s and [`walk_type_items`]'s callbacks
@@ -572,6 +648,7 @@ fn publishable_crates(workspace_root: &Path) -> Result<HashSet<String>, cargo_me
 fn check_item(
     analysis: &ra_ap_ide::Analysis,
     crate_of_file: &HashMap<FileId, &str>,
+    module_of_file: &HashMap<FileId, String>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
     proc_macro_exposed: &HashSet<String>,
     file: &SourceFile,
@@ -586,6 +663,7 @@ fn check_item(
     evidence_class: EvidenceClass,
     reason: &str,
     edge_counts: &mut HashMap<(String, String), u32>,
+    module_edge_counts: &mut HashMap<(String, String), u32>,
     report: &mut WorkspaceDeadCode,
 ) {
     report.checked += 1;
@@ -614,6 +692,20 @@ fn check_item(
                     .entry((krate_name.to_string(), referencing_crate.to_string()))
                     .or_insert(0) += 1;
             }
+        }
+        // `module-coupling`'s edge accumulation (see [`MODULE_COUPLING_RULE`]):
+        // the item's own module (this call's `file_id`, looked up in
+        // `module_of_file`) against the referencing file's module — counted
+        // whenever the two differ, whether or not they're in the same crate
+        // (unlike the cross-crate-only accumulation just above).
+        if let (Some(owner_module), Some(referencing_module)) = (
+            module_of_file.get(&file_id),
+            module_of_file.get(referencing_file),
+        ) && owner_module != referencing_module
+        {
+            *module_edge_counts
+                .entry((owner_module.clone(), referencing_module.clone()))
+                .or_insert(0) += 1;
         }
     }
     let used_externally = referencing.iter().any(|referencing_file| {
@@ -1013,11 +1105,21 @@ pub fn analyze_workspace(
 
     let mut crate_of_file: HashMap<FileId, &str> = HashMap::new();
     let mut file_path_by_id: HashMap<FileId, PathBuf> = HashMap::new();
+    // `module-coupling`'s file-to-module-bucket map (see
+    // [`MODULE_COUPLING_RULE`], [`top_level_module_bucket`]) — built once
+    // here, the same way `crate_of_file` is, so `check_item` can look up
+    // both an item's own module (via its `file_id`) and a referencing file's
+    // module without re-deriving either per query.
+    let mut module_of_file: HashMap<FileId, String> = HashMap::new();
     for krate in &workspace.crates {
         for file in &krate.source_files {
             if let Some(file_id) = ctx.file_id(&file.path) {
                 crate_of_file.insert(file_id, krate.name.as_str());
                 file_path_by_id.insert(file_id, file.path.clone());
+                if let Some(bucket) = top_level_module_bucket(&krate.root, &file.path, &krate.name)
+                {
+                    module_of_file.insert(file_id, bucket);
+                }
             }
         }
     }
@@ -1048,6 +1150,13 @@ pub fn analyze_workspace(
     // `referencing_files` query below, then folded into per-crate Ce/Ca
     // findings after the crate loop.
     let mut edge_counts: HashMap<(String, String), u32> = HashMap::new();
+
+    // `module-coupling`'s edge-count accumulator (see
+    // [`MODULE_COUPLING_RULE`]) — `(owner_module, referencing_module) ->
+    // count`, filled in alongside `edge_counts` above by the same
+    // `check_item` call, then folded into per-module Ce/Ca findings after
+    // the crate loop.
+    let mut module_edge_counts: HashMap<(String, String), u32> = HashMap::new();
 
     let proc_macro_exposed = match proc_macro_exposed_crates(&workspace.root) {
         Ok(exposed) => exposed,
@@ -1121,6 +1230,7 @@ pub fn analyze_workspace(
                     check_item(
                         &analysis,
                         &crate_of_file,
+                        &module_of_file,
                         entry_keys,
                         &proc_macro_exposed,
                         file,
@@ -1135,6 +1245,7 @@ pub fn analyze_workspace(
                         evidence_class,
                         reason,
                         &mut edge_counts,
+                        &mut module_edge_counts,
                         &mut report,
                     );
                     check_test_only_pub(
@@ -1183,6 +1294,7 @@ pub fn analyze_workspace(
                     check_item(
                         &analysis,
                         &crate_of_file,
+                        &module_of_file,
                         entry_keys,
                         &proc_macro_exposed,
                         file,
@@ -1197,6 +1309,7 @@ pub fn analyze_workspace(
                         evidence_class,
                         reason,
                         &mut edge_counts,
+                        &mut module_edge_counts,
                         &mut report,
                     );
                     check_test_only_pub(
@@ -1252,6 +1365,9 @@ pub fn analyze_workspace(
     report
         .findings
         .extend(crate_coupling_findings(workspace, &edge_counts));
+    report
+        .findings
+        .extend(module_coupling_findings(workspace, &module_edge_counts));
 
     Ok(report)
 }
@@ -1313,6 +1429,95 @@ fn crate_coupling_findings(
                     .map(|set| set.iter().copied().collect::<Vec<_>>())
                     .unwrap_or_default(),
                 "afferent_crates": afferent_crates
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        });
+    }
+    findings
+}
+
+/// Folds [`analyze_workspace`]'s accumulated `module_edge_counts` into one
+/// `module-coupling` [`Finding`] per top-level module bucket with at least
+/// one observed coupling edge (`Ca + Ce > 0` — see [`MODULE_COUPLING_RULE`]).
+/// A module with no coupling at all is skipped, not flagged — there is
+/// nothing to report for it. Mirrors [`crate_coupling_findings`]'s Ce/Ca
+/// fold exactly, just keyed by module bucket string instead of crate name;
+/// see [`MODULE_COUPLING_RULE`]'s doc comment for how that bucket string is
+/// derived and why it's broader in scope (same-crate cross-module edges
+/// count here, not just cross-crate ones).
+fn module_coupling_findings(
+    workspace: &Workspace,
+    edge_counts: &HashMap<(String, String), u32>,
+) -> Vec<Finding> {
+    // owner -> distinct modules referencing it (Ca); referencer -> distinct
+    // modules it references (Ce). `BTreeSet` for deterministic, sorted,
+    // deduped evidence lists — same shape as `crate_coupling_findings`.
+    let mut afferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    let mut efferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    let mut modules: BTreeSet<&str> = BTreeSet::new();
+    for (owner, referencer) in edge_counts.keys() {
+        afferent
+            .entry(owner.as_str())
+            .or_default()
+            .insert(referencer.as_str());
+        efferent
+            .entry(referencer.as_str())
+            .or_default()
+            .insert(owner.as_str());
+        modules.insert(owner.as_str());
+        modules.insert(referencer.as_str());
+    }
+
+    // A module bucket string is `krate_name::segment` — its leading
+    // component before the first `::` is always the owning crate's name, so
+    // the finding's location can point at that crate's manifest the same
+    // way `crate_coupling_findings` does, rather than picking one arbitrary
+    // file out of the (possibly many) files a module bucket spans.
+    let manifest_path_by_crate: HashMap<&str, &Path> = workspace
+        .crates
+        .iter()
+        .map(|krate| (krate.name.as_str(), krate.manifest_path.as_path()))
+        .collect();
+
+    let mut findings = Vec::new();
+    for module in modules {
+        let afferent_modules = afferent.get(module);
+        let efferent_modules = efferent.get(module);
+        let ca = afferent_modules.map_or(0, BTreeSet::len);
+        let ce = efferent_modules.map_or(0, BTreeSet::len);
+        if ca + ce == 0 {
+            continue;
+        }
+        let instability = ce as f64 / (ca + ce) as f64;
+        let krate_name = module.split("::").next().unwrap_or(module);
+        let manifest_path = manifest_path_by_crate
+            .get(krate_name)
+            .copied()
+            .unwrap_or_else(|| Path::new(""));
+        findings.push(Finding {
+            id: format!("{MODULE_COUPLING_RULE}:{module}").into(),
+            rule: MODULE_COUPLING_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: manifest_path.to_path_buf(),
+                line: OneBasedLine::FIRST,
+                item_path: module.to_string(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "tier": "deep",
+                "module": module,
+                "efferent_coupling": ce,
+                "afferent_coupling": ca,
+                "instability": instability,
+                "efferent_modules": efferent_modules
+                    .map(|set| set.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                "afferent_modules": afferent_modules
                     .map(|set| set.iter().copied().collect::<Vec<_>>())
                     .unwrap_or_default(),
             })),
@@ -1961,6 +2166,7 @@ pub extern "C" fn exported_b() -> i32 {
             .unwrap();
         let file_id = ctx.file_id(&file.path).unwrap();
         let crate_of_file = HashMap::from([(file_id, krate.name.as_str())]);
+        let module_of_file = HashMap::new();
         let entry_keys = std::collections::HashSet::new();
 
         // Strictly inside the body's indentation whitespace — no symbol.
@@ -1969,9 +2175,11 @@ pub extern "C" fn exported_b() -> i32 {
         let mut report = WorkspaceDeadCode::default();
         let proc_macro_exposed = HashSet::new();
         let mut edge_counts = HashMap::new();
+        let mut module_edge_counts = HashMap::new();
         check_item(
             &analysis,
             &crate_of_file,
+            &module_of_file,
             &entry_keys,
             &proc_macro_exposed,
             file,
@@ -1986,6 +2194,7 @@ pub extern "C" fn exported_b() -> i32 {
             EvidenceClass::BoundedSemantic,
             UNUSED_PUB_WORKSPACE_REASON,
             &mut edge_counts,
+            &mut module_edge_counts,
             &mut report,
         );
 
@@ -3054,6 +3263,208 @@ publish = false
                 .findings
                 .iter()
                 .filter(|f| f.rule == CRATE_COUPLING_RULE)
+                .count(),
+            3,
+            "{:?}",
+            report.findings
+        );
+    }
+
+    /// Writes an extra source file into a [`load_single_crate_workspace`]-
+    /// style single-crate fixture's `src/` directory — `module-coupling`'s
+    /// tests need several top-level modules within one crate, unlike
+    /// `crate-coupling`'s multi-crate `write_crate`/`write_workspace_manifest`
+    /// fixtures.
+    #[cfg(feature = "deep")]
+    fn write_single_crate_module(dir: &TempDir, relative_path: &str, source: &str) {
+        let path = dir.join("src").join(relative_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, source).unwrap();
+    }
+
+    /// `module-coupling`'s Ca/Ce shape, the module-granularity counterpart
+    /// to `crate_coupling_reports_ca_ce_for_a_shared_core_crate`: within one
+    /// crate, `core` is called by both `consumer_a` and `consumer_b`, so it
+    /// should get `Ca=2` (two distinct modules reference it), `Ce=0` (it
+    /// references nothing cross-module itself), and an Instability near
+    /// 0.0. `consumer_a` and `consumer_b` each call into `core`, so each
+    /// should get `Ce>=1`.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn module_coupling_reports_ca_ce_for_a_shared_core_module() {
+        let dir = TempDir::new("dead-code-module-coupling-core");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            "pub mod core_mod;\npub mod consumer_a;\npub mod consumer_b;\n",
+        );
+        write_single_crate_module(
+            &dir,
+            "core_mod.rs",
+            r#"pub fn shared_helper() -> i32 {
+    1
+}
+"#,
+        );
+        write_single_crate_module(
+            &dir,
+            "consumer_a.rs",
+            r#"pub fn run() -> i32 {
+    crate::core_mod::shared_helper()
+}
+"#,
+        );
+        write_single_crate_module(
+            &dir,
+            "consumer_b.rs",
+            r#"pub fn run() -> i32 {
+    crate::core_mod::shared_helper()
+}
+"#,
+        );
+
+        let workspace = crate::ingest::load(Some(&workspace.root.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        let krate_name = &workspace.crates[0].name;
+        let core_module = format!("{krate_name}::core_mod");
+        let core_finding = report
+            .findings
+            .iter()
+            .find(|f| f.rule == MODULE_COUPLING_RULE && f.location.item_path == core_module)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no module-coupling finding for `{core_module}`: {:?}",
+                    report.findings
+                )
+            });
+        let evidence = core_finding
+            .evidence
+            .as_ref()
+            .expect("evidence must be present");
+        assert_eq!(evidence["afferent_coupling"], serde_json::json!(2));
+        assert_eq!(evidence["efferent_coupling"], serde_json::json!(0));
+        assert_eq!(evidence["instability"], serde_json::json!(0.0));
+        assert_eq!(
+            evidence["afferent_modules"],
+            serde_json::json!([
+                format!("{krate_name}::consumer_a"),
+                format!("{krate_name}::consumer_b"),
+            ])
+        );
+
+        for consumer_module in [
+            format!("{krate_name}::consumer_a"),
+            format!("{krate_name}::consumer_b"),
+        ] {
+            let consumer_finding = report
+                .findings
+                .iter()
+                .find(|f| f.rule == MODULE_COUPLING_RULE && f.location.item_path == consumer_module)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "no module-coupling finding for `{consumer_module}`: {:?}",
+                        report.findings
+                    )
+                });
+            let evidence = consumer_finding
+                .evidence
+                .as_ref()
+                .expect("evidence must be present");
+            assert!(
+                evidence["efferent_coupling"].as_u64().unwrap() >= 1,
+                "`{consumer_module}` calls into `core_mod` — must have Ce >= 1: {evidence:?}"
+            );
+        }
+    }
+
+    /// A module with zero cross-module coupling (nothing calls it, it calls
+    /// nothing) must not be flagged — there is nothing to report, the
+    /// module-granularity counterpart to
+    /// `crate_coupling_skips_a_fully_isolated_crate`.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn module_coupling_skips_a_module_with_no_cross_module_coupling() {
+        let dir = TempDir::new("dead-code-module-coupling-isolated");
+        let workspace = load_single_crate_workspace(&dir, "pub mod isolated_mod;\n");
+        write_single_crate_module(
+            &dir,
+            "isolated_mod.rs",
+            r#"pub fn never_referenced_elsewhere() -> i32 {
+    1
+}
+"#,
+        );
+
+        let workspace = crate::ingest::load(Some(&workspace.root.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == MODULE_COUPLING_RULE),
+            "a module with no cross-module coupling at all must not be flagged: {:?}",
+            report.findings
+        );
+    }
+
+    /// Splits a `// file: <name>.rs` marked multi-module source (see the
+    /// `module-coupling` registry example in `rule_registry.rs`) into
+    /// `(file_name, source)` pairs, in encounter order — the single-crate
+    /// counterpart to `split_marked_crates`.
+    #[cfg(feature = "deep")]
+    fn split_marked_files(source: &str) -> Vec<(&str, String)> {
+        let mut result: Vec<(&str, String)> = Vec::new();
+        for line in source.lines() {
+            if let Some(name) = line.strip_prefix("// file: ") {
+                result.push((name, String::new()));
+            } else if let Some(entry) = result.last_mut() {
+                entry.1.push_str(line);
+                entry.1.push('\n');
+            }
+        }
+        result
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn module_coupling_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(MODULE_COUPLING_RULE)
+            .expect("module-coupling has a registry entry")
+            .example
+            .expect("module-coupling has a curated example")
+            .before;
+
+        let files = split_marked_files(example);
+        assert_eq!(files.len(), 3, "expected 3 marked files: {files:?}");
+
+        let dir = TempDir::new("dead-code-module-coupling-registry-example");
+        let mod_declarations: String = files
+            .iter()
+            .map(|(name, _)| {
+                let mod_name = name.strip_suffix(".rs").expect("marked file ends in .rs");
+                format!("pub mod {mod_name};\n")
+            })
+            .collect();
+        let workspace = load_single_crate_workspace(&dir, &mod_declarations);
+        for (name, source) in &files {
+            write_single_crate_module(&dir, name, source);
+        }
+
+        let workspace = crate::ingest::load(Some(&workspace.root.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == MODULE_COUPLING_RULE)
                 .count(),
             3,
             "{:?}",

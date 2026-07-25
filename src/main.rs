@@ -3816,6 +3816,10 @@ fn run_dead_code_deep(
                 judge::dead_code::CRATE_COUPLING_RULE_REVISION,
             ),
             (
+                judge::dead_code::MODULE_COUPLING_RULE.to_string(),
+                judge::dead_code::MODULE_COUPLING_RULE_REVISION,
+            ),
+            (
                 judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE.to_string(),
                 judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE_REVISION,
             ),
@@ -3902,6 +3906,7 @@ fn run_dead_code_deep(
                 judge::dead_code::TEST_ONLY_PUB_RULE,
                 judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
                 judge::dead_code::CRATE_COUPLING_RULE,
+                judge::dead_code::MODULE_COUPLING_RULE,
                 judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
                 judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
