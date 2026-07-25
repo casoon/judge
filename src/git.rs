@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use gix::bstr::ByteSlice;
 
 use crate::complexity::FunctionInfo;
+use crate::duplication::WorkspaceDuplication;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::ingest::Workspace;
 
@@ -81,6 +82,81 @@ pub const COMMIT_SIZE_DISTRIBUTION_RULE_REVISION: u32 = 1;
 /// commits"), so it shares a threshold for consistency until a distribution
 /// study justifies diverging.
 pub const COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD: f64 = 0.6;
+
+/// Rule id used for [`move_ratio`] findings (see todo.md §E "Churn-Signale:
+/// `move-ratio`").
+pub const MOVE_RATIO_RULE: &str = "move-ratio";
+/// Bump when the move-ratio rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const MOVE_RATIO_RULE_REVISION: u32 = 1;
+
+/// Minimum fraction of a commit's changed files (see [`CommitInfo::moved_files`])
+/// that must be classified as renamed/moved for that commit to be flagged by
+/// [`move_ratio`]. First-cut, adjustable threshold — not yet backed by a
+/// distribution study of what counts as a normal move share across real
+/// commits (mirrors [`COMMIT_SIZE_DISTRIBUTION_GINI_THRESHOLD`]'s
+/// arbitrary-but-documented style).
+pub const MOVE_RATIO_THRESHOLD: f64 = 0.7;
+
+/// Minimum number of files a commit must change for [`move_ratio`] to
+/// consider it at all — below this, a single-file (or two-file) rename is
+/// common and not interesting on its own, so it's skipped rather than
+/// flagged regardless of its ratio.
+pub const MIN_FILES_FOR_MOVE_RATIO: usize = 3;
+
+/// Rule id used for [`copy_paste_ratio`] findings (see todo.md §E
+/// "Churn-Signale: ... `copy-paste-ratio`").
+pub const COPY_PASTE_RATIO_RULE: &str = "copy-paste-ratio";
+/// Bump when the copy-paste-ratio rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const COPY_PASTE_RATIO_RULE_REVISION: u32 = 1;
+
+/// Minimum number of a commit's added lines — restricted to lines in files
+/// still present at HEAD at the same path, see [`copy_paste_ratio`] — for
+/// that commit to be considered at all; below this, a tiny commit's ratio
+/// is noise.
+pub const MIN_ADDED_LINES_FOR_COPY_PASTE_RATIO: u32 = 10;
+
+/// Minimum fraction of a commit's still-present added lines that must
+/// currently fall inside a detected clone family for that commit to be
+/// flagged by [`copy_paste_ratio`]. First-cut, adjustable threshold — not
+/// yet backed by a distribution study of what counts as a normal
+/// copy-paste share across real commits (mirrors [`MOVE_RATIO_THRESHOLD`]'s
+/// arbitrary-but-documented style).
+pub const COPY_PASTE_RATIO_THRESHOLD: f64 = 0.3;
+
+/// Rule id used for [`long_term_update_share`] findings (see todo.md §E
+/// "Churn-Signale: ... `long-term-update-share`").
+pub const LONG_TERM_UPDATE_SHARE_RULE: &str = "long-term-update-share";
+/// Bump when the long-term-update-share rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const LONG_TERM_UPDATE_SHARE_RULE_REVISION: u32 = 1;
+
+/// Size, in days, of each bucket [`long_term_update_share`] divides a
+/// file's whole recorded lifetime (first commit to now) into — a day-based
+/// unit, mirroring `crate::slop_structural`'s 14-day `churn-hotspot` window
+/// and this module's own 365-day [`DEFAULT_WINDOW_DAYS`], rather than true
+/// calendar months (which have varying lengths and would need their own
+/// leap-year-aware arithmetic for no benefit here).
+pub const LONG_TERM_UPDATE_SHARE_BUCKET_DAYS: i64 = 30;
+
+/// Minimum number of lifetime buckets (see
+/// [`LONG_TERM_UPDATE_SHARE_BUCKET_DAYS`]) — roughly 6 months / 180 days of
+/// recorded history — a file must have for [`long_term_update_share`] to
+/// consider it at all. Below this floor the ratio is too coarse to mean
+/// anything (a 1- or 2-bucket-old file with a single commit already sits at
+/// a 50%-100% share by construction); a newly created file is excluded
+/// entirely rather than reported with a misleadingly extreme share.
+pub const MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE: u32 = 6;
+
+/// Maximum fraction of a file's lifetime buckets (see
+/// [`LONG_TERM_UPDATE_SHARE_BUCKET_DAYS`]) that may contain at least one
+/// commit touching the file for [`long_term_update_share`] to fire: below
+/// 15% of its whole recorded history touched at all. First-cut, adjustable
+/// threshold — not yet backed by a distribution study of what counts as a
+/// normal lifetime-wide update cadence across real files (mirrors
+/// [`MOVE_RATIO_THRESHOLD`]'s arbitrary-but-documented style).
+pub const LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD: f64 = 0.15;
 
 #[derive(Debug)]
 pub enum GitError {
@@ -286,6 +362,23 @@ pub struct CommitInfo {
     /// [`blob_text_at`]'s tolerance for non-UTF8 content elsewhere in this
     /// module.
     pub lines_changed: u64,
+    /// Number of files in this commit's tree diff classified as a rename or
+    /// copy (`gix`'s `Change::Rewrite`, rewrite tracking enabled at its
+    /// default 50% content-similarity threshold — see [`move_ratio`]),
+    /// computed from the same diff as `files_changed`/`lines_changed`. Each
+    /// rewrite is a single entry in `files_changed` (the destination path),
+    /// not a separate deletion and addition.
+    pub moved_files: u32,
+    /// Per-file 1-based, inclusive line ranges this commit inserted in its
+    /// post-commit content — `(file, start_line, end_line)`, one entry per
+    /// diff hunk with a non-empty "after" side, computed from the same diff
+    /// as `lines_changed` (`gix_diff::blob`'s hunk iterator over the same
+    /// resource-cache diff, rather than `line_counts()`'s aggregate
+    /// summary). `None` for binary files, mirroring `lines_changed`'s
+    /// tolerance. Used by [`copy_paste_ratio`] to check whether a commit's
+    /// added lines, at their position in the file's CURRENT (HEAD) content,
+    /// fall inside a currently-detected clone family.
+    pub added_line_ranges: Vec<(PathBuf, usize, usize)>,
 }
 
 /// Walks commits reachable from `HEAD` within `window_days` of now, in the
@@ -329,23 +422,59 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
 
         let mut files_changed = Vec::new();
         let mut lines_changed: u64 = 0;
+        let mut moved_files: u32 = 0;
+        let mut added_line_ranges: Vec<(PathBuf, usize, usize)> = Vec::new();
         let mut resource_cache = repo
             .diff_resource_cache_for_tree_diff()
             .map_err(|err| GitError::Walk(err.into()))?;
         parent_tree
             .changes()
             .map_err(|err| GitError::Walk(err.into()))?
+            // Explicitly enabled rather than left to ambient repo/global git
+            // config, so `moved_files` (see [`move_ratio`]) doesn't depend on
+            // whether `diff.renames` happens to be set — same default (50%
+            // content similarity, no copy detection) `ownership.rs`'s blame
+            // call already relies on.
+            .options(|opts| {
+                opts.track_rewrites(Some(gix::diff::Rewrites::default()));
+            })
             .for_each_to_obtain_tree(&tree, |change| {
-                if let Some(path) = path_of(&change) {
-                    files_changed.push(path);
+                let path = path_of(&change);
+                if let Some(path) = &path {
+                    files_changed.push(path.clone());
                 }
-                if let Some(counts) = change
-                    .diff(&mut resource_cache)
-                    .ok()
-                    .and_then(|mut platform| platform.line_counts().ok())
-                    .flatten()
-                {
-                    lines_changed += u64::from(counts.insertions) + u64::from(counts.removals);
+                if matches!(change, gix::object::tree::diff::Change::Rewrite { .. }) {
+                    moved_files += 1;
+                }
+                if let Ok(mut platform) = change.diff(&mut resource_cache) {
+                    if let Some(counts) = platform.line_counts().ok().flatten() {
+                        lines_changed += u64::from(counts.insertions) + u64::from(counts.removals);
+                    }
+                    // Hunk-level view of the same diff, used only to recover
+                    // which post-commit line numbers were actually inserted
+                    // (see [`CommitInfo::added_line_ranges`]) — `line_counts()`
+                    // above only exposes the aggregate insertion/removal
+                    // totals, not their positions.
+                    if let Some(path) = &path {
+                        if let Ok(prep) = platform.resource_cache.prepare_diff() {
+                            if let gix::diff::blob::platform::prepare_diff::Operation::InternalDiff {
+                                algorithm,
+                            } = prep.operation
+                            {
+                                let input = prep.interned_input();
+                                let diff = gix::diff::blob::Diff::compute(algorithm, &input);
+                                for hunk in diff.hunks() {
+                                    if hunk.after.start < hunk.after.end {
+                                        added_line_ranges.push((
+                                            path.clone(),
+                                            hunk.after.start as usize + 1,
+                                            hunk.after.end as usize,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 resource_cache.clear_resource_cache_keep_allocation();
                 Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
@@ -382,6 +511,8 @@ pub fn walk_commits(repo_root: &Path, window_days: i64) -> Result<Vec<CommitInfo
             message_body,
             files_changed,
             lines_changed,
+            moved_files,
+            added_line_ranges,
         });
     }
 
@@ -983,6 +1114,457 @@ pub fn commit_size_distribution(
         .collect())
 }
 
+/// A commit whose move ratio (moved files ÷ total changed files, see
+/// [`CommitInfo::moved_files`]) meets [`MOVE_RATIO_THRESHOLD`] while
+/// touching at least [`MIN_FILES_FOR_MOVE_RATIO`] files — see [`move_ratio`].
+#[derive(Debug, Clone)]
+pub struct MoveRatioOutlier {
+    pub commit_id: String,
+    pub move_ratio: f64,
+    pub moved_files: u32,
+    pub files_changed_count: usize,
+    /// First file touched by this commit's tree diff, in diff order — an
+    /// arbitrary representative location, mirroring
+    /// [`CommitSizeDistributionOutlier::representative_file`], not a claim
+    /// that this particular file is what was moved.
+    pub representative_file: PathBuf,
+    /// Commit message title, if non-empty; otherwise the commit hash — used
+    /// as [`Location::item_path`].
+    pub item_path: String,
+}
+
+impl MoveRatioOutlier {
+    /// Renders this outlier as a [`Finding`], mirroring
+    /// [`CommitSizeDistributionOutlier::to_finding`]: `Severity::Info`,
+    /// evidence class `Heuristic` — rename/move detection is itself a
+    /// content-similarity heuristic (50% by default, see
+    /// [`CommitInfo::moved_files`]), not an exact identity check, so this is
+    /// a descriptive "mostly a reorg commit" framing, never a claim that the
+    /// commit "is" a pure rename (todo.md §17.4).
+    pub fn to_finding(&self) -> Finding {
+        Finding {
+            id: format!("{MOVE_RATIO_RULE}:{}", self.commit_id).into(),
+            rule: MOVE_RATIO_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: self.representative_file.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: self.item_path.clone(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "commit_hash": self.commit_id,
+                "move_ratio": self.move_ratio,
+                "moved_files_count": self.moved_files,
+                "total_files_changed": self.files_changed_count,
+                "reason": format!(
+                    "{} of {} files changed in this commit were classified as a rename/move (similarity-based rewrite detection, default 50% content-similarity threshold), a move ratio of {:.2} (threshold: {MOVE_RATIO_THRESHOLD})",
+                    self.moved_files, self.files_changed_count, self.move_ratio
+                ),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+}
+
+/// Within the commit history reachable from `HEAD` inside `window_days`,
+/// flags commits whose move ratio — moved files (see
+/// [`CommitInfo::moved_files`]) divided by total changed files — is at least
+/// [`MOVE_RATIO_THRESHOLD`], restricted to commits touching at least
+/// [`MIN_FILES_FOR_MOVE_RATIO`] files (a one- or two-file rename is common
+/// and not interesting on its own).
+///
+/// Unlike [`commit_size_distribution`]/[`size_distribution`], this is a flat
+/// per-commit threshold, not a window-level distribution claim: a commit's
+/// move ratio doesn't depend on how other commits in the window looked.
+pub fn move_ratio(repo_root: &Path, window_days: i64) -> Result<Vec<MoveRatioOutlier>, GitError> {
+    let commits = walk_commits(repo_root, window_days)?;
+
+    Ok(commits
+        .into_iter()
+        .filter_map(|commit| {
+            let files_changed_count = commit.files_changed.len();
+            if files_changed_count < MIN_FILES_FOR_MOVE_RATIO {
+                return None;
+            }
+            let ratio = f64::from(commit.moved_files) / files_changed_count as f64;
+            if ratio < MOVE_RATIO_THRESHOLD {
+                return None;
+            }
+
+            let representative_file = commit
+                .files_changed
+                .first()
+                .cloned()
+                .unwrap_or_else(|| repo_root.join("Cargo.toml"));
+            let item_path = if commit.message_title.is_empty() {
+                commit.id.clone()
+            } else {
+                commit.message_title.clone()
+            };
+            Some(MoveRatioOutlier {
+                commit_id: commit.id,
+                move_ratio: ratio,
+                moved_files: commit.moved_files,
+                files_changed_count,
+                representative_file,
+                item_path,
+            })
+        })
+        .collect())
+}
+
+/// A commit whose added lines — evaluated at their position in the file's
+/// CURRENT (HEAD) content — overlap a currently-detected clone family at a
+/// ratio meeting [`COPY_PASTE_RATIO_THRESHOLD`]; see [`copy_paste_ratio`].
+#[derive(Debug, Clone)]
+pub struct CopyPasteRatioOutlier {
+    pub commit_id: String,
+    pub copy_paste_ratio: f64,
+    pub lines_in_clone_families: usize,
+    pub total_added_lines_still_present: usize,
+    /// First still-present file this commit added lines to, in diff order —
+    /// an arbitrary representative location, mirroring
+    /// [`MoveRatioOutlier::representative_file`].
+    pub representative_file: PathBuf,
+    /// Commit message title, if non-empty; otherwise the commit hash — used
+    /// as [`Location::item_path`].
+    pub item_path: String,
+}
+
+impl CopyPasteRatioOutlier {
+    /// Renders this outlier as a [`Finding`], mirroring
+    /// [`MoveRatioOutlier::to_finding`]: `Severity::Info`, evidence class
+    /// `Heuristic` — this is explicitly the most speculative of this
+    /// module's git-signal rules. It states only that the commit's added
+    /// lines, evaluated at their CURRENT position, currently fall inside a
+    /// currently-detected clone family — never that the commit "copy-pasted"
+    /// or "introduced a duplicate" (todo.md §17.4): the underlying
+    /// duplication may have existed before the commit, been introduced by a
+    /// later commit at the same lines, or the file may have shifted enough
+    /// since that this no longer reflects the commit's actual content at
+    /// all.
+    pub fn to_finding(&self) -> Finding {
+        Finding {
+            id: format!("{COPY_PASTE_RATIO_RULE}:{}", self.commit_id).into(),
+            rule: COPY_PASTE_RATIO_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: self.representative_file.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: self.item_path.clone(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "commit_hash": self.commit_id,
+                "copy_paste_ratio": self.copy_paste_ratio,
+                "lines_in_clone_families": self.lines_in_clone_families,
+                "total_added_lines_still_present": self.total_added_lines_still_present,
+                "reason": format!(
+                    "{} of {} lines this commit added, still present at HEAD, currently fall within a detected clone family, a ratio of {:.2} (threshold: {COPY_PASTE_RATIO_THRESHOLD}); this reflects duplication as it exists today at those line positions, not necessarily at commit time",
+                    self.lines_in_clone_families, self.total_added_lines_still_present, self.copy_paste_ratio
+                ),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+}
+
+/// Within the commit history reachable from `HEAD` inside `window_days`,
+/// flags commits whose added lines overlap a clone family detected by
+/// [`crate::duplication::analyze_workspace`] (`dupes`) in the workspace's
+/// CURRENT content, at a ratio meeting [`COPY_PASTE_RATIO_THRESHOLD`], among
+/// commits adding at least [`MIN_ADDED_LINES_FOR_COPY_PASTE_RATIO`] such
+/// lines.
+///
+/// This is a **retrospective approximation**, the most speculative of this
+/// module's git-signal rules: for each file a commit touched, it looks up
+/// that commit's inserted line numbers (see
+/// [`CommitInfo::added_line_ranges`]) and checks whether those *same line
+/// numbers*, in the file's content *today*, fall inside a clone family —
+/// not whether duplication existed at commit time. If the file has been
+/// substantially edited since (lines shifted) or the duplicate has since
+/// been removed — or introduced later by an unrelated commit — this
+/// degrades gracefully to "no overlap found" rather than a false-positive
+/// claim; it is a proxy, not proof, the same posture as
+/// `integer-cast-risk`/other heuristic proxies in this crate. Files renamed
+/// or deleted since the commit (no longer present in `dupes` at the same
+/// path) are skipped entirely — no path-history tracking is attempted.
+pub fn copy_paste_ratio(
+    repo_root: &Path,
+    window_days: i64,
+    dupes: &WorkspaceDuplication,
+) -> Result<Vec<CopyPasteRatioOutlier>, GitError> {
+    let commits = walk_commits(repo_root, window_days)?;
+
+    let mut spans_by_file: HashMap<&Path, Vec<(usize, usize)>> = HashMap::new();
+    for family in &dupes.families {
+        for member in &family.members {
+            if let Ok(relative) = member.file.strip_prefix(repo_root) {
+                spans_by_file
+                    .entry(relative)
+                    .or_default()
+                    .push((member.start_line, member.end_line));
+            }
+        }
+    }
+
+    Ok(commits
+        .into_iter()
+        .filter_map(|commit| {
+            let mut lines_in_clone_families = 0usize;
+            let mut total_added_lines_still_present = 0usize;
+            let mut representative_file = None;
+            for (file, start_line, end_line) in &commit.added_line_ranges {
+                let Some(spans) = spans_by_file.get(file.as_path()) else {
+                    continue;
+                };
+                representative_file.get_or_insert_with(|| file.clone());
+                for line in *start_line..=*end_line {
+                    total_added_lines_still_present += 1;
+                    if spans.iter().any(|(span_start, span_end)| {
+                        *span_start <= line && line <= *span_end
+                    }) {
+                        lines_in_clone_families += 1;
+                    }
+                }
+            }
+
+            if total_added_lines_still_present < MIN_ADDED_LINES_FOR_COPY_PASTE_RATIO as usize {
+                return None;
+            }
+            let ratio = lines_in_clone_families as f64 / total_added_lines_still_present as f64;
+            if ratio < COPY_PASTE_RATIO_THRESHOLD {
+                return None;
+            }
+
+            let item_path = if commit.message_title.is_empty() {
+                commit.id.clone()
+            } else {
+                commit.message_title.clone()
+            };
+            Some(CopyPasteRatioOutlier {
+                commit_id: commit.id,
+                copy_paste_ratio: ratio,
+                lines_in_clone_families,
+                total_added_lines_still_present,
+                representative_file: representative_file
+                    .unwrap_or_else(|| repo_root.join("Cargo.toml")),
+                item_path,
+            })
+        })
+        .collect())
+}
+
+/// A file whose commit activity, spread across its *entire* recorded
+/// history (first commit to now — not a fixed recent window), lands in
+/// fewer than [`LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD`] of that history's
+/// [`LONG_TERM_UPDATE_SHARE_BUCKET_DAYS`]-day buckets; see
+/// [`long_term_update_share`].
+#[derive(Debug, Clone)]
+pub struct LongTermUpdateShareOutlier {
+    pub file: PathBuf,
+    pub long_term_update_share: f64,
+    /// Days between this file's first recorded commit and now.
+    pub lifetime_days: i64,
+    /// Total number of [`LONG_TERM_UPDATE_SHARE_BUCKET_DAYS`]-day buckets
+    /// spanning the file's recorded lifetime.
+    pub bucket_count: u32,
+    /// Of `bucket_count`, how many contain at least one commit touching
+    /// this file.
+    pub active_bucket_count: u32,
+    /// Unix-seconds timestamp of this file's first recorded commit.
+    pub first_commit_time: i64,
+}
+
+impl LongTermUpdateShareOutlier {
+    /// Renders this outlier as a [`Finding`]. `Severity::Info`, evidence
+    /// class `Heuristic`, mirroring [`MoveRatioOutlier::to_finding`]'s
+    /// posture: a low lifetime-wide update share is routinely legitimate (a
+    /// stable utility module, a finished vendored file, a config file that
+    /// rarely needs to change), so this must never gate. The wording states
+    /// only the measured share against the threshold, over how many buckets
+    /// and days — never that the file is "neglected", "abandoned", or
+    /// "dead" (todo.md §17.4; Grundregeln: no absolute claims).
+    ///
+    /// **Deliberately orthogonal to [`crate::slop_structural::legacy_freeze`],
+    /// not a restatement of it**: `legacy-freeze` asks whether a file is
+    /// frozen *right now*, relative to its currently active siblings (a
+    /// snapshot over a fixed recent window); this rule asks whether a file
+    /// was rarely touched across its *entire* recorded lifetime, regardless
+    /// of recent activity or sibling comparison. A file can have a low
+    /// `long_term_update_share` while still being active this week (a burst
+    /// of activity after a long quiet history — `legacy-freeze` would never
+    /// fire on it), and conversely a file `legacy-freeze` flags as frozen
+    /// can have a HIGH `long_term_update_share` (churned constantly for
+    /// years, then stopped recently — this rule would not fire on it). Some
+    /// files will naturally satisfy both; that overlap is expected, not
+    /// double-counting, and is never artificially suppressed.
+    pub fn to_finding(&self) -> Finding {
+        Finding {
+            id: format!("{LONG_TERM_UPDATE_SHARE_RULE}:{}", self.file.display()).into(),
+            rule: LONG_TERM_UPDATE_SHARE_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: self.file.clone(),
+                line: OneBasedLine::FIRST,
+                item_path: self.file.display().to_string(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "file": self.file.display().to_string(),
+                "long_term_update_share": self.long_term_update_share,
+                "lifetime_days": self.lifetime_days,
+                "bucket_count": self.bucket_count,
+                "active_bucket_count": self.active_bucket_count,
+                "first_commit_date": unix_seconds_to_date_string(self.first_commit_time),
+                "reason": format!(
+                    "in its recorded history so far, this file was touched in only {} of {} {}-day windows ({:.2} of its lifetime, threshold: {LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD}), first recorded on {}",
+                    self.active_bucket_count, self.bucket_count, LONG_TERM_UPDATE_SHARE_BUCKET_DAYS,
+                    self.long_term_update_share, unix_seconds_to_date_string(self.first_commit_time)
+                ),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+}
+
+/// Full-history commit-touch timestamps for every file ever touched by a
+/// commit reachable from `HEAD`, keyed by path relative to the repository
+/// root — a single unwindowed walk of the *entire* history (unlike
+/// [`churn`]/[`walk_commits`], which stop at a `window_days` cutoff),
+/// shared across every file so [`long_term_update_share`] doesn't re-walk
+/// history per file, mirroring [`churn`]'s own "walk once, aggregate per
+/// path" shape. Same plain, non-rewrite-tracked tree diff as [`churn`]: a
+/// file renamed at any point in its history has its commit history split
+/// across its old and new paths, understating the older path's actual
+/// activity — the same accepted limitation
+/// `churn_hotspot_history_splits_across_a_rename_and_stays_under_threshold`
+/// documents for `churn`/`legacy-freeze`. An unborn `HEAD` yields an empty
+/// map, matching [`churn`]'s tolerance.
+fn file_commit_timestamps(repo_root: &Path) -> Result<HashMap<PathBuf, Vec<i64>>, GitError> {
+    let repo = gix::open(repo_root)?;
+    let mut timestamps: HashMap<PathBuf, Vec<i64>> = HashMap::new();
+
+    let Ok(head_id) = repo.head_id() else {
+        return Ok(timestamps);
+    };
+
+    let walk = repo
+        .rev_walk(Some(head_id.detach()))
+        .all()
+        .map_err(|err| GitError::Walk(err.into()))?;
+
+    for info in walk {
+        let info = info.map_err(|err| GitError::Walk(err.into()))?;
+        let commit = info.object().map_err(|err| GitError::Walk(err.into()))?;
+        let commit_time = commit
+            .time()
+            .map_err(|err| GitError::Walk(err.into()))?
+            .seconds;
+
+        let tree = commit.tree().map_err(|err| GitError::Walk(err.into()))?;
+        let parent_tree = match commit.parent_ids().next() {
+            Some(parent_id) => parent_id
+                .object()
+                .map_err(|err| GitError::Walk(err.into()))?
+                .into_commit()
+                .tree()
+                .map_err(|err| GitError::Walk(err.into()))?,
+            None => repo.empty_tree(),
+        };
+
+        parent_tree
+            .changes()
+            .map_err(|err| GitError::Walk(err.into()))?
+            .for_each_to_obtain_tree(&tree, |change| {
+                if let Some(path) = path_of(&change) {
+                    timestamps.entry(path).or_default().push(commit_time);
+                }
+                Ok::<_, std::convert::Infallible>(gix::object::tree::diff::Action::Continue(()))
+            })
+            .map_err(|err| GitError::Walk(err.into()))?;
+    }
+
+    Ok(timestamps)
+}
+
+/// Flags files whose commit activity, spread across their *entire* recorded
+/// history (first commit to now — not a fixed recent window), lands in
+/// fewer than [`LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD`] of that history's
+/// [`LONG_TERM_UPDATE_SHARE_BUCKET_DAYS`]-day buckets (see todo.md §E
+/// "Churn-Signale: ... `long-term-update-share`").
+///
+/// For each file: `first_seen` is its earliest recorded commit timestamp,
+/// `now` is [`now_unix_seconds`] — the same wall-clock "now" reference
+/// [`WindowDays::cutoff_seconds`]/[`active_authors_since`] already use
+/// throughout this module, not the timestamp of the most recent commit.
+/// The span `first_seen..now` is divided into fixed-size
+/// [`LONG_TERM_UPDATE_SHARE_BUCKET_DAYS`]-day buckets (the file's first
+/// commit always falls in bucket 0 by construction); `long_term_update_share`
+/// is the fraction of those buckets containing at least one commit that
+/// touched the file. Files with fewer than
+/// [`MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE`] lifetime buckets are excluded
+/// entirely — too little recorded history for the ratio to mean anything.
+///
+/// **Deliberately orthogonal to [`crate::slop_structural::legacy_freeze`]**
+/// — see [`LongTermUpdateShareOutlier::to_finding`] for the full contrast:
+/// `legacy-freeze` is a snapshot ("is this file frozen right now, relative
+/// to its currently active siblings?"); this rule looks at the file's whole
+/// recorded shape ("was this file rarely touched across its entire
+/// lifetime, regardless of recent activity or its neighbors?"). Neither is
+/// a restatement of the other, and some files will naturally satisfy both —
+/// that overlap is expected, not suppressed.
+pub fn long_term_update_share(
+    repo_root: &Path,
+) -> Result<Vec<LongTermUpdateShareOutlier>, GitError> {
+    let now = now_unix_seconds();
+    let bucket_seconds = LONG_TERM_UPDATE_SHARE_BUCKET_DAYS * 24 * 3600;
+    let history = file_commit_timestamps(repo_root)?;
+
+    let mut outliers = Vec::new();
+    for (file, times) in history {
+        let Some(&first_commit_time) = times.iter().min() else {
+            continue;
+        };
+        let lifetime_seconds = (now - first_commit_time).max(0);
+        let bucket_count = (lifetime_seconds / bucket_seconds) as u32 + 1;
+        if bucket_count < MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE {
+            continue;
+        }
+
+        let active_buckets: HashSet<u32> = times
+            .iter()
+            .map(|&time| (((time - first_commit_time).max(0)) / bucket_seconds) as u32)
+            .collect();
+        let active_bucket_count = active_buckets.len() as u32;
+        let share = f64::from(active_bucket_count) / f64::from(bucket_count);
+        if share >= LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD {
+            continue;
+        }
+
+        outliers.push(LongTermUpdateShareOutlier {
+            file,
+            long_term_update_share: share,
+            lifetime_days: lifetime_seconds / (24 * 3600),
+            bucket_count,
+            active_bucket_count,
+            first_commit_time,
+        });
+    }
+
+    // `history` is a `HashMap`, so its iteration order isn't stable — sort
+    // for deterministic output, mirroring `churn_hotspots`' same need.
+    outliers.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok(outliers)
+}
+
 /// The current `HEAD` commit as a full hex object id (see todo.md §5,
 /// `first_seen_commit`).
 pub fn head_commit(repo_root: &Path) -> Result<String, GitError> {
@@ -1142,9 +1724,33 @@ fn now_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// Formats `unix_seconds` as a `YYYY-MM-DD` UTC calendar date, day
+/// precision only — the same dependency-free Howard Hinnant
+/// `civil_from_days` algorithm `crate::slopsquat` already uses for its own
+/// Unix-seconds/civil-date conversions (see that module's
+/// `days_from_civil`), avoiding a chrono/time dependency just for
+/// [`LongTermUpdateShareOutlier::to_finding`]'s human-readable
+/// `first_commit_date` field.
+fn unix_seconds_to_date_string(unix_seconds: i64) -> String {
+    let days = unix_seconds.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::duplication::{self, DupeMode};
+    use crate::ingest::{SourceFile, SourceKind};
     use crate::test_util::TempDir;
 
     /// Runs `git` in `dir` with a fixed test identity, so these tests don't
@@ -2120,6 +2726,229 @@ mod tests {
         );
     }
 
+    #[test]
+    fn move_ratio_flags_a_commit_dominated_by_renames() {
+        let dir = TempDir::new("move-ratio-renames");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(dir.join("c.rs"), "fn c() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        git(&dir, &["mv", "a.rs", "a2.rs"]);
+        git(&dir, &["mv", "b.rs", "b2.rs"]);
+        git(&dir, &["mv", "c.rs", "c2.rs"]);
+        git(&dir, &["commit", "-q", "-m", "reorg module layout"]);
+        let rename_sha = commit_sha(&dir, "HEAD");
+
+        let outliers = move_ratio(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(
+            outliers.len(),
+            1,
+            "expected the rename commit to be flagged, got {outliers:?}"
+        );
+        assert_eq!(outliers[0].commit_id, rename_sha);
+        assert_eq!(outliers[0].moved_files, 3);
+        assert_eq!(outliers[0].files_changed_count, 3);
+        assert!((outliers[0].move_ratio - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn move_ratio_does_not_fire_for_pure_content_edits() {
+        let dir = TempDir::new("move-ratio-no-renames");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(dir.join("c.rs"), "fn c() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() { 1 }\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() { 1 }\n").unwrap();
+        std::fs::write(dir.join("c.rs"), "fn c() { 1 }\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch all three"]);
+
+        let outliers = move_ratio(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(
+            outliers.is_empty(),
+            "expected no move-ratio outliers for pure content edits, got {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn move_ratio_does_not_fire_below_the_minimum_file_count() {
+        let dir = TempDir::new("move-ratio-too-few-files");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        git(&dir, &["mv", "a.rs", "a2.rs"]);
+        git(&dir, &["mv", "b.rs", "b2.rs"]);
+        git(&dir, &["commit", "-q", "-m", "rename both"]);
+
+        let outliers = move_ratio(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(
+            outliers.is_empty(),
+            "expected no outliers below MIN_FILES_FOR_MOVE_RATIO, got {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn copy_paste_ratio_flags_a_commit_whose_added_lines_fall_inside_a_current_clone_family() {
+        let dir = TempDir::new("copy-paste-ratio-hit");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn dup_one(x: i32) -> i32 {\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n\nfn unique_one() -> i32 {\n    let mut total = 0;\n    for i in 0..3 {\n        total += i * 2;\n    }\n    total\n}\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add a.rs"]);
+
+        std::fs::write(
+            dir.join("b.rs"),
+            "fn dup_two(x: i32) -> i32 {\n    // reformatted duplicate of dup_one\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n\nfn filler_one() {\n    println!(\"filler\");\n}\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add near-duplicate in b.rs"]);
+        let dup_sha = commit_sha(&dir, "HEAD");
+
+        let files = vec![
+            SourceFile {
+                path: dir.join("a.rs"),
+                kind: SourceKind::Authored,
+            },
+            SourceFile {
+                path: dir.join("b.rs"),
+                kind: SourceKind::Authored,
+            },
+        ];
+        let dupes = duplication::analyze_workspace(
+            files.iter(),
+            DupeMode::Mild,
+            duplication::DEFAULT_MIN_TOKENS,
+            false,
+        );
+        assert_eq!(
+            dupes.families.len(),
+            1,
+            "expected a.rs's dup_one and b.rs's dup_two to form a clone family"
+        );
+
+        let outliers = copy_paste_ratio(&dir, DEFAULT_WINDOW_DAYS, &dupes).unwrap();
+
+        // The commit that added a.rs's `dup_one` is also expected to fire —
+        // it's the other half of the same clone family — so this asserts
+        // the b.rs commit is *among* the flagged commits rather than the
+        // only one.
+        let flagged = outliers
+            .iter()
+            .find(|outlier| outlier.commit_id == dup_sha)
+            .unwrap_or_else(|| panic!("expected the b.rs-adding commit to be flagged, got {outliers:?}"));
+        assert!(flagged.lines_in_clone_families > 0);
+        assert!(flagged.copy_paste_ratio >= COPY_PASTE_RATIO_THRESHOLD);
+    }
+
+    #[test]
+    fn copy_paste_ratio_does_not_fire_when_no_current_clone_family_overlaps() {
+        let dir = TempDir::new("copy-paste-ratio-no-overlap");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn solo(x: i32) -> i32 {\n    let mut acc = x;\n    acc += 1;\n    acc *= 2;\n    acc -= 3;\n    acc /= 4;\n    acc %= 5;\n    acc\n}\n\nfn other() -> i32 {\n    7\n}\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add a.rs"]);
+
+        let files = vec![SourceFile {
+            path: dir.join("a.rs"),
+            kind: SourceKind::Authored,
+        }];
+        let dupes = duplication::analyze_workspace(
+            files.iter(),
+            DupeMode::Mild,
+            duplication::DEFAULT_MIN_TOKENS,
+            false,
+        );
+        assert!(
+            dupes.families.is_empty(),
+            "expected no clone family for a single unique file"
+        );
+
+        let outliers = copy_paste_ratio(&dir, DEFAULT_WINDOW_DAYS, &dupes).unwrap();
+
+        assert!(
+            outliers.is_empty(),
+            "expected no copy-paste-ratio outliers without a current clone family, got {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn copy_paste_ratio_does_not_fire_below_the_minimum_added_lines() {
+        let dir = TempDir::new("copy-paste-ratio-too-few-lines");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn dup_one(x: i32) -> i32 {\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n\nfn unique_one() -> i32 {\n    let mut total = 0;\n    for i in 0..3 {\n        total += i * 2;\n    }\n    total\n}\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add a.rs"]);
+
+        std::fs::write(
+            dir.join("b.rs"),
+            "fn dup_two(x: i32) -> i32 {\n    // reformatted duplicate of dup_one\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n",
+        )
+        .unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add small near-duplicate in b.rs"]);
+        let small_sha = commit_sha(&dir, "HEAD");
+
+        let files = vec![
+            SourceFile {
+                path: dir.join("a.rs"),
+                kind: SourceKind::Authored,
+            },
+            SourceFile {
+                path: dir.join("b.rs"),
+                kind: SourceKind::Authored,
+            },
+        ];
+        let dupes = duplication::analyze_workspace(
+            files.iter(),
+            DupeMode::Mild,
+            duplication::DEFAULT_MIN_TOKENS,
+            false,
+        );
+        assert_eq!(dupes.families.len(), 1);
+
+        let outliers = copy_paste_ratio(&dir, DEFAULT_WINDOW_DAYS, &dupes).unwrap();
+
+        // b.rs's commit only added 8 lines (all inside the clone family, a
+        // ratio of 1.0), below MIN_ADDED_LINES_FOR_COPY_PASTE_RATIO (10), so
+        // it must not fire — regardless of whether the earlier a.rs commit
+        // (which adds enough lines to qualify) fires independently.
+        assert!(
+            !outliers.iter().any(|outlier| outlier.commit_id == small_sha),
+            "expected the small b.rs commit to stay below MIN_ADDED_LINES_FOR_COPY_PASTE_RATIO, got {outliers:?}"
+        );
+    }
+
     fn commit_sha(dir: &Path, rev: &str) -> String {
         let output = std::process::Command::new("git")
             .args(["rev-parse", rev])
@@ -2128,6 +2957,163 @@ mod tests {
             .expect("failed to run git rev-parse");
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Commits with both author and committer date pinned to `epoch_seconds`
+    /// (`@<seconds> +0000`, git's own epoch date syntax) — mirrors
+    /// `crate::slop_structural`'s own `git_dated` test helper, letting the
+    /// `long-term-update-share` fixtures below place commits precisely
+    /// across a file's simulated lifetime without racing the wall clock.
+    fn git_dated(dir: &Path, args: &[&str], epoch_seconds: i64) {
+        let date = format!("@{epoch_seconds} +0000");
+        run_git(
+            dir,
+            args,
+            &[
+                ("GIT_AUTHOR_DATE", date.as_str()),
+                ("GIT_COMMITTER_DATE", date.as_str()),
+            ],
+        );
+    }
+
+    #[test]
+    fn long_term_update_share_fires_for_sparse_activity_over_a_long_lifetime() {
+        let dir = TempDir::new("long-term-update-share-sparse");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let first = now_unix_seconds() - 1800 * 24 * 3600;
+        let offsets_days: [i64; 5] = [0, 400, 800, 1200, 1600];
+
+        for (i, offset) in offsets_days.iter().enumerate() {
+            std::fs::write(dir.join("sparse.rs"), format!("fn sparse() {{ {i} }}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git_dated(
+                &dir,
+                &["commit", "-q", "-m", &format!("edit {i}")],
+                first + *offset * 24 * 3600,
+            );
+        }
+
+        let outliers = long_term_update_share(&dir).unwrap();
+        let outlier = outliers
+            .iter()
+            .find(|o| o.file == PathBuf::from("sparse.rs"))
+            .unwrap_or_else(|| panic!("sparse.rs should fire long-term-update-share: {outliers:?}"));
+        assert!(
+            outlier.long_term_update_share < LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD,
+            "expected a low lifetime-wide update share, got {outlier:?}"
+        );
+        assert_eq!(outlier.active_bucket_count, 5);
+    }
+
+    #[test]
+    fn long_term_update_share_does_not_fire_for_steady_activity_across_a_long_lifetime() {
+        let dir = TempDir::new("long-term-update-share-steady");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let first = now_unix_seconds() - 360 * 24 * 3600;
+
+        for i in 0..=12i64 {
+            std::fs::write(dir.join("steady.rs"), format!("fn steady() {{ {i} }}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git_dated(
+                &dir,
+                &["commit", "-q", "-m", &format!("edit {i}")],
+                first + i * 30 * 24 * 3600,
+            );
+        }
+
+        let outliers = long_term_update_share(&dir).unwrap();
+        assert!(
+            outliers
+                .iter()
+                .all(|o| o.file != PathBuf::from("steady.rs")),
+            "expected steady, roughly-monthly activity across the whole lifetime not to fire: \
+             {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn long_term_update_share_does_not_fire_below_the_bucket_floor() {
+        let dir = TempDir::new("long-term-update-share-too-short");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let first = now_unix_seconds() - 100 * 24 * 3600;
+
+        std::fs::write(dir.join("young.rs"), "fn young() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git_dated(&dir, &["commit", "-q", "-m", "create"], first);
+
+        let outliers = long_term_update_share(&dir).unwrap();
+        assert!(
+            outliers.iter().all(|o| o.file != PathBuf::from("young.rs")),
+            "a file with fewer than MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE lifetime buckets \
+             must never fire, regardless of its commit pattern: {outliers:?}"
+        );
+    }
+
+    /// The rule's reason for existing: a file `legacy-freeze` calls frozen
+    /// (zero commits in the trailing 365-day window, while ≥2 siblings are
+    /// active in that window) can still have a HIGH `long_term_update_share`
+    /// if it was churned heavily across most of its recorded lifetime and
+    /// only recently went quiet — the two rules measure different things
+    /// and must not agree by construction.
+    #[test]
+    fn long_term_update_share_and_legacy_freeze_measure_different_things() {
+        let dir = TempDir::new("long-term-update-share-vs-legacy-freeze");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+
+        let first = now_unix_seconds() - 900 * 24 * 3600;
+        let offsets_days: [i64; 9] = [0, 60, 120, 180, 240, 300, 360, 420, 480];
+
+        for (i, offset) in offsets_days.iter().enumerate() {
+            std::fs::write(
+                dir.join("src/churned.rs"),
+                format!("fn churned() {{ {i} }}\n"),
+            )
+            .unwrap();
+            git(&dir, &["add", "."]);
+            git_dated(
+                &dir,
+                &["commit", "-q", "-m", &format!("churn {i}")],
+                first + *offset * 24 * 3600,
+            );
+        }
+
+        // Two siblings, both edited just now — recent enough to satisfy
+        // legacy-freeze's active-sibling requirement, while churned.rs's
+        // last commit (~420 days before this one) is well outside its
+        // 365-day window.
+        std::fs::write(dir.join("src/sibling_a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("src/sibling_b.rs"), "fn b() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "recent sibling activity"]);
+
+        let year_churn = churn(&dir, 365).unwrap();
+        let all_files = vec![
+            PathBuf::from("src/churned.rs"),
+            PathBuf::from("src/sibling_a.rs"),
+            PathBuf::from("src/sibling_b.rs"),
+        ];
+        let legacy_findings = crate::slop_structural::legacy_freeze(&year_churn, &all_files);
+        assert!(
+            legacy_findings
+                .iter()
+                .any(|f| f.location.file == PathBuf::from("src/churned.rs")),
+            "expected legacy-freeze to fire for churned.rs (frozen now, relative to its \
+             active siblings): {legacy_findings:?}"
+        );
+
+        let outliers = long_term_update_share(&dir).unwrap();
+        assert!(
+            outliers
+                .iter()
+                .all(|o| o.file != PathBuf::from("src/churned.rs")),
+            "expected long-term-update-share NOT to fire for a file churned across most of \
+             its recorded lifetime and only recently gone quiet — that's legacy-freeze's job, \
+             not this rule's: {outliers:?}"
+        );
     }
 
     #[test]

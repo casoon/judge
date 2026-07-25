@@ -786,6 +786,18 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::git::COMMIT_SIZE_DISTRIBUTION_RULE_REVISION,
         ),
         (
+            judge::git::MOVE_RATIO_RULE.to_string(),
+            judge::git::MOVE_RATIO_RULE_REVISION,
+        ),
+        (
+            judge::git::COPY_PASTE_RATIO_RULE.to_string(),
+            judge::git::COPY_PASTE_RATIO_RULE_REVISION,
+        ),
+        (
+            judge::git::LONG_TERM_UPDATE_SHARE_RULE.to_string(),
+            judge::git::LONG_TERM_UPDATE_SHARE_RULE_REVISION,
+        ),
+        (
             judge::duplication::DUPLICATE_RULE.to_string(),
             judge::duplication::DUPLICATE_RULE_REVISION,
         ),
@@ -972,6 +984,22 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         ),
         Err(err) => analysis_errors.push(err.to_string()),
     }
+    match judge::git::move_ratio(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
+        Ok(outliers) => findings.extend(
+            outliers
+                .iter()
+                .map(judge::git::MoveRatioOutlier::to_finding),
+        ),
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
+    match judge::git::long_term_update_share(&workspace.root) {
+        Ok(outliers) => findings.extend(
+            outliers
+                .iter()
+                .map(judge::git::LongTermUpdateShareOutlier::to_finding),
+        ),
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
     findings.extend(judge::slop_structural::complexity_inflation(
         &complexity.functions,
     ));
@@ -1032,6 +1060,15 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
     );
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     findings.extend(dupes.to_findings());
+
+    match judge::git::copy_paste_ratio(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS, &dupes) {
+        Ok(outliers) => findings.extend(
+            outliers
+                .iter()
+                .map(judge::git::CopyPasteRatioOutlier::to_finding),
+        ),
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
 
     let abstraction_source_files = workspace
         .crates

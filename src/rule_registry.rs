@@ -742,6 +742,33 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         verdict_effect: VerdictEffect::AdvisoryOnly,
         example: None,
     },
+    RuleMetadata {
+        id: "move-ratio",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier, needs real git history over `DEFAULT_WINDOW_DAYS` (365) days; part of bare `cargo judge` and `audit`).",
+        exclusions: "First-cut, adjustable ratio threshold (`MOVE_RATIO_THRESHOLD`, 0.7) and file-count floor (`MIN_FILES_FOR_MOVE_RATIO`, 3 — a one- or two-file rename is common and not interesting on its own). Rename/copy detection is `gix`'s own content-similarity heuristic (`Rewrites::default()`, 50% similarity, no copy tracking) classified in the analyzed window, not exact file identity: a heavily-edited file moved to a new path may fall under the similarity threshold and simply not be detected as a move, and conversely a coincidentally similar delete+add pair could be misclassified as one. Unlike `commit-size-distribution`, this is a flat per-commit threshold, not a window-level distribution claim.",
+        allowed_wording: "State only the moved-files count, total files changed, and the resulting ratio against the threshold — never that the commit 'is a pure rename', 'is safe', or 'needs no review' (todo.md §17.4); frame detection as similarity-based classification, not identity.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
+    },
+    RuleMetadata {
+        id: "copy-paste-ratio",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier, needs real git history over `DEFAULT_WINDOW_DAYS` (365) days plus the current `duplication::analyze_workspace` result; part of bare `cargo judge` and `audit`).",
+        exclusions: "This is a **retrospective approximation**, the most speculative git-signal rule in this crate: it checks whether a commit's added line numbers, evaluated at their position in the file's CURRENT (HEAD) content, fall inside a clone family detected in that CURRENT content — not whether duplication existed at commit time. If the file has been substantially edited since (lines shifted) or the duplicate has since been removed, or was introduced later by an unrelated commit at the same lines, this degrades gracefully to 'no overlap found' rather than a false-positive claim — a proxy, not proof, the same posture as `integer-cast-risk`/other heuristic proxies. Files renamed or deleted since the commit (no longer present at the same path at HEAD) are skipped entirely — no path-history tracking is attempted. First-cut, adjustable thresholds: `MIN_ADDED_LINES_FOR_COPY_PASTE_RATIO` (10) and `COPY_PASTE_RATIO_THRESHOLD` (0.3).",
+        allowed_wording: "State only the count of added, still-present lines currently inside a detected clone family, the total still-present added lines, and the resulting ratio against the threshold — never that the commit 'copy-pasted' or 'introduced a duplicate' (todo.md §17.4); frame this explicitly as duplication as it exists today at those line positions, not proof of what happened at commit time.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
+    },
+    RuleMetadata {
+        id: "long-term-update-share",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier, needs a file's full recorded commit history from its first touch to now — not a fixed `DEFAULT_WINDOW_DAYS` window like the other git-signal rules in this module; part of bare `cargo judge` and `audit`).",
+        exclusions: "First-cut, adjustable constants: a 30-day bucket unit (`LONG_TERM_UPDATE_SHARE_BUCKET_DAYS`, chosen to avoid calendar-month complexity, mirroring `churn-hotspot`'s day-based window style) and a 15% low-share threshold (`LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD`, same arbitrary-but-documented style as `MOVE_RATIO_THRESHOLD`). Files with fewer than `MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE` (6, roughly 180 days) lifetime buckets are excluded entirely — too little recorded history for the ratio to mean anything. Uses the same plain, non-rewrite-tracked tree diff as `churn`/`legacy-freeze`: a file renamed at any point in its history has its commit history split across its old and new paths, understating the older path's actual activity. **Deliberately orthogonal to `legacy-freeze`, not a restatement of it**: `legacy-freeze` is a snapshot asking whether a file is frozen *right now* relative to its currently active siblings; this rule asks whether a file was rarely touched across its *entire* recorded lifetime, independent of recent activity or sibling comparison. A file can have a low `long_term_update_share` while still being active this week (a burst of activity after a long quiet history — `legacy-freeze` would never fire on it), and conversely a file `legacy-freeze` flags as frozen can have a HIGH `long_term_update_share` (churned constantly for years, then stopped recently — this rule would not fire on it). Some files will naturally satisfy both; that overlap is expected and never artificially suppressed.",
+        allowed_wording: "State only the fraction of the file's recorded lifetime buckets touched, over how many buckets and days, against the threshold — never that the file is 'neglected', 'abandoned', or 'dead' (todo.md §17.4); this describes the whole recorded history's shape, not the file's current state.",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
+    },
     // -- module_graph.rs ------------------------------------------------
     RuleMetadata {
         id: "unlinked-file",
@@ -1435,8 +1462,20 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
         "needs real git commit history (window-scoped commit-size distribution) — not expressible as a single source snippet",
     ),
     (
+        "move-ratio",
+        "needs a real git commit with an actual rename/move (rewrite-tracked tree diff) — not expressible as a single source snippet",
+    ),
+    (
+        "copy-paste-ratio",
+        "needs real git commit history plus a `duplication::analyze_workspace` clone family detected in the CURRENT workspace at the commit's added line positions — not expressible as a single source snippet",
+    ),
+    (
         "legacy-freeze",
         "needs real git commit history (12-month window)",
+    ),
+    (
+        "long-term-update-share",
+        "needs a file's full recorded commit history spanning at least MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE (6) 30-day buckets — not expressible as a single source snippet",
     ),
 ];
 
@@ -1496,6 +1535,9 @@ mod tests {
             crate::git::SIZE_DISTRIBUTION_RULE,
             crate::git::COMPLEXITY_CONCENTRATION_RULE,
             crate::git::COMMIT_SIZE_DISTRIBUTION_RULE,
+            crate::git::MOVE_RATIO_RULE,
+            crate::git::COPY_PASTE_RATIO_RULE,
+            crate::git::LONG_TERM_UPDATE_SHARE_RULE,
             crate::module_graph::UNLINKED_FILE_RULE,
             crate::module_graph::ORPHAN_MODULE_RULE,
             crate::mutants::MUTATION_SURVIVOR_RULE,
