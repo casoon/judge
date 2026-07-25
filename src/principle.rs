@@ -25,7 +25,7 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus nine real detectors —
+//! sixteen table entries), plus ten real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
 //! (see [`functional_core_imperative_shell_candidates`]),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
@@ -40,11 +40,13 @@
 //! [`ParseDontValidate`](DesignPrinciple::ParseDontValidate) (see
 //! [`parse_dont_validate_candidates`]),
 //! [`ApiEvolvability`](DesignPrinciple::ApiEvolvability) (see
-//! [`api_evolvability_candidates`]), and
+//! [`api_evolvability_candidates`]),
 //! [`UnsafeContainment`](DesignPrinciple::UnsafeContainment) (see
-//! [`unsafe_containment_candidates`]). The remaining `DesignPrinciple`
-//! variants are unused for now; they document the target space rather than
-//! being implemented.
+//! [`unsafe_containment_candidates`]), and
+//! [`MakeIllegalStatesUnrepresentable`](DesignPrinciple::MakeIllegalStatesUnrepresentable)
+//! (see [`make_illegal_states_unrepresentable_candidates`]). The remaining
+//! `DesignPrinciple` variants are unused for now; they document the target
+//! space rather than being implemented.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -99,6 +101,20 @@ pub const LAW_OF_DEMETER_CHAIN_THRESHOLD: usize = 3;
 /// targets is real once callers can already rely on a combination of
 /// several fields at once.
 pub const API_EVOLVABILITY_MIN_FIELDS: usize = 2;
+
+/// Minimum count of `Option<T>` fields [`make_illegal_states_unrepresentable_
+/// candidates`] treats as "a struct with several candidate fields" (signal
+/// 1) — below this, there is nothing for signal 2's mutual-exclusivity check
+/// to corroborate (a single `Option<T>` field is never a "which one is set"
+/// question).
+pub const MISU_MIN_OPTION_FIELDS: usize = 2;
+
+/// Minimum count of usable struct-literal construction sites (sites that
+/// determinably set at least one candidate `Option<T>` field to either
+/// `Some(..)` or `None`) [`make_illegal_states_unrepresentable_candidates`]
+/// requires before drawing any conclusion from signal 2 — one data point is
+/// a coincidence, not corroboration.
+pub const MISU_MIN_CONSTRUCTION_SITES: usize = 2;
 
 /// A prüffähiges Designprinzip from todo.md §16.7's table. All sixteen table
 /// entries are represented so the enum documents the full target space, even
@@ -288,6 +304,7 @@ pub fn analyze_workspace(
     heuristics.extend(parse_dont_validate_candidates(workspace));
     heuristics.extend(api_evolvability_candidates(workspace));
     heuristics.extend(unsafe_containment_candidates(workspace));
+    heuristics.extend(make_illegal_states_unrepresentable_candidates(workspace));
     Ok(heuristics)
 }
 
@@ -3416,6 +3433,362 @@ fn build_unsafe_containment_heuristic(
     }
 }
 
+/// Whether `ty` is a `syn::Type::Path` whose last segment is literally
+/// `Option` — the same accepted-limitation, no-type-resolution matching
+/// [`primitive_scalar_kind`] and [`api_evolvability_candidates`]'s struct-
+/// name matching use elsewhere in this module; a local type alias also named
+/// `Option` would be misdetected, an accepted rare-case limitation.
+fn is_option_type(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Path(type_path) if type_path.qself.is_none() => type_path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "Option"),
+        _ => false,
+    }
+}
+
+/// A struct declaration found while scanning a crate for
+/// [`make_illegal_states_unrepresentable_candidates`]'s signal 1: its name,
+/// the names of its `Option<T>` fields (at least [`MISU_MIN_OPTION_FIELDS`]
+/// of them), and where it's declared. Any visibility is considered — unlike
+/// [`api_evolvability_candidates`], illegal-state modeling is an internal
+/// design concern, not only a public-API one.
+struct MisuStructCandidate {
+    name: String,
+    option_fields: Vec<String>,
+    location: EvidenceLocation,
+}
+
+/// Collects [`MisuStructCandidate`]s in one parsed file — a small,
+/// scope-specific `Visit` impl in the same style as this module's other
+/// structural collectors (e.g. [`EvolvableStructCollector`]), used instead
+/// of [`crate::dead_code::walk_type_items`] because that walker's
+/// `TypeItemSite` doesn't expose field-level detail, the same limitation
+/// [`EvolvableStructCollector`]'s own doc comment describes.
+struct MisuStructCollector {
+    file: PathBuf,
+    candidates: Vec<MisuStructCandidate>,
+}
+
+impl<'ast> Visit<'ast> for MisuStructCollector {
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if let syn::Fields::Named(named) = &node.fields {
+            let option_fields: Vec<String> = named
+                .named
+                .iter()
+                .filter_map(|field| {
+                    let ident = field.ident.as_ref()?;
+                    is_option_type(&field.ty).then(|| ident.to_string())
+                })
+                .collect();
+            if option_fields.len() >= MISU_MIN_OPTION_FIELDS {
+                self.candidates.push(MisuStructCandidate {
+                    name: node.ident.to_string(),
+                    option_fields,
+                    location: EvidenceLocation {
+                        file: self.file.clone(),
+                        item_path: Some(node.ident.to_string()),
+                    },
+                });
+            }
+        }
+        syn::visit::visit_item_struct(self, node);
+    }
+}
+
+/// How one candidate `Option<T>` field was set at a single struct-literal
+/// construction site. `Ambiguous` covers every shape other than a direct
+/// `Some(..)` call or a bare `None` path (a variable, a function call, a
+/// method chain, a nested struct literal, ...) — none of those can be
+/// resolved to Some-or-None without type information, so
+/// [`MisuConstructionCollector`] treats them as simply not observed rather
+/// than guessing either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldSetting {
+    SomeShaped,
+    NoneShaped,
+    Ambiguous,
+}
+
+/// Classifies one field-value expression from a struct literal as
+/// [`FieldSetting::SomeShaped`] (a direct `Some(..)` call), [`FieldSetting::
+/// NoneShaped`] (a bare `None` path), or [`FieldSetting::Ambiguous`] (see
+/// that variant's doc comment) — matched purely by last path segment, the
+/// same accepted-limitation approach [`is_option_type`] uses.
+fn field_setting(expr: &syn::Expr) -> FieldSetting {
+    match expr {
+        syn::Expr::Call(call) => match &*call.func {
+            syn::Expr::Path(path)
+                if path.path.segments.last().is_some_and(|s| s.ident == "Some") =>
+            {
+                FieldSetting::SomeShaped
+            }
+            _ => FieldSetting::Ambiguous,
+        },
+        syn::Expr::Path(path) if path.path.segments.last().is_some_and(|s| s.ident == "None") => {
+            FieldSetting::NoneShaped
+        }
+        _ => FieldSetting::Ambiguous,
+    }
+}
+
+/// One struct-literal construction expression (`Foo { a: Some(x), .. }`)
+/// found while scanning a crate for [`make_illegal_states_unrepresentable_
+/// candidates`]'s signal 2: which struct type it names (matched by last path
+/// segment only, same as [`StructConstructionCollector`]), where it appears,
+/// and the determinable [`FieldSetting`] of every named field present in the
+/// literal. A field that is absent from the literal, or present but
+/// [`FieldSetting::Ambiguous`], is simply missing from this map rather than
+/// guessed at.
+struct MisuConstructionSite {
+    type_name: String,
+    line: usize,
+    location: EvidenceLocation,
+    field_settings: BTreeMap<String, FieldSetting>,
+}
+
+/// Collects [`MisuConstructionSite`]s in one parsed file: every
+/// `syn::Expr::Struct` with at least one named field, anywhere in the file —
+/// not restricted to function bodies, the same crate-wide scope
+/// [`StructConstructionCollector`] uses for the same reason (a struct
+/// literal can appear in a `const`, a `static`, or any other item, not only
+/// inside a function).
+struct MisuConstructionCollector {
+    file: PathBuf,
+    sites: Vec<MisuConstructionSite>,
+}
+
+impl<'ast> Visit<'ast> for MisuConstructionCollector {
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        if let Some(segment) = node.path.segments.last() {
+            let mut field_settings = BTreeMap::new();
+            for field_value in &node.fields {
+                if let syn::Member::Named(ident) = &field_value.member {
+                    let setting = field_setting(&field_value.expr);
+                    if setting != FieldSetting::Ambiguous {
+                        field_settings.insert(ident.to_string(), setting);
+                    }
+                }
+            }
+            self.sites.push(MisuConstructionSite {
+                type_name: segment.ident.to_string(),
+                line: node.span().start().line,
+                location: EvidenceLocation {
+                    file: self.file.clone(),
+                    item_path: None,
+                },
+                field_settings,
+            });
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+}
+
+/// Make Illegal States Unrepresentable (todo.md §16.7's table): several
+/// independently-declared `Option<T>` fields on the same struct can, in
+/// principle, be set in any combination — including combinations the domain
+/// never actually intends. The naive version of this check ("a struct has
+/// ≥N `Option<T>` fields") would be far too noisy: independently optional
+/// fields (e.g. several unrelated config overrides) are extremely common and
+/// entirely legitimate. This heuristic instead requires genuine usage-based
+/// corroboration that the fields are, in practice, mutually exclusive — not
+/// just shaped that way.
+///
+/// Two independent signals, both required for the same struct:
+///
+/// 1. **Structural (AST)** — a struct (any visibility — illegal-state
+///    modeling is an internal design concern, not only a public-API one)
+///    with at least [`MISU_MIN_OPTION_FIELDS`] fields of type `Option<T>`
+///    ([`MisuStructCollector`]).
+/// 2. **Usage-based (independent, crate-wide)** — every struct-literal
+///    construction site anywhere in the crate that determinably sets at
+///    least one candidate field (explicitly `Some(..)` or explicitly
+///    `None` — an ambiguous assignment is skipped rather than guessed at,
+///    see [`FieldSetting::Ambiguous`]) sets at most one candidate field to
+///    `Some(..)` at the same time. At least [`MISU_MIN_CONSTRUCTION_SITES`]
+///    such usable sites are required — one data point is a coincidence, not
+///    a corroborated pattern — and a single site that sets more than one
+///    candidate field to `Some(..)` simultaneously disproves the pattern
+///    entirely, so no heuristic is produced for that struct.
+///
+/// This mirrors [`interface_segregation_candidates`]'s "structural +
+/// usage, both independently sourced" shape, but the usage signal itself is
+/// its own thing: it counts how many candidate fields are set to `Some(..)`
+/// per construction site and requires that count to never exceed one across
+/// every usable site, rather than [`api_evolvability_candidates`]'s "does at
+/// least one construction site exist" or [`parse_dont_validate_candidates`]'s
+/// per-function guard search.
+fn make_illegal_states_unrepresentable_candidates(
+    workspace: &Workspace,
+) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        let mut candidates: Vec<MisuStructCandidate> = Vec::new();
+        let mut construction_sites: Vec<MisuConstructionSite> = Vec::new();
+
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+
+            let mut struct_collector = MisuStructCollector {
+                file: source.path.clone(),
+                candidates: Vec::new(),
+            };
+            struct_collector.visit_file(&ast);
+            candidates.extend(struct_collector.candidates);
+
+            let mut construction_collector = MisuConstructionCollector {
+                file: source.path.clone(),
+                sites: Vec::new(),
+            };
+            construction_collector.visit_file(&ast);
+            construction_sites.extend(construction_collector.sites);
+        }
+
+        for candidate in &candidates {
+            let mut usable_sites: Vec<&MisuConstructionSite> = Vec::new();
+            let mut violates_exclusivity = false;
+            for site in construction_sites
+                .iter()
+                .filter(|site| site.type_name == candidate.name)
+            {
+                let determinable_count = candidate
+                    .option_fields
+                    .iter()
+                    .filter(|field| site.field_settings.contains_key(*field))
+                    .count();
+                if determinable_count == 0 {
+                    continue;
+                }
+                let some_count = candidate
+                    .option_fields
+                    .iter()
+                    .filter(|field| {
+                        site.field_settings.get(*field) == Some(&FieldSetting::SomeShaped)
+                    })
+                    .count();
+                if some_count > 1 {
+                    violates_exclusivity = true;
+                }
+                usable_sites.push(site);
+            }
+            if violates_exclusivity || usable_sites.len() < MISU_MIN_CONSTRUCTION_SITES {
+                continue;
+            }
+            usable_sites
+                .sort_by(|a, b| (&a.location.file, a.line).cmp(&(&b.location.file, b.line)));
+            heuristics.push(build_misu_heuristic(krate, candidate, &usable_sites));
+        }
+    }
+    heuristics
+}
+
+fn build_misu_heuristic(
+    krate: &CrateInfo,
+    candidate: &MisuStructCandidate,
+    usable_sites: &[&MisuConstructionSite],
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![candidate.name.clone()],
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{}` has {} `Option<T>` fields: {}.",
+            candidate.name,
+            candidate.option_fields.len(),
+            candidate.option_fields.join(", "),
+        ),
+        locations: vec![candidate.location.clone()],
+    };
+
+    let site_refs: Vec<String> = usable_sites
+        .iter()
+        .map(|site| format!("{}:{}", site.location.file.display(), site.line))
+        .collect();
+    let usage = Evidence {
+        description: format!(
+            "Observed across {} construction sites ({}), no site sets more than one of `{}`'s \
+             candidate `Option<T>` fields to `Some(..)` at the same time — every determinable \
+             construction site treats them as mutually exclusive.",
+            usable_sites.len(),
+            site_refs.join(", "),
+            candidate.name,
+        ),
+        locations: usable_sites
+            .iter()
+            .map(|site| site.location.clone())
+            .collect(),
+    };
+
+    let mut evidence_identities = vec![candidate.name.clone()];
+    evidence_identities.extend(site_refs.iter().cloned());
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::MakeIllegalStatesUnrepresentable,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::MakeIllegalStatesUnrepresentable,
+        scope,
+        evidence: vec![structural, usage],
+        interpretation: format!(
+            "`{}` declares {} `Option<T>` fields ({}), and every construction site in the crate \
+             that determinably sets any of them sets at most one to `Some(..)` at a time. That \
+             correlation suggests the fields might be better modeled as a single `enum` with one \
+             named variant per case, so the \"at most one set\" pattern becomes a property the \
+             compiler enforces rather than a convention every construction site happens to \
+             follow so far.",
+            candidate.name,
+            candidate.option_fields.len(),
+            candidate.option_fields.join(", "),
+        ),
+        contraindications: vec![
+            Contraindication {
+                description: "Fields that are genuinely independent optional overrides — where \
+                    any combination, including several set at once, is a valid and meaningful \
+                    state — would show the same observed shape without the fields actually \
+                    being illegal-state prone."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "A combination this heuristic never observed set together may still \
+                    have a real, if rare, valid meaning that the crate's current construction \
+                    sites simply haven't exercised yet."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether setting more than one of these fields at once would actually \
+                be an illegal state, or is instead a legitimate combination the examined \
+                construction sites simply haven't exercised, is not checked here — only that no \
+                observed site exercises it."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the fields as separate `Option<T>`s.".to_string(),
+            },
+            DesignAlternative {
+                description: "Replace the fields with a single `enum` whose variants name each \
+                    mutually exclusive case, so the \"at most one set\" invariant is enforced by \
+                    the type system instead of by every construction site's discipline."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5118,6 +5491,156 @@ mod tests {
             heuristics
                 .iter()
                 .all(|h| h.principle != DesignPrinciple::UnsafeContainment)
+        );
+    }
+
+    /// (a) A struct with [`MISU_MIN_OPTION_FIELDS`] `Option<T>` fields, and
+    /// three construction sites elsewhere in the crate where each site sets
+    /// at most one of the two fields to `Some(..)` (two sites set exactly
+    /// one field each, one site sets neither) ⇒ exactly one
+    /// `MakeIllegalStatesUnrepresentable` heuristic, with both evidence
+    /// slots populated and all three sites reflected in the usage evidence.
+    #[test]
+    fn misu_with_mutually_exclusive_construction_sites_produces_one_heuristic() {
+        let dir = TempDir::new("principle-misu-mutually-exclusive");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Shipping {\n\
+             \x20   pub express: Option<String>,\n\
+             \x20   pub pickup: Option<String>,\n\
+             }\n\
+             \n\
+             pub fn via_express(courier: String) -> Shipping {\n\
+             \x20   Shipping { express: Some(courier), pickup: None }\n\
+             }\n\
+             \n\
+             pub fn via_pickup(location: String) -> Shipping {\n\
+             \x20   Shipping { express: None, pickup: Some(location) }\n\
+             }\n\
+             \n\
+             pub fn unspecified() -> Shipping {\n\
+             \x20   Shipping { express: None, pickup: None }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let misu: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::MakeIllegalStatesUnrepresentable)
+            .collect();
+
+        assert_eq!(misu.len(), 1);
+        let heuristic = misu[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert_eq!(heuristic.evidence[1].locations.len(), 3);
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) The same struct shape and the same two mutually-exclusive sites,
+    /// but a third construction site sets BOTH fields to `Some(..)`
+    /// simultaneously ⇒ no heuristic — proves the mutual-exclusivity check
+    /// actually looks at real usage rather than assuming it.
+    #[test]
+    fn misu_with_simultaneous_construction_site_produces_no_heuristic() {
+        let dir = TempDir::new("principle-misu-simultaneous");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Shipping {\n\
+             \x20   pub express: Option<String>,\n\
+             \x20   pub pickup: Option<String>,\n\
+             }\n\
+             \n\
+             pub fn via_express(courier: String) -> Shipping {\n\
+             \x20   Shipping { express: Some(courier), pickup: None }\n\
+             }\n\
+             \n\
+             pub fn via_pickup(location: String) -> Shipping {\n\
+             \x20   Shipping { express: None, pickup: Some(location) }\n\
+             }\n\
+             \n\
+             pub fn via_both(courier: String, location: String) -> Shipping {\n\
+             \x20   Shipping { express: Some(courier), pickup: Some(location) }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::MakeIllegalStatesUnrepresentable)
+        );
+    }
+
+    /// (c) The same struct shape, but only one usable construction site
+    /// exists anywhere in the crate ⇒ no heuristic — proves the
+    /// [`MISU_MIN_CONSTRUCTION_SITES`] floor actually gates, one data point
+    /// is not corroboration.
+    #[test]
+    fn misu_with_one_construction_site_produces_no_heuristic() {
+        let dir = TempDir::new("principle-misu-one-site");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Shipping {\n\
+             \x20   pub express: Option<String>,\n\
+             \x20   pub pickup: Option<String>,\n\
+             }\n\
+             \n\
+             pub fn via_express(courier: String) -> Shipping {\n\
+             \x20   Shipping { express: Some(courier), pickup: None }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::MakeIllegalStatesUnrepresentable)
+        );
+    }
+
+    /// (d) A struct with only one `Option<T>` field (plus enough
+    /// construction sites to otherwise satisfy signal 2) ⇒ no heuristic —
+    /// proves [`MISU_MIN_OPTION_FIELDS`]'s signal 1 floor actually gates.
+    #[test]
+    fn misu_with_single_option_field_produces_no_heuristic() {
+        let dir = TempDir::new("principle-misu-single-field");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Shipping {\n\
+             \x20   pub express: Option<String>,\n\
+             \x20   pub carrier: String,\n\
+             }\n\
+             \n\
+             pub fn via_express(courier: String) -> Shipping {\n\
+             \x20   Shipping { express: Some(courier.clone()), carrier: courier }\n\
+             }\n\
+             \n\
+             pub fn without_express(courier: String) -> Shipping {\n\
+             \x20   Shipping { express: None, carrier: courier }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::MakeIllegalStatesUnrepresentable)
         );
     }
 }
