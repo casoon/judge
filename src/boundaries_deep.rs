@@ -108,7 +108,7 @@ pub fn analyze_workspace(
 
         let mut file_path_by_id: HashMap<FileId, PathBuf> = HashMap::new();
         for file in &krate.source_files {
-            if let Some(file_id) = ctx.file_id(&file.path) {
+            if let Some(file_id) = ctx.file_id(&file.path).map_err(BoundaryDeepError::Deep)? {
                 file_path_by_id.insert(file_id, file.path.clone());
             }
         }
@@ -124,7 +124,7 @@ pub fn analyze_workspace(
             if !in_forbidden_scope {
                 continue;
             }
-            let Some(file_id) = ctx.file_id(&file.path) else {
+            let Some(file_id) = ctx.file_id(&file.path).map_err(BoundaryDeepError::Deep)? else {
                 // Not indexed by the loader — nothing to query.
                 continue;
             };

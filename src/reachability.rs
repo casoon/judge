@@ -263,15 +263,19 @@ pub(crate) fn entry_point_positions(
 ) -> Result<Vec<(String, FilePosition)>, ReachabilityError> {
     let mut entries = Vec::new();
     for krate in &workspace.crates {
-        let bin_or_example_name: HashMap<FileId, &str> = krate
+        let mut bin_or_example_name: HashMap<FileId, &str> = HashMap::new();
+        for entry in krate
             .entry_points
             .iter()
             .filter(|entry| matches!(entry.kind, EntryPointKind::Bin | EntryPointKind::Example))
-            .filter_map(|entry| Some((ctx.file_id(&entry.path)?, entry.name.as_str())))
-            .collect();
+        {
+            if let Some(file_id) = ctx.file_id(&entry.path).map_err(ReachabilityError::Deep)? {
+                bin_or_example_name.insert(file_id, entry.name.as_str());
+            }
+        }
 
         for file in &krate.source_files {
-            let Some(file_id) = ctx.file_id(&file.path) else {
+            let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? else {
                 continue;
             };
             let source = std::fs::read_to_string(&file.path)
@@ -337,7 +341,7 @@ fn find_item_position(
     let mut matches: Vec<(FilePosition, PathBuf, usize)> = Vec::new();
     for krate in crates {
         for file in &krate.source_files {
-            let Some(file_id) = ctx.file_id(&file.path) else {
+            let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? else {
                 continue;
             };
             let source = std::fs::read_to_string(&file.path)
@@ -488,12 +492,16 @@ pub fn why_live(
     let db = ctx.raw_database();
     let sema = Semantics::new(db);
 
-    let file_source_kind: HashMap<FileId, SourceKind> = workspace
+    let mut file_source_kind: HashMap<FileId, SourceKind> = HashMap::new();
+    for file in workspace
         .crates
         .iter()
         .flat_map(|krate| &krate.source_files)
-        .filter_map(|file| Some((ctx.file_id(&file.path)?, file.kind)))
-        .collect();
+    {
+        if let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? {
+            file_source_kind.insert(file_id, file.kind);
+        }
+    }
 
     let entries = entry_point_positions(workspace, &ctx, include_tests)?;
     let entry_keys: HashSet<(FileId, u32)> = entries
@@ -577,8 +585,9 @@ fn describe_position(
 ) -> (PathBuf, usize) {
     for krate in &workspace.crates {
         for file in &krate.source_files {
-            if ctx.file_id(&file.path) != Some(position.file_id) {
-                continue;
+            match ctx.file_id(&file.path) {
+                Ok(Some(file_id)) if file_id == position.file_id => {}
+                _ => continue,
             }
             let line = std::fs::read_to_string(&file.path)
                 .ok()

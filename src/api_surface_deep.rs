@@ -228,14 +228,14 @@ fn build_module_index(
     workspace: &Workspace,
     ctx: &DeepContext,
     sema: &Semantics<'_, RootDatabase>,
-) -> Vec<ModuleFile> {
+) -> Result<Vec<ModuleFile>, DeepError> {
     let mut index = Vec::new();
     for krate in &workspace.crates {
         for file in &krate.source_files {
             if !file.kind.is_locally_reportable() {
                 continue;
             }
-            let Some(file_id) = ctx.file_id(&file.path) else {
+            let Some(file_id) = ctx.file_id(&file.path)? else {
                 continue;
             };
             let Some(module) = sema.file_to_module_def(file_id) else {
@@ -248,7 +248,7 @@ fn build_module_index(
             });
         }
     }
-    index
+    Ok(index)
 }
 
 /// Whether `vis` is a plain, unrestricted `pub` — not absent, and not a
@@ -500,8 +500,8 @@ fn re_export_chain_findings(
     ctx: &DeepContext,
     sema: &Semantics<'_, RootDatabase>,
     db: &RootDatabase,
-) -> Vec<Finding> {
-    let index = build_module_index(workspace, ctx, sema);
+) -> Result<Vec<Finding>, DeepError> {
+    let index = build_module_index(workspace, ctx, sema)?;
     let mut findings = Vec::new();
 
     for entry in &index {
@@ -559,7 +559,7 @@ fn re_export_chain_findings(
         }
     }
 
-    findings
+    Ok(findings)
 }
 
 /// Whether `krate` is one of the language's own crates (see
@@ -824,7 +824,8 @@ pub fn analyze_workspace(
                 if !file.kind.is_locally_reportable() {
                     continue;
                 }
-                let Some(file_id) = ctx.file_id(&file.path) else {
+                let Some(file_id) = ctx.file_id(&file.path).map_err(ApiSurfaceDeepError::Deep)?
+                else {
                     continue;
                 };
                 let Some(own_module) = sema.file_to_module_def(file_id) else {
@@ -861,9 +862,10 @@ pub fn analyze_workspace(
             }
         }
 
-        report
-            .findings
-            .extend(re_export_chain_findings(workspace, &ctx, &sema, db));
+        report.findings.extend(
+            re_export_chain_findings(workspace, &ctx, &sema, db)
+                .map_err(ApiSurfaceDeepError::Deep)?,
+        );
 
         Ok(report)
     })

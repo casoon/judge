@@ -381,7 +381,10 @@ pub fn analyze_workspace(workspace: &Workspace) -> Result<DeadTraitImplReport, D
         // only those whose trait is defined within the analyzed workspace.
         let mut resolved: Vec<(ImplCandidate, ra_ap_hir::Impl)> = Vec::new();
         for candidate in syn_candidates {
-            let Some(file_id) = ctx.file_id(&candidate.file_path) else {
+            let Some(file_id) = ctx
+                .file_id(&candidate.file_path)
+                .map_err(DeadCodeError::Deep)?
+            else {
                 continue;
             };
             let Some(impl_node) = resolve_impl_node(&sema, file_id, candidate.impl_token_span)
@@ -410,7 +413,7 @@ pub fn analyze_workspace(workspace: &Workspace) -> Result<DeadTraitImplReport, D
                 if !file.kind.is_locally_reportable() {
                     continue;
                 }
-                let Some(file_id) = ctx.file_id(&file.path) else {
+                let Some(file_id) = ctx.file_id(&file.path).map_err(DeadCodeError::Deep)? else {
                     continue;
                 };
                 let source_file = sema.parse_guess_edition(file_id);

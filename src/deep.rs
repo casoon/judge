@@ -201,19 +201,24 @@ impl DeepContext {
         self.host.raw_database()
     }
 
-    /// Resolves an absolute file path to the `FileId` the loader assigned it,
-    /// if the file was actually indexed (e.g. not excluded, and part of a
-    /// crate the loader discovered).
+    /// Resolves an absolute file path to the `FileId` the loader assigned it.
     ///
-    /// A path that is not absolute UTF-8 (see [`validated_utf8_abs`]) cannot
-    /// name a vfs file at all and comes back as `None` — the same conservative
-    /// "skip this file" answer as "not indexed", never a panic.
-    pub fn file_id(&self, path: &Path) -> Option<FileId> {
-        let abs_path = validated_utf8_abs(path).ok()?;
+    /// Three-way outcome, kept distinct because the two failure-shaped cases
+    /// mean different things (todo.md §17.5): a path that is not absolute
+    /// UTF-8 (see [`validated_utf8_abs`]) cannot name a vfs file at all and
+    /// is a real error, `Err(DeepError::InvalidPath)` — this should not
+    /// happen for any path built by `crate::ingest`, and callers may treat it
+    /// as such. A path that *is* well-formed but was never indexed (e.g.
+    /// excluded, or not part of a crate the loader discovered — see
+    /// `crate::feature_matrix`'s `#[cfg]`-exclusion case) is a legitimate,
+    /// expected skip, `Ok(None)`, never an error. Otherwise `Ok(Some(_))`.
+    pub fn file_id(&self, path: &Path) -> Result<Option<FileId>, DeepError> {
+        let abs_path = validated_utf8_abs(path)?;
         let vfs_path = VfsPath::from(abs_path);
-        self.vfs
+        Ok(self
+            .vfs
             .file_id(&vfs_path)
-            .map(|(file_id, _excluded)| file_id)
+            .map(|(file_id, _excluded)| file_id))
     }
 }
 
@@ -347,6 +352,7 @@ pub fn caller() -> i32 {
         let analysis = ctx.analysis();
         let file_id = ctx
             .file_id(&dir.join("src/lib.rs"))
+            .expect("path should be valid for the vfs")
             .expect("lib.rs should be indexed by the vfs");
 
         // Byte offset of the `used` identifier in `pub fn used`.
@@ -381,11 +387,14 @@ pub fn caller() -> i32 {
 
         // Piggybacked on the already-loaded (expensive) context: a relative
         // path used to panic inside `AbsPathBuf::assert_utf8` and must now be
-        // the same conservative `None` as "not indexed" (todo.md §15.2).
-        assert_eq!(
-            ctx.file_id(Path::new("src/lib.rs")),
-            None,
-            "a relative path names no vfs file and must be None, not a panic"
+        // a real `Err(InvalidPath)`, distinct from the legitimate `Ok(None)`
+        // "not indexed" skip (todo.md §17.5).
+        assert!(
+            matches!(
+                ctx.file_id(Path::new("src/lib.rs")),
+                Err(DeepError::InvalidPath(path)) if path == Path::new("src/lib.rs")
+            ),
+            "a relative path names no vfs file and must be InvalidPath, not a panic"
         );
     }
 
@@ -490,6 +499,7 @@ pub fn count_used(files: &[SourceFile]) -> usize {
         let analysis = ctx.analysis();
         let file_id = ctx
             .file_id(&dir.join("src/a.rs"))
+            .expect("path should be valid for the vfs")
             .expect("a.rs should be indexed by the vfs");
 
         // Byte offset of the `used` identifier in `pub const fn used`.
@@ -559,6 +569,7 @@ pub fn item() -> i32 {
         let analysis = ctx.analysis();
         let file_id = ctx
             .file_id(&dir.join("src/lib.rs"))
+            .expect("path should be valid for the vfs")
             .expect("lib.rs should be indexed by the vfs");
 
         // Strictly inside the leading comment's text.
@@ -646,6 +657,7 @@ mod tests {
         let analysis = ctx.analysis();
         let file_id = ctx
             .file_id(&dir.join("src/lib.rs"))
+            .expect("path should be valid for the vfs")
             .expect("lib.rs should be indexed by the vfs");
         let helper_offset = lib_source.find("helper").unwrap() as u32;
         let position = FilePosition {

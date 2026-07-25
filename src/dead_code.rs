@@ -1113,7 +1113,7 @@ pub fn analyze_workspace(
     let mut module_of_file: HashMap<FileId, String> = HashMap::new();
     for krate in &workspace.crates {
         for file in &krate.source_files {
-            if let Some(file_id) = ctx.file_id(&file.path) {
+            if let Some(file_id) = ctx.file_id(&file.path).map_err(DeadCodeError::Deep)? {
                 crate_of_file.insert(file_id, krate.name.as_str());
                 file_path_by_id.insert(file_id, file.path.clone());
                 if let Some(bucket) = top_level_module_bucket(&krate.root, &file.path, &krate.name)
@@ -1198,7 +1198,7 @@ pub fn analyze_workspace(
             if !file.kind.is_locally_reportable() {
                 continue;
             }
-            let Some(file_id) = ctx.file_id(&file.path) else {
+            let Some(file_id) = ctx.file_id(&file.path).map_err(DeadCodeError::Deep)? else {
                 // Not indexed by the loader (e.g. excluded, or the loader
                 // failed to discover this target) — nothing to query.
                 continue;
@@ -2164,7 +2164,7 @@ pub extern "C" fn exported_b() -> i32 {
             .iter()
             .find(|file| file.path.ends_with("src/lib.rs"))
             .unwrap();
-        let file_id = ctx.file_id(&file.path).unwrap();
+        let file_id = ctx.file_id(&file.path).unwrap().unwrap();
         let crate_of_file = HashMap::from([(file_id, krate.name.as_str())]);
         let module_of_file = HashMap::new();
         let entry_keys = std::collections::HashSet::new();

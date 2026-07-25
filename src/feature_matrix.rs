@@ -228,8 +228,13 @@ pub fn analyze_workspace(
             // `#[cfg]` evaluation excluded this file under this combination.
             // Expected signal that the item isn't compiled in here, not an
             // error.
-            let Some(file_id) = ctx.file_id(&candidate.file_path) else {
-                continue;
+            let file_id = match ctx.file_id(&candidate.file_path) {
+                Ok(Some(file_id)) => file_id,
+                Ok(None) => continue,
+                Err(err) => {
+                    report.errors.push(DeadCodeError::Deep(err));
+                    continue;
+                }
             };
             let position = FilePosition {
                 file_id,

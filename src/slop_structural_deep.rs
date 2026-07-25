@@ -214,8 +214,13 @@ fn collect_function_fan_in(
             if !file.kind.is_locally_reportable() {
                 continue;
             }
-            let Some(file_id) = ctx.file_id(&file.path) else {
-                continue;
+            let file_id = match ctx.file_id(&file.path) {
+                Ok(Some(file_id)) => file_id,
+                Ok(None) => continue,
+                Err(err) => {
+                    errors.push(SlopStructuralDeepError::Deep(err));
+                    continue;
+                }
             };
 
             let source = match std::fs::read_to_string(&file.path) {
@@ -482,8 +487,13 @@ fn orphaned_code_findings(
         if active_authors.contains(dominant_author) {
             continue;
         }
-        let Some(file_id) = ctx.file_id(&record.file) else {
-            continue;
+        let file_id = match ctx.file_id(&record.file) {
+            Ok(Some(file_id)) => file_id,
+            Ok(None) => continue,
+            Err(err) => {
+                errors.push(SlopStructuralDeepError::Deep(err));
+                continue;
+            }
         };
         let position = ra_ap_ide::FilePosition {
             file_id,
