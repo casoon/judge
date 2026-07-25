@@ -1,13 +1,13 @@
 //! Structural slop signals (see todo.md §3.G "G4 — Strukturelle
-//! Slop-Signale"). Four of the six G4 rules live here: `churn-hotspot`,
-//! `complexity-inflation`, `legacy-freeze`, `abstraction-inflation`. Unlike
-//! [`crate::slop`], most of these don't parse files as their primary
-//! signal — `churn-hotspot`/`legacy-freeze` aggregate [`crate::git::churn`]
-//! output, `complexity-inflation` aggregates
-//! [`crate::complexity::FunctionInfo`]. `abstraction-inflation` is the
-//! exception: it needs its own workspace-wide `syn` pass (trait-impl
-//! counts, wrapper-struct delegation, builder-struct shape), since none of
-//! the existing analyzers already compute that.
+//! Slop-Signale"). Three of the six G4 rules live here: `churn-hotspot`,
+//! `complexity-inflation`, `abstraction-inflation`. Unlike [`crate::slop`],
+//! most of these don't parse files as their primary signal —
+//! `churn-hotspot` aggregates [`crate::git::churn`] output,
+//! `complexity-inflation` aggregates [`crate::complexity::FunctionInfo`].
+//! `abstraction-inflation` is the exception: it needs its own
+//! workspace-wide `syn` pass (trait-impl counts, wrapper-struct delegation,
+//! builder-struct shape), since none of the existing analyzers already
+//! compute that.
 //!
 //! The other two G4 rules, `duplicative-reinvention` and
 //! `connectivity-drop`, need cross-file reference data (fan-in per item)
@@ -51,11 +51,6 @@ pub const CHURN_HOTSPOT_RULE_REVISION: u32 = 1;
 /// §3.G).
 pub const COMPLEXITY_INFLATION_RULE: &str = "complexity-inflation";
 pub const COMPLEXITY_INFLATION_RULE_REVISION: u32 = 3;
-
-/// Rule id for a file untouched for a year while its neighbors keep
-/// changing (see todo.md §3.G).
-pub const LEGACY_FREEZE_RULE: &str = "legacy-freeze";
-pub const LEGACY_FREEZE_RULE_REVISION: u32 = 1;
 
 /// Rule id shared by all three `abstraction-inflation` sub-patterns
 /// (single-impl trait, delegating wrapper, builder for a small struct —
@@ -200,62 +195,6 @@ pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
             causes: Vec::new(),
         })
         .collect()
-}
-
-/// Minimum number of sibling files (same parent directory) that changed
-/// within the last 12 months for an unchanged file to count as frozen (see
-/// todo.md §3.G: "Module ohne Änderung >12 Monate bei gleichzeitig
-/// wachsendem Umfeld"). Below this, an unchanged file is just as likely to
-/// be a quiet corner of a quiet directory as a frozen spot in an otherwise
-/// active one.
-const MIN_ACTIVE_SIBLINGS: u32 = 2;
-/// The churn window this rule assumes its caller used — see [`legacy_freeze`].
-const LEGACY_FREEZE_WINDOW_DAYS: i64 = 365;
-
-/// Flags files with zero commits in the last 12 months whose directory
-/// otherwise keeps changing — a module the rest of its neighborhood has
-/// moved past (see todo.md §3.G). `churn_12mo` and `all_files` must use the
-/// same path representation (both relative to the repository root,
-/// matching [`crate::git::churn`]'s own convention) for the
-/// membership/sibling comparisons below to line up.
-pub fn legacy_freeze(churn_12mo: &HashMap<PathBuf, u32>, all_files: &[PathBuf]) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    for file in all_files {
-        let is_active = churn_12mo.get(file).is_some_and(|&count| count > 0);
-        if is_active {
-            continue;
-        }
-        let Some(parent) = file.parent() else {
-            continue;
-        };
-        let active_siblings = all_files
-            .iter()
-            .filter(|other| other.as_path() != file.as_path() && other.parent() == Some(parent))
-            .filter(|other| churn_12mo.get(*other).is_some_and(|&count| count > 0))
-            .count() as u32;
-        if active_siblings < MIN_ACTIVE_SIBLINGS {
-            continue;
-        }
-        findings.push(Finding {
-            id: format!("{LEGACY_FREEZE_RULE}:{}", file.display()).into(),
-            rule: LEGACY_FREEZE_RULE.into(),
-            severity: Severity::Info,
-            location: Location {
-                file: file.clone(),
-                line: OneBasedLine::FIRST,
-                item_path: file.display().to_string(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
-                "active_siblings": active_siblings,
-                "window_days": LEGACY_FREEZE_WINDOW_DAYS,
-            })),
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
-    }
-    findings
 }
 
 /// Traits conventionally derived (`#[derive(...)]`) rather than
@@ -910,29 +849,6 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
-    /// Commits with both author and committer date pinned to `epoch_seconds`
-    /// (`@<seconds> +0000`, git's own epoch date syntax), so `legacy_freeze`
-    /// fixtures below can place commits precisely inside or outside its
-    /// 365-day window without racing the wall clock.
-    fn git_dated(dir: &Path, args: &[&str], epoch_seconds: i64) {
-        let date = format!("@{epoch_seconds} +0000");
-        run_git(
-            dir,
-            args,
-            &[
-                ("GIT_AUTHOR_DATE", date.as_str()),
-                ("GIT_COMMITTER_DATE", date.as_str()),
-            ],
-        );
-    }
-
-    fn now_unix_seconds() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64
-    }
-
     /// `churn-hotspot` (todo.md §17.5 candidate 1) — unentscheidbar: a file
     /// renamed mid-window. [`crate::git::churn`] walks a plain tree diff
     /// with no rewrite/rename tracking configured, so a `git mv` commit is
@@ -1210,118 +1126,6 @@ mod tests {
                 .filter(|f| f.rule == COMPLEXITY_INFLATION_RULE)
                 .count(),
             1
-        );
-    }
-
-    #[test]
-    fn legacy_freeze_fires_when_enough_siblings_are_active() {
-        let churn = HashMap::from([
-            (PathBuf::from("src/a.rs"), 3),
-            (PathBuf::from("src/b.rs"), 1),
-        ]);
-        let all_files = vec![
-            PathBuf::from("src/a.rs"),
-            PathBuf::from("src/b.rs"),
-            PathBuf::from("src/frozen.rs"),
-        ];
-
-        let findings = legacy_freeze(&churn, &all_files);
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].location.file, PathBuf::from("src/frozen.rs"));
-        assert_eq!(
-            findings[0].evidence,
-            Some(json!({"active_siblings": 2, "window_days": 365}))
-        );
-    }
-
-    #[test]
-    fn legacy_freeze_does_not_fire_with_zero_active_siblings() {
-        let churn: HashMap<PathBuf, u32> = HashMap::new();
-        let all_files = vec![PathBuf::from("src/a.rs"), PathBuf::from("src/frozen.rs")];
-
-        assert!(legacy_freeze(&churn, &all_files).is_empty());
-    }
-
-    #[test]
-    fn legacy_freeze_does_not_fire_with_only_one_active_sibling() {
-        let churn = HashMap::from([(PathBuf::from("src/a.rs"), 3)]);
-        let all_files = vec![
-            PathBuf::from("src/a.rs"),
-            PathBuf::from("src/b.rs"),
-            PathBuf::from("src/frozen.rs"),
-        ];
-
-        assert!(legacy_freeze(&churn, &all_files).is_empty());
-    }
-
-    /// `legacy-freeze` (todo.md §17.5 candidate 3) — unentscheidbar:
-    /// [`legacy_freeze`] only sees whether *any* commit landed inside the
-    /// 365-day window, never how much history a file had before that window
-    /// opened. A file with exactly one commit ever (created once, never
-    /// touched again) and a file that was actively edited for a while and
-    /// then went quiet look identical to this rule once both trails end
-    /// more than 365 days ago — same `is_active = false`, same evidence
-    /// shape. Golden test of that: both fire, with indistinguishable
-    /// evidence, so "just created and abandoned" and "was active, now
-    /// frozen since X" can't be told apart from `churn_12mo` alone.
-    #[test]
-    fn legacy_freeze_cannot_distinguish_created_once_from_once_active_then_frozen() {
-        let dir = TempDir::new("legacy-freeze-created-vs-frozen");
-        git(&dir, &["init", "-q", "-b", "main"]);
-
-        let old_time = now_unix_seconds() - 400 * 24 * 3600;
-        let older_time = old_time - 10 * 24 * 3600;
-        let oldest_time = older_time - 10 * 24 * 3600;
-
-        std::fs::write(dir.join("once.rs"), "fn once() {}\n").unwrap();
-        std::fs::write(dir.join("long_lived.rs"), "fn a() {}\n").unwrap();
-        git(&dir, &["add", "."]);
-        git_dated(&dir, &["commit", "-q", "-m", "create both"], oldest_time);
-
-        std::fs::write(dir.join("long_lived.rs"), "fn a() { 1 }\n").unwrap();
-        git_dated(
-            &dir,
-            &["commit", "-q", "-am", "edit long_lived"],
-            older_time,
-        );
-
-        std::fs::write(dir.join("long_lived.rs"), "fn a() { 2 }\n").unwrap();
-        git_dated(
-            &dir,
-            &["commit", "-q", "-am", "edit long_lived again"],
-            old_time,
-        );
-
-        std::fs::write(dir.join("a.rs"), "fn s() {}\n").unwrap();
-        std::fs::write(dir.join("b.rs"), "fn s() {}\n").unwrap();
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "recent sibling activity"]);
-
-        let churn = crate::git::churn(&dir, LEGACY_FREEZE_WINDOW_DAYS).unwrap();
-        assert!(!churn.contains_key(&PathBuf::from("once.rs")));
-        assert!(!churn.contains_key(&PathBuf::from("long_lived.rs")));
-
-        let all_files = vec![
-            PathBuf::from("once.rs"),
-            PathBuf::from("long_lived.rs"),
-            PathBuf::from("a.rs"),
-            PathBuf::from("b.rs"),
-        ];
-
-        let findings = legacy_freeze(&churn, &all_files);
-        let find = |name: &str| {
-            findings
-                .iter()
-                .find(|f| f.location.file == Path::new(name))
-                .unwrap_or_else(|| panic!("expected {name} to be flagged: {findings:?}"))
-        };
-        let once_finding = find("once.rs");
-        let long_lived_finding = find("long_lived.rs");
-
-        assert_eq!(
-            once_finding.evidence, long_lived_finding.evidence,
-            "created-once and actively-developed-then-frozen produce identical evidence"
         );
     }
 

@@ -200,7 +200,7 @@ mod tests {
     /// verbatim (especially the deliberately-malformed, missing-reason
     /// cases below) would itself read as a real directive when `judge`
     /// analyzes its own `suppression.rs`, wherever a `duplicate-code`/
-    /// `legacy-freeze`/etc. finding happens to land on or next to that line.
+    /// `churn-hotspot`/etc. finding happens to land on or next to that line.
     fn ignore_marker() -> String {
         ["judge", "-ignore:"].concat()
     }

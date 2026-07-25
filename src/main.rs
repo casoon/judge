@@ -782,22 +782,6 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::git::COMPLEXITY_CONCENTRATION_RULE_REVISION,
         ),
         (
-            judge::git::COMMIT_SIZE_DISTRIBUTION_RULE.to_string(),
-            judge::git::COMMIT_SIZE_DISTRIBUTION_RULE_REVISION,
-        ),
-        (
-            judge::git::MOVE_RATIO_RULE.to_string(),
-            judge::git::MOVE_RATIO_RULE_REVISION,
-        ),
-        (
-            judge::git::COPY_PASTE_RATIO_RULE.to_string(),
-            judge::git::COPY_PASTE_RATIO_RULE_REVISION,
-        ),
-        (
-            judge::git::LONG_TERM_UPDATE_SHARE_RULE.to_string(),
-            judge::git::LONG_TERM_UPDATE_SHARE_RULE_REVISION,
-        ),
-        (
             judge::git::CROSS_FILE_CONNECTIVITY_RULE.to_string(),
             judge::git::CROSS_FILE_CONNECTIVITY_RULE_REVISION,
         ),
@@ -906,10 +890,6 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
         ),
         (
-            judge::ownership::KNOWLEDGE_LOSS_RISK_RULE.to_string(),
-            judge::ownership::KNOWLEDGE_LOSS_RISK_RULE_REVISION,
-        ),
-        (
             judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
             judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
         ),
@@ -928,10 +908,6 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         (
             judge::complexity::MAINTAINABILITY_INDEX_RULE.to_string(),
             judge::complexity::MAINTAINABILITY_INDEX_RULE_REVISION,
-        ),
-        (
-            judge::slop_structural::LEGACY_FREEZE_RULE.to_string(),
-            judge::slop_structural::LEGACY_FREEZE_RULE_REVISION,
         ),
         (
             judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
@@ -992,30 +968,6 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             .iter()
             .map(judge::git::ComplexityConcentrationOutlier::to_finding),
     );
-    match judge::git::commit_size_distribution(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
-        Ok(outliers) => findings.extend(
-            outliers
-                .iter()
-                .map(judge::git::CommitSizeDistributionOutlier::to_finding),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-    match judge::git::move_ratio(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
-        Ok(outliers) => findings.extend(
-            outliers
-                .iter()
-                .map(judge::git::MoveRatioOutlier::to_finding),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-    match judge::git::long_term_update_share(&workspace.root) {
-        Ok(outliers) => findings.extend(
-            outliers
-                .iter()
-                .map(judge::git::LongTermUpdateShareOutlier::to_finding),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
     match judge::git::cross_file_connectivity(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
         Ok(outliers) => findings.extend(
             outliers
@@ -1034,33 +986,12 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         &complexity.functions,
     ));
 
-    // G4 structural slop: `churn-hotspot` (2-week window) and `legacy-freeze`
-    // (12-month window) each need their own [`judge::git::churn`] call at a
-    // different window than [`judge::git::hotspots`]'s internal one above —
-    // matching the precedent set by `churn-hotspot`'s own additional call.
+    // G4 structural slop: `churn-hotspot` needs its own [`judge::git::churn`]
+    // call at a different window (2 weeks) than [`judge::git::hotspots`]'s
+    // internal one above.
     match judge::git::churn(&workspace.root, 14) {
         Ok(two_week_churn) => {
             findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
-        }
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-    match judge::git::churn(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
-        Ok(year_churn) => {
-            let all_files: Vec<PathBuf> = workspace
-                .crates
-                .iter()
-                .flat_map(|krate| krate.source_files.iter())
-                .filter_map(|file| {
-                    file.path
-                        .strip_prefix(&workspace.root)
-                        .ok()
-                        .map(Path::to_path_buf)
-                })
-                .collect();
-            findings.extend(judge::slop_structural::legacy_freeze(
-                &year_churn,
-                &all_files,
-            ));
         }
         Err(err) => analysis_errors.push(err.to_string()),
     }
@@ -1090,15 +1021,6 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
     );
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     findings.extend(dupes.to_findings());
-
-    match judge::git::copy_paste_ratio(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS, &dupes) {
-        Ok(outliers) => findings.extend(
-            outliers
-                .iter()
-                .map(judge::git::CopyPasteRatioOutlier::to_finding),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
 
     let abstraction_source_files = workspace
         .crates
@@ -2601,10 +2523,6 @@ fn run_distribution(
                 judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
             ),
             (
-                judge::ownership::KNOWLEDGE_LOSS_RISK_RULE.to_string(),
-                judge::ownership::KNOWLEDGE_LOSS_RISK_RULE_REVISION,
-            ),
-            (
                 judge::ownership::OWNERSHIP_FRAGMENTATION_RULE.to_string(),
                 judge::ownership::OWNERSHIP_FRAGMENTATION_RULE_REVISION,
             ),
@@ -2653,12 +2571,9 @@ fn run_distribution(
                 writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
             }
 
-            let (bus_factor, rest): (Vec<&Finding>, Vec<&Finding>) = findings
+            let (bus_factor, fragmentation): (Vec<&Finding>, Vec<&Finding>) = findings
                 .iter()
                 .partition(|finding| finding.rule == judge::ownership::LOW_BUS_FACTOR_RULE);
-            let (knowledge_loss_risk, fragmentation): (Vec<&Finding>, Vec<&Finding>) = rest
-                .into_iter()
-                .partition(|finding| finding.rule == judge::ownership::KNOWLEDGE_LOSS_RISK_RULE);
 
             writeln!(out)?;
             writeln!(out, "low-bus-factor findings: {}", bus_factor.len())?;
@@ -2666,22 +2581,6 @@ fn run_distribution(
                 writeln!(
                     out,
                     "  [{}] {}  primary author: {}",
-                    severity_label(finding.severity),
-                    finding.location.file.display(),
-                    finding.location.item_path
-                )?;
-            }
-
-            writeln!(out)?;
-            writeln!(
-                out,
-                "knowledge-loss-risk findings: {}",
-                knowledge_loss_risk.len()
-            )?;
-            for finding in &knowledge_loss_risk {
-                writeln!(
-                    out,
-                    "  [{}] {}  {}",
                     severity_label(finding.severity),
                     finding.location.file.display(),
                     finding.location.item_path
@@ -3739,11 +3638,10 @@ fn run_dead_code_deep(
 
     // `orphaned-code` needs a file's dominant blame author and the repo's
     // active-author set — same Fast Tier, git-blame-based data
-    // `low-bus-factor`/`knowledge-loss-risk` already compute (see
-    // `judge::ownership` module docs). Only `.files` is used here; the
-    // low-bus-factor/knowledge-loss-risk/ownership-fragmentation findings
-    // this also computes belong to `cargo judge distribution`, not this
-    // command, so they're discarded.
+    // `low-bus-factor` already computes (see `judge::ownership` module
+    // docs). Only `.files` is used here; the low-bus-factor/
+    // ownership-fragmentation findings this also computes belong to `cargo
+    // judge distribution`, not this command, so they're discarded.
     let window_days = judge::git::DEFAULT_WINDOW_DAYS;
     let active_authors = judge::git::active_authors_since(&workspace.root, window_days)?;
     let ownership_report = judge::ownership::analyze_workspace(&workspace, window_days)?;
@@ -4127,26 +4025,6 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
         }
         Err(err) => analysis_errors.push(err.to_string()),
     }
-    match judge::git::churn(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
-        Ok(year_churn) => {
-            let all_files: Vec<PathBuf> = workspace
-                .crates
-                .iter()
-                .flat_map(|krate| krate.source_files.iter())
-                .filter_map(|file| {
-                    file.path
-                        .strip_prefix(&workspace.root)
-                        .ok()
-                        .map(Path::to_path_buf)
-                })
-                .collect();
-            findings.extend(judge::slop_structural::legacy_freeze(
-                &year_churn,
-                &all_files,
-            ));
-        }
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
     let abstraction_source_files = workspace
         .crates
         .iter()
@@ -4282,10 +4160,6 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
             (
                 judge::complexity::SIGNATURE_COMPLEXITY_RULE.to_string(),
                 judge::complexity::SIGNATURE_COMPLEXITY_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::LEGACY_FREEZE_RULE.to_string(),
-                judge::slop_structural::LEGACY_FREEZE_RULE_REVISION,
             ),
             (
                 judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
@@ -4617,7 +4491,7 @@ fn print_hotspots(
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 26] = [
+const SLOP_RULES: [&str; 25] = [
     judge::slop::SWALLOWED_RESULT_RULE,
     judge::slop::EMPTY_ERROR_ARM_RULE,
     judge::slop::CATCH_ALL_ERROR_RULE,
@@ -4636,7 +4510,6 @@ const SLOP_RULES: [&str; 26] = [
     judge::slop_structural::COMPLEXITY_INFLATION_RULE,
     judge::complexity::SIGNATURE_COMPLEXITY_RULE,
     judge::complexity::MAINTAINABILITY_INDEX_RULE,
-    judge::slop_structural::LEGACY_FREEZE_RULE,
     judge::slop_structural::ABSTRACTION_INFLATION_RULE,
     judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
     judge::security::UNSAFE_SURFACE_RULE,
@@ -4827,7 +4700,7 @@ mod tests {
     /// verbatim (especially the deliberately-malformed, missing-reason
     /// cases below) would itself read as a real directive when `judge`
     /// analyzes its own `main.rs`, wherever a `duplicate-code`/
-    /// `legacy-freeze`/etc. finding happens to land on or next to that line.
+    /// `churn-hotspot`/etc. finding happens to land on or next to that line.
     fn ignore_marker() -> String {
         ["judge", "-ignore:"].concat()
     }

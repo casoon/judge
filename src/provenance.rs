@@ -928,9 +928,6 @@ mod tests {
             message_title: "an ordinary commit".to_string(),
             message_body: String::new(),
             files_changed: vec![PathBuf::from("a.rs")],
-            lines_changed: 0,
-            moved_files: 0,
-            added_line_ranges: Vec::new(),
         }
     }
 

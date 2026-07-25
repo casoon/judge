@@ -428,10 +428,10 @@ fn duplicative_reinvention_findings(
 /// `Severity::Info`, `EvidenceClass::Heuristic`: even though the fan-in and
 /// reachability legs are exact Deep Tier facts, "the file-level dominant
 /// author is inactive" is inherently interpretive (the same classification
-/// `low-bus-factor`/`knowledge-loss-risk` already use for that judgment),
-/// and this rule compounds several heterogeneous signal types into one
-/// claim — never "totter Code"/"sicher löschbar", only that these three
-/// conditions co-occurred in the examined view.
+/// `low-bus-factor` already uses for that judgment), and this rule compounds
+/// several heterogeneous signal types into one claim — never "totter
+/// Code"/"sicher löschbar", only that these three conditions co-occurred in
+/// the examined view.
 fn orphaned_code_findings(
     workspace: &Workspace,
     ctx: &DeepContext,
@@ -639,10 +639,10 @@ fn monomorphization_load_findings(
 /// `complexity_functions` is the caller's already-computed
 /// [`crate::complexity::WorkspaceComplexity::functions`] (Fast Tier), reused
 /// as-is for its `generic_param_count` — see [`monomorphization_load_findings`].
-/// `orphaned-code` is skipped entirely (same as `low-bus-factor`/
-/// `knowledge-loss-risk`, see [`crate::ownership::LOW_BUS_FACTOR_MIN_REPO_AUTHORS`])
-/// if the repository doesn't have enough distinct active authors for
-/// "inactive" to be a meaningful comparison.
+/// `orphaned-code` is skipped entirely (same as `low-bus-factor`, see
+/// [`crate::ownership::LOW_BUS_FACTOR_MIN_REPO_AUTHORS`]) if the repository
+/// doesn't have enough distinct active authors for "inactive" to be a
+/// meaningful comparison.
 pub fn analyze_workspace(
     workspace: &Workspace,
     duplication: &WorkspaceDuplication,

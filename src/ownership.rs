@@ -1,19 +1,12 @@
 //! Ownership / code distribution via `git blame` (see todo.md §3.E
-//! "Ownership / Code-Verteilung"). Deliberately scoped to four of the five
+//! "Ownership / Code-Verteilung"). Deliberately scoped to three of the five
 //! metrics in that table:
 //!
 //! - `primary-author-share`: the dominant author's share of a file's lines.
 //! - `bus-factor`: the fewest top authors (by lines) whose cumulative share
-//!   exceeds 50%.
-//! - `knowledge-loss-risk`: the full "line-share of authors with no commit
-//!   in N months" from the table — see
-//!   [`FileOwnership::to_knowledge_loss_risk_finding`]. `low-bus-factor` is
-//!   the narrower single-dominant-author special case of the same
-//!   underlying signal; the two are expected to co-fire often (a
-//!   bus-factor-1 file with an inactive sole author trivially has an
-//!   inactive share near 100%), and that overlap is intentional, not a bug
-//!   — see that method's docs for the diffused-ownership case
-//!   `knowledge-loss-risk` newly covers.
+//!   exceeds 50%, surfaced as `low-bus-factor` when that share is
+//!   concentrated in a single, now-inactive author (see
+//!   [`FileOwnership::to_finding`]).
 //! - `ownership-fragmentation`: many small blame shares with no dominant
 //!   owner (advisory heuristic — see
 //!   [`FileOwnership::to_fragmentation_finding`]).
@@ -58,21 +51,6 @@ pub const LOW_BUS_FACTOR_RULE_REVISION: u32 = 2;
 /// `orphaned-code` for the same repo-level gate on its own
 /// dominant-author-inactive leg.
 pub(crate) const LOW_BUS_FACTOR_MIN_REPO_AUTHORS: usize = 2;
-
-/// Rule id used for [`FileOwnership`] findings whose share of blamed lines
-/// from now-inactive authors exceeds [`KNOWLEDGE_LOSS_RISK_SHARE_THRESHOLD`]
-/// (see todo.md §3.E "knowledge-loss-risk": "line-share of authors with no
-/// commit in N months").
-pub const KNOWLEDGE_LOSS_RISK_RULE: &str = "knowledge-loss-risk";
-/// Bump when the knowledge-loss-risk rule's logic changes (see todo.md §5
-/// "Regelversions-Schutz").
-pub const KNOWLEDGE_LOSS_RISK_RULE_REVISION: u32 = 1;
-
-/// `knowledge-loss-risk` fires once the share of a file's blamed lines
-/// belonging to authors no longer active anywhere in the repo exceeds this
-/// fraction — a majority of the file's current lines, the same 50% framing
-/// `low-bus-factor` already uses for its own bus-factor cutoff.
-const KNOWLEDGE_LOSS_RISK_SHARE_THRESHOLD: f64 = 0.5;
 
 /// Rule id for files whose blame is split into many small author shares with
 /// no dominant owner (todo.md §3.E: "Verteilung vieler kleiner Blame-Anteile;
@@ -158,82 +136,6 @@ impl FileOwnership {
         })
     }
 
-    /// Renders a `knowledge-loss-risk` [`Finding`] if the share of this
-    /// file's blamed lines belonging to authors no longer active anywhere in
-    /// the repo exceeds [`KNOWLEDGE_LOSS_RISK_SHARE_THRESHOLD`]. This
-    /// generalizes `low-bus-factor` beyond the single-dominant-author case:
-    /// a file can have several roughly-equal-share authors — no individual
-    /// author dominant enough for `bus_factor` to be 1 — where all of them
-    /// have since gone inactive, diffusing the risk `low-bus-factor` alone
-    /// would miss (it only ever looks at bus-factor-1 files). A bus-factor-1
-    /// file with an inactive sole author trivially has an inactive share
-    /// near 100% here too, so the two rules are expected to co-fire often —
-    /// that overlap is intentional (see the module doc comment), not
-    /// double-counting. `Severity::Fail` if none of the file's blamed
-    /// authors are currently active (the strongest form of the signal);
-    /// `Severity::Warn` if some are, but their combined share still doesn't
-    /// reach a majority. The evidence class is `heuristic` for the same
-    /// reason as `low-bus-factor`: the blame shares are exact historical
-    /// facts, but "this is a knowledge risk" is an interpretation of them.
-    /// Callers must additionally gate this on
-    /// [`LOW_BUS_FACTOR_MIN_REPO_AUTHORS`] at the repo level (see
-    /// [`analyze_workspace`]), same as `low-bus-factor` — this method has no
-    /// visibility into how many authors the repository has overall.
-    pub fn to_knowledge_loss_risk_finding(
-        &self,
-        active_authors: &HashSet<String>,
-    ) -> Option<Finding> {
-        if self.total_lines == 0 {
-            return None;
-        }
-        let mut inactive_lines: u32 = 0;
-        let mut inactive_authors: Vec<String> = Vec::new();
-        let mut active_authors_count = 0usize;
-        for author in &self.authors {
-            if active_authors.contains(&author.email) {
-                active_authors_count += 1;
-            } else {
-                inactive_lines += author.lines;
-                inactive_authors.push(author.email.clone());
-            }
-        }
-        let inactive_share = f64::from(inactive_lines) / f64::from(self.total_lines);
-        if inactive_share <= KNOWLEDGE_LOSS_RISK_SHARE_THRESHOLD {
-            return None;
-        }
-        inactive_authors.sort();
-
-        let severity = if active_authors_count == 0 {
-            Severity::Fail
-        } else {
-            Severity::Warn
-        };
-        Some(Finding {
-            id: format!("{KNOWLEDGE_LOSS_RISK_RULE}:{}", self.file.display()).into(),
-            rule: KNOWLEDGE_LOSS_RISK_RULE.into(),
-            severity,
-            location: Location {
-                file: self.file.clone(),
-                line: OneBasedLine::FIRST,
-                item_path: format!(
-                    "{:.0}% of lines from inactive authors",
-                    inactive_share * 100.0
-                ),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(serde_json::json!({
-                "file": self.file.display().to_string(),
-                "inactive_share": inactive_share,
-                "total_lines": self.total_lines,
-                "inactive_authors": inactive_authors,
-                "active_authors_count": active_authors_count,
-            })),
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        })
-    }
-
     /// Renders an `ownership-fragmentation` [`Finding`] if this file's blame
     /// is split across at least [`FRAGMENTATION_MIN_AUTHORS`] authors, none
     /// of whom holds [`FRAGMENTATION_MAX_TOP_SHARE`] or more of the lines,
@@ -314,19 +216,16 @@ pub struct WorkspaceOwnership {
     /// Every analyzed file's raw ownership data, not just the ones with
     /// findings.
     pub files: Vec<FileOwnership>,
-    /// The `low-bus-factor`, `knowledge-loss-risk`, and
-    /// `ownership-fragmentation` findings.
+    /// The `low-bus-factor` and `ownership-fragmentation` findings.
     pub findings: Vec<Finding>,
     pub errors: Vec<OwnershipError>,
 }
 
 /// Computes per-file ownership across every source file in `workspace` by
 /// blaming each at `HEAD`, and emits `low-bus-factor` findings for files with
-/// a bus factor of 1, `knowledge-loss-risk` findings for files where a
-/// majority of blamed lines belong to now-inactive authors, plus
-/// `ownership-fragmentation` findings for files with many small blame
-/// shares. `low-bus-factor` and `knowledge-loss-risk` are both skipped for
-/// the whole workspace if the repository has fewer than
+/// a bus factor of 1, plus `ownership-fragmentation` findings for files with
+/// many small blame shares. `low-bus-factor` is skipped for the whole
+/// workspace if the repository has fewer than
 /// [`LOW_BUS_FACTOR_MIN_REPO_AUTHORS`] distinct authors active in
 /// `window_days` (see that constant's docs and GitHub issue #2) — the
 /// repo-wide author count is computed once via `active_authors_since`, not
@@ -391,12 +290,6 @@ pub fn analyze_workspace(
                 Ok(ownership) => {
                     if repo_has_enough_authors_for_bus_factor
                         && let Some(finding) = ownership.to_finding(&active_authors)
-                    {
-                        result.findings.push(finding);
-                    }
-                    if repo_has_enough_authors_for_bus_factor
-                        && let Some(finding) =
-                            ownership.to_knowledge_loss_risk_finding(&active_authors)
                     {
                         result.findings.push(finding);
                     }
@@ -672,27 +565,10 @@ mod tests {
         let workspace = workspace_of(dir.to_path_buf(), file.clone());
         let report = analyze_workspace(&workspace, 30).unwrap();
 
-        // A bus-factor-1 file with an inactive sole author trivially has an
-        // inactive share near 100%, so it's expected to ALSO fire
-        // `knowledge-loss-risk` — see that method's docs on the intentional
-        // overlap between the two rules.
-        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
         assert_eq!(report.findings[0].rule, LOW_BUS_FACTOR_RULE);
         assert_eq!(report.findings[0].severity, Severity::Fail);
         assert_eq!(report.findings[0].location.item_path, "gone@example.com");
-
-        assert_eq!(report.findings[1].rule, KNOWLEDGE_LOSS_RISK_RULE);
-        assert_eq!(report.findings[1].severity, Severity::Fail);
-        let evidence = report.findings[1]
-            .evidence
-            .as_ref()
-            .expect("evidence must be set");
-        assert_eq!(evidence["inactive_share"], 1.0);
-        assert_eq!(evidence["active_authors_count"], 0);
-        assert_eq!(
-            evidence["inactive_authors"],
-            serde_json::json!(["gone@example.com"])
-        );
     }
 
     /// Regression test for GitHub issue #2: on a repo with a single overall
@@ -734,8 +610,7 @@ mod tests {
             report
                 .findings
                 .iter()
-                .all(|finding| finding.rule != LOW_BUS_FACTOR_RULE
-                    && finding.rule != KNOWLEDGE_LOSS_RISK_RULE),
+                .all(|finding| finding.rule != LOW_BUS_FACTOR_RULE),
             "{:?}",
             report.findings
         );
@@ -758,162 +633,6 @@ mod tests {
             run_git_as(dir, email, &["add", "."], &[]);
             run_git_as(dir, email, &["commit", "-q", "-m", "chunk"], &[]);
         }
-    }
-
-    /// Same as [`commit_chunks_as`], but each commit runs with `extra_env`
-    /// set (e.g. `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE`), so tests can
-    /// backdate every chunk's author to make them inactive.
-    fn commit_chunks_as_with_env(
-        dir: &std::path::Path,
-        file: &std::path::Path,
-        authors: &[&str],
-        lines_per_author: &[usize],
-        extra_env: &[(&str, &str)],
-    ) {
-        let mut contents = String::new();
-        for (index, (email, lines)) in authors.iter().zip(lines_per_author).enumerate() {
-            for line in 0..*lines {
-                contents.push_str(&format!("fn f{index}_{line}() {{}}\n"));
-            }
-            std::fs::write(file, &contents).unwrap();
-            run_git_as(dir, email, &["add", "."], extra_env);
-            run_git_as(dir, email, &["commit", "-q", "-m", "chunk"], extra_env);
-        }
-    }
-
-    #[test]
-    fn file_with_several_roughly_equal_now_inactive_authors_fires_knowledge_loss_risk() {
-        let dir = TempDir::new("ownership-diffused-inactive");
-        git(&dir, &["init", "-q", "-b", "main"]);
-
-        let old_date = [
-            ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00"),
-            ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00"),
-        ];
-        let file = dir.join("shared.rs");
-        commit_chunks_as_with_env(
-            &dir,
-            &file,
-            &["a@example.com", "b@example.com", "c@example.com"],
-            &[10, 10, 10],
-            &old_date,
-        );
-
-        // Two recent, unrelated authors so the repo has the
-        // LOW_BUS_FACTOR_MIN_REPO_AUTHORS distinct authors the gate
-        // requires, without either of them being one of the analyzed file's
-        // (all inactive) authors.
-        let other_file = dir.join("other.rs");
-        std::fs::write(&other_file, "fn y() {}\n").unwrap();
-        run_git_as(&dir, "recent-a@example.com", &["add", "."], &[]);
-        run_git_as(
-            &dir,
-            "recent-a@example.com",
-            &["commit", "-q", "-m", "unrelated a"],
-            &[],
-        );
-        std::fs::write(&other_file, "fn y() {}\nfn z() {}\n").unwrap();
-        run_git_as(&dir, "recent-b@example.com", &["add", "."], &[]);
-        run_git_as(
-            &dir,
-            "recent-b@example.com",
-            &["commit", "-q", "-m", "unrelated b"],
-            &[],
-        );
-
-        let workspace = workspace_of(dir.to_path_buf(), file.clone());
-        let report = analyze_workspace(&workspace, 30).unwrap();
-
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        // No individual author dominates (bus_factor > 1), so low-bus-factor
-        // never looks at this file — the diffused-ownership case
-        // knowledge-loss-risk newly covers.
-        assert!(
-            report
-                .findings
-                .iter()
-                .all(|finding| finding.rule != LOW_BUS_FACTOR_RULE),
-            "{:?}",
-            report.findings
-        );
-        let finding = report
-            .findings
-            .iter()
-            .find(|finding| finding.rule == KNOWLEDGE_LOSS_RISK_RULE)
-            .expect("knowledge-loss-risk must fire");
-        assert_eq!(finding.severity, Severity::Fail);
-        let evidence = finding.evidence.as_ref().expect("evidence must be set");
-        assert_eq!(evidence["inactive_share"], 1.0);
-        assert_eq!(evidence["active_authors_count"], 0);
-        assert_eq!(
-            evidence["inactive_authors"],
-            serde_json::json!(["a@example.com", "b@example.com", "c@example.com"])
-        );
-    }
-
-    #[test]
-    fn file_with_active_majority_and_one_inactive_minor_contributor_does_not_fire_knowledge_loss_risk()
-     {
-        let dir = TempDir::new("ownership-active-majority");
-        git(&dir, &["init", "-q", "-b", "main"]);
-
-        let old_date = [
-            ("GIT_AUTHOR_DATE", "2000-01-01T00:00:00"),
-            ("GIT_COMMITTER_DATE", "2000-01-01T00:00:00"),
-        ];
-        let file = dir.join("mostly-active.rs");
-        // Minor, backdated/inactive contributor writes first.
-        let mut contents = String::new();
-        for line in 0..10 {
-            contents.push_str(&format!("fn f0_{line}() {{}}\n"));
-        }
-        std::fs::write(&file, &contents).unwrap();
-        run_git_as(&dir, "gone@example.com", &["add", "."], &old_date);
-        run_git_as(
-            &dir,
-            "gone@example.com",
-            &["commit", "-q", "-m", "minor, inactive"],
-            &old_date,
-        );
-
-        // Majority-share, recent/active author adds much more on top.
-        for line in 0..40 {
-            contents.push_str(&format!("fn f1_{line}() {{}}\n"));
-        }
-        std::fs::write(&file, &contents).unwrap();
-        run_git_as(&dir, "active@example.com", &["add", "."], &[]);
-        run_git_as(
-            &dir,
-            "active@example.com",
-            &["commit", "-q", "-m", "majority, active"],
-            &[],
-        );
-
-        // A second, unrelated recent author so the repo has the
-        // LOW_BUS_FACTOR_MIN_REPO_AUTHORS distinct authors the gate
-        // requires.
-        let other_file = dir.join("other.rs");
-        std::fs::write(&other_file, "fn z() {}\n").unwrap();
-        run_git_as(&dir, "other@example.com", &["add", "."], &[]);
-        run_git_as(
-            &dir,
-            "other@example.com",
-            &["commit", "-q", "-m", "unrelated"],
-            &[],
-        );
-
-        let workspace = workspace_of(dir.to_path_buf(), file.clone());
-        let report = analyze_workspace(&workspace, 30).unwrap();
-
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-        assert!(
-            report
-                .findings
-                .iter()
-                .all(|finding| finding.rule != KNOWLEDGE_LOSS_RISK_RULE),
-            "{:?}",
-            report.findings
-        );
     }
 
     #[test]
