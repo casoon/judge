@@ -25,7 +25,7 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus seven real detectors —
+//! sixteen table entries), plus eight real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
 //! (see [`functional_core_imperative_shell_candidates`]),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
@@ -36,9 +36,11 @@
 //! [`LawOfDemeter`](DesignPrinciple::LawOfDemeter) (see
 //! [`law_of_demeter_candidates`]),
 //! [`BoundedResources`](DesignPrinciple::BoundedResources) (see
-//! [`bounded_resources_candidates`]), and
+//! [`bounded_resources_candidates`]),
 //! [`ParseDontValidate`](DesignPrinciple::ParseDontValidate) (see
-//! [`parse_dont_validate_candidates`]). The remaining `DesignPrinciple`
+//! [`parse_dont_validate_candidates`]), and
+//! [`ApiEvolvability`](DesignPrinciple::ApiEvolvability) (see
+//! [`api_evolvability_candidates`]). The remaining `DesignPrinciple`
 //! variants are unused for now; they document the target space rather than
 //! being implemented.
 
@@ -86,6 +88,14 @@ pub const COHESION_ITEM_THRESHOLD: usize = 3;
 /// still being cheap to reach by adding one more call to an
 /// already-two-call chain.
 pub const LAW_OF_DEMETER_CHAIN_THRESHOLD: usize = 3;
+
+/// Minimum field count [`api_evolvability_candidates`] treats as "an
+/// evolvability concern" (signal 1) — chosen to mean more than a 0-1-field
+/// struct, where adding a field isn't meaningfully different from the
+/// struct's only field already being present; the concern this heuristic
+/// targets is real once callers can already rely on a combination of
+/// several fields at once.
+pub const API_EVOLVABILITY_MIN_FIELDS: usize = 2;
 
 /// A prüffähiges Designprinzip from todo.md §16.7's table. All sixteen table
 /// entries are represented so the enum documents the full target space, even
@@ -273,6 +283,7 @@ pub fn analyze_workspace(
     heuristics.extend(law_of_demeter_candidates(workspace));
     heuristics.extend(bounded_resources_candidates(workspace));
     heuristics.extend(parse_dont_validate_candidates(workspace));
+    heuristics.extend(api_evolvability_candidates(workspace));
     Ok(heuristics)
 }
 
@@ -2789,6 +2800,302 @@ fn build_parse_dont_validate_heuristic(
     }
 }
 
+/// Whether any attribute in `attrs` is `#[non_exhaustive]` — the exact
+/// syntax fact `api_surface::has_non_exhaustive` also turns on, duplicated
+/// here for the same reason this module's other helpers duplicate
+/// `pattern.rs`/`boundaries.rs`/`api_surface.rs` internals rather than
+/// making them `pub`.
+fn struct_has_non_exhaustive(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|attr| attr.path().is_ident("non_exhaustive"))
+}
+
+/// Number of fields `fields` declares, regardless of shape (named, tuple, or
+/// unit).
+fn field_count(fields: &syn::Fields) -> usize {
+    match fields {
+        syn::Fields::Named(named) => named.named.len(),
+        syn::Fields::Unnamed(unnamed) => unnamed.unnamed.len(),
+        syn::Fields::Unit => 0,
+    }
+}
+
+/// Whether every field in `fields` is `pub` — a struct with any private
+/// field already forces construction through some non-literal path in most
+/// cases, so [`api_evolvability_candidates`]'s signal 1 only considers
+/// fully-open structs (see that function's doc comment).
+fn all_fields_public(fields: &syn::Fields) -> bool {
+    let vis_iter: Box<dyn Iterator<Item = &syn::Visibility>> = match fields {
+        syn::Fields::Named(named) => Box::new(named.named.iter().map(|f| &f.vis)),
+        syn::Fields::Unnamed(unnamed) => Box::new(unnamed.unnamed.iter().map(|f| &f.vis)),
+        syn::Fields::Unit => Box::new(std::iter::empty()),
+    };
+    vis_iter
+        .into_iter()
+        .all(|vis| matches!(vis, syn::Visibility::Public(_)))
+}
+
+/// A `pub struct` declaration found while scanning a crate for
+/// [`api_evolvability_candidates`]'s signal 1: its name, field count, and
+/// where it's declared. Only structs whose fields are *all* `pub`, with no
+/// `#[non_exhaustive]` attribute, and at least
+/// [`API_EVOLVABILITY_MIN_FIELDS`] fields are collected — see that
+/// function's doc comment.
+struct EvolvableStructCandidate {
+    name: String,
+    field_count: usize,
+    location: EvidenceLocation,
+}
+
+/// Collects [`EvolvableStructCandidate`]s in one parsed file — a small,
+/// scope-specific `Visit` impl in the same style as this module's other
+/// structural collectors (e.g. `DeclaredItemCollector`, interface
+/// segregation's `Collector`), used instead of
+/// [`crate::dead_code::walk_type_items`] because that walker's
+/// `TypeItemSite` only carries a struct's qualified name/span/visibility —
+/// not its field list or attributes, both of which this signal needs.
+struct EvolvableStructCollector {
+    file: PathBuf,
+    candidates: Vec<EvolvableStructCandidate>,
+}
+
+impl<'ast> Visit<'ast> for EvolvableStructCollector {
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if matches!(node.vis, syn::Visibility::Public(_))
+            && !struct_has_non_exhaustive(&node.attrs)
+            && all_fields_public(&node.fields)
+        {
+            let count = field_count(&node.fields);
+            if count >= API_EVOLVABILITY_MIN_FIELDS {
+                self.candidates.push(EvolvableStructCandidate {
+                    name: node.ident.to_string(),
+                    field_count: count,
+                    location: EvidenceLocation {
+                        file: self.file.clone(),
+                        item_path: Some(node.ident.to_string()),
+                    },
+                });
+            }
+        }
+        syn::visit::visit_item_struct(self, node);
+    }
+}
+
+/// One struct-literal construction expression (`Foo { a: x, b: y, .. }`)
+/// found while scanning a crate for [`api_evolvability_candidates`]'s signal
+/// 2: which struct type it names (matched by last path segment only, the
+/// same accepted-limitation approach as [`path_matches_io_prefix`]) and
+/// where it appears.
+struct StructConstructionSite {
+    type_name: String,
+    line: usize,
+    location: EvidenceLocation,
+}
+
+/// Collects [`StructConstructionSite`]s in one parsed file: every
+/// `syn::Expr::Struct` with at least one explicit field. A construction that
+/// is *only* a `..` spread (`Foo { ..Default::default() }`, zero explicit
+/// fields) is excluded — it demonstrates nothing about reliance on the
+/// struct's exact field set. A construction with at least one explicit field
+/// plus a partial `..` spread still counts, since the explicit field is
+/// still coupled to the struct's current shape. No existing crate-wide
+/// expression walker covers this, so this is a small, scope-specific `Visit`
+/// impl, the same approach this module's other usage-evidence signals use
+/// (e.g. [`law_of_demeter_chain_hits`], [`direct_recursive_calls`]).
+struct StructConstructionCollector {
+    file: PathBuf,
+    sites: Vec<StructConstructionSite>,
+}
+
+impl<'ast> Visit<'ast> for StructConstructionCollector {
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        if !node.fields.is_empty()
+            && let Some(segment) = node.path.segments.last()
+        {
+            self.sites.push(StructConstructionSite {
+                type_name: segment.ident.to_string(),
+                line: node.span().start().line,
+                location: EvidenceLocation {
+                    file: self.file.clone(),
+                    item_path: None,
+                },
+            });
+        }
+        syn::visit::visit_expr_struct(self, node);
+    }
+}
+
+/// API Evolvability (todo.md §16.7's table): a `pub struct` with all-public
+/// fields and no `#[non_exhaustive]` attribute is fragile to future
+/// evolution — adding a field later breaks every existing struct-literal
+/// construction site, forcing either a semver-major bump or a retrofitted
+/// `#[non_exhaustive]`.
+///
+/// This is deliberately narrower, and independently corroborated, compared
+/// to `api_surface`'s `semver-hazard` rule (`missing_non_exhaustive_struct_
+/// fields`): that Deep-Tier finding fires on the static shape fact alone —
+/// any `pub struct` with at least one `pub` field (mixed visibility
+/// included) and no `#[non_exhaustive]`. This heuristic requires strictly
+/// more: *all* fields public (not just one), at least
+/// [`API_EVOLVABILITY_MIN_FIELDS`] of them, *and* a second, independent
+/// signal — proof the crate already constructs the struct via field-literal
+/// syntax, not just a hypothetical future risk.
+///
+/// Two independent signals, both required for the same struct:
+///
+/// 1. **Structural (AST)** — a `pub struct` with [`API_EVOLVABILITY_MIN_
+///    FIELDS`] or more fields, all `pub`, and no `#[non_exhaustive]`
+///    attribute ([`EvolvableStructCollector`]).
+/// 2. **Usage-based (independent, crate-wide)** — at least one struct-
+///    literal construction expression elsewhere in the same crate names
+///    this struct's type and supplies at least one explicit field
+///    ([`StructConstructionCollector`]). This is qualitatively different
+///    from signal 1: it is empirical evidence that a caller already depends
+///    on the exact field set, not a reading of the struct's own
+///    declaration.
+///
+/// Struct names are matched to construction sites purely by last path
+/// segment, not full path resolution — the same accepted-limitation
+/// approach [`path_matches_io_prefix`] and `interface_segregation_
+/// candidates` use for their own name matching. At most one heuristic per
+/// struct: the first qualifying construction site found, in file-then-line
+/// order.
+fn api_evolvability_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        let mut candidates: Vec<EvolvableStructCandidate> = Vec::new();
+        let mut construction_sites: Vec<StructConstructionSite> = Vec::new();
+
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+
+            let mut struct_collector = EvolvableStructCollector {
+                file: source.path.clone(),
+                candidates: Vec::new(),
+            };
+            struct_collector.visit_file(&ast);
+            candidates.extend(struct_collector.candidates);
+
+            let mut construction_collector = StructConstructionCollector {
+                file: source.path.clone(),
+                sites: Vec::new(),
+            };
+            construction_collector.visit_file(&ast);
+            construction_sites.extend(construction_collector.sites);
+        }
+        construction_sites
+            .sort_by(|a, b| (&a.location.file, a.line).cmp(&(&b.location.file, b.line)));
+
+        for candidate in &candidates {
+            let Some(site) = construction_sites
+                .iter()
+                .find(|site| site.type_name == candidate.name)
+            else {
+                continue;
+            };
+            heuristics.push(build_api_evolvability_heuristic(krate, candidate, site));
+        }
+    }
+    heuristics
+}
+
+fn build_api_evolvability_heuristic(
+    krate: &CrateInfo,
+    candidate: &EvolvableStructCandidate,
+    site: &StructConstructionSite,
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![candidate.name.clone()],
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{}` has {} all-public fields and no `#[non_exhaustive]` attribute, at or above \
+             the {API_EVOLVABILITY_MIN_FIELDS}-field threshold this heuristic treats as an \
+             evolvability concern.",
+            candidate.name, candidate.field_count
+        ),
+        locations: vec![candidate.location.clone()],
+    };
+    let usage = Evidence {
+        description: format!(
+            "`{}` is constructed via field-literal syntax at {}:{} in the same crate, with at \
+             least one explicit field rather than only a `..` spread — evidence a caller \
+             already depends on this struct's current field set.",
+            candidate.name,
+            site.location.file.display(),
+            site.line,
+        ),
+        locations: vec![site.location.clone()],
+    };
+
+    let evidence_identities = vec![
+        candidate.name.clone(),
+        site.location.file.display().to_string(),
+        site.line.to_string(),
+    ];
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::ApiEvolvability,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::ApiEvolvability,
+        scope,
+        evidence: vec![structural, usage],
+        interpretation: format!(
+            "`{}` exposes every field as `pub` with no `#[non_exhaustive]` attribute, and at \
+             least one construction site elsewhere in the crate already relies on its exact \
+             field set via field-literal syntax. Adding a field later would break that \
+             construction site, either forcing a coordinated update or a semver-major bump for \
+             any external caller doing the same.",
+            candidate.name
+        ),
+        contraindications: vec![
+            Contraindication {
+                description: "A small, stable data-transfer struct that is unlikely to ever \
+                    gain a field may not benefit from the added friction of \
+                    `#[non_exhaustive]` or a constructor function."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "If every construction site is internal to this crate (never \
+                    exposed to external callers), adding a field later is a local, coordinated \
+                    change rather than a semver hazard."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether this struct is actually part of the crate's external public \
+                API (re-exported, reachable by downstream crates) or only an internal \
+                implementation detail is not checked here — only that a field-literal \
+                construction site exists somewhere in the same crate."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the struct as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Add `#[non_exhaustive]` and a constructor function or builder, so \
+                    a future field can be added without breaking existing field-literal \
+                    construction sites."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4265,6 +4572,135 @@ mod tests {
             heuristics
                 .iter()
                 .all(|h| h.principle != DesignPrinciple::ParseDontValidate)
+        );
+    }
+
+    /// (a) An all-public-field `pub struct` (no `#[non_exhaustive]`, at or
+    /// above [`API_EVOLVABILITY_MIN_FIELDS`]) plus a field-literal
+    /// construction site elsewhere in the crate ⇒ exactly one
+    /// `ApiEvolvability` heuristic, with both evidence slots populated.
+    #[test]
+    fn api_evolvability_with_construction_site_produces_one_heuristic() {
+        let dir = TempDir::new("principle-api-evolvability");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Point {\n\
+             \x20   pub x: i32,\n\
+             \x20   pub y: i32,\n\
+             }\n\
+             \n\
+             pub fn origin_shifted() -> Point {\n\
+             \x20   Point { x: 1, y: 2 }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let api_evolvability: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::ApiEvolvability)
+            .collect();
+
+        assert_eq!(api_evolvability.len(), 1);
+        let heuristic = api_evolvability[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) The same struct shape, but no construction site anywhere in the
+    /// crate (only ever built via `Default::default()`) ⇒ no heuristic —
+    /// proves signal 2 actually gates the result.
+    #[test]
+    fn api_evolvability_without_construction_site_produces_no_heuristic() {
+        let dir = TempDir::new("principle-api-evolvability-no-construction");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "#[derive(Default)]\n\
+             pub struct Point {\n\
+             \x20   pub x: i32,\n\
+             \x20   pub y: i32,\n\
+             }\n\
+             \n\
+             pub fn origin() -> Point {\n\
+             \x20   Point { ..Default::default() }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::ApiEvolvability)
+        );
+    }
+
+    /// (c) The same struct shape, but with `#[non_exhaustive]` ⇒ no
+    /// heuristic.
+    #[test]
+    fn api_evolvability_with_non_exhaustive_produces_no_heuristic() {
+        let dir = TempDir::new("principle-api-evolvability-non-exhaustive");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "#[non_exhaustive]\n\
+             pub struct Point {\n\
+             \x20   pub x: i32,\n\
+             \x20   pub y: i32,\n\
+             }\n\
+             \n\
+             pub fn origin_shifted() -> Point {\n\
+             \x20   Point { x: 1, y: 2 }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::ApiEvolvability)
+        );
+    }
+
+    /// (d) A struct with at least one private field (mixed visibility) ⇒ no
+    /// heuristic, even with a matching field-literal construction site —
+    /// proves signal 1's "fully public" requirement actually gates.
+    #[test]
+    fn api_evolvability_with_private_field_produces_no_heuristic() {
+        let dir = TempDir::new("principle-api-evolvability-private-field");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Point {\n\
+             \x20   pub x: i32,\n\
+             \x20   y: i32,\n\
+             }\n\
+             \n\
+             impl Point {\n\
+             \x20   pub fn shifted() -> Point {\n\
+             \x20\x20\x20   Point { x: 1, y: 2 }\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::ApiEvolvability)
         );
     }
 }
