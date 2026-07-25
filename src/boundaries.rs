@@ -2427,6 +2427,104 @@ order = ["domain", "application", "infrastructure"]
         );
     }
 
+    /// Undecidable fixture (todo.md §17.5): `layers.assign` is a
+    /// `HashMap<String, String>` (see [`LayersConfig::assign`]) -- every
+    /// crate gets exactly one group/role, full stop. A small crate that
+    /// legitimately straddles two roles at once (common in small
+    /// workspaces -- e.g. a tiny crate that defines both a domain type
+    /// *and* the port trait an adapter needs to call it) cannot be
+    /// expressed at all: the user must pick a single classification, and
+    /// [`generate_hexagonal_rules`] has no way to know that choice erases
+    /// real information. This fixture proves it structurally: the exact
+    /// same dependency graph -- `adapter-crate` depending directly on the
+    /// dual-role `shared-types` crate -- flips between "gating
+    /// boundary-violation" and "no violation at all" purely because of
+    /// which single role was assigned to `shared-types` in config, with the
+    /// actual code and its actual dependency edges unchanged between the
+    /// two runs. The same single-valued-role limitation applies identically
+    /// to `layered`'s and `feature-sliced`'s `assign` (todo.md §9, all
+    /// three presets share this one `LayersConfig::assign` field) -- this
+    /// fixture stands in for all three rather than repeating the same root
+    /// cause three times.
+    #[test]
+    fn hexagonal_preset_cannot_express_a_crate_that_legitimately_holds_two_roles_at_once() {
+        let dir = TempDir::new("layers-hexagonal-dual-role");
+        write_crate(&dir, "core-domain", &[]);
+        write_crate(&dir, "shared-types", &[]);
+        write_crate(
+            &dir,
+            "adapter-crate",
+            &[
+                ("shared-types", "../shared-types"),
+                ("port-iface", "../port-iface"),
+            ],
+        );
+        write_crate(&dir, "port-iface", &[]);
+        write_workspace_manifest(
+            &dir,
+            &["core-domain", "shared-types", "adapter-crate", "port-iface"],
+        );
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        // Classification A: the dual-role crate is assigned to "core" --
+        // its domain-type half. `adapter-crate`'s real, intentional
+        // dependency on it (to reach the port trait it also defines) is now
+        // indistinguishable from an adapter illegitimately reaching into
+        // the domain core.
+        let config_core = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Hexagonal,
+                &[],
+                None,
+                &[
+                    ("core-domain", "core"),
+                    ("shared-types", "core"),
+                    ("adapter-crate", "adapters"),
+                    ("port-iface", "ports"),
+                ],
+            )),
+            ..Default::default()
+        };
+        let result_core = evaluate(&workspace, &config_core).unwrap();
+        assert_eq!(result_core.findings.len(), 1, "{:?}", result_core.findings);
+        assert!(
+            result_core.findings[0]
+                .location
+                .item_path
+                .contains("adapter-crate -> shared-types"),
+            "classified as core, the adapter's legitimate use of the crate's port half now \
+             reads as a domain-boundary violation: {:?}",
+            result_core.findings[0]
+        );
+
+        // Classification B: the exact same crate, the exact same
+        // dependency graph, assigned to "ports" instead -- its port half.
+        // The identical edge now satisfies the "adapters must reach ports"
+        // wiring and produces zero findings.
+        let config_ports = BoundaryConfig {
+            layers: Some(layers_config(
+                LayerPreset::Hexagonal,
+                &[],
+                None,
+                &[
+                    ("core-domain", "core"),
+                    ("shared-types", "ports"),
+                    ("adapter-crate", "adapters"),
+                    ("port-iface", "ports"),
+                ],
+            )),
+            ..Default::default()
+        };
+        let result_ports = evaluate(&workspace, &config_ports).unwrap();
+        assert!(
+            result_ports.findings.is_empty(),
+            "classified as ports, the identical edge is now the expected \
+             adapters-reach-ports wiring: {:?}",
+            result_ports.findings
+        );
+    }
+
     #[test]
     fn unknown_crate_in_layers_assign_is_a_config_error() {
         let dir = TempDir::new("layers-unknown-crate");

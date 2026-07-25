@@ -780,6 +780,55 @@ mod tests {
         assert_eq!(loc, 2);
     }
 
+    /// Undecidable fixture (todo.md §17.5): `multiplier_for`'s own doc
+    /// comment says "the first profile in `crate_profiles` naming the
+    /// owning crate wins" -- a deliberate, documented precedence rule, not
+    /// a bug. But nothing in `judge.toml`'s shape, nor in the resulting
+    /// [`HealthScore`], distinguishes two very different authoring stories
+    /// that produce the identical winning multiplier: (1) a leftover,
+    /// never-cleaned-up duplicate profile that happens to be harmlessly
+    /// shadowed by the one that was always meant to win, versus (2) someone
+    /// appending a second, stricter profile meaning to override the first,
+    /// unaware that first-wins semantics silently keep the original,
+    /// lenient one active instead. Both configs below produce byte-identical
+    /// deductions -- indistinguishable from a config where the second,
+    /// silently-ignored profile was never written at all -- so there is no
+    /// way to tell a broken override attempt apart from harmless dead
+    /// config just by looking at the score.
+    #[test]
+    fn a_crate_named_in_two_profiles_silently_keeps_only_the_first_multiplier() {
+        let workspace = workspace_with_crate("/repo", "vendor");
+        let findings = vec![finding(Severity::Fail, "/repo/src/lib.rs")];
+
+        let shadowed_override = vec![
+            CrateProfile {
+                name: "legacy-lenient".to_string(),
+                crates: vec!["vendor".to_string()],
+                deduction_multiplier: multiplier(0.5),
+            },
+            CrateProfile {
+                name: "attempted-strict-override".to_string(),
+                crates: vec!["vendor".to_string()],
+                deduction_multiplier: multiplier(2.0),
+            },
+        ];
+        let first_profile_only = vec![CrateProfile {
+            name: "legacy-lenient".to_string(),
+            crates: vec!["vendor".to_string()],
+            deduction_multiplier: multiplier(0.5),
+        }];
+
+        let scaled = available(compute(&findings, 1000, &workspace, &shadowed_override));
+        let lenient_only = available(compute(&findings, 1000, &workspace, &first_profile_only));
+
+        assert_eq!(
+            scaled.deduction, lenient_only.deduction,
+            "the second profile's 2.0 multiplier is silently shadowed by the first's 0.5 -- \
+             the score is byte-identical to a config where the second entry was never written \
+             at all"
+        );
+    }
+
     #[test]
     fn crate_profile_multiplier_scales_that_crates_deductions() {
         let workspace = workspace_with_crate("/repo", "parser");

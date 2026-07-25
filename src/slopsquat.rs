@@ -1560,6 +1560,55 @@ edition = "2021"
         assert!(report.errors[0].contains("unreachable"));
     }
 
+    /// Undecidable fixture (todo.md §17.5): the `phantom-crate`/
+    /// `phantom-version` registry entries' own `exclusions` text names "a
+    /// snapshot at lookup time" — a crate published moments after the check
+    /// ran is indistinguishable from one that never existed. This proves it
+    /// structurally rather than just asserting it in prose: `FixtureIndex`
+    /// is a single point-in-time snapshot with no notion of "when" — a name
+    /// that will simply never be registered and a name that gets registered
+    /// a second after `index.lookup` returns both produce exactly `Ok(None)`
+    /// from [`CratesIoIndex::lookup`] (a real `SparseIndexClient` is no
+    /// different: an HTTP 404 carries no promise about the future), so
+    /// `analyze_phantom_dependencies` reports the two dependencies below
+    /// with byte-identical findings even though only one of them is a real
+    /// phantom crate. Not a bug — a single HTTP round trip cannot see past
+    /// the instant it ran.
+    #[test]
+    fn phantom_crate_cannot_distinguish_a_permanently_nonexistent_name_from_one_registered_a_moment_after_the_snapshot()
+     {
+        let dir = TempDir::new("slopsquat-phantom-snapshot-race");
+        let manifest = write_manifest(
+            &dir,
+            &[
+                ("truly-never-registered-crate-xyz", "1.0"),
+                ("registered-a-moment-after-the-lookup-ran", "1.0"),
+            ],
+        );
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        // A single snapshot: neither name is present in it, regardless of
+        // which real-world story -- "never existed" or "existed a moment
+        // too late for this lookup" -- turns out to be true.
+        let index = FixtureIndex::new();
+
+        let report = analyze_phantom_dependencies(&workspace, &index);
+
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+        let by_name: HashMap<&str, &Finding> = report
+            .findings
+            .iter()
+            .map(|f| (f.location.item_path.as_str(), f))
+            .collect();
+        for finding in by_name.values() {
+            assert_eq!(finding.rule, PHANTOM_CRATE_RULE);
+            assert_eq!(
+                finding.evidence.as_ref().unwrap()["result"],
+                "not_found",
+                "nothing in the evidence distinguishes the two stories: {finding:?}"
+            );
+        }
+    }
+
     // -- fresh-low-reputation-dep --
 
     #[test]
@@ -1888,6 +1937,75 @@ edition = "2021"
         assert!(report.errors[0].contains("failed to resolve dependency graph"));
     }
 
+    /// Undecidable fixture (todo.md §17.5): `yanked-dependency`'s own
+    /// `exclusions` text names the same "snapshot at lookup time" limitation
+    /// as `phantom-crate`/`phantom-version` -- "a publisher un-yanking a
+    /// version moments after the check ran is indistinguishable from one
+    /// that was never yanked." `IndexVersion::yanked` is a bare `bool`, with
+    /// no timestamp of when the yank happened or how long it lasted, so
+    /// [`analyze_yanked_dependencies`] cannot tell apart two very different
+    /// real situations that both resolve to `yanked: true` in the fixture
+    /// snapshot below: a version pulled for a genuine security problem and
+    /// never restored, versus a publisher's five-minute mistake (e.g. a
+    /// bad `cargo publish`) that was un-yanked moments after this lookup
+    /// happened to run. Both dependencies get byte-identical findings.
+    /// Not a bug -- a sparse-index lookup is one HTTP round trip, not a
+    /// subscription to future yank/un-yank events.
+    #[test]
+    fn yanked_dependency_cannot_distinguish_a_permanent_yank_from_one_reverted_a_moment_after_the_snapshot()
+     {
+        let vendor_a = TempDir::new("slopsquat-yanked-snapshot-race-vendor-a");
+        write_vendored_crate(&vendor_a, "permanently-yanked-dep", "1.2.3");
+        let vendor_b = TempDir::new("slopsquat-yanked-snapshot-race-vendor-b");
+        write_vendored_crate(&vendor_b, "reverted-a-moment-later-dep", "1.2.3");
+
+        let dir = TempDir::new("slopsquat-yanked-snapshot-race-fixture");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\npermanently-yanked-dep = {{ path = {:?} }}\nreverted-a-moment-later-dep = {{ path = {:?} }}\n",
+                vendor_a.to_path_buf(),
+                vendor_b.to_path_buf()
+            ),
+        )
+        .unwrap();
+        let manifest = dir.join("Cargo.toml");
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+
+        // A single snapshot: both resolved versions read as yanked in it,
+        // regardless of which real-world story -- "permanently pulled" or
+        // "un-yanked a moment too late for this lookup" -- turns out true.
+        let index = FixtureIndex::new()
+            .with_crate(
+                "permanently-yanked-dep",
+                vec![IndexVersion {
+                    vers: "1.2.3".to_string(),
+                    yanked: true,
+                }],
+            )
+            .with_crate(
+                "reverted-a-moment-later-dep",
+                vec![IndexVersion {
+                    vers: "1.2.3".to_string(),
+                    yanked: true,
+                }],
+            );
+
+        let report = analyze_yanked_dependencies(&workspace, &index);
+
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+        for finding in &report.findings {
+            assert_eq!(finding.rule, YANKED_DEPENDENCY_RULE);
+            assert_eq!(
+                finding.evidence.as_ref().unwrap()["resolved_version"],
+                "1.2.3",
+                "nothing in the evidence distinguishes the two stories: {finding:?}"
+            );
+        }
+    }
+
     // -- dep-single-maintainer --
 
     #[test]
@@ -1988,6 +2106,69 @@ edition = "2021"
 
         assert!(report.findings.is_empty());
         assert!(report.errors.is_empty());
+    }
+
+    /// Undecidable fixture (todo.md §17.5): `dep-single-maintainer`'s own
+    /// `exclusions` text names this limitation directly -- "a raw crates.io
+    /// owner count ... with no insight into each owner's actual activity;
+    /// two owners who are both inactive score the same as two active
+    /// ones." `single_maintainer_finding` (see [`analyze_single_maintainer_dependencies`])
+    /// only ever compares `owner_list.len()` against [`MIN_MAINTAINER_COUNT`]
+    /// -- crates.io's owners endpoint reports logins, not last-activity
+    /// timestamps, so there is nothing in [`CrateOwner`] the rule could even
+    /// check. This fixture proves it structurally: two two-owner crates,
+    /// one whose owners are both genuinely active maintainers and one whose
+    /// owners both went silent years ago, are indistinguishable from the
+    /// `dep-single-maintainer` finding's own logic -- both simply clear the
+    /// `>= 2` bar and produce no finding at all, regardless of which one is
+    /// the real redundancy risk.
+    #[test]
+    fn dep_single_maintainer_cannot_distinguish_two_active_owners_from_two_dormant_ones() {
+        let dir = TempDir::new("slopsquat-single-maintainer-activity-blind");
+        let manifest = write_manifest(
+            &dir,
+            &[
+                ("actively-maintained-project", "1.0"),
+                ("abandoned-in-all-but-name-project", "1.0"),
+            ],
+        );
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        // Both crates report exactly two owners -- the only fact
+        // `dep-single-maintainer` can see. Whether those owners are still
+        // active or have been dormant for years is invisible to the rule
+        // either way.
+        let owners_source = FixtureOwners::new()
+            .with_crate(
+                "actively-maintained-project",
+                vec![
+                    CrateOwner {
+                        login: "active-dev-one".to_string(),
+                    },
+                    CrateOwner {
+                        login: "active-dev-two".to_string(),
+                    },
+                ],
+            )
+            .with_crate(
+                "abandoned-in-all-but-name-project",
+                vec![
+                    CrateOwner {
+                        login: "dormant-dev-one".to_string(),
+                    },
+                    CrateOwner {
+                        login: "dormant-dev-two".to_string(),
+                    },
+                ],
+            );
+
+        let report = analyze_single_maintainer_dependencies(&workspace, &owners_source);
+
+        assert!(
+            report.findings.is_empty(),
+            "neither the genuinely healthy crate nor the effectively-abandoned one is flagged \
+             -- a raw owner count of 2 can't tell them apart: {:?}",
+            report.findings
+        );
     }
 
     #[test]
