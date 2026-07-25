@@ -25,7 +25,7 @@
 //!
 //! Scope of this module (MVP slice): the [`PrincipleHeuristic`] type
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
-//! sixteen table entries), plus six real detectors —
+//! sixteen table entries), plus seven real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
 //! (see [`functional_core_imperative_shell_candidates`]),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
@@ -34,9 +34,11 @@
 //! [`dependency_inversion_candidates`]),
 //! [`Cohesion`](DesignPrinciple::Cohesion) (see [`cohesion_candidates`]),
 //! [`LawOfDemeter`](DesignPrinciple::LawOfDemeter) (see
-//! [`law_of_demeter_candidates`]), and
+//! [`law_of_demeter_candidates`]),
 //! [`BoundedResources`](DesignPrinciple::BoundedResources) (see
-//! [`bounded_resources_candidates`]). The remaining `DesignPrinciple`
+//! [`bounded_resources_candidates`]), and
+//! [`ParseDontValidate`](DesignPrinciple::ParseDontValidate) (see
+//! [`parse_dont_validate_candidates`]). The remaining `DesignPrinciple`
 //! variants are unused for now; they document the target space rather than
 //! being implemented.
 
@@ -270,6 +272,7 @@ pub fn analyze_workspace(
     heuristics.extend(cohesion_candidates(workspace, complexity));
     heuristics.extend(law_of_demeter_candidates(workspace));
     heuristics.extend(bounded_resources_candidates(workspace));
+    heuristics.extend(parse_dont_validate_candidates(workspace));
     Ok(heuristics)
 }
 
@@ -2291,6 +2294,501 @@ fn bounded_resources_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic
     heuristics
 }
 
+/// Leaf identifiers [`primitive_scalar_kind`] recognizes as a "primitive/
+/// string" shape — Rust's built-in scalar types plus `str`/`String`. Kept as
+/// a fixed, narrow list rather than any type-resolution: this is a
+/// syntactic proxy, the same accepted-limitation approach every other
+/// detector in this module uses for type/path matching.
+const PRIMITIVE_SCALAR_IDENTS: &[&str] = &[
+    "str", "String", "bool", "char", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16",
+    "u32", "u64", "u128", "usize", "f32", "f64",
+];
+
+/// Whether `ty` is (optionally through one layer of `&`) one of
+/// [`PRIMITIVE_SCALAR_IDENTS`] — matched purely by the type's leaf segment
+/// identifier, not full path/type resolution. Canonicalizes `String` to the
+/// same `"str"` kind as `str`/`&str`, since both represent the same
+/// "textual, not yet parsed into a distinct shape" family for
+/// [`parse_dont_validate_candidates`]'s purposes.
+fn primitive_scalar_kind(ty: &syn::Type) -> Option<String> {
+    let inner = match ty {
+        syn::Type::Reference(reference) => reference.elem.as_ref(),
+        other => other,
+    };
+    let syn::Type::Path(type_path) = inner else {
+        return None;
+    };
+    let ident = type_path.path.segments.last()?.ident.to_string();
+    if !PRIMITIVE_SCALAR_IDENTS.contains(&ident.as_str()) {
+        return None;
+    }
+    Some(if ident == "String" {
+        "str".to_string()
+    } else {
+        ident
+    })
+}
+
+/// [`primitive_scalar_kind`] of `sig`'s return type, unwrapping one layer of
+/// `Result<T, _>`/`Option<T>` first so a function returning e.g.
+/// `Result<&str, Error>` is still recognized as "still the same loosely-
+/// typed shape" rather than treated as if it returned the error type. A
+/// function with no return type (`-> ()`), or one whose return type's leaf
+/// identifier isn't a primitive/string/bool at all, yields `None` — the
+/// latter is exactly the "already parses into a distinct newtype, don't
+/// flag it" exclusion [`parse_dont_validate_candidates`] depends on.
+fn return_scalar_kind(output: &syn::ReturnType) -> Option<String> {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return None;
+    };
+    if let Some(kind) = primitive_scalar_kind(ty) {
+        return Some(kind);
+    }
+    let syn::Type::Path(type_path) = ty.as_ref() else {
+        return None;
+    };
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Result" && segment.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    let first_type = args.args.iter().find_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    })?;
+    primitive_scalar_kind(first_type)
+}
+
+/// `(name, type)` for every simple `Pat::Ident` parameter of `sig`,
+/// excluding the receiver — the same destructuring-pattern limitation as
+/// [`param_names`], but keeping the type alongside the name since
+/// [`parse_dont_validate_candidates`] needs both.
+fn typed_params(sig: &syn::Signature) -> Vec<(String, &syn::Type)> {
+    sig.inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
+                syn::Pat::Ident(pat_ident) => {
+                    Some((pat_ident.ident.to_string(), pat_type.ty.as_ref()))
+                }
+                _ => None,
+            },
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect()
+}
+
+/// Whether `block` (or, via [`Visit::visit_expr`], a single match arm's
+/// body) contains a `return`, anywhere in its own lexical scope, or a call
+/// to the `panic!` macro — the "guard actually exits" half of a validation-
+/// shaped check. Does not descend into a nested closure or a locally
+/// defined nested `fn`, the same exclusion [`loop_has_any_exit`] uses.
+struct ReturnOrPanicFinder {
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for ReturnOrPanicFinder {
+    fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+        self.found = true;
+        syn::visit::visit_expr_return(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        if node.path.is_ident("panic") {
+            self.found = true;
+        }
+        syn::visit::visit_macro(self, node);
+    }
+
+    fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
+
+    fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+}
+
+fn block_has_return_or_panic(block: &syn::Block) -> bool {
+    let mut finder = ReturnOrPanicFinder { found: false };
+    finder.visit_block(block);
+    finder.found
+}
+
+fn expr_has_return_or_panic(expr: &syn::Expr) -> bool {
+    let mut finder = ReturnOrPanicFinder { found: false };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+/// Whether `path` names one of the `assert!`/`assert_eq!`/`assert_ne!`
+/// family (including the `debug_` variants) — [`validation_guard_hit`]'s
+/// third guard shape, alongside `if`/`match`.
+fn path_is_assert_like(path: &syn::Path) -> bool {
+    const ASSERT_MACROS: &[&str] = &[
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+    ];
+    path.get_ident()
+        .is_some_and(|ident| ASSERT_MACROS.contains(&ident.to_string().as_str()))
+}
+
+/// Whether `macro_call`'s own token stream mentions `param` as a whole
+/// identifier — a crude, purely textual check (split on non-identifier
+/// characters and compare), since `assert!`/`assert_eq!` bodies are
+/// arbitrary token trees `syn` doesn't parse as an `Expr` by default. The
+/// same accepted-limitation trade-off other detectors in this module make
+/// for macro-body matching.
+fn macro_tokens_reference_param(macro_call: &syn::Macro, param: &str) -> bool {
+    macro_call
+        .tokens
+        .to_string()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|token| token == param)
+}
+
+/// One validation-shaped guard [`validation_guard_hit`] found on a single
+/// parameter: the source line the guard starts on, and a rendered
+/// (`quote`-token-stream) snippet of the condition/macro for evidence text.
+struct ValidationGuard {
+    line: usize,
+    rendered: String,
+}
+
+/// Finds a validation-shaped guard on `param` in `block`: an `if` whose
+/// condition references `param` and whose then-branch contains a `return`
+/// or `panic!` ([`block_has_return_or_panic`]); a `match` whose scrutinee
+/// references `param` and at least one arm's body contains a `return` or
+/// `panic!` ([`expr_has_return_or_panic`]); or a bare `assert!`/`assert_eq!`/
+/// `assert_ne!` (or `debug_` variant) macro call whose tokens mention
+/// `param` ([`macro_tokens_reference_param`]). Returns the first such guard
+/// found in source order; does not descend into a nested closure or locally
+/// defined nested `fn`, the same exclusion [`has_parameter_guard_before`]
+/// uses.
+fn validation_guard_hit(block: &syn::Block, param: &str) -> Option<ValidationGuard> {
+    use quote::ToTokens;
+
+    struct Finder<'a> {
+        param: &'a str,
+        hit: Option<ValidationGuard>,
+    }
+    impl<'ast> Visit<'ast> for Finder<'_> {
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            if self.hit.is_none()
+                && expr_references_any(&node.cond, std::slice::from_ref(&self.param.to_string()))
+                && block_has_return_or_panic(&node.then_branch)
+            {
+                self.hit = Some(ValidationGuard {
+                    line: node.if_token.span().start().line,
+                    rendered: node.cond.to_token_stream().to_string(),
+                });
+            }
+            syn::visit::visit_expr_if(self, node);
+        }
+
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            if self.hit.is_none()
+                && expr_references_any(&node.expr, std::slice::from_ref(&self.param.to_string()))
+                && node
+                    .arms
+                    .iter()
+                    .any(|arm| expr_has_return_or_panic(&arm.body))
+            {
+                self.hit = Some(ValidationGuard {
+                    line: node.match_token.span().start().line,
+                    rendered: node.expr.to_token_stream().to_string(),
+                });
+            }
+            syn::visit::visit_expr_match(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if self.hit.is_none()
+                && path_is_assert_like(&node.path)
+                && macro_tokens_reference_param(node, self.param)
+            {
+                self.hit = Some(ValidationGuard {
+                    line: node.path.span().start().line,
+                    rendered: node.tokens.to_string(),
+                });
+            }
+            syn::visit::visit_macro(self, node);
+        }
+
+        fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+    }
+    let mut finder = Finder { param, hit: None };
+    finder.visit_block(block);
+    finder.hit
+}
+
+/// Signal 1's result for one function: the primitive/string parameter that
+/// carries a validation-shaped guard, alongside the function's own
+/// still-primitive/string/bool return kind — see
+/// [`parse_dont_validate_candidates`].
+struct ParamGuardHit {
+    param_name: String,
+    param_kind: String,
+    return_kind: String,
+    guard_line: usize,
+    guard_rendered: String,
+}
+
+/// Signal 1, in full: `sig`'s return type must itself still be a primitive/
+/// string/bool shape ([`return_scalar_kind`] — this is what excludes a
+/// function that already parses into a distinct newtype), and at least one
+/// of `sig`'s primitive/string parameters must carry a validation-shaped
+/// guard in `block` ([`validation_guard_hit`]). Returns the first such
+/// parameter in signature order.
+fn parse_dont_validate_signal1(sig: &syn::Signature, block: &syn::Block) -> Option<ParamGuardHit> {
+    let return_kind = return_scalar_kind(&sig.output)?;
+    for (name, ty) in typed_params(sig) {
+        let param_kind = primitive_scalar_kind(ty)?;
+        if let Some(guard) = validation_guard_hit(block, &name) {
+            return Some(ParamGuardHit {
+                param_name: name,
+                param_kind,
+                return_kind: return_kind.clone(),
+                guard_line: guard.line,
+                guard_rendered: guard.rendered,
+            });
+        }
+    }
+    None
+}
+
+/// A weaker, visibility-independent reading of the same guard shape signal
+/// 1 uses, without signal 1's own return-type gate — every primitive/string
+/// parameter of `sig` that carries a validation-shaped guard in `block`,
+/// regardless of the function's own return type or visibility. Feeds
+/// [`parse_dont_validate_candidates`]'s crate-wide signal 2 aggregation,
+/// which is deliberately broader than signal 1: a private helper doing the
+/// same kind of validation, even one that doesn't itself qualify as a
+/// signal-1 candidate, still counts as evidence that the check is
+/// duplicated across the crate instead of centralized into one parse step.
+fn parse_dont_validate_guard_kinds(sig: &syn::Signature, block: &syn::Block) -> Vec<String> {
+    typed_params(sig)
+        .into_iter()
+        .filter_map(|(name, ty)| {
+            let kind = primitive_scalar_kind(ty)?;
+            validation_guard_hit(block, &name).map(|_| kind)
+        })
+        .collect()
+}
+
+/// One other function in the crate, found by
+/// [`parse_dont_validate_guard_kinds`], that also validates a parameter of
+/// a given primitive kind — [`parse_dont_validate_candidates`]'s signal 2
+/// corroboration for one particular candidate function.
+struct GuardedParam {
+    qualified_name: String,
+    param_kind: String,
+}
+
+/// Parse, Don't Validate (todo.md §16.7's table; the Rust-community idiom
+/// popularized by Alexis King's essay of the same name): a function that
+/// repeatedly re-checks a primitive/string value's shape via runtime
+/// control flow but hands the caller back the same loosely-typed value,
+/// instead of parsing it once into a distinct, more precisely-typed
+/// newtype/struct that makes the invalid state statically unrepresentable
+/// downstream.
+///
+/// Two independent signals, both required:
+///
+/// 1. **Structural, single-function** ([`parse_dont_validate_signal1`]) — a
+///    `pub fn` (chosen over "any `fn`" because the principle matters most at
+///    an API boundary, where a caller can't see the validation logic behind
+///    the call) with a primitive/string parameter guarded by validation-
+///    shaped control flow (an `if`/`match` with an early `return`/`panic!`,
+///    or a bare `assert!`-family call, referencing that parameter), whose
+///    own return type is *still* a primitive/string/bool shape rather than
+///    a distinct named type. That last condition is also this detector's
+///    main built-in exclusion: a function that validates and then returns
+///    `Result<NewType, _>`/`Option<NewType>` for some distinct `NewType` is
+///    already doing Parse, Don't Validate correctly and is never flagged —
+///    [`return_scalar_kind`] returns `None` for it.
+/// 2. **Usage-based, crate-wide** ([`parse_dont_validate_guard_kinds`]) — the
+///    same crate contains at least one *other*, independently written
+///    function that also guards a parameter of the same primitive kind with
+///    a validation-shaped check. This detector picks the "duplicated
+///    validation logic" framing over the alternative "the caller re-
+///    validates the value coming back from this function" framing: tracing
+///    a value from a call site back through the caller's own control flow
+///    is a dataflow question `syn` alone can't answer without overreaching
+///    into semantic analysis, while "does this crate have more than one
+///    function independently re-implementing the same shape of guard on the
+///    same primitive type" is fully syntactic and checkable per-file. It's
+///    also the more direct evidence for the actual concern: one function
+///    validating a primitive is unremarkable input sanitization on its own,
+///    but the *same* validation shape recurring across independent call
+///    sites for the same primitive kind is what suggests the check was
+///    never centralized into a single parse step in the first place.
+///
+/// A Fast-Tier syntactic proxy, not a semantic/dataflow analysis — like
+/// every other detector in this module, narrow and precision-biased rather
+/// than exhaustive; see [`build_parse_dont_validate_heuristic`]'s
+/// `contraindications`/`missing_evidence` for what's out of scope.
+fn parse_dont_validate_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        let mut guarded: Vec<GuardedParam> = Vec::new();
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            walk_functions(&ast, |site| {
+                for param_kind in parse_dont_validate_guard_kinds(site.sig, site.block) {
+                    guarded.push(GuardedParam {
+                        qualified_name: site.qualified_name.clone(),
+                        param_kind,
+                    });
+                }
+            });
+        }
+
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            walk_functions(&ast, |site| {
+                if !matches!(site.vis, Some(syn::Visibility::Public(_))) {
+                    return;
+                }
+                let Some(hit) = parse_dont_validate_signal1(site.sig, site.block) else {
+                    return;
+                };
+                let mut siblings: Vec<String> = guarded
+                    .iter()
+                    .filter(|g| {
+                        g.param_kind == hit.param_kind && g.qualified_name != site.qualified_name
+                    })
+                    .map(|g| g.qualified_name.clone())
+                    .collect();
+                siblings.sort();
+                siblings.dedup();
+                if siblings.is_empty() {
+                    return;
+                }
+                heuristics.push(build_parse_dont_validate_heuristic(
+                    krate,
+                    &source.path,
+                    &site.qualified_name,
+                    &hit,
+                    &siblings,
+                ));
+            });
+        }
+    }
+    heuristics
+}
+
+fn build_parse_dont_validate_heuristic(
+    krate: &CrateInfo,
+    file: &Path,
+    item_path: &str,
+    hit: &ParamGuardHit,
+    siblings: &[String],
+) -> PrincipleHeuristic {
+    let scope = CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![item_path.to_string()],
+    };
+    let location = EvidenceLocation {
+        file: file.to_path_buf(),
+        item_path: Some(item_path.to_string()),
+    };
+
+    let structural = Evidence {
+        description: format!(
+            "`{item_path}` takes a `{}`-shaped parameter `{}` guarded by a validation-shaped \
+             check at line {} (`{}`), and its own return type is still a `{}`-shaped value \
+             rather than a distinct named type.",
+            hit.param_kind, hit.param_name, hit.guard_line, hit.guard_rendered, hit.return_kind
+        ),
+        locations: vec![location.clone()],
+    };
+    let corroborating = Evidence {
+        description: format!(
+            "Elsewhere in crate `{}`, {} other function(s) independently guard a parameter of \
+             the same `{}` kind with a similarly shaped validation check, instead of one shared \
+             parse step: {}.",
+            krate.name,
+            siblings.len(),
+            hit.param_kind,
+            siblings.join(", ")
+        ),
+        locations: vec![location],
+    };
+
+    let evidence_identities = vec![item_path.to_string(), hit.param_name.clone()];
+    let id = PrincipleHeuristicId::compute(
+        DesignPrinciple::ParseDontValidate,
+        &scope,
+        &evidence_identities,
+    );
+
+    PrincipleHeuristic {
+        id,
+        principle: DesignPrinciple::ParseDontValidate,
+        scope,
+        evidence: vec![structural, corroborating],
+        interpretation: format!(
+            "In the examined function, parameter `{}` is checked at the boundary but the \
+             function hands back the same loosely-typed `{}` shape, and a similarly shaped \
+             check recurs on the same primitive kind elsewhere in the crate. That combination \
+             may suggest the validation could be centralized into a single parse step that \
+             returns a more precisely typed value, rather than repeated at each call site.",
+            hit.param_name, hit.param_kind
+        ),
+        contraindications: vec![
+            Contraindication {
+                description: "A validation predicate meant to stay a reusable, general-purpose \
+                    yes/no check (e.g. a small `is_valid`/`looks_like` helper called from several \
+                    unrelated contexts) is a reasonable design on its own and not necessarily \
+                    evidence that a boundary parse step is missing."
+                    .to_string(),
+            },
+            Contraindication {
+                description: "The sibling functions this heuristic points to may validate \
+                    different, unrelated properties of the same primitive kind (e.g. one checks \
+                    length, another checks character set) rather than duplicating the same check \
+                    — this detector only compares primitive kind, not what the check actually \
+                    verifies."
+                    .to_string(),
+            },
+        ],
+        missing_evidence: vec![MissingEvidence {
+            description: "Whether the sibling functions this heuristic points to actually \
+                duplicate the same semantic check, and whether a caller of the examined function \
+                re-validates the value it gets back, are not checked here — only that a \
+                similarly shaped guard recurs on the same primitive kind somewhere else in the \
+                crate."
+                .to_string(),
+        }],
+        alternatives: vec![
+            DesignAlternative {
+                description: "Keep the function as-is.".to_string(),
+            },
+            DesignAlternative {
+                description: "Introduce a newtype/struct that performs the validation once in a \
+                    constructor (or a `TryFrom`/`FromStr` impl) and carries the result, so \
+                    downstream callers and the sibling functions this heuristic points to can \
+                    depend on a value whose shape already guarantees the check passed."
+                    .to_string(),
+            },
+        ],
+        related_findings: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3654,6 +4152,119 @@ mod tests {
             heuristics
                 .iter()
                 .all(|h| h.principle != DesignPrinciple::BoundedResources)
+        );
+    }
+
+    // --- ParseDontValidate --------------------------------------------
+
+    /// (a) A `pub fn` with a validation-shaped guard on a `&str` parameter
+    /// that still returns a `bool`, plus a private sibling function
+    /// elsewhere in the crate independently guarding another `&str`
+    /// parameter the same way ⇒ exactly one `ParseDontValidate` heuristic
+    /// (the private sibling only corroborates signal 2, it does not itself
+    /// qualify for signal 1's `pub fn` gate).
+    #[test]
+    fn parse_dont_validate_with_crate_wide_duplication_produces_one_heuristic() {
+        let dir = TempDir::new("principle-parse-dont-validate");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn validate_email(s: &str) -> bool {\n\
+             \x20   if s.is_empty() {\n\
+             \x20\x20\x20   return false;\n\
+             \x20   }\n\
+             \x20   true\n\
+             }\n\
+             \n\
+             fn check_username(u: &str) -> bool {\n\
+             \x20   if u.is_empty() {\n\
+             \x20\x20\x20   return false;\n\
+             \x20   }\n\
+             \x20   true\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        let parse_dont_validate: Vec<&PrincipleHeuristic> = heuristics
+            .iter()
+            .filter(|h| h.principle == DesignPrinciple::ParseDontValidate)
+            .collect();
+
+        assert_eq!(parse_dont_validate.len(), 1);
+        let heuristic = parse_dont_validate[0];
+        assert_eq!(heuristic.scope.krate, "fixture");
+        assert_eq!(heuristic.evidence.len(), 2);
+        assert!(!heuristic.evidence[0].locations.is_empty());
+        assert!(!heuristic.evidence[1].locations.is_empty());
+        assert!(heuristic.contraindications.len() >= 2);
+        assert!(heuristic.alternatives.len() >= 2);
+        assert!(!heuristic.missing_evidence.is_empty());
+    }
+
+    /// (b) The same target function, but with no other function in the
+    /// crate guarding a parameter of the same primitive kind ⇒ no
+    /// heuristic — proves signal 2 actually gates, it isn't decorative.
+    #[test]
+    fn parse_dont_validate_without_crate_wide_duplication_produces_no_heuristic() {
+        let dir = TempDir::new("principle-parse-dont-validate-no-corroboration");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn validate_email(s: &str) -> bool {\n\
+             \x20   if s.is_empty() {\n\
+             \x20\x20\x20   return false;\n\
+             \x20   }\n\
+             \x20   true\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::ParseDontValidate)
+        );
+    }
+
+    /// (c) A function that validates and then parses into a distinct
+    /// newtype (`Result<Email, _>`) ⇒ no heuristic, even with a private
+    /// sibling elsewhere guarding another `&str` parameter the same way —
+    /// proves the "already parses into a distinct type" exclusion works
+    /// rather than the negative result just being an absence of signal 2.
+    #[test]
+    fn parse_dont_validate_that_parses_into_a_newtype_produces_no_heuristic() {
+        let dir = TempDir::new("principle-parse-dont-validate-newtype");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub struct Email(String);\n\
+             \n\
+             pub fn parse_email(s: &str) -> Result<Email, String> {\n\
+             \x20   if s.is_empty() {\n\
+             \x20\x20\x20   return Err(\"empty\".to_string());\n\
+             \x20   }\n\
+             \x20   Ok(Email(s.to_string()))\n\
+             }\n\
+             \n\
+             fn check_username(u: &str) -> bool {\n\
+             \x20   if u.is_empty() {\n\
+             \x20\x20\x20   return false;\n\
+             \x20   }\n\
+             \x20   true\n\
+             }\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let heuristics = analyze(&workspace);
+        assert!(
+            heuristics
+                .iter()
+                .all(|h| h.principle != DesignPrinciple::ParseDontValidate)
         );
     }
 }
