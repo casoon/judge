@@ -3758,6 +3758,15 @@ fn run_dead_code_deep(
             })
             .collect();
 
+    // `monomorphization-load` needs each function's `generic_param_count` —
+    // cheap, Fast Tier, the same `Vec<FunctionInfo>` `signature-complexity`
+    // already computes.
+    let monomorphization_source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let complexity = judge::complexity::analyze_workspace(monomorphization_source_files, false);
+
     // `connectivity-drop`/`duplicative-reinvention`/`orphaned-code` load
     // their own second `DeepContext` here rather than sharing
     // `dead_code`'s — `dead_code::analyze_workspace` doesn't expose the
@@ -3771,6 +3780,7 @@ fn run_dead_code_deep(
         include_tests,
         &dominant_author_by_file,
         &active_authors,
+        &complexity.functions,
     )?;
 
     let mut findings = dead_code_report.findings;
@@ -3787,6 +3797,7 @@ fn run_dead_code_deep(
     analysis_errors.extend(dead_trait_impl_report.errors.iter().map(ToString::to_string));
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     analysis_errors.extend(ownership_report.errors.iter().map(ToString::to_string));
+    analysis_errors.extend(complexity.errors.iter().map(ToString::to_string));
     analysis_errors.extend(structural_report.errors.iter().map(ToString::to_string));
 
     // Inline `judge-ignore` suppression (todo.md §5).
@@ -3842,6 +3853,10 @@ fn run_dead_code_deep(
             (
                 judge::slop_structural_deep::ORPHANED_CODE_RULE.to_string(),
                 judge::slop_structural_deep::ORPHANED_CODE_RULE_REVISION,
+            ),
+            (
+                judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE.to_string(),
+                judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE_REVISION,
             ),
         ]);
         return handle_baseline(
@@ -3916,6 +3931,7 @@ fn run_dead_code_deep(
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
                 judge::slop_structural_deep::ORPHANED_CODE_RULE,
+                judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE,
             ] {
                 let rule_findings: Vec<&Finding> = findings
                     .iter()

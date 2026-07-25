@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
+use crate::complexity::FunctionInfo;
 use crate::deep::{DeepContext, DeepError, FileId};
 use crate::duplication::WorkspaceDuplication;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
@@ -77,6 +78,23 @@ pub const ORPHANED_CODE_RULE: &str = "orphaned-code";
 /// Bump when the orphaned-code rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
 pub const ORPHANED_CODE_RULE_REVISION: u32 = 1;
+
+/// Rule id for `monomorphization-load` (todo.md §3.C "Rust-spezifisch:
+/// Monomorphisierungs-Last (Proxy für `cargo-llvm-lines`)") — see
+/// [`monomorphization_load_findings`].
+pub const MONOMORPHIZATION_LOAD_RULE: &str = "monomorphization-load";
+/// Bump when the monomorphization-load rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const MONOMORPHIZATION_LOAD_RULE_REVISION: u32 = 1;
+
+/// `monomorphization_load_score = generic_param_count * cross_file_call_sites`
+/// above which a generic function is flagged. An illustrative starting
+/// point, not a rigorously derived cutoff — e.g. 2 generic params × 11 call
+/// sites, or 4 params × 6 sites. There is no ground truth to calibrate this
+/// against short of actually running `cargo-llvm-lines`, so this threshold
+/// is explicitly subject to revision (see [`monomorphization_load_findings`]
+/// for the full proxy caveat).
+const MONOMORPHIZATION_LOAD_THRESHOLD: u32 = 20;
 
 #[derive(Debug)]
 pub enum SlopStructuralDeepError {
@@ -512,15 +530,115 @@ fn orphaned_code_findings(
     (findings, errors)
 }
 
-/// Runs `connectivity-drop`, `duplicative-reinvention`, and `orphaned-code`
-/// over `workspace`, sharing one Deep Tier workspace load and one
-/// function-fan-in pass across all three. `duplication` is the caller's
-/// already-computed [`WorkspaceDuplication`] (Fast Tier, cheap) — this
-/// function only adds the Deep Tier fan-in check on top of it, it doesn't
-/// re-run duplicate detection itself. `dominant_author_by_file` and
-/// `active_authors` are the caller's already-computed
+/// `monomorphization-load` (todo.md §3.C "Rust-spezifisch:
+/// Monomorphisierungs-Last (Proxy für `cargo-llvm-lines`)"): a Fast-signal
+/// PROXY for `cargo-llvm-lines`-style monomorphization bloat — judge never
+/// runs `cargo-llvm-lines` itself, the same "delegate/proxy to the real
+/// external tool, don't rebuild it" philosophy `untested-hotspot`/
+/// `mutation-survivor` already use for their imported reports, except this
+/// rule needs no import at all, only a cheap local estimate.
+///
+/// **The proxy, stated plainly — the single most important caveat for this
+/// rule:** `cargo-llvm-lines` measures actual generated-LLVM-IR line count
+/// per monomorphized instantiation of a generic function, which needs a real
+/// compile judge never performs. The cheap, honest stand-in used here
+/// instead: `monomorphization_load_score = generic_param_count *
+/// cross_file_call_sites` — more type parameters means more code gets
+/// duplicated per instantiation, and more call sites means more
+/// instantiations plausibly get generated. This does **not** count distinct
+/// *type arguments* at each call site (that would need real type
+/// resolution, unavailable here) — it uses call-site *count* as a cheap
+/// stand-in for instantiation-context diversity, on the reasoning that more
+/// callers plausibly means more distinct instantiation contexts on average.
+/// This is a proxy for a proxy: the least measurement-backed rule in this
+/// batch.
+///
+/// Only functions with at least one generic type parameter
+/// (`generic_param_count >= 1`, from [`FunctionInfo`], already computed for
+/// `signature-complexity`) are candidates — a non-generic function trivially
+/// has zero monomorphization load, so it's skipped rather than reported at a
+/// load of 0. `production_records` must already be a
+/// [`collect_function_fan_in`] pass run with `include_tests: false` — a
+/// test-only call site never produces production binary bloat, so it must
+/// not count toward this score (mirrors [`orphaned_code_findings`]'s own
+/// dedicated production-only `entry_point_positions(.., false)` pass for the
+/// same reason). `Severity::Info`/`EvidenceClass::Heuristic`, the same
+/// current-state-only framing this module's other two rules use (see module
+/// docs) — trend-against-baseline is handled by the existing baseline/delta
+/// system.
+fn monomorphization_load_findings(
+    production_records: &[FunctionFanIn],
+    complexity_functions: &[FunctionInfo],
+) -> Vec<Finding> {
+    let generic_param_counts: HashMap<(&Path, &str), u32> = complexity_functions
+        .iter()
+        .map(|function| {
+            (
+                (function.file.as_path(), function.qualified_name.as_str()),
+                function.generic_param_count,
+            )
+        })
+        .collect();
+
+    production_records
+        .iter()
+        .filter_map(|record| {
+            let generic_param_count = *generic_param_counts
+                .get(&(record.file.as_path(), record.qualified_name.as_str()))?;
+            if generic_param_count == 0 {
+                return None;
+            }
+            let cross_file_call_sites = record.cross_file_references as u32;
+            let monomorphization_load_score = generic_param_count * cross_file_call_sites;
+            if monomorphization_load_score <= MONOMORPHIZATION_LOAD_THRESHOLD {
+                return None;
+            }
+
+            Some(Finding {
+                id: format!(
+                    "{MONOMORPHIZATION_LOAD_RULE}:{}:{}",
+                    record.file.display(),
+                    record.qualified_name
+                )
+                .into(),
+                rule: MONOMORPHIZATION_LOAD_RULE.into(),
+                severity: Severity::Info,
+                location: Location {
+                    file: record.file.clone(),
+                    line: OneBasedLine::new(record.line)
+                        .expect("proc-macro2 span lines are 1-based"),
+                    item_path: record.qualified_name.clone(),
+                },
+                evidence_class: EvidenceClass::Heuristic,
+                origin: Origin::Code,
+                evidence: Some(json!({
+                    "tier": "deep",
+                    "file": record.file.display().to_string(),
+                    "function": record.qualified_name,
+                    "line": record.line,
+                    "generic_param_count": generic_param_count,
+                    "cross_file_call_sites": cross_file_call_sites,
+                    "monomorphization_load_score": monomorphization_load_score,
+                })),
+                caused_by: Vec::new(),
+                causes: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Runs `connectivity-drop`, `duplicative-reinvention`, `orphaned-code`, and
+/// `monomorphization-load` over `workspace`, sharing one Deep Tier workspace
+/// load and one function-fan-in pass across the first three. `duplication`
+/// is the caller's already-computed [`WorkspaceDuplication`] (Fast Tier,
+/// cheap) — this function only adds the Deep Tier fan-in check on top of it,
+/// it doesn't re-run duplicate detection itself. `dominant_author_by_file`
+/// and `active_authors` are the caller's already-computed
 /// [`crate::ownership`]/`active_authors_since` data (Fast Tier, git-blame
 /// based) — see [`orphaned_code_findings`] for how they're used.
+/// `complexity_functions` is the caller's already-computed
+/// [`crate::complexity::WorkspaceComplexity::functions`] (Fast Tier), reused
+/// as-is for its `generic_param_count` — see [`monomorphization_load_findings`].
 /// `orphaned-code` is skipped entirely (same as `low-bus-factor`/
 /// `knowledge-loss-risk`, see [`crate::ownership::LOW_BUS_FACTOR_MIN_REPO_AUTHORS`])
 /// if the repository doesn't have enough distinct active authors for
@@ -531,6 +649,7 @@ pub fn analyze_workspace(
     include_tests: bool,
     dominant_author_by_file: &HashMap<PathBuf, String>,
     active_authors: &HashSet<String>,
+    complexity_functions: &[FunctionInfo],
 ) -> Result<DeepStructuralReport, SlopStructuralDeepError> {
     let ctx = DeepContext::load(&workspace.root).map_err(SlopStructuralDeepError::Deep)?;
     let analysis = ctx.analysis();
@@ -540,6 +659,27 @@ pub fn analyze_workspace(
 
     let mut findings = connectivity_drop_findings(&records);
     findings.extend(duplicative_reinvention_findings(duplication, &records));
+
+    // `monomorphization-load` needs production-only fan-in specifically
+    // (test-only call sites never produce production binary bloat, see
+    // `monomorphization_load_findings`) — reuse `records` as-is when it's
+    // already production-only, otherwise run one dedicated extra pass rather
+    // than let a caller-requested `include_tests: true` leak into this
+    // rule's score.
+    if include_tests {
+        let (production_records, production_errors) =
+            collect_function_fan_in(workspace, &ctx, &analysis, false);
+        errors.extend(production_errors);
+        findings.extend(monomorphization_load_findings(
+            &production_records,
+            complexity_functions,
+        ));
+    } else {
+        findings.extend(monomorphization_load_findings(
+            &records,
+            complexity_functions,
+        ));
+    }
 
     if active_authors.len() >= crate::ownership::LOW_BUS_FACTOR_MIN_REPO_AUTHORS {
         let (orphaned_code, orphaned_code_errors) = orphaned_code_findings(
@@ -631,6 +771,7 @@ fn isolated_helper() -> i32 {
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -687,6 +828,7 @@ fn some_test() {
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -736,6 +878,7 @@ resolver = "2"
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -774,6 +917,7 @@ resolver = "2"
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -850,6 +994,7 @@ resolver = "2"
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
         let hit = report
@@ -931,6 +1076,7 @@ fn clone_two() -> i32 {
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1010,6 +1156,7 @@ resolver = "2"
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1061,6 +1208,7 @@ fn calls_it() {
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -1121,6 +1269,7 @@ fn calls_it() {
             false,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -1205,6 +1354,7 @@ fn calls_it() {
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1324,6 +1474,7 @@ macros = { path = "../macros" }
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
         assert!(
@@ -1362,6 +1513,7 @@ macros = { path = "../macros" }
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -1437,6 +1589,7 @@ macros = { path = "../macros" }
             true,
             &HashMap::new(),
             &HashSet::new(),
+            &Vec::new(),
         )
         .unwrap();
 
@@ -1482,6 +1635,7 @@ macros = { path = "../macros" }
             true,
             &dominant_author_by_file,
             &active_authors,
+            &Vec::new(),
         )
         .unwrap();
 
@@ -1533,6 +1687,7 @@ fn calls_orphaned_helper() {
             true,
             &dominant_author_by_file,
             &active_authors,
+            &Vec::new(),
         )
         .unwrap();
 
@@ -1582,6 +1737,7 @@ fn calls_orphaned_helper() {
             true,
             &dominant_author_by_file,
             &active_authors,
+            &Vec::new(),
         )
         .unwrap();
 
@@ -1623,12 +1779,205 @@ fn calls_orphaned_helper() {
             true,
             &dominant_author_by_file,
             &active_authors,
+            &Vec::new(),
         )
         .unwrap();
 
         assert!(
             !report.findings.iter().any(|f| f.rule == ORPHANED_CODE_RULE),
             "the file's dominant author is still active — must not fire: {:?}",
+            report.findings
+        );
+    }
+
+    /// Writes a single-crate fixture with a `mod`-declared generic function
+    /// and `caller_count` distinct caller files, each calling it once — the
+    /// same "several files, one crate" pattern already used above for
+    /// `duplicative_reinvention_does_not_flag_a_family_with_a_generated_file_member`,
+    /// reused here so [`FunctionFanIn::cross_file_references`] counts one
+    /// per caller file. `generic_fn_source` must define a `pub fn` whose
+    /// name is `generic_fn_name` in `generic.rs`; `caller_body` is the
+    /// caller file's full source, called `caller_N.rs`.
+    fn write_monomorphization_fixture(
+        dir: &TempDir,
+        generic_fn_source: &str,
+        caller_body: &str,
+        caller_count: usize,
+    ) {
+        std::fs::create_dir_all(dir.join("core/src")).unwrap();
+        std::fs::write(
+            dir.join("core/Cargo.toml"),
+            "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let mut lib_source = String::from("mod generic;\n");
+        for i in 0..caller_count {
+            lib_source.push_str(&format!("mod caller_{i};\n"));
+        }
+        std::fs::write(dir.join("core/src/lib.rs"), lib_source).unwrap();
+        std::fs::write(dir.join("core/src/generic.rs"), generic_fn_source).unwrap();
+        for i in 0..caller_count {
+            std::fs::write(dir.join(format!("core/src/caller_{i}.rs")), caller_body).unwrap();
+        }
+        write_workspace_manifest(dir, &["core"]);
+    }
+
+    /// Runs `monomorphization-load` end to end over a fixture built by
+    /// [`write_monomorphization_fixture`]: loads the workspace, computes the
+    /// real `Vec<FunctionInfo>` via [`crate::complexity::analyze_workspace`]
+    /// (the same Fast Tier pass `main.rs` runs in production), then the Deep
+    /// Tier `analyze_workspace` above.
+    fn run_monomorphization_fixture(dir: &TempDir) -> DeepStructuralReport {
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let duplication = WorkspaceDuplication::default();
+        let source_files = workspace
+            .crates
+            .iter()
+            .flat_map(|krate| krate.source_files.iter());
+        let complexity = crate::complexity::analyze_workspace(source_files, false);
+
+        analyze_workspace(
+            &workspace,
+            &duplication,
+            true,
+            &HashMap::new(),
+            &HashSet::new(),
+            &complexity.functions,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn monomorphization_load_fires_for_a_generic_function_with_many_cross_file_callers() {
+        let dir = TempDir::new("monomorphization-load-fires");
+        write_monomorphization_fixture(
+            &dir,
+            "pub fn wrap_triple<T, U, E>(first: T, second: U, _tag: E) -> (T, U) {\n    (first, second)\n}\n",
+            "pub fn run() -> (i32, i32) {\n    crate::generic::wrap_triple(1, 2, \"tag\")\n}\n",
+            7,
+        );
+
+        let report = run_monomorphization_fixture(&dir);
+
+        let finding = report.findings.iter().find(|f| {
+            f.rule == MONOMORPHIZATION_LOAD_RULE && f.location.item_path == "wrap_triple"
+        });
+        assert!(finding.is_some(), "{:?}", report.findings);
+        let evidence = finding.unwrap().evidence.as_ref().unwrap();
+        assert_eq!(evidence["generic_param_count"], 3);
+        assert_eq!(evidence["cross_file_call_sites"], 7);
+        assert_eq!(evidence["monomorphization_load_score"], 21);
+    }
+
+    #[test]
+    fn monomorphization_load_does_not_fire_for_a_generic_function_with_few_callers() {
+        let dir = TempDir::new("monomorphization-load-few-callers");
+        write_monomorphization_fixture(
+            &dir,
+            "pub fn wrap_triple<T, U, E>(first: T, second: U, _tag: E) -> (T, U) {\n    (first, second)\n}\n",
+            "pub fn run() -> (i32, i32) {\n    crate::generic::wrap_triple(1, 2, \"tag\")\n}\n",
+            1,
+        );
+
+        let report = run_monomorphization_fixture(&dir);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == MONOMORPHIZATION_LOAD_RULE),
+            "generic_param_count 3 * cross_file_call_sites 1 = 3, well under the threshold — \
+             must not fire: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn monomorphization_load_does_not_fire_for_a_non_generic_function_with_many_callers() {
+        let dir = TempDir::new("monomorphization-load-non-generic");
+        write_monomorphization_fixture(
+            &dir,
+            "pub fn wrap_triple(first: i32, second: i32, _tag: &str) -> (i32, i32) {\n    (first, second)\n}\n",
+            "pub fn run() -> (i32, i32) {\n    crate::generic::wrap_triple(1, 2, \"tag\")\n}\n",
+            7,
+        );
+
+        let report = run_monomorphization_fixture(&dir);
+
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.rule == MONOMORPHIZATION_LOAD_RULE),
+            "zero generic params means zero monomorphization load regardless of fan-in — must \
+             not fire: {:?}",
+            report.findings
+        );
+    }
+
+    /// Splits a `// file: <name>.rs` marked multi-module source (see the
+    /// `monomorphization-load` registry example in `rule_registry.rs`) into
+    /// `(file_name, source)` pairs, in encounter order — this module's
+    /// counterpart to `dead_code.rs`'s own `split_marked_files` helper.
+    fn split_marked_files(source: &str) -> Vec<(&str, String)> {
+        let mut result: Vec<(&str, String)> = Vec::new();
+        for line in source.lines() {
+            if let Some(name) = line.strip_prefix("// file: ") {
+                result.push((name, String::new()));
+            } else if let Some(entry) = result.last_mut() {
+                entry.1.push_str(line);
+                entry.1.push('\n');
+            }
+        }
+        result
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn monomorphization_load_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(MONOMORPHIZATION_LOAD_RULE)
+            .expect("monomorphization-load has a registry entry")
+            .example
+            .expect("monomorphization-load has a curated example")
+            .before;
+
+        let files = split_marked_files(example);
+        assert_eq!(files.len(), 8, "expected 8 marked files: {files:?}");
+
+        let dir = TempDir::new("monomorphization-load-registry-example");
+        std::fs::create_dir_all(dir.join("core/src")).unwrap();
+        std::fs::write(
+            dir.join("core/Cargo.toml"),
+            "[package]\nname = \"core\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let mod_declarations: String = files
+            .iter()
+            .map(|(name, _)| {
+                let mod_name = name.strip_suffix(".rs").expect("marked file ends in .rs");
+                format!("mod {mod_name};\n")
+            })
+            .collect();
+        std::fs::write(dir.join("core/src/lib.rs"), mod_declarations).unwrap();
+        for (name, source) in &files {
+            std::fs::write(dir.join("core/src").join(name), source).unwrap();
+        }
+        write_workspace_manifest(&dir, &["core"]);
+
+        let report = run_monomorphization_fixture(&dir);
+
+        assert_eq!(
+            report
+                .findings
+                .iter()
+                .filter(|f| f.rule == MONOMORPHIZATION_LOAD_RULE)
+                .count(),
+            1,
+            "{:?}",
             report.findings
         );
     }
