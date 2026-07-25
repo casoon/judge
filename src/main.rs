@@ -926,6 +926,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::complexity::SIGNATURE_COMPLEXITY_RULE_REVISION,
         ),
         (
+            judge::complexity::MAINTAINABILITY_INDEX_RULE.to_string(),
+            judge::complexity::MAINTAINABILITY_INDEX_RULE_REVISION,
+        ),
+        (
             judge::slop_structural::LEGACY_FREEZE_RULE.to_string(),
             judge::slop_structural::LEGACY_FREEZE_RULE_REVISION,
         ),
@@ -1020,6 +1024,9 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
         &complexity.functions,
     ));
     findings.extend(judge::complexity::signature_complexity(
+        &complexity.functions,
+    ));
+    findings.extend(judge::complexity::maintainability_index(
         &complexity.functions,
     ));
 
@@ -4088,6 +4095,7 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
     // `health`-only-missing.
     findings.extend(judge::slop_structural::complexity_inflation(&functions));
     findings.extend(judge::complexity::signature_complexity(&functions));
+    findings.extend(judge::complexity::maintainability_index(&functions));
     match judge::git::churn(&workspace.root, 14) {
         Ok(two_week_churn) => {
             findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
@@ -4580,7 +4588,7 @@ fn print_hotspots(
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 24] = [
+const SLOP_RULES: [&str; 25] = [
     judge::slop::SWALLOWED_RESULT_RULE,
     judge::slop::EMPTY_ERROR_ARM_RULE,
     judge::slop::CATCH_ALL_ERROR_RULE,
@@ -4598,6 +4606,7 @@ const SLOP_RULES: [&str; 24] = [
     judge::slop_structural::CHURN_HOTSPOT_RULE,
     judge::slop_structural::COMPLEXITY_INFLATION_RULE,
     judge::complexity::SIGNATURE_COMPLEXITY_RULE,
+    judge::complexity::MAINTAINABILITY_INDEX_RULE,
     judge::slop_structural::LEGACY_FREEZE_RULE,
     judge::slop_structural::ABSTRACTION_INFLATION_RULE,
     judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,

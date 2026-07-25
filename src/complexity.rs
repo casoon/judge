@@ -1,13 +1,15 @@
 //! Fast-tier complexity analysis: cyclomatic complexity per function via `syn`,
 //! no build required (see todo.md §2.1, §3.C).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use quote::ToTokens;
 use serde_json::json;
 use syn::visit::{self, Visit};
 use syn::{
-    BinOp, Expr, ExprIf, GenericArgument, GenericParam, ItemFn, PathArguments, ReturnType, Type,
-    TypeParamBound, WherePredicate,
+    BinOp, Expr, ExprIf, GenericArgument, GenericParam, ItemFn, Macro, PathArguments, ReturnType,
+    Type, TypeParamBound, UnOp, WherePredicate,
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
@@ -656,6 +658,274 @@ impl<'ast> Visit<'ast> for ExpressionShapeVisitor {
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
 }
 
+/// Fourth, separate `syn::Visit` pass — but over an entire file's AST at
+/// once rather than per function body, since Halstead Volume (feeding
+/// [`maintainability_index`]) is a whole-file metric with no natural
+/// per-function decomposition. Counts operators and operands per the classic
+/// Halstead "software science" metrics
+/// (<https://en.wikipedia.org/wiki/Halstead_complexity_measures>), adapted
+/// for Rust — the original definition is C-era and doesn't map 1:1 onto
+/// Rust syntax, so this is a documented, reproducible approximation, not a
+/// claim of fidelity to the canonical metric (see the `maintainability-index`
+/// `rule_registry` entry's `exclusions` for the full caveat):
+/// - Operators: [`BinOp`]/[`UnOp`] variants (kept as distinct kinds even
+///   where a binary and a unary use of the same token exist, e.g. binary `*`
+///   vs. unary deref `*`, so token collisions don't understate `n1`), plus
+///   `if`/`match`/`for`/`while`/`loop`, `?` (`Expr::Try`), plain `=`
+///   (`Expr::Assign`; compound assignment like `+=` is already its own
+///   `BinOp` variant), a path call (`Expr::Call`) and a method call
+///   (`Expr::MethodCall`) as two distinct operator kinds, and any macro
+///   invocation ([`Macro`], in any syntactic position — expression,
+///   statement, item, pattern, or type).
+/// - Operands: `Expr::Path` idents and `Expr::Lit` literal values, each
+///   deduplicated within the file by their token-stream text (so two
+///   references to `a` are one distinct operand, but `1` and `1.0` are two).
+///   A path in type position (e.g. a parameter's declared type) is not an
+///   `Expr::Path` and so is not counted.
+#[derive(Default)]
+struct HalsteadVisitor {
+    operator_kinds: HashSet<&'static str>,
+    total_operators: u32,
+    operand_values: HashSet<String>,
+    total_operands: u32,
+}
+
+impl HalsteadVisitor {
+    fn operator(&mut self, kind: &'static str) {
+        self.operator_kinds.insert(kind);
+        self.total_operators += 1;
+    }
+
+    fn operand(&mut self, value: String) {
+        self.operand_values.insert(value);
+        self.total_operands += 1;
+    }
+}
+
+/// Canonical operator-kind label for a [`BinOp`], used as [`HalsteadVisitor`]'s
+/// distinct-operator (`n1`) dedup key. `BinOp` is `#[non_exhaustive]`, hence
+/// the catch-all arm.
+fn binop_label(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::Add(_) => "bin +",
+        BinOp::Sub(_) => "bin -",
+        BinOp::Mul(_) => "bin *",
+        BinOp::Div(_) => "bin /",
+        BinOp::Rem(_) => "bin %",
+        BinOp::And(_) => "bin &&",
+        BinOp::Or(_) => "bin ||",
+        BinOp::BitXor(_) => "bin ^",
+        BinOp::BitAnd(_) => "bin &",
+        BinOp::BitOr(_) => "bin |",
+        BinOp::Shl(_) => "bin <<",
+        BinOp::Shr(_) => "bin >>",
+        BinOp::Eq(_) => "bin ==",
+        BinOp::Lt(_) => "bin <",
+        BinOp::Le(_) => "bin <=",
+        BinOp::Ne(_) => "bin !=",
+        BinOp::Ge(_) => "bin >=",
+        BinOp::Gt(_) => "bin >",
+        BinOp::AddAssign(_) => "bin +=",
+        BinOp::SubAssign(_) => "bin -=",
+        BinOp::MulAssign(_) => "bin *=",
+        BinOp::DivAssign(_) => "bin /=",
+        BinOp::RemAssign(_) => "bin %=",
+        BinOp::BitXorAssign(_) => "bin ^=",
+        BinOp::BitAndAssign(_) => "bin &=",
+        BinOp::BitOrAssign(_) => "bin |=",
+        BinOp::ShlAssign(_) => "bin <<=",
+        BinOp::ShrAssign(_) => "bin >>=",
+        _ => "bin ?",
+    }
+}
+
+/// Canonical operator-kind label for a [`UnOp`], same convention as
+/// [`binop_label`]; deliberately namespaced (`"un ..."`) so a unary and a
+/// binary use of the same token (e.g. `*`) count as two distinct operator
+/// kinds, not one.
+fn unop_label(op: &UnOp) -> &'static str {
+    match op {
+        UnOp::Deref(_) => "un *",
+        UnOp::Not(_) => "un !",
+        UnOp::Neg(_) => "un -",
+        _ => "un ?",
+    }
+}
+
+impl<'ast> Visit<'ast> for HalsteadVisitor {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        match expr {
+            Expr::Binary(node) => self.operator(binop_label(&node.op)),
+            Expr::Unary(node) => self.operator(unop_label(&node.op)),
+            Expr::If(_) => self.operator("if"),
+            Expr::Match(_) => self.operator("match"),
+            Expr::ForLoop(_) => self.operator("for"),
+            Expr::While(_) => self.operator("while"),
+            Expr::Loop(_) => self.operator("loop"),
+            Expr::Try(_) => self.operator("?"),
+            Expr::Assign(_) => self.operator("="),
+            Expr::Call(_) => self.operator("call()"),
+            Expr::MethodCall(_) => self.operator(".method()"),
+            Expr::Path(node) => self.operand(node.path.to_token_stream().to_string()),
+            Expr::Lit(node) => self.operand(node.lit.to_token_stream().to_string()),
+            _ => {}
+        }
+        visit::visit_expr(self, expr);
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        self.operator("macro!");
+        visit::visit_macro(self, node);
+    }
+}
+
+/// Whole-file Halstead operator/operand totals, computed by
+/// [`analyze_file_halstead`] — see [`HalsteadVisitor`] for the counting
+/// rules.
+#[derive(Debug, Clone, Copy, Default)]
+struct FileHalstead {
+    distinct_operators: u32,
+    total_operators: u32,
+    distinct_operands: u32,
+    total_operands: u32,
+}
+
+/// Parses `path` again and walks its whole `syn::File` AST with
+/// [`HalsteadVisitor`] — a second, independent parse from [`analyze_file`]'s
+/// (which only walks individual function bodies), since Halstead Volume is a
+/// file-level metric with no natural per-function decomposition.
+fn analyze_file_halstead(path: &Path) -> Result<FileHalstead, ComplexityError> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|err| ComplexityError::Io(path.to_path_buf(), err))?;
+    let ast =
+        syn::parse_file(&source).map_err(|err| ComplexityError::Parse(path.to_path_buf(), err))?;
+
+    let mut visitor = HalsteadVisitor::default();
+    visitor.visit_file(&ast);
+    Ok(FileHalstead {
+        distinct_operators: visitor.operator_kinds.len() as u32,
+        total_operators: visitor.total_operators,
+        distinct_operands: visitor.operand_values.len() as u32,
+        total_operands: visitor.total_operands,
+    })
+}
+
+/// Halstead Volume — `(N1 + N2) * log2(n1 + n2)` — the one Halstead metric
+/// [`maintainability_index`] needs (Halstead Difficulty/Effort/Time are out
+/// of scope). `0.0` for an empty file (`n1 + n2 == 0`), rather than dividing
+/// by zero / taking the log of zero.
+fn halstead_volume(halstead: &FileHalstead) -> f64 {
+    let vocabulary = (halstead.distinct_operators + halstead.distinct_operands) as f64;
+    if vocabulary == 0.0 {
+        return 0.0;
+    }
+    let length = (halstead.total_operators + halstead.total_operands) as f64;
+    length * vocabulary.log2()
+}
+
+/// Per-file `lines_of_code`/`cyclomatic` totals folded from
+/// [`FunctionInfo`] — [`WorkspaceComplexity::functions`] is a flat
+/// per-function list across the whole workspace with no existing per-file
+/// grouping, so [`fold_by_file`] is the first such fold in this crate.
+#[derive(Debug, Clone, Copy, Default)]
+struct FileTotals {
+    cyclomatic: u32,
+    lines_of_code: usize,
+}
+
+fn fold_by_file(functions: &[FunctionInfo]) -> HashMap<&Path, FileTotals> {
+    let mut totals: HashMap<&Path, FileTotals> = HashMap::new();
+    for function in functions {
+        let entry = totals.entry(function.file.as_path()).or_default();
+        entry.cyclomatic += function.cyclomatic;
+        entry.lines_of_code += function.lines_of_code;
+    }
+    totals
+}
+
+/// Rule id for a whole file whose Maintainability Index — the standard
+/// SEI-derived, 0-100-normalized formula also used by Visual Studio and most
+/// modern tooling, combining Halstead Volume, cyclomatic complexity, and
+/// lines of code — falls at or below the widely-cited "yellow or worse"
+/// threshold (see [`MAINTAINABILITY_INDEX_LOW_THRESHOLD`], todo.md §3.C
+/// "Halstead / Maintainability Index (Datei-Ebene)").
+pub const MAINTAINABILITY_INDEX_RULE: &str = "maintainability-index";
+pub const MAINTAINABILITY_INDEX_RULE_REVISION: u32 = 1;
+
+/// Maintainability Index threshold below which a file is flagged — the
+/// widely-cited convention for this exact 0-100 normalized formula (the same
+/// one Visual Studio uses): `MI < 10` is "red" (hard to maintain), `10-19`
+/// is "yellow" (moderately maintainable), `20+` is "green". This rule fires
+/// at "yellow or worse", i.e. `MI < 20`.
+pub const MAINTAINABILITY_INDEX_LOW_THRESHOLD: f64 = 20.0;
+
+/// Flags a whole file whose Maintainability Index falls below
+/// [`MAINTAINABILITY_INDEX_LOW_THRESHOLD`]:
+/// ```text
+/// MI_raw = 171 - 5.2*ln(HalsteadVolume) - 0.23*CyclomaticComplexity - 16.2*ln(LinesOfCode)
+/// MI = max(0, MI_raw * 100 / 171)
+/// ```
+/// `CyclomaticComplexity`/`LinesOfCode` are the file-level sums folded by
+/// [`fold_by_file`] over `functions`; `HalsteadVolume` comes from a second,
+/// independent parse of the file via [`analyze_file_halstead`] — see
+/// [`HalsteadVisitor`] for the Rust-adapted counting rules. A file with
+/// `HalsteadVolume <= 0.0` or zero summed lines of code is skipped entirely
+/// rather than scored (no meaningful MI for a file with no measurable
+/// content).
+pub fn maintainability_index(functions: &[FunctionInfo]) -> Vec<Finding> {
+    let totals = fold_by_file(functions);
+    let mut files: Vec<&Path> = totals.keys().copied().collect();
+    files.sort();
+
+    let mut findings = Vec::new();
+    for file in files {
+        let Ok(halstead) = analyze_file_halstead(file) else {
+            continue;
+        };
+        let volume = halstead_volume(&halstead);
+        let file_totals = totals[file];
+        if volume <= 0.0 || file_totals.lines_of_code == 0 {
+            continue;
+        }
+
+        let mi_raw = 171.0
+            - 5.2 * volume.ln()
+            - 0.23 * file_totals.cyclomatic as f64
+            - 16.2 * (file_totals.lines_of_code as f64).ln();
+        let mi = (mi_raw * 100.0 / 171.0).max(0.0);
+        if mi >= MAINTAINABILITY_INDEX_LOW_THRESHOLD {
+            continue;
+        }
+
+        findings.push(Finding {
+            id: format!("{MAINTAINABILITY_INDEX_RULE}:{}", file.display()).into(),
+            rule: MAINTAINABILITY_INDEX_RULE.into(),
+            severity: Severity::Warn,
+            location: Location {
+                file: file.to_path_buf(),
+                line: OneBasedLine::FIRST,
+                item_path: file.display().to_string(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(json!({
+                "file": file.display().to_string(),
+                "maintainability_index": mi,
+                "halstead_volume": volume,
+                "distinct_operators": halstead.distinct_operators,
+                "total_operators": halstead.total_operators,
+                "distinct_operands": halstead.distinct_operands,
+                "total_operands": halstead.total_operands,
+                "cyclomatic_complexity_sum": file_totals.cyclomatic,
+                "lines_of_code_sum": file_totals.lines_of_code,
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        });
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1120,6 +1390,150 @@ where
             findings
                 .iter()
                 .filter(|f| f.rule == SIGNATURE_COMPLEXITY_RULE)
+                .count(),
+            1
+        );
+    }
+
+    /// `a + b` gives exactly one distinct operator (`bin +`, `n1` = 1, `N1` =
+    /// 1) and two distinct operands (`a`, `b`; `n2` = 2, `N2` = 2), so
+    /// Halstead Volume and the resulting Maintainability Index can be
+    /// computed by hand from the same formula [`maintainability_index`] uses
+    /// and checked for an exact match — mirrors this crate's
+    /// `cognitive_complexity_matches_hand_calculation` precedent.
+    #[test]
+    fn maintainability_index_matches_hand_calculation() {
+        let dir = TempDir::new("complexity-maintainability-index-hand-calc");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn simple(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#,
+        )
+        .unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        assert_eq!(functions[0].cyclomatic, 1);
+        assert_eq!(functions[0].lines_of_code, 3);
+
+        let halstead = analyze_file_halstead(&file).unwrap();
+        assert_eq!(halstead.distinct_operators, 1);
+        assert_eq!(halstead.total_operators, 1);
+        assert_eq!(halstead.distinct_operands, 2);
+        assert_eq!(halstead.total_operands, 2);
+
+        // n1 + n2 = 3, N1 + N2 = 3: Volume = 3 * log2(3).
+        let expected_volume = 3.0_f64 * 3.0_f64.log2();
+        let volume = halstead_volume(&halstead);
+        assert!(
+            (volume - expected_volume).abs() < 1e-9,
+            "got {volume}, expected {expected_volume}"
+        );
+
+        // MI_raw = 171 - 5.2*ln(volume) - 0.23*1 - 16.2*ln(3); MI = max(0, MI_raw * 100 / 171).
+        let expected_mi_raw = 171.0 - 5.2 * expected_volume.ln() - 0.23 * 1.0 - 16.2 * 3.0_f64.ln();
+        let expected_mi = (expected_mi_raw * 100.0 / 171.0).max(0.0);
+        assert!(
+            expected_mi >= MAINTAINABILITY_INDEX_LOW_THRESHOLD,
+            "hand-calculated MI {expected_mi} should be well above the threshold"
+        );
+
+        // Well above the threshold, so this file must not produce a finding.
+        assert!(maintainability_index(&functions).is_empty());
+    }
+
+    #[test]
+    fn maintainability_index_does_not_fire_for_well_structured_files() {
+        let dir = TempDir::new("complexity-maintainability-index-low");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub fn greet(name: &str) -> String {
+    format!("hello, {name}")
+}
+
+pub fn is_even(n: i32) -> bool {
+    n % 2 == 0
+}
+"#,
+        )
+        .unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let findings = maintainability_index(&functions);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn maintainability_index_fires_for_a_long_high_branching_file() {
+        let dir = TempDir::new("complexity-maintainability-index-high");
+        let file = dir.join("lib.rs");
+        let mut source = String::from("fn tangled(x: i32) -> i32 {\n    let mut y = 0;\n");
+        for i in 0..120 {
+            source.push_str(&format!(
+                "    if x > {i} {{ y = {i}; }} else if x < -{i} {{ y = -{i}; }}\n"
+            ));
+        }
+        source.push_str("    y\n}\n");
+        std::fs::write(&file, source).unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let findings = maintainability_index(&functions);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, MAINTAINABILITY_INDEX_RULE);
+        let mi = findings[0].evidence.as_ref().unwrap()["maintainability_index"]
+            .as_f64()
+            .unwrap();
+        assert!(
+            mi < MAINTAINABILITY_INDEX_LOW_THRESHOLD,
+            "expected mi < {MAINTAINABILITY_INDEX_LOW_THRESHOLD}, got {mi}"
+        );
+    }
+
+    #[test]
+    fn maintainability_index_does_not_fire_for_an_empty_or_trivial_file() {
+        let dir = TempDir::new("complexity-maintainability-index-trivial");
+        let empty_file = dir.join("empty.rs");
+        std::fs::write(&empty_file, "").unwrap();
+        let empty_functions = analyze_file(&empty_file).unwrap();
+        assert!(maintainability_index(&empty_functions).is_empty());
+
+        let trivial_file = dir.join("trivial.rs");
+        std::fs::write(&trivial_file, "fn trivial() {}\n").unwrap();
+        let trivial_functions = analyze_file(&trivial_file).unwrap();
+        assert!(maintainability_index(&trivial_functions).is_empty());
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// same drift-guard convention as
+    /// `signature_complexity_registry_example_still_triggers_the_rule`.
+    #[test]
+    fn maintainability_index_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(MAINTAINABILITY_INDEX_RULE)
+            .expect("maintainability-index has a registry entry")
+            .example
+            .expect("maintainability-index has a curated example")
+            .before;
+        let dir = TempDir::new("complexity-maintainability-index-registry-example");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let findings = maintainability_index(&functions);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.rule == MAINTAINABILITY_INDEX_RULE)
                 .count(),
             1
         );
