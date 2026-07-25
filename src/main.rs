@@ -384,6 +384,16 @@ struct PatternsOptions {
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
     format: OutputFormat,
+    /// Opt-in: cross-reference an already-generated `cargo clippy
+    /// --message-format=json` report, strengthening `boolean-state-cluster`
+    /// candidates with a third, cross-call-site corroborating evidence
+    /// signal (`clippy::fn_params_excessive_bools`) when clippy
+    /// independently flags the same function. judge never runs `cargo
+    /// clippy` itself — generate the report with `cargo clippy
+    /// --message-format=json > PATH` first (see `judge::clippy_import`
+    /// module docs).
+    #[arg(long, value_name = "PATH")]
+    clippy_json: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -624,6 +634,12 @@ impl From<judge::coverage::LcovError> for CliError {
 
 impl From<judge::advisories::AuditImportError> for CliError {
     fn from(err: judge::advisories::AuditImportError) -> Self {
+        Self::Config(err.to_string())
+    }
+}
+
+impl From<judge::clippy_import::ClippyImportError> for CliError {
+    fn from(err: judge::clippy_import::ClippyImportError) -> Self {
         Self::Config(err.to_string())
     }
 }
@@ -3099,6 +3115,7 @@ fn run_provenance(
 /// re-runs its own analysis rather than caching a prior run.
 fn collect_pattern_candidates(
     workspace: &judge::ingest::Workspace,
+    clippy_json: Option<&Path>,
 ) -> Result<Vec<judge::pattern::PatternCandidate>, CliError> {
     let slop_source_files = workspace
         .crates
@@ -3110,7 +3127,15 @@ fn collect_pattern_candidates(
         false,
         rules_config.catch_all_error.allow_anyhow_at_boundary,
     );
-    Ok(judge::pattern::analyze_workspace(workspace, &slop.findings))
+    let clippy_hits = match clippy_json {
+        Some(path) => judge::clippy_import::read_clippy_report(path)?,
+        None => Vec::new(),
+    };
+    Ok(judge::pattern::analyze_workspace_with_clippy(
+        workspace,
+        &slop.findings,
+        &clippy_hits,
+    ))
 }
 
 /// `cargo judge patterns` (todo.md §16.5, §16.6): heuristic Rust
@@ -3119,12 +3144,15 @@ fn collect_pattern_candidates(
 /// verdict on its own; a real analyzer/config failure still surfaces as a
 /// `CliError` (exit 2), same as every other command.
 fn run_patterns(options: PatternsOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let PatternsOptions { format } = options;
+    let PatternsOptions {
+        format,
+        clippy_json,
+    } = options;
     if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
         return Err(unsupported_format("`patterns`", format, "tty, json"));
     }
     let workspace = judge::ingest::load(None)?;
-    let candidates = collect_pattern_candidates(&workspace)?;
+    let candidates = collect_pattern_candidates(&workspace, clippy_json.as_deref())?;
 
     match format {
         OutputFormat::Json => {
@@ -3232,7 +3260,7 @@ fn find_pattern_candidate(
     workspace: &judge::ingest::Workspace,
     id: &str,
 ) -> Result<judge::pattern::PatternCandidate, CliError> {
-    collect_pattern_candidates(workspace)?
+    collect_pattern_candidates(workspace, None)?
         .into_iter()
         .find(|candidate| candidate.id.as_str() == id)
         .ok_or_else(|| CliError::Analyzer(format!("unknown pattern candidate id: {id}")))
@@ -5519,6 +5547,7 @@ fn dup_two(x: i32) -> i32 {
             &dir,
             cli_with(Command::Patterns(PatternsOptions {
                 format: OutputFormat::Json,
+                clippy_json: None,
             })),
             &mut out,
         )
@@ -5547,6 +5576,7 @@ fn dup_two(x: i32) -> i32 {
             &dir,
             cli_with(Command::Patterns(PatternsOptions {
                 format: OutputFormat::Json,
+                clippy_json: None,
             })),
             &mut out,
         )
@@ -5870,6 +5900,7 @@ fn dup_two(x: i32) -> i32 {
             &dir,
             cli_with(Command::Patterns(PatternsOptions {
                 format: OutputFormat::Json,
+                clippy_json: None,
             })),
             &mut json_out,
         )

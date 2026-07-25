@@ -23,8 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+use crate::clippy_import::ClippyBoolParamsHit;
 use crate::finding::{Finding, FindingId};
 use crate::ingest::{CrateInfo, Workspace};
 
@@ -261,9 +263,23 @@ pub struct PatternCandidate {
 /// `manual-resource-lifecycle` — this is the dispatch point future rules
 /// from todo.md §16.3 attach to.
 pub fn analyze_workspace(workspace: &Workspace, findings: &[Finding]) -> Vec<PatternCandidate> {
+    analyze_workspace_with_clippy(workspace, findings, &[])
+}
+
+/// Same as [`analyze_workspace`], plus `clippy_hits` — parsed
+/// `clippy::fn_params_excessive_bools` results (see
+/// [`crate::clippy_import::read_clippy_report`]) that
+/// [`boolean_state_cluster_candidates`] uses as optional, additive
+/// corroborating evidence. Passing an empty slice is exactly
+/// [`analyze_workspace`]'s behavior — the clippy import is fully opt-in.
+pub fn analyze_workspace_with_clippy(
+    workspace: &Workspace,
+    findings: &[Finding],
+    clippy_hits: &[ClippyBoolParamsHit],
+) -> Vec<PatternCandidate> {
     let mut candidates = stringly_error_boundary_candidates(workspace, findings);
     candidates.extend(primitive_domain_value_candidates(workspace));
-    candidates.extend(boolean_state_cluster_candidates(workspace));
+    candidates.extend(boolean_state_cluster_candidates(workspace, clippy_hits));
     candidates.extend(public_invariant_bypass_candidates(workspace));
     candidates.extend(manual_resource_lifecycle_candidates(workspace));
     candidates
@@ -1002,7 +1018,19 @@ fn body_has_validation_guard_for(block: &syn::Block, param: &str) -> bool {
 /// function, scoped to that function rather than the whole crate (unlike
 /// `primitive-domain-value`, since the finding here is local to one
 /// function).
-fn boolean_state_cluster_candidates(workspace: &Workspace) -> Vec<PatternCandidate> {
+///
+/// `clippy_hits` (optional, see [`crate::clippy_import`]) never creates a
+/// candidate on its own — only the two signals above can do that. When a
+/// function already produces a candidate and a
+/// `clippy::fn_params_excessive_bools` hit independently matches the same
+/// function (same file, overlapping line range — see
+/// [`clippy_hit_matches_fact`]), it is added as a third, purely additive
+/// [`Evidence`] entry (todo.md §16: "mehrere `fn_params_excessive_bools`-
+/// Fundstellen als Signal").
+fn boolean_state_cluster_candidates(
+    workspace: &Workspace,
+    clippy_hits: &[ClippyBoolParamsHit],
+) -> Vec<PatternCandidate> {
     let mut candidates = Vec::new();
     for krate in &workspace.crates {
         for source in &krate.source_files {
@@ -1019,11 +1047,53 @@ fn boolean_state_cluster_candidates(workspace: &Workspace) -> Vec<PatternCandida
             };
             visitor.visit_file(&ast);
             for fact in visitor.facts {
-                candidates.push(build_boolean_state_cluster_candidate(krate, &fact));
+                let mut candidate = build_boolean_state_cluster_candidate(krate, &fact);
+                if let Some(hit) = clippy_hits
+                    .iter()
+                    .find(|hit| clippy_hit_matches_fact(&workspace.root, hit, &fact))
+                {
+                    candidate.evidence.additional.push(Evidence {
+                        description: format!(
+                            "`clippy::fn_params_excessive_bools` independently flagged \
+                             `{}`'s parameter list (lines {}-{}), corroborating this from a \
+                             separate tool.",
+                            fact.item_path, hit.line_start, hit.line_end
+                        ),
+                        locations: vec![EvidenceLocation {
+                            file: fact.file.clone(),
+                            item_path: Some(fact.item_path.clone()),
+                        }],
+                    });
+                }
+                candidates.push(candidate);
             }
         }
     }
     candidates
+}
+
+/// Whether a `clippy::fn_params_excessive_bools` hit corroborates `fact`:
+/// same file, normalized relative to `workspace_root` (clippy's
+/// `file_name` is relative to the directory `cargo clippy` was invoked in,
+/// typically the workspace root, mirroring
+/// [`crate::coverage::parse_lcov`]'s `SF:`-path normalization), and an
+/// overlapping line range — clippy's span may cover just the parameter
+/// list while `fact`'s span covers the whole item, so overlap (not
+/// equality) is what proves they're the same function.
+fn clippy_hit_matches_fact(
+    workspace_root: &Path,
+    hit: &ClippyBoolParamsHit,
+    fact: &BoolClusterFact,
+) -> bool {
+    let fact_relative = fact.file.strip_prefix(workspace_root).unwrap_or(&fact.file);
+    let hit_normalized: PathBuf = hit
+        .file
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect();
+    fact_relative == hit_normalized
+        && fact.line_start <= hit.line_end
+        && hit.line_start <= fact.line_end
 }
 
 /// One function whose signature/body satisfy both
@@ -1033,6 +1103,8 @@ struct BoolClusterFact {
     item_path: String,
     bool_params: BTreeSet<String>,
     combo_hits: Vec<String>,
+    line_start: usize,
+    line_end: usize,
 }
 
 fn build_boolean_state_cluster_candidate(
@@ -1157,7 +1229,13 @@ struct BooleanStateClusterVisitor<'a> {
 }
 
 impl BooleanStateClusterVisitor<'_> {
-    fn record_fn(&mut self, name: &str, sig: &syn::Signature, block: &syn::Block) {
+    fn record_fn(
+        &mut self,
+        name: &str,
+        sig: &syn::Signature,
+        block: &syn::Block,
+        span: proc_macro2::Span,
+    ) {
         let item_path = match &self.self_type {
             Some(self_type) => format!("{self_type}::{name}"),
             None => name.to_string(),
@@ -1190,13 +1268,20 @@ impl BooleanStateClusterVisitor<'_> {
             item_path,
             bool_params,
             combo_hits,
+            line_start: span.start().line,
+            line_end: span.end().line,
         });
     }
 }
 
 impl<'ast> Visit<'ast> for BooleanStateClusterVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+        self.record_fn(
+            &node.sig.ident.to_string(),
+            &node.sig,
+            &node.block,
+            node.span(),
+        );
         syn::visit::visit_item_fn(self, node);
     }
 
@@ -1210,7 +1295,12 @@ impl<'ast> Visit<'ast> for BooleanStateClusterVisitor<'_> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+        self.record_fn(
+            &node.sig.ident.to_string(),
+            &node.sig,
+            &node.block,
+            node.span(),
+        );
         syn::visit::visit_impl_item_fn(self, node);
     }
 }
@@ -2345,6 +2435,89 @@ mod tests {
 
         let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
         assert!(analyze_workspace(&workspace, &[]).is_empty());
+    }
+
+    /// `boolean-state-cluster` + clippy corroboration (d): the same fixture
+    /// as (a) already produces a candidate from the two AST signals alone.
+    /// A matching `clippy::fn_params_excessive_bools` hit for the same
+    /// function (same file, overlapping line range) adds a third
+    /// `additional` evidence entry — purely additive, on top of the
+    /// existing `primary`/`independent` pair.
+    #[test]
+    fn boolean_cluster_with_matching_clippy_hit_gains_a_third_evidence_entry() {
+        let dir = TempDir::new("pattern-bool-clippy-corroborated");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn configure(verbose: bool, strict: bool, dry_run: bool) {\n\
+             \x20   if verbose && strict {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             \x20   let _ = dry_run;\n\
+             }\n\
+             fn do_thing() {}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+
+        // Without `--clippy-json`: unchanged, no `additional` evidence —
+        // proves the feature is fully backward-compatible/opt-in.
+        let without_clippy = analyze_workspace(&workspace, &[]);
+        assert_eq!(without_clippy.len(), 1);
+        assert!(without_clippy[0].evidence.additional.is_empty());
+
+        // With a matching `--clippy-json` hit: a third evidence entry.
+        let clippy_hits = vec![ClippyBoolParamsHit {
+            file: PathBuf::from("lib.rs"),
+            line_start: 1,
+            line_end: 1,
+        }];
+        let with_clippy = analyze_workspace_with_clippy(&workspace, &[], &clippy_hits);
+        assert_eq!(with_clippy.len(), 1);
+        assert_eq!(with_clippy[0].evidence.additional.len(), 1);
+        assert!(
+            with_clippy[0].evidence.additional[0]
+                .description
+                .contains("fn_params_excessive_bools")
+        );
+    }
+
+    /// `boolean-state-cluster` + clippy corroboration (e): a clippy hit
+    /// alone, for a function that does *not* independently satisfy the
+    /// existing 2-signal AST check (bool params never combined in a
+    /// condition, same fixture as (b)), must not create a candidate —
+    /// clippy can only corroborate a candidate the AST signals already
+    /// found, never create one by itself.
+    #[test]
+    fn boolean_cluster_clippy_hit_alone_does_not_create_a_candidate() {
+        let dir = TempDir::new("pattern-bool-clippy-alone");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "pub fn configure(verbose: bool, strict: bool, dry_run: bool) {\n\
+             \x20   if verbose {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             \x20   if strict {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             \x20   if dry_run {\n\
+             \x20       do_thing();\n\
+             \x20   }\n\
+             }\n\
+             fn do_thing() {}\n",
+        )
+        .unwrap();
+
+        let workspace = workspace_with_crate(dir.to_path_buf(), vec![file]);
+        let clippy_hits = vec![ClippyBoolParamsHit {
+            file: PathBuf::from("lib.rs"),
+            line_start: 1,
+            line_end: 1,
+        }];
+
+        assert!(analyze_workspace_with_clippy(&workspace, &[], &clippy_hits).is_empty());
     }
 
     /// `public-invariant-bypass` (a): a `pub struct` with two `pub` fields

@@ -8,6 +8,7 @@ pub mod baseline;
 pub mod boundaries;
 #[cfg(feature = "deep")]
 pub mod boundaries_deep;
+pub mod clippy_import;
 pub mod complexity;
 pub mod coverage;
 #[cfg(feature = "deep")]
