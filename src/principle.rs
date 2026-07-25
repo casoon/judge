@@ -840,86 +840,39 @@ fn leaked_type_in(ty: &syn::Type, forbidden: &[String]) -> Option<(String, Strin
     })
 }
 
-/// Collects every `pub fn`/`pub` impl-method signature in one parsed file
-/// whose parameter or return type matches [`leaked_type_in`], tracking the
-/// enclosing `mod`/`impl` path for a qualified item name (same path-tracking
-/// shape as `crate::functions::walk_functions`' `Walker`, reimplemented here
-/// because that helper doesn't expose parameter/return types).
-struct SignatureCollector<'a> {
-    path: Vec<String>,
-    file: PathBuf,
-    forbidden: &'a [String],
-    hits: Vec<LeakedSignature>,
-}
-
-impl SignatureCollector<'_> {
-    fn qualified(&self, name: &str) -> String {
-        if self.path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}::{name}", self.path.join("::"))
-        }
+/// Checks one `pub fn`/`pub` impl-method signature against [`leaked_type_in`],
+/// pushing a [`LeakedSignature`] onto `hits` for every parameter/return type
+/// that matches.
+fn check_signature(
+    hits: &mut Vec<LeakedSignature>,
+    item_path: &str,
+    sig: &syn::Signature,
+    file: &Path,
+    forbidden: &[String],
+) {
+    let mut types: Vec<&syn::Type> = sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(pat_type) => Some(pat_type.ty.as_ref()),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect();
+    if let syn::ReturnType::Type(_, ty) = &sig.output {
+        types.push(ty.as_ref());
     }
-
-    fn check_signature(&mut self, item_path: &str, sig: &syn::Signature) {
-        let mut types: Vec<&syn::Type> = sig
-            .inputs
-            .iter()
-            .filter_map(|arg| match arg {
-                syn::FnArg::Typed(pat_type) => Some(pat_type.ty.as_ref()),
-                syn::FnArg::Receiver(_) => None,
-            })
-            .collect();
-        if let syn::ReturnType::Type(_, ty) = &sig.output {
-            types.push(ty.as_ref());
+    for ty in types {
+        if let Some((leaked_type, forbidden)) = leaked_type_in(ty, forbidden) {
+            hits.push(LeakedSignature {
+                item_path: item_path.to_string(),
+                leaked_type,
+                forbidden,
+                location: EvidenceLocation {
+                    file: file.to_path_buf(),
+                    item_path: Some(item_path.to_string()),
+                },
+            });
         }
-        for ty in types {
-            if let Some((leaked_type, forbidden)) = leaked_type_in(ty, self.forbidden) {
-                self.hits.push(LeakedSignature {
-                    item_path: item_path.to_string(),
-                    leaked_type,
-                    forbidden,
-                    location: EvidenceLocation {
-                        file: self.file.clone(),
-                        item_path: Some(item_path.to_string()),
-                    },
-                });
-            }
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for SignatureCollector<'_> {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if node.content.is_some() {
-            self.path.push(node.ident.to_string());
-            syn::visit::visit_item_mod(self, node);
-            self.path.pop();
-        } else {
-            syn::visit::visit_item_mod(self, node);
-        }
-    }
-
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        self.path.push(crate::functions::type_name(&node.self_ty));
-        syn::visit::visit_item_impl(self, node);
-        self.path.pop();
-    }
-
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            let item_path = self.qualified(&node.sig.ident.to_string());
-            self.check_signature(&item_path, &node.sig);
-        }
-        syn::visit::visit_item_fn(self, node);
-    }
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            let item_path = self.qualified(&node.sig.ident.to_string());
-            self.check_signature(&item_path, &node.sig);
-        }
-        syn::visit::visit_impl_item_fn(self, node);
     }
 }
 
@@ -949,14 +902,18 @@ fn leaked_signatures(
         let Ok(ast) = syn::parse_file(&text) else {
             continue;
         };
-        let mut collector = SignatureCollector {
-            path: Vec::new(),
-            file: source.path.clone(),
-            forbidden,
-            hits: Vec::new(),
-        };
-        collector.visit_file(&ast);
-        leaks.extend(collector.hits);
+        walk_functions(&ast, |site| {
+            if !matches!(site.vis, Some(syn::Visibility::Public(_))) {
+                return;
+            }
+            check_signature(
+                &mut leaks,
+                &site.qualified_name,
+                site.sig,
+                &source.path,
+                forbidden,
+            );
+        });
     }
     leaks
 }
@@ -2172,64 +2129,6 @@ fn bounded_resources_recursion_hit(
     })
 }
 
-/// Walks a crate's parsed files for [`bounded_resources_recursion_candidates`],
-/// tracking the enclosing `mod`/`impl` path for a qualified item name — the
-/// same path-tracking shape `SignatureCollector` uses, reimplemented here
-/// because that helper doesn't run [`bounded_resources_recursion_hit`]'s
-/// check.
-struct RecursionCollector {
-    path: Vec<String>,
-    hits: Vec<(String, RecursionHit)>,
-}
-
-impl RecursionCollector {
-    fn qualified(&self, name: &str) -> String {
-        if self.path.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}::{name}", self.path.join("::"))
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for RecursionCollector {
-    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if node.content.is_some() {
-            self.path.push(node.ident.to_string());
-            syn::visit::visit_item_mod(self, node);
-            self.path.pop();
-        } else {
-            syn::visit::visit_item_mod(self, node);
-        }
-    }
-
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        self.path.push(crate::functions::type_name(&node.self_ty));
-        syn::visit::visit_item_impl(self, node);
-        self.path.pop();
-    }
-
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        let item_path = self.qualified(&node.sig.ident.to_string());
-        if let Some(hit) =
-            bounded_resources_recursion_hit(&node.sig.ident.to_string(), &node.sig, &node.block)
-        {
-            self.hits.push((item_path, hit));
-        }
-        syn::visit::visit_item_fn(self, node);
-    }
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        let item_path = self.qualified(&node.sig.ident.to_string());
-        if let Some(hit) =
-            bounded_resources_recursion_hit(&node.sig.ident.to_string(), &node.sig, &node.block)
-        {
-            self.hits.push((item_path, hit));
-        }
-        syn::visit::visit_impl_item_fn(self, node);
-    }
-}
-
 fn bounded_resources_recursion_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
     for krate in &workspace.crates {
@@ -2240,12 +2139,20 @@ fn bounded_resources_recursion_candidates(workspace: &Workspace) -> Vec<Principl
             let Ok(ast) = syn::parse_file(&text) else {
                 continue;
             };
-            let mut collector = RecursionCollector {
-                path: Vec::new(),
-                hits: Vec::new(),
-            };
-            collector.visit_file(&ast);
-            for (item_path, hit) in collector.hits {
+            let mut hits: Vec<(String, RecursionHit)> = Vec::new();
+            walk_functions(&ast, |site| {
+                // Trait default methods have no `vis` of their own — skip
+                // them, matching the pre-migration hand-rolled visitor,
+                // which never visited `TraitItemFn` bodies for this check.
+                if site.vis.is_none() {
+                    return;
+                }
+                let name = site.sig.ident.to_string();
+                if let Some(hit) = bounded_resources_recursion_hit(&name, site.sig, site.block) {
+                    hits.push((site.qualified_name.clone(), hit));
+                }
+            });
+            for (item_path, hit) in hits {
                 heuristics.push(build_bounded_resources_recursion_heuristic(
                     krate,
                     &source.path,
