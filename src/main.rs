@@ -946,6 +946,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::security::UNSAFE_SURFACE_RULE_REVISION,
         ),
         (
+            judge::security::UNSAFE_DENSITY_RULE.to_string(),
+            judge::security::UNSAFE_DENSITY_RULE_REVISION,
+        ),
+        (
             judge::security::INTEGER_CAST_RISK_RULE.to_string(),
             judge::security::INTEGER_CAST_RISK_RULE_REVISION,
         ),
@@ -4280,6 +4284,10 @@ fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutc
                 judge::security::UNSAFE_SURFACE_RULE_REVISION,
             ),
             (
+                judge::security::UNSAFE_DENSITY_RULE.to_string(),
+                judge::security::UNSAFE_DENSITY_RULE_REVISION,
+            ),
+            (
                 judge::security::INTEGER_CAST_RISK_RULE.to_string(),
                 judge::security::INTEGER_CAST_RISK_RULE_REVISION,
             ),
@@ -4593,7 +4601,7 @@ fn print_hotspots(
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 25] = [
+const SLOP_RULES: [&str; 26] = [
     judge::slop::SWALLOWED_RESULT_RULE,
     judge::slop::EMPTY_ERROR_ARM_RULE,
     judge::slop::CATCH_ALL_ERROR_RULE,
@@ -4616,6 +4624,7 @@ const SLOP_RULES: [&str; 25] = [
     judge::slop_structural::ABSTRACTION_INFLATION_RULE,
     judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
     judge::security::UNSAFE_SURFACE_RULE,
+    judge::security::UNSAFE_DENSITY_RULE,
     judge::security::INTEGER_CAST_RISK_RULE,
     judge::security::PANIC_IN_LIB_RULE,
     judge::security::HARDCODED_SECRET_RULE,

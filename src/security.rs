@@ -1,24 +1,29 @@
 //! Fast-tier security-shaped signals (see todo.md §F "Security-Candidates").
-//! Four syntax-only detectors live here: `unsafe-surface` (an `unsafe { .. }`
-//! expression block with no adjacent `// SAFETY:` comment), `integer-cast-risk`
-//! (an `as` cast whose target type is a narrow integer type — a syntax-only
-//! proxy for a possible truncation, not a proof), `panic-in-lib`
-//! (`.unwrap()`/`.expect(..)`/`panic!(..)`/indexing reachable from a `pub`
-//! item — a syntax-only proxy for an unhandled panic, not a proof), and
-//! `hardcoded-secret` (a string literal matching a known secret-provider
-//! pattern, or bound to a suspiciously-named `let`/`const`/`static` with high
-//! Shannon entropy — a syntax-only proxy for a real secret, not a proof).
+//! Five syntax-only detectors live here: `unsafe-surface` (an `unsafe { .. }`
+//! expression block with no adjacent `// SAFETY:` comment), `unsafe-density`
+//! (a whole-file companion metric: how much of a file's lines live inside
+//! `unsafe { .. }` blocks, and how large the single largest block is — see
+//! "`unsafe-density` scope" below), `integer-cast-risk` (an `as` cast whose
+//! target type is a narrow integer type — a syntax-only proxy for a possible
+//! truncation, not a proof), `panic-in-lib` (`.unwrap()`/`.expect(..)`/
+//! `panic!(..)`/indexing reachable from a `pub` item — a syntax-only proxy
+//! for an unhandled panic, not a proof), and `hardcoded-secret` (a string
+//! literal matching a known secret-provider pattern, or bound to a
+//! suspiciously-named `let`/`const`/`static` with high Shannon entropy — a
+//! syntax-only proxy for a real secret, not a proof).
 //!
 //! None fits an existing home: `complexity.rs`/`functions.rs` have no prior
 //! `unsafe`-block handling, and `slop_structural.rs`'s G4 scope (structural
 //! slop — churn, boilerplate, abstraction shape) is deliberately kept
-//! unblurred rather than absorbing security-shaped checks. The first three
-//! detectors reuse [`crate::functions::walk_functions`] for the
-//! per-function-body traversal, exactly like [`crate::complexity`] and
-//! [`crate::duplication`] already do; `hardcoded-secret` needs its own
-//! whole-file traversal instead (see its own scope section below) since it
-//! must also see module-level `const`/`static` items, which
-//! `walk_functions` never visits.
+//! unblurred rather than absorbing security-shaped checks. `unsafe-surface`,
+//! `integer-cast-risk`, and `panic-in-lib` reuse
+//! [`crate::functions::walk_functions`] for the per-function-body traversal,
+//! exactly like [`crate::complexity`] and [`crate::duplication`] already do;
+//! `hardcoded-secret` and `unsafe-density` each need their own whole-file
+//! traversal instead (see their own scope sections below), since a
+//! module-level `const`/`static` item — which `walk_functions` never
+//! visits — can itself contain both a hardcoded secret and an `unsafe { .. }`
+//! block.
 //!
 //! `unsafe-surface` additionally needs [`crate::slop_text::extract_comments`]:
 //! `syn` discards plain `//`/`/* */` comments entirely during parsing (only
@@ -27,6 +32,29 @@
 //! comment is invisible to a pure `syn::visit::Visit` pass. This module runs
 //! that same raw-source-text scanner alongside its `syn` pass, rather than
 //! duplicating the comment-extraction logic.
+//!
+//! ## `unsafe-density` scope
+//!
+//! A whole-file companion metric to `unsafe-surface`, not a replacement for
+//! it: `unsafe-surface` flags one `unsafe { .. }` block per *site* (missing
+//! a `SAFETY:` comment); `unsafe-density` instead aggregates every `unsafe {
+//! .. }` block found anywhere in the file into two measures — `unsafe_density`
+//! (the sum of every block's own line count, divided by the file's total
+//! lines of code) and `max_unsafe_block_size` (the single largest block's own
+//! line count) — and fires if either crosses its threshold (see
+//! [`UNSAFE_DENSITY_THRESHOLD`]/[`MAX_UNSAFE_BLOCK_SIZE_THRESHOLD`]). Files
+//! with zero `unsafe` blocks are skipped entirely — a density of `0.0` is not
+//! itself a finding. Runs its own whole-file [`syn::visit::Visit`] pass (see
+//! [`UnsafeBlockSizeVisitor`]) — deliberately separate from `unsafe-surface`'s
+//! own [`UnsafeVisitor`] rather than extending it, so this rule's aggregation
+//! can never risk disturbing `unsafe-surface`'s existing per-site detection
+//! or its tests. A lexically nested `unsafe { .. }` block found inside
+//! another one (rare, and itself a target of rustc's own "unnecessary
+//! `unsafe`" lint) is not descended into and so not separately counted —
+//! otherwise the same source lines would be counted twice. Neither measure is
+//! itself a defect: an FFI wrapper, a `no_std` allocator, or SIMD code can
+//! legitimately need a high, necessary `unsafe` density (see this rule's
+//! `crate::rule_registry` entry).
 //!
 //! `integer-cast-risk` is an honestly-labeled proxy, not a truncation proof:
 //! knowing whether a cast can really lose precision needs the *source*
@@ -170,6 +198,30 @@ pub const UNSAFE_SURFACE_RULE: &str = "unsafe-surface";
 /// "Regelversions-Schutz").
 pub const UNSAFE_SURFACE_RULE_REVISION: u32 = 1;
 
+/// Rule id for a whole file's `unsafe`-block density/size (see todo.md §3.C
+/// "`unsafe`-Blockdichte/-Größe", module doc "`unsafe-density` scope"). A
+/// companion metric to [`UNSAFE_SURFACE_RULE`] (per-site), not a replacement
+/// for it.
+pub const UNSAFE_DENSITY_RULE: &str = "unsafe-density";
+/// Bump when the unsafe-density rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const UNSAFE_DENSITY_RULE_REVISION: u32 = 1;
+
+/// `unsafe_density` (sum of every `unsafe { .. }` block's own line count,
+/// divided by the file's total lines of code) above which `unsafe-density`
+/// fires (see module doc). `0.1` (10%): a first-cut, adjustable constant, not
+/// calibrated against a corpus — same honest style as
+/// [`crate::git::SIZE_DISTRIBUTION_GINI_THRESHOLD`].
+pub const UNSAFE_DENSITY_THRESHOLD: f64 = 0.1;
+
+/// A single `unsafe { .. }` block's own line count above which
+/// `unsafe-density` fires, independent of the file-wide density (see module
+/// doc). `30`: the same order of magnitude as
+/// `crate::slop_structural`'s `MIN_LOC_FOR_INFLATION` (`40`) — a single block
+/// this long is large enough that reviewing it as one unaudited unit, rather
+/// than several smaller purpose-scoped blocks, becomes its own concern.
+pub const MAX_UNSAFE_BLOCK_SIZE_THRESHOLD: u32 = 30;
+
 /// Rule id for an `as` cast whose target type is a narrow integer type (see
 /// todo.md §F). A syntax-only proxy for a possible truncation, not a proof —
 /// see the module doc.
@@ -293,7 +345,8 @@ pub struct WorkspaceSecurity {
 }
 
 /// Parses a single Rust source file and returns every `unsafe-surface`/
-/// `integer-cast-risk`/`panic-in-lib`/`hardcoded-secret` finding in it.
+/// `unsafe-density`/`integer-cast-risk`/`panic-in-lib`/`hardcoded-secret`
+/// finding in it.
 pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
     let source =
         std::fs::read_to_string(path).map_err(|err| SecurityError::Io(path.to_path_buf(), err))?;
@@ -340,6 +393,10 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
     };
     secret_visitor.visit_file(&ast);
     findings.append(&mut secret_visitor.findings);
+
+    if let Some(finding) = unsafe_density_finding_for_file(path, &ast, &source) {
+        findings.push(finding);
+    }
 
     Ok(findings)
 }
@@ -582,6 +639,86 @@ impl<'ast> Visit<'ast> for UnsafeVisitor<'_> {
     }
 
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
+/// Whole-file visitor collecting every `unsafe { .. }` block's own line count
+/// (see [`UNSAFE_DENSITY_RULE`], module doc "`unsafe-density` scope").
+/// Deliberately separate from [`UnsafeVisitor`] (`unsafe-surface`'s own
+/// per-function-body visitor) rather than extending it, and driven directly
+/// over the whole [`syn::File`] rather than per-function via
+/// [`walk_functions`] (same reason [`SecretVisitor`] is), so it also sees an
+/// `unsafe { .. }` block outside any function body — e.g. a `const`/`static`
+/// initializer.
+#[derive(Default)]
+struct UnsafeBlockSizeVisitor {
+    block_line_counts: Vec<u32>,
+}
+
+impl<'ast> Visit<'ast> for UnsafeBlockSizeVisitor {
+    /// Records this block's own line count but does not descend into it — a
+    /// lexically nested `unsafe { .. }` block found inside another one would
+    /// otherwise have its lines counted twice (see module doc).
+    fn visit_expr_unsafe(&mut self, node: &'ast ExprUnsafe) {
+        let span = node.span();
+        let line_count = (span.end().line - span.start().line + 1) as u32;
+        self.block_line_counts.push(line_count);
+    }
+}
+
+/// Builds this file's `unsafe-density` finding, if any (see
+/// [`UNSAFE_DENSITY_RULE`], module doc "`unsafe-density` scope"). `None` if
+/// the file has no `unsafe` block at all, or if neither threshold is
+/// crossed. `file_lines_of_code` is the file's raw physical line count
+/// (`source.lines().count()`) rather than a fold of per-function
+/// `crate::complexity::FunctionInfo::lines_of_code` (unlike
+/// `maintainability-index`'s own per-file fold): that fold sums each
+/// function's own span, which double-counts a nested local `fn`'s lines (its
+/// own `FunctionInfo` entry, plus again as part of its enclosing function's
+/// span) — harmless for a Maintainability Index's logarithm, but would skew a
+/// ratio.
+fn unsafe_density_finding_for_file(path: &Path, ast: &syn::File, source: &str) -> Option<Finding> {
+    let mut visitor = UnsafeBlockSizeVisitor::default();
+    visitor.visit_file(ast);
+    if visitor.block_line_counts.is_empty() {
+        return None;
+    }
+
+    let unsafe_lines_total: u32 = visitor.block_line_counts.iter().sum();
+    let max_unsafe_block_size = visitor.block_line_counts.iter().copied().max()?;
+    let file_lines_of_code = source.lines().count();
+    if file_lines_of_code == 0 {
+        return None;
+    }
+    let unsafe_density = f64::from(unsafe_lines_total) / file_lines_of_code as f64;
+
+    if unsafe_density <= UNSAFE_DENSITY_THRESHOLD
+        && max_unsafe_block_size <= MAX_UNSAFE_BLOCK_SIZE_THRESHOLD
+    {
+        return None;
+    }
+
+    Some(Finding {
+        id: format!("{UNSAFE_DENSITY_RULE}:{}", path.display()).into(),
+        rule: UNSAFE_DENSITY_RULE.into(),
+        severity: Severity::Warn,
+        location: Location {
+            file: path.to_path_buf(),
+            line: OneBasedLine::FIRST,
+            item_path: path.display().to_string(),
+        },
+        evidence_class: EvidenceClass::DerivedFact,
+        origin: Origin::Code,
+        evidence: Some(serde_json::json!({
+            "file": path.display().to_string(),
+            "unsafe_density": unsafe_density,
+            "unsafe_lines_total": unsafe_lines_total,
+            "file_lines_of_code": file_lines_of_code,
+            "max_unsafe_block_size": max_unsafe_block_size,
+            "unsafe_block_count": visitor.block_line_counts.len(),
+        })),
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    })
 }
 
 /// Visits a single function body for `as` casts to a narrow integer type
@@ -1097,6 +1234,99 @@ mod tests {
             .before;
         let findings = findings_for(example, "unsafe-surface-registry-example");
         assert_eq!(rule_findings(&findings, UNSAFE_SURFACE_RULE).len(), 1);
+    }
+
+    /// A single `unsafe { .. }` block spanning 31 lines (over
+    /// [`MAX_UNSAFE_BLOCK_SIZE_THRESHOLD`]) fires `unsafe-density`, even
+    /// though 300 lines of unrelated padding keep the file-wide density well
+    /// under [`UNSAFE_DENSITY_THRESHOLD`] (31 / 336 ≈ 9.2%) — isolating the
+    /// size arm of the OR-gate.
+    #[test]
+    fn a_single_large_unsafe_block_fires_via_the_size_arm() {
+        let mut source = String::from("fn padding() {\n");
+        for i in 0..300 {
+            source.push_str(&format!("    let _ = {i};\n"));
+        }
+        source.push_str("}\n\nfn big_unsafe() {\n    unsafe {\n");
+        for _ in 0..29 {
+            source.push_str("        std::hint::unreachable_unchecked();\n");
+        }
+        source.push_str("    }\n}\n");
+
+        let findings = findings_for(&source, "security-unsafe-density-large-block");
+        let hits = rule_findings(&findings, UNSAFE_DENSITY_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].evidence_class, EvidenceClass::DerivedFact);
+        assert!(hits[0].is_gating());
+        let evidence = hits[0].evidence.as_ref().unwrap();
+        assert_eq!(evidence["max_unsafe_block_size"], 31);
+        assert!(evidence["unsafe_density"].as_f64().unwrap() <= UNSAFE_DENSITY_THRESHOLD);
+    }
+
+    /// Five small (3-line) `unsafe { .. }` blocks summing to half of a
+    /// 30-line file fire `unsafe-density` via the density arm — no single
+    /// block itself crosses [`MAX_UNSAFE_BLOCK_SIZE_THRESHOLD`].
+    #[test]
+    fn several_small_unsafe_blocks_fire_via_the_density_arm() {
+        let mut source = String::new();
+        for i in 0..5 {
+            source.push_str(&format!(
+                "fn f{i}() {{\n    unsafe {{\n        std::hint::unreachable_unchecked();\n    }}\n}}\n\n"
+            ));
+        }
+
+        let findings = findings_for(&source, "security-unsafe-density-many-small-blocks");
+        let hits = rule_findings(&findings, UNSAFE_DENSITY_RULE);
+        assert_eq!(hits.len(), 1);
+        let evidence = hits[0].evidence.as_ref().unwrap();
+        assert_eq!(evidence["unsafe_block_count"], 5);
+        assert!(evidence["unsafe_density"].as_f64().unwrap() > UNSAFE_DENSITY_THRESHOLD);
+        assert!(
+            evidence["max_unsafe_block_size"].as_u64().unwrap()
+                <= u64::from(MAX_UNSAFE_BLOCK_SIZE_THRESHOLD)
+        );
+    }
+
+    /// A small, isolated 3-line `unsafe { .. }` block in an otherwise-long
+    /// file stays well under both thresholds and does not fire.
+    #[test]
+    fn a_small_isolated_unsafe_block_is_not_flagged() {
+        let mut source = String::from("fn padding() {\n");
+        for i in 0..60 {
+            source.push_str(&format!("    let _ = {i};\n"));
+        }
+        source.push_str(
+            "}\n\nfn f() {\n    unsafe {\n        std::hint::unreachable_unchecked();\n    }\n}\n",
+        );
+
+        let findings = findings_for(&source, "security-unsafe-density-small-isolated");
+        assert!(rule_findings(&findings, UNSAFE_DENSITY_RULE).is_empty());
+    }
+
+    /// A file with zero `unsafe` blocks is skipped entirely — no "0%
+    /// unsafe" finding.
+    #[test]
+    fn a_file_with_no_unsafe_blocks_is_not_flagged() {
+        let findings = findings_for(
+            "fn f(x: i32) -> i32 {\n    x + 1\n}\n",
+            "security-unsafe-density-none",
+        );
+        assert!(rule_findings(&findings, UNSAFE_DENSITY_RULE).is_empty());
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn unsafe_density_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(UNSAFE_DENSITY_RULE)
+            .expect("unsafe-density has a registry entry")
+            .example
+            .expect("unsafe-density has a curated example")
+            .before;
+        let findings = findings_for(example, "unsafe-density-registry-example");
+        assert_eq!(rule_findings(&findings, UNSAFE_DENSITY_RULE).len(), 1);
     }
 
     #[test]

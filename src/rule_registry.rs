@@ -985,6 +985,18 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         }),
     },
     RuleMetadata {
+        id: "unsafe-density",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
+        exclusions: "A whole-file companion metric to `unsafe-surface` (which flags one `unsafe { .. }` block per site), not a replacement for it: this rule aggregates every `unsafe { .. }` block in the file into `unsafe_density` (the fraction of the file's lines sitting inside any `unsafe { .. }` block) and `max_unsafe_block_size` (the single largest block's own line count), and fires if either crosses its threshold (10% density, or a single block over 30 lines). Only files with at least one `unsafe` block are considered — a file with none is skipped, not reported at 0%. A lexically nested `unsafe { .. }` block found inside another one is not separately counted, to avoid double-counting the same lines. Crossing either threshold is not itself a defect: an FFI wrapper, a `no_std` allocator, or SIMD code can legitimately need a high, necessary `unsafe` density — unlike `unsafe-surface`'s per-site missing-SAFETY-comment check (a concrete, actionable documentation gap worth gating on), this is a distributional signal about a file's overall shape, advisory only, never a violation on its own.",
+        allowed_wording: "State only the measured `unsafe_density` ratio and/or `max_unsafe_block_size` in lines for this file — never that the file is 'unsafe', 'dangerous', or 'risky' (todo.md §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: Some(RuleExample {
+            before: "pub fn read_first_four(buf: &[u8]) -> u32 {\n    unsafe {\n        let ptr = buf.as_ptr() as *const u32;\n        *ptr\n    }\n}\n",
+            why_it_matters: "When almost an entire function's body sits inside one unsafe block, the compiler has stopped checking nearly everything that function does, and a reviewer can no longer tell which lines are the actual reason it needed to be unsafe at all.",
+        }),
+    },
+    RuleMetadata {
         id: "integer-cast-risk",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
@@ -1611,6 +1623,7 @@ mod tests {
             crate::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE,
             crate::provenance::DEP_ADDED_BY_AGENT_RULE,
             crate::security::UNSAFE_SURFACE_RULE,
+            crate::security::UNSAFE_DENSITY_RULE,
             crate::security::INTEGER_CAST_RISK_RULE,
             crate::security::PANIC_IN_LIB_RULE,
             crate::security::HARDCODED_SECRET_RULE,
