@@ -3,9 +3,14 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
 use syn::visit::{self, Visit};
-use syn::{BinOp, Expr, ExprIf, ItemFn};
+use syn::{
+    BinOp, Expr, ExprIf, GenericArgument, GenericParam, ItemFn, PathArguments, ReturnType, Type,
+    TypeParamBound, WherePredicate,
+};
 
+use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::walk_functions;
 use crate::ingest::SourceFile;
 
@@ -33,6 +38,35 @@ pub struct FunctionInfo {
     /// Number of parameters in the function's signature (see todo.md §3.C
     /// "Argument Count").
     pub arg_count: usize,
+    /// Nesting depth of the return type's generic arguments (see todo.md
+    /// §3.C "Return-Type-Komplexität") — `bool`/`()` is 0, `Result<T, E>` is
+    /// 1, `Result<Option<Vec<T>>, E>` is 3. Computed by [`type_depth`].
+    pub return_type_depth: u32,
+    /// Number of type parameters in the function's signature — i.e.
+    /// `syn::GenericParam::Type` entries in `sig.generics.params`, excluding
+    /// lifetimes and const generics (see todo.md §3.C
+    /// "Generic-/Lifetime-Parameter-Anzahl").
+    pub generic_param_count: u32,
+    /// Number of lifetime parameters in the function's signature — i.e.
+    /// `syn::GenericParam::Lifetime` entries in `sig.generics.params` (see
+    /// todo.md §3.C "Generic-/Lifetime-Parameter-Anzahl").
+    pub lifetime_param_count: u32,
+    /// Total number of trait bounds across both a generic parameter's own
+    /// inline bounds (`T: Clone + Debug`) and any `where` clause bounds
+    /// (`where T: Clone, U: Debug + Send`) — see todo.md §3.C
+    /// "Trait-Bound-Komplexität".
+    pub trait_bound_count: u32,
+    /// Maximum nesting depth of `async` blocks/closures found *inside* the
+    /// function body — distinct from the function's own `async fn` status,
+    /// which does not itself count (see [`ExpressionShapeVisitor`], todo.md
+    /// §3.C "`async`-Verschachtelungstiefe").
+    pub async_nesting_depth: u32,
+    /// Maximum "width" (direct child count) of any single expression in the
+    /// function body — a call's argument count, a tuple/array/struct
+    /// literal's element count, or a flattened chain of same-operator binary
+    /// expressions' operand count (see [`ExpressionShapeVisitor`], todo.md
+    /// §3.C "Ausdrucksbreite").
+    pub max_expression_width: u32,
 }
 
 #[derive(Debug)]
@@ -83,6 +117,13 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
         };
         cognitive.visit_block(site.block);
 
+        let mut shape = ExpressionShapeVisitor {
+            async_nesting: 0,
+            max_async_nesting: 0,
+            max_width: 0,
+        };
+        shape.visit_block(site.block);
+
         let start_line = site.span.start().line;
         let end_line = site.span.end().line.max(start_line);
 
@@ -96,6 +137,27 @@ pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
             nesting_depth: complexity.nesting_depth,
             match_arm_count: complexity.match_arm_count,
             arg_count: site.arg_count,
+            return_type_depth: match &site.sig.output {
+                ReturnType::Default => 0,
+                ReturnType::Type(_, ty) => type_depth(ty),
+            },
+            generic_param_count: site
+                .sig
+                .generics
+                .params
+                .iter()
+                .filter(|param| matches!(param, GenericParam::Type(_)))
+                .count() as u32,
+            lifetime_param_count: site
+                .sig
+                .generics
+                .params
+                .iter()
+                .filter(|param| matches!(param, GenericParam::Lifetime(_)))
+                .count() as u32,
+            trait_bound_count: trait_bound_count(&site.sig.generics),
+            async_nesting_depth: shape.max_async_nesting,
+            max_expression_width: shape.max_width,
         });
     });
     Ok(functions)
@@ -365,6 +427,235 @@ impl<'ast> Visit<'ast> for CognitiveComplexityVisitor {
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
 }
 
+/// Nesting depth of a type's generic arguments, used for
+/// [`FunctionInfo::return_type_depth`]. A bare type (`bool`, `()`, `T`) is 0;
+/// each level of generic nesting adds 1 — `Result<T, E>` is 1,
+/// `Result<Option<Vec<T>>, E>` is 3 (`Result` at 1, `Option` at 2, `Vec` at
+/// 3). References, parens, and grouping tokens are transparent and do not add
+/// depth of their own; a tuple's depth is the deepest of its elements.
+fn type_depth(ty: &Type) -> u32 {
+    match ty {
+        Type::Path(type_path) => {
+            let Some(segment) = type_path.path.segments.last() else {
+                return 0;
+            };
+            match &segment.arguments {
+                PathArguments::AngleBracketed(args) => {
+                    let inner_max = args
+                        .args
+                        .iter()
+                        .filter_map(|arg| match arg {
+                            GenericArgument::Type(inner) => Some(type_depth(inner)),
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    1 + inner_max
+                }
+                _ => 0,
+            }
+        }
+        Type::Tuple(tuple) => tuple.elems.iter().map(type_depth).max().unwrap_or(0),
+        Type::Reference(reference) => type_depth(&reference.elem),
+        Type::Paren(paren) => type_depth(&paren.elem),
+        Type::Group(group) => type_depth(&group.elem),
+        _ => 0,
+    }
+}
+
+/// Total number of trait bounds across a signature's generics — both a
+/// generic parameter's own inline bounds (`T: Clone + Debug`) and any
+/// `where` clause bounds (`where T: Clone, U: Debug + Send`), used for
+/// [`FunctionInfo::trait_bound_count`]. Lifetime bounds (`'a: 'b`) are not
+/// counted, only [`TraitBound`]s.
+fn trait_bound_count(generics: &syn::Generics) -> u32 {
+    let inline: u32 = generics
+        .params
+        .iter()
+        .filter_map(|param| match param {
+            GenericParam::Type(type_param) => Some(
+                type_param
+                    .bounds
+                    .iter()
+                    .filter(|bound| matches!(bound, TypeParamBound::Trait(_)))
+                    .count() as u32,
+            ),
+            _ => None,
+        })
+        .sum();
+    let where_clause: u32 = generics
+        .where_clause
+        .iter()
+        .flat_map(|clause| &clause.predicates)
+        .filter_map(|predicate| match predicate {
+            WherePredicate::Type(predicate_type) => Some(
+                predicate_type
+                    .bounds
+                    .iter()
+                    .filter(|bound| matches!(bound, TypeParamBound::Trait(_)))
+                    .count() as u32,
+            ),
+            _ => None,
+        })
+        .sum();
+    inline + where_clause
+}
+
+/// Rule id for a function whose signature — not body — is disproportionately
+/// complex: a deeply nested return type, a large number of generic type
+/// parameters, or a large number of trait bounds (see todo.md §3.C
+/// "Return-Type-Komplexität", "Generic-/Lifetime-Parameter-Anzahl",
+/// "Trait-Bound-Komplexität").
+pub const SIGNATURE_COMPLEXITY_RULE: &str = "signature-complexity";
+pub const SIGNATURE_COMPLEXITY_RULE_REVISION: u32 = 1;
+
+/// Return-type nesting depth above which a signature is flagged — a plain
+/// `Result<T, E>` (depth 1) or `Result<Option<T>, E>` (depth 2) is ordinary
+/// Rust; four or more levels (e.g. `Result<Option<Vec<Box<T>>>, E>`) starts
+/// to demand real unwrapping effort from every caller.
+const MAX_RETURN_TYPE_DEPTH: u32 = 3;
+/// Number of generic type parameters above which a signature is flagged —
+/// beyond four, tracking which parameter constrains what starts to strain
+/// working memory (a first-cut, adjustable threshold, same style as
+/// [`MIN_LOC_FOR_INFLATION`]-style constants elsewhere in this crate).
+const MAX_GENERIC_PARAM_COUNT: u32 = 4;
+/// Total trait bound count (inline plus `where` clause) above which a
+/// signature is flagged — five is already generous for a single function;
+/// beyond that, the signature reads more like a capability checklist than a
+/// contract.
+const MAX_TRAIT_BOUND_COUNT: u32 = 5;
+
+/// Flags functions whose *signature* — independent of their body — is
+/// disproportionately complex by any of three measures: an over-nested
+/// return type, too many generic type parameters, or too many trait bounds
+/// (see [`MAX_RETURN_TYPE_DEPTH`]/[`MAX_GENERIC_PARAM_COUNT`]/
+/// [`MAX_TRAIT_BOUND_COUNT`], todo.md §3.C). Unlike `complexity-inflation`,
+/// there is no LOC floor — a one-line function can still have a complex
+/// signature.
+pub fn signature_complexity(functions: &[FunctionInfo]) -> Vec<Finding> {
+    functions
+        .iter()
+        .filter(|function| {
+            function.return_type_depth > MAX_RETURN_TYPE_DEPTH
+                || function.generic_param_count > MAX_GENERIC_PARAM_COUNT
+                || function.trait_bound_count > MAX_TRAIT_BOUND_COUNT
+        })
+        .map(|function| Finding {
+            id: format!(
+                "{SIGNATURE_COMPLEXITY_RULE}:{}:{}",
+                function.file.display(),
+                function.qualified_name
+            )
+            .into(),
+            rule: SIGNATURE_COMPLEXITY_RULE.into(),
+            severity: Severity::Warn,
+            location: Location {
+                file: function.file.clone(),
+                line: OneBasedLine::new(function.line).expect("proc-macro2 span lines are 1-based"),
+                item_path: function.qualified_name.clone(),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(json!({
+                "file": function.file.display().to_string(),
+                "function": function.qualified_name,
+                "line": function.line,
+                "return_type_depth": function.return_type_depth,
+                "generic_param_count": function.generic_param_count,
+                "lifetime_param_count": function.lifetime_param_count,
+                "trait_bound_count": function.trait_bound_count,
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        })
+        .collect()
+}
+
+/// Third, separate `syn::Visit` pass per function alongside
+/// [`ComplexityVisitor`]/[`CognitiveComplexityVisitor`] — same convention:
+/// each metric family gets its own uncomplicated walk rather than one
+/// entangled visitor. Computes two body-shape metrics for
+/// `complexity-inflation` (see [`crate::slop_structural::complexity_inflation`]):
+/// [`FunctionInfo::async_nesting_depth`] and
+/// [`FunctionInfo::max_expression_width`].
+struct ExpressionShapeVisitor {
+    /// Running nesting depth of `async` blocks/closures at the current point
+    /// of the walk.
+    async_nesting: u32,
+    /// Maximum `async_nesting` reached so far — the value stored in
+    /// [`FunctionInfo::async_nesting_depth`].
+    max_async_nesting: u32,
+    /// Maximum expression "width" (direct child count) found so far — the
+    /// value stored in [`FunctionInfo::max_expression_width`].
+    max_width: u32,
+}
+
+/// Flattens a chain of same-operator [`Expr::Binary`] nodes into its leaf
+/// operands, so [`ExpressionShapeVisitor`] can score the whole chain's width
+/// at once (`a + b + c + d` is width 4) instead of each binary node's own
+/// two operands. Deliberately does not merge different-but-same-precedence
+/// operators (e.g. `+` and `-`) into one chain — a simplification, not a
+/// claim that `a + b - c` is any less "wide" than `a + b + c`.
+fn flatten_binary_chain<'ast>(expr: &'ast Expr, op: &BinOp, leaves: &mut Vec<&'ast Expr>) {
+    match expr {
+        Expr::Binary(node) if std::mem::discriminant(&node.op) == std::mem::discriminant(op) => {
+            flatten_binary_chain(&node.left, op, leaves);
+            flatten_binary_chain(&node.right, op, leaves);
+        }
+        other => leaves.push(other),
+    }
+}
+
+impl<'ast> Visit<'ast> for ExpressionShapeVisitor {
+    fn visit_expr(&mut self, expr: &'ast Expr) {
+        match expr {
+            Expr::Async(node) => {
+                self.async_nesting += 1;
+                self.max_async_nesting = self.max_async_nesting.max(self.async_nesting);
+                self.visit_block(&node.block);
+                self.async_nesting -= 1;
+            }
+            Expr::Closure(node) if node.asyncness.is_some() => {
+                self.async_nesting += 1;
+                self.max_async_nesting = self.max_async_nesting.max(self.async_nesting);
+                self.visit_expr(&node.body);
+                self.async_nesting -= 1;
+            }
+            Expr::Binary(node) => {
+                let mut leaves = Vec::new();
+                flatten_binary_chain(expr, &node.op, &mut leaves);
+                self.max_width = self.max_width.max(leaves.len() as u32);
+                for leaf in leaves {
+                    self.visit_expr(leaf);
+                }
+            }
+            Expr::Call(node) => {
+                self.max_width = self.max_width.max(node.args.len() as u32);
+                visit::visit_expr(self, expr);
+            }
+            Expr::MethodCall(node) => {
+                self.max_width = self.max_width.max(node.args.len() as u32);
+                visit::visit_expr(self, expr);
+            }
+            Expr::Tuple(node) => {
+                self.max_width = self.max_width.max(node.elems.len() as u32);
+                visit::visit_expr(self, expr);
+            }
+            Expr::Array(node) => {
+                self.max_width = self.max_width.max(node.elems.len() as u32);
+                visit::visit_expr(self, expr);
+            }
+            Expr::Struct(node) => {
+                self.max_width = self.max_width.max(node.fields.len() as u32);
+                visit::visit_expr(self, expr);
+            }
+            _ => visit::visit_expr(self, expr),
+        }
+    }
+
+    fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +847,77 @@ fn bool_chain_mixed(a: bool, b: bool, c: bool) -> bool {
     }
 
     #[test]
+    fn expression_width_and_async_nesting_match_hand_calculation() {
+        let dir = TempDir::new("complexity-expression-shape");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn straight_line() {
+    let _ = 1;
+}
+
+fn wide_call() {
+    foo(1, 2, 3, 4, 5, 6, 7);
+}
+
+fn wide_chain(a: i32, b: i32, c: i32, d: i32, e: i32) -> i32 {
+    a + b + c + d + e
+}
+
+async fn own_async_not_counted() {
+    let _ = 1;
+}
+
+fn nested_async_block() {
+    let _ = async {
+        async {
+            1
+        }
+    };
+}
+
+fn nested_async_closure() {
+    let _ = async || {
+        async {
+            1
+        }
+    };
+}
+"#,
+        )
+        .unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let get = |name: &str| {
+            functions
+                .iter()
+                .find(|f| f.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing function {name}"))
+        };
+
+        assert_eq!(get("straight_line").max_expression_width, 0);
+        assert_eq!(get("straight_line").async_nesting_depth, 0);
+
+        // A call's argument count, not any nested-tree shape.
+        assert_eq!(get("wide_call").max_expression_width, 7);
+
+        // `a + b + c + d + e` flattens to 5 operands, not the nested
+        // binary-tree's pairwise width of 2 per node.
+        assert_eq!(get("wide_chain").max_expression_width, 5);
+
+        // The function's own `async fn` status is not itself nesting — only
+        // a nested async block/closure *inside* the body counts.
+        assert_eq!(get("own_async_not_counted").async_nesting_depth, 0);
+
+        // Two levels of nested `async { .. }` blocks.
+        assert_eq!(get("nested_async_block").async_nesting_depth, 2);
+
+        // An async closure nests the same way as an async block.
+        assert_eq!(get("nested_async_closure").async_nesting_depth, 2);
+    }
+
+    #[test]
     fn nested_fn_is_analyzed_separately_and_excluded_from_outer() {
         let dir = TempDir::new("complexity-nested-fn");
         let file = dir.join("lib.rs");
@@ -673,5 +1035,93 @@ fn outer(x: i32) -> i32 {
         let source = std::error::Error::source(&err).expect("Parse must carry a source");
         assert!(source.downcast_ref::<syn::Error>().is_some());
         assert!(err.to_string().starts_with("src/lib.rs: failed to parse: "));
+    }
+
+    #[test]
+    fn signature_complexity_fires_for_each_trigger_independently() {
+        let dir = TempDir::new("complexity-signature-complexity");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn simple(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fn deep_return() -> Result<Option<Vec<Box<i32>>>, ()> {
+    Ok(None)
+}
+
+fn many_generics<A, B, C, D, E>(a: A, b: B, c: C, d: D, e: E) {
+    let _ = (a, b, c, d, e);
+}
+
+fn many_trait_bounds<T: Clone + Debug, U>(t: T, u: U)
+where
+    T: Send + Sync + Serialize,
+    U: Default + PartialEq + Ord,
+{
+    let _ = (t, u);
+}
+"#,
+        )
+        .unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let get = |name: &str| {
+            functions
+                .iter()
+                .find(|f| f.qualified_name == name)
+                .unwrap_or_else(|| panic!("missing function {name}"))
+        };
+
+        // `Result<Option<Vec<Box<i32>>>, ()>` nests 4 levels deep, above
+        // `MAX_RETURN_TYPE_DEPTH` (3).
+        assert_eq!(get("deep_return").return_type_depth, 4);
+        assert_eq!(get("many_generics").generic_param_count, 5);
+        // 2 inline (`T: Clone + Debug`) + 3 + 3 where-clause bounds = 8,
+        // above `MAX_TRAIT_BOUND_COUNT` (5).
+        assert_eq!(get("many_trait_bounds").trait_bound_count, 8);
+
+        let findings = signature_complexity(&functions);
+        let fired: std::collections::HashSet<&str> = findings
+            .iter()
+            .map(|finding| finding.location.item_path.as_str())
+            .collect();
+
+        assert!(!fired.contains("simple"));
+        assert!(fired.contains("deep_return"));
+        assert!(fired.contains("many_generics"));
+        assert!(fired.contains("many_trait_bounds"));
+        assert_eq!(findings.len(), 3);
+        for finding in &findings {
+            assert_eq!(finding.rule, SIGNATURE_COMPLEXITY_RULE);
+        }
+    }
+
+    /// The registry's curated `example.before` for this rule (see
+    /// `rule_registry::RULE_REGISTRY`) must itself still trigger the rule —
+    /// this is what keeps a landing-page-facing example from silently
+    /// drifting away from what judge actually flags.
+    #[test]
+    fn signature_complexity_registry_example_still_triggers_the_rule() {
+        let example = crate::rule_registry::lookup(SIGNATURE_COMPLEXITY_RULE)
+            .expect("signature-complexity has a registry entry")
+            .example
+            .expect("signature-complexity has a curated example")
+            .before;
+        let dir = TempDir::new("complexity-signature-complexity-registry-example");
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, example).unwrap();
+
+        let functions = analyze_file(&file).unwrap();
+        let findings = signature_complexity(&functions);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|f| f.rule == SIGNATURE_COMPLEXITY_RULE)
+                .count(),
+            1
+        );
     }
 }

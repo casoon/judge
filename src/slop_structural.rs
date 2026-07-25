@@ -50,7 +50,7 @@ pub const CHURN_HOTSPOT_RULE_REVISION: u32 = 1;
 /// Rule id for a long function with implausibly low branching (see todo.md
 /// §3.G).
 pub const COMPLEXITY_INFLATION_RULE: &str = "complexity-inflation";
-pub const COMPLEXITY_INFLATION_RULE_REVISION: u32 = 2;
+pub const COMPLEXITY_INFLATION_RULE_REVISION: u32 = 3;
 
 /// Rule id for a file untouched for a year while its neighbors keep
 /// changing (see todo.md §3.G).
@@ -140,19 +140,38 @@ const MAX_COMPLEXITY_FOR_INFLATION: u32 = 3;
 /// different shape of "long function that's more costly to read than its
 /// length alone suggests".
 const MAX_COGNITIVE_FOR_INFLATION: u32 = 15;
+/// `async_nesting_depth` above which a function this long is flagged
+/// regardless of its cyclomatic/cognitive complexity — 2+ levels of nested
+/// `async` blocks/closures is a well-known Rust async-ergonomics pain point
+/// (each level adds its own `.await` point and captured state), independent
+/// of how much the surrounding code branches (see
+/// [`crate::complexity::FunctionInfo::async_nesting_depth`]).
+const MAX_ASYNC_NESTING_FOR_INFLATION: u32 = 2;
+/// `max_expression_width` above which a function this long is flagged
+/// regardless of its cyclomatic/cognitive complexity — 6+ direct operands in
+/// one expression (call arguments, tuple/array/struct-literal elements, or a
+/// flattened same-operator chain) is a widely-cited "hard to scan at a
+/// glance" threshold, the same spirit as the argument-count conventions
+/// already used elsewhere in this crate for [`FunctionInfo::arg_count`] (see
+/// [`crate::complexity::FunctionInfo::max_expression_width`]).
+const MAX_EXPRESSION_WIDTH_FOR_INFLATION: u32 = 6;
 
 /// Flags long functions that are either boilerplate-shaped (barely branch,
-/// more typical of copy-pasted/repetitive code than hand-written logic) or
-/// deeply nested/hard to follow relative to their length, per
-/// [`MAX_COMPLEXITY_FOR_INFLATION`]/[`MAX_COGNITIVE_FOR_INFLATION`] (see
-/// todo.md §3.G).
+/// more typical of copy-pasted/repetitive code than hand-written logic),
+/// deeply nested/hard to follow relative to their length, deeply nested in
+/// `async` constructs, or contain an implausibly wide single expression, per
+/// [`MAX_COMPLEXITY_FOR_INFLATION`]/[`MAX_COGNITIVE_FOR_INFLATION`]/
+/// [`MAX_ASYNC_NESTING_FOR_INFLATION`]/[`MAX_EXPRESSION_WIDTH_FOR_INFLATION`]
+/// (see todo.md §3.G).
 pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
     functions
         .iter()
         .filter(|function| {
             function.lines_of_code >= MIN_LOC_FOR_INFLATION
                 && (function.cyclomatic <= MAX_COMPLEXITY_FOR_INFLATION
-                    || function.cognitive > MAX_COGNITIVE_FOR_INFLATION)
+                    || function.cognitive > MAX_COGNITIVE_FOR_INFLATION
+                    || function.async_nesting_depth > MAX_ASYNC_NESTING_FOR_INFLATION
+                    || function.max_expression_width > MAX_EXPRESSION_WIDTH_FOR_INFLATION)
         })
         .map(|function| Finding {
             id: format!(
@@ -174,6 +193,8 @@ pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
                 "lines_of_code": function.lines_of_code,
                 "cyclomatic": function.cyclomatic,
                 "cognitive": function.cognitive,
+                "async_nesting_depth": function.async_nesting_depth,
+                "max_expression_width": function.max_expression_width,
             })),
             caused_by: Vec::new(),
             causes: Vec::new(),
@@ -987,6 +1008,37 @@ mod tests {
             nesting_depth: 0,
             match_arm_count: 0,
             arg_count: 0,
+            return_type_depth: 0,
+            generic_param_count: 0,
+            lifetime_param_count: 0,
+            trait_bound_count: 0,
+            async_nesting_depth: 0,
+            max_expression_width: 0,
+        }
+    }
+
+    fn function_info_with_shape(
+        lines_of_code: usize,
+        cyclomatic: u32,
+        async_nesting_depth: u32,
+        max_expression_width: u32,
+    ) -> FunctionInfo {
+        FunctionInfo {
+            qualified_name: "f".to_string(),
+            file: PathBuf::from("src/lib.rs"),
+            line: 1,
+            cyclomatic,
+            cognitive: 0,
+            lines_of_code,
+            nesting_depth: 0,
+            match_arm_count: 0,
+            arg_count: 0,
+            return_type_depth: 0,
+            generic_param_count: 0,
+            lifetime_param_count: 0,
+            trait_bound_count: 0,
+            async_nesting_depth,
+            max_expression_width,
         }
     }
 
@@ -1004,7 +1056,13 @@ mod tests {
         assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
         assert_eq!(
             findings[0].evidence,
-            Some(json!({"lines_of_code": 50, "cyclomatic": 2, "cognitive": 0}))
+            Some(json!({
+                "lines_of_code": 50,
+                "cyclomatic": 2,
+                "cognitive": 0,
+                "async_nesting_depth": 0,
+                "max_expression_width": 0,
+            }))
         );
     }
 
@@ -1024,7 +1082,13 @@ mod tests {
         assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
         assert_eq!(
             findings[0].evidence,
-            Some(json!({"lines_of_code": 50, "cyclomatic": 7, "cognitive": 21}))
+            Some(json!({
+                "lines_of_code": 50,
+                "cyclomatic": 7,
+                "cognitive": 21,
+                "async_nesting_depth": 0,
+                "max_expression_width": 0,
+            }))
         );
     }
 
@@ -1067,6 +1131,60 @@ mod tests {
         let findings = complexity_inflation(&functions);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
+    }
+
+    /// A function whose cyclomatic/cognitive complexity are both well under
+    /// their own thresholds (so neither of those two arms would fire) but
+    /// whose `async_nesting_depth` exceeds [`MAX_ASYNC_NESTING_FOR_INFLATION`]
+    /// — proves the new async-nesting arm of the `OR` gate fires findings the
+    /// cyclomatic/cognitive checks alone would miss.
+    #[test]
+    fn complexity_inflation_fires_for_deeply_nested_async_via_async_nesting() {
+        let functions = vec![
+            function_info_with_shape(50, 7, 3, 0),
+            function_info_with_shape(50, 7, 0, 0),
+        ];
+
+        let findings = complexity_inflation(&functions);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
+        assert_eq!(
+            findings[0].evidence,
+            Some(json!({
+                "lines_of_code": 50,
+                "cyclomatic": 7,
+                "cognitive": 0,
+                "async_nesting_depth": 3,
+                "max_expression_width": 0,
+            }))
+        );
+    }
+
+    /// Same shape as the async-nesting test above, but via
+    /// `max_expression_width` exceeding [`MAX_EXPRESSION_WIDTH_FOR_INFLATION`]
+    /// — proves the width arm of the `OR` gate fires independently too.
+    #[test]
+    fn complexity_inflation_fires_for_a_wide_expression_via_expression_width() {
+        let functions = vec![
+            function_info_with_shape(50, 7, 0, 7),
+            function_info_with_shape(50, 7, 0, 0),
+        ];
+
+        let findings = complexity_inflation(&functions);
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, COMPLEXITY_INFLATION_RULE);
+        assert_eq!(
+            findings[0].evidence,
+            Some(json!({
+                "lines_of_code": 50,
+                "cyclomatic": 7,
+                "cognitive": 0,
+                "async_nesting_depth": 0,
+                "max_expression_width": 7,
+            }))
+        );
     }
 
     /// The registry's curated `example.before` for this rule (see

@@ -19,6 +19,11 @@ pub struct FunctionSite<'ast> {
     /// Number of parameters in the function's signature (`self` included),
     /// i.e. `sig.inputs.len()`.
     pub arg_count: usize,
+    /// The function's full signature — return type, generics, `where`
+    /// clause, and everything else `arg_count` doesn't already summarize.
+    /// Used by [`crate::complexity`] for signature-shape metrics (return-type
+    /// nesting depth, generic/lifetime parameter counts, trait bound counts).
+    pub sig: &'ast syn::Signature,
     /// Span of just the function's identifier — narrower than `span`, which
     /// covers the whole item. Needed to position a Deep Tier query exactly
     /// on the name token (see [`crate::deep`]). Only consumed behind the
@@ -99,6 +104,7 @@ where
         vis: Option<&'ast syn::Visibility>,
         attrs: &'ast [syn::Attribute],
         in_trait_impl: bool,
+        sig: &'ast syn::Signature,
     ) {
         let qualified_name = self.qualified_name(name);
         (self.on_function)(FunctionSite {
@@ -110,6 +116,7 @@ where
             vis,
             attrs,
             in_trait_impl,
+            sig,
         });
     }
 }
@@ -163,6 +170,7 @@ where
             Some(&node.vis),
             &node.attrs,
             false,
+            &node.sig,
         );
         visit::visit_item_fn(self, node);
     }
@@ -178,6 +186,7 @@ where
             Some(&node.vis),
             &node.attrs,
             in_trait_impl,
+            &node.sig,
         );
         visit::visit_impl_item_fn(self, node);
     }
@@ -193,6 +202,7 @@ where
                 None,
                 &node.attrs,
                 false,
+                &node.sig,
             );
         }
         visit::visit_trait_item_fn(self, node);

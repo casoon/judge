@@ -681,6 +681,12 @@ end_of_record
             nesting_depth: 0,
             match_arm_count: 0,
             arg_count: 0,
+            return_type_depth: 0,
+            generic_param_count: 0,
+            lifetime_param_count: 0,
+            trait_bound_count: 0,
+            async_nesting_depth: 0,
+            max_expression_width: 0,
         }
     }
 

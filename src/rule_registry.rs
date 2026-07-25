@@ -196,6 +196,19 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
             why_it_matters: "A caller importing `PaymentGateway` from `gateway_api` can't tell from that import alone that it's actually implemented two crates away in `gateway_core` — tracing a bug back to its owner means manually unwinding every re-export hop.",
         }),
     },
+    // -- complexity.rs ------------------------------------------------------
+    RuleMetadata {
+        id: "signature-complexity",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block, same wiring as `complexity-inflation` — reuses the same `Vec<FunctionInfo>` already computed over the loaded workspace, no extra parse pass).",
+        exclusions: "Fires on any of three independent signature-shape measures, no LOC floor (unlike `complexity-inflation`, a one-line function can still have a complex signature): return-type nesting depth over 3 (`Result<Option<Vec<T>>, E>` is 3 and does not fire; one more level of nesting does), more than 4 generic type parameters, or more than 5 total trait bounds (inline `T: Clone + Debug` plus `where`-clause bounds summed together). Lifetime parameters are counted and reported in `evidence.lifetime_param_count` but never gate on their own — lifetimes rarely indicate complexity by themselves in idiomatic Rust. Does not distinguish a genuinely generic library/framework signature (where breadth is the point) from an accidentally over-parameterized one.",
+        allowed_wording: HEURISTIC_WORDING,
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: Some(RuleExample {
+            before: "pub fn fetch<T: Clone + Debug, U, E>(id: &str) -> Option<T>\nwhere\n    T: Send + Sync + Serialize,\n    U: Default + PartialEq,\n    E: std::error::Error,\n{\n    todo!()\n}\n",
+            why_it_matters: "A signature carrying eight trait bounds across three generic parameters demands the caller understand an enormous contract before calling it at all — one glance at the call site tells you nothing about what behavior actually varies across `T`, `U`, and `E`.",
+        }),
+    },
     // -- coverage.rs ------------------------------------------------------
     RuleMetadata {
         id: "untested-hotspot",
@@ -1207,7 +1220,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "complexity-inflation",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Flags a long function that either has implausibly low branching (cyclomatic complexity) or is deeply nested/hard to follow relative to its length (Cognitive Complexity, SonarSource's approximated metric, threshold 15); does not distinguish a genuinely simple long function (e.g. a large match/data table) from a padded one, and does not distinguish deliberately layered control flow from code that would benefit from flattening.",
+        exclusions: "Flags a long function that either has implausibly low branching (cyclomatic complexity), is deeply nested/hard to follow relative to its length (Cognitive Complexity, SonarSource's approximated metric, threshold 15), nests `async` blocks/closures more than 2 levels deep (`async_nesting_depth`, a distinct dimension from the function's own `async fn` status), or contains a single expression with more than 6 direct operands (`max_expression_width` — a call's argument count, a tuple/array/struct literal's element count, or a flattened same-operator binary chain); does not distinguish a genuinely simple long function (e.g. a large match/data table) from a padded one, and does not distinguish deliberately layered control flow (or deliberately wide data literals) from code that would benefit from flattening.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
         example: Some(RuleExample {
@@ -1531,6 +1544,7 @@ mod tests {
             crate::boundaries::MODULE_BOUNDARY_VIOLATION_RULE,
             crate::boundaries::FEATURE_GRAPH_CYCLE_RULE,
             crate::boundaries::CHANGE_COUPLING_SIGNAL_RULE,
+            crate::complexity::SIGNATURE_COMPLEXITY_RULE,
             crate::coverage::UNTESTED_HOTSPOT_RULE,
             crate::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE,
             crate::dep_graph::MSRV_DRIFT_RULE,
