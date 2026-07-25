@@ -158,6 +158,30 @@ pub const MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE: u32 = 6;
 /// [`MOVE_RATIO_THRESHOLD`]'s arbitrary-but-documented style).
 pub const LONG_TERM_UPDATE_SHARE_LOW_THRESHOLD: f64 = 0.15;
 
+/// Rule id used for [`cross_file_connectivity`] findings (see todo.md §E
+/// "Churn-Signale: ... `cross-file-connectivity`"). Not to be confused with
+/// `crate::slop_structural_deep`'s unrelated `connectivity-drop` (a
+/// rust-analyzer call-graph fan-in signal, no relation to git history).
+pub const CROSS_FILE_CONNECTIVITY_RULE: &str = "cross-file-connectivity";
+/// Bump when the cross-file-connectivity rule's logic changes (see todo.md §5
+/// "Regelversions-Schutz").
+pub const CROSS_FILE_CONNECTIVITY_RULE_REVISION: u32 = 1;
+
+/// Minimum number of commits co-touching both files in a pair (see
+/// [`cross_file_connectivity`]) for that pair to be considered at all — same
+/// value as `crate::boundaries`'s crate-pair-granularity `MIN_CO_CHANGE_SAMPLE`,
+/// kept as its own constant so the two rules' tuning can diverge
+/// independently even though they start at the same value.
+pub const MIN_FILE_CO_CHANGE_SAMPLE: u32 = 5;
+
+/// Minimum ratio of a file pair's co-touch count over the
+/// less-frequently-touched file's own total touch count (see
+/// [`cross_file_connectivity`]) for that pair to be flagged — same value as
+/// `crate::boundaries`'s crate-pair-granularity `CHANGE_COUPLING_RATIO_THRESHOLD`,
+/// kept as its own constant for the same reason as
+/// [`MIN_FILE_CO_CHANGE_SAMPLE`].
+pub const FILE_CO_CHANGE_RATIO_THRESHOLD: f64 = 0.6;
+
 #[derive(Debug)]
 pub enum GitError {
     Open(Box<gix::open::Error>),
@@ -1562,6 +1586,155 @@ pub fn long_term_update_share(
     // `history` is a `HashMap`, so its iteration order isn't stable — sort
     // for deterministic output, mirroring `churn_hotspots`' same need.
     outliers.sort_by(|a, b| a.file.cmp(&b.file));
+    Ok(outliers)
+}
+
+/// A file pair whose co-change count and ratio (see
+/// [`cross_file_connectivity`]) meet [`MIN_FILE_CO_CHANGE_SAMPLE`]/
+/// [`FILE_CO_CHANGE_RATIO_THRESHOLD`]. `file_a`/`file_b` are always ordered
+/// so `file_a <= file_b` (`PathBuf`'s own `Ord`), for deterministic output.
+#[derive(Debug, Clone)]
+pub struct CrossFileConnectivityOutlier {
+    pub file_a: PathBuf,
+    pub file_b: PathBuf,
+    pub co_touch_count: u32,
+    pub total_touches_a: u32,
+    pub total_touches_b: u32,
+    pub ratio: f64,
+}
+
+impl CrossFileConnectivityOutlier {
+    /// Renders this outlier as a [`Finding`], mirroring
+    /// [`crate::boundaries::change_coupling_signals`]'s own finding at
+    /// file-pair rather than crate-pair granularity: `Severity::Info`,
+    /// evidence class `Heuristic` — co-change counts are exact, but reading
+    /// them as evidence of a genuine relationship, rather than coincidence
+    /// within one git window, is an interpretation, never proof.
+    ///
+    /// `Location.file` is the repository's root `Cargo.toml`, mirroring
+    /// [`crate::boundaries::change_coupling_signal_finding`]'s own choice
+    /// for the same "no single natural location" problem: a file pair has no
+    /// one file that is more the "owner" of the finding than the other.
+    pub fn to_finding(&self, repo_root: &Path) -> Finding {
+        Finding {
+            id: format!(
+                "{CROSS_FILE_CONNECTIVITY_RULE}:{}:{}",
+                self.file_a.display(),
+                self.file_b.display()
+            )
+            .into(),
+            rule: CROSS_FILE_CONNECTIVITY_RULE.into(),
+            severity: Severity::Info,
+            location: Location {
+                file: repo_root.join("Cargo.toml"),
+                line: OneBasedLine::FIRST,
+                item_path: format!("{} <-> {}", self.file_a.display(), self.file_b.display()),
+            },
+            evidence_class: EvidenceClass::Heuristic,
+            origin: Origin::Code,
+            evidence: Some(serde_json::json!({
+                "file_a": self.file_a.display().to_string(),
+                "file_b": self.file_b.display().to_string(),
+                "co_touch_count": self.co_touch_count,
+                "total_touches_a": self.total_touches_a,
+                "total_touches_b": self.total_touches_b,
+                "ratio": self.ratio,
+                "reason": format!(
+                    "these two files were changed together in {} of the commits touching either of them within the examined git window, a ratio of {:.2} (threshold: {FILE_CO_CHANGE_RATIO_THRESHOLD}); co-located files that are naturally edited together, such as a module and its test file, are expected to appear here often — that alone is not a problem",
+                    self.co_touch_count, self.ratio
+                ),
+            })),
+            caused_by: Vec::new(),
+            causes: Vec::new(),
+        }
+    }
+}
+
+/// Within the commit history reachable from `HEAD` inside `window_days`,
+/// flags file pairs whose co-change count and ratio meet
+/// [`MIN_FILE_CO_CHANGE_SAMPLE`]/[`FILE_CO_CHANGE_RATIO_THRESHOLD`] — a
+/// direct generalization of [`crate::boundaries::change_coupling_signals`]
+/// from crate-pair to file-pair granularity: no crate resolution, no
+/// `judge.toml` `[layers]` config, and no filtering to only cross-layer
+/// pairs. Unlike that rule, this needs no config at all and runs
+/// unconditionally as part of bare `cargo judge`/`audit` — "these two files
+/// tend to change together" is a plain descriptive/statistical fact, the
+/// same epistemic status as `churn-hotspot`/`size-distribution`/
+/// `move-ratio` (none of which need config either), not an architectural
+/// claim that needs a declared layer config to interpret (todo.md §17 "Kein
+/// Raten von Projektabsicht").
+///
+/// For each commit, every pair of files it touches counts once toward
+/// `co_touches`; `total_touches` counts, per file, how many commits touched
+/// it at all (both within `window_days`). A pair fires when its co-touch
+/// count is at least [`MIN_FILE_CO_CHANGE_SAMPLE`] and `co_touches /
+/// min(total_touches_a, total_touches_b) >= FILE_CO_CHANGE_RATIO_THRESHOLD`
+/// — the same ratio shape `change_coupling_signals` uses.
+///
+/// Scale stays bounded the same way `change_coupling_signals` already
+/// relies on: the number of pairs counted is, per commit, `C(k, 2)` where
+/// `k` is that commit's own touched-file count (not the repository's total
+/// file count), summed over commits — never a full N² file-pair cross
+/// product over the whole repo.
+///
+/// This rule does not distinguish a co-located pair that is unsurprising
+/// (e.g. a module and its test file, or a `mod.rs` and its main file) from
+/// one that is surprising given the files' directory distance or the
+/// absence of an obvious structural relationship — both are reported
+/// identically. Co-located pairs appearing here often is expected, not a
+/// defect of this rule.
+pub fn cross_file_connectivity(
+    repo_root: &Path,
+    window_days: i64,
+) -> Result<Vec<CrossFileConnectivityOutlier>, GitError> {
+    let commits = walk_commits(repo_root, window_days)?;
+
+    let mut total_touches: HashMap<PathBuf, u32> = HashMap::new();
+    let mut co_touches: HashMap<(PathBuf, PathBuf), u32> = HashMap::new();
+
+    for commit in &commits {
+        let touched_set: HashSet<&PathBuf> = commit.files_changed.iter().collect();
+        let mut touched: Vec<&PathBuf> = touched_set.into_iter().collect();
+        touched.sort_unstable();
+
+        for file in &touched {
+            *total_touches.entry((*file).clone()).or_insert(0) += 1;
+        }
+        for i in 0..touched.len() {
+            for j in (i + 1)..touched.len() {
+                let (a, b) = (touched[i], touched[j]);
+                co_touches
+                    .entry((a.clone(), b.clone()))
+                    .and_modify(|count| *count += 1)
+                    .or_insert(1);
+            }
+        }
+    }
+
+    let mut outliers = Vec::new();
+    for ((file_a, file_b), co_touch_count) in &co_touches {
+        if *co_touch_count < MIN_FILE_CO_CHANGE_SAMPLE {
+            continue;
+        }
+        let total_a = total_touches.get(file_a).copied().unwrap_or(0);
+        let total_b = total_touches.get(file_b).copied().unwrap_or(0);
+        let denominator = total_a.min(total_b);
+        if denominator == 0 {
+            continue;
+        }
+        let ratio = f64::from(*co_touch_count) / f64::from(denominator);
+        if ratio >= FILE_CO_CHANGE_RATIO_THRESHOLD {
+            outliers.push(CrossFileConnectivityOutlier {
+                file_a: file_a.clone(),
+                file_b: file_b.clone(),
+                co_touch_count: *co_touch_count,
+                total_touches_a: total_a,
+                total_touches_b: total_b,
+                ratio,
+            });
+        }
+    }
+    outliers.sort_by(|a, b| (&a.file_a, &a.file_b).cmp(&(&b.file_a, &b.file_b)));
     Ok(outliers)
 }
 
@@ -3113,6 +3286,114 @@ mod tests {
             "expected long-term-update-share NOT to fire for a file churned across most of \
              its recorded lifetime and only recently gone quiet — that's legacy-freeze's job, \
              not this rule's: {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_connectivity_fires_for_a_highly_correlated_file_pair() {
+        let dir = TempDir::new("cross-file-connectivity-fires");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add a.rs"]);
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add b.rs"]);
+
+        for i in 0..6 {
+            std::fs::write(dir.join("a.rs"), format!("fn a{i}() {{}}\n")).unwrap();
+            std::fs::write(dir.join("b.rs"), format!("fn b{i}() {{}}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", &format!("touch both {i}")]);
+        }
+
+        let outliers = cross_file_connectivity(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert_eq!(
+            outliers.len(),
+            1,
+            "expected exactly one flagged file pair, got {outliers:?}"
+        );
+        let outlier = &outliers[0];
+        assert_eq!(outlier.file_a, PathBuf::from("a.rs"));
+        assert_eq!(outlier.file_b, PathBuf::from("b.rs"));
+        // 6 co-change commits, plus each file's own solo scaffolding commit
+        // (1 apiece) in the denominator: 6 / (6 + 1) ≈ 0.857.
+        assert_eq!(outlier.co_touch_count, 6);
+        assert_eq!(outlier.total_touches_a, 7);
+        assert_eq!(outlier.total_touches_b, 7);
+        assert!(
+            outlier.ratio >= FILE_CO_CHANGE_RATIO_THRESHOLD,
+            "ratio was {}",
+            outlier.ratio
+        );
+
+        let finding = outlier.to_finding(&dir);
+        assert_eq!(finding.rule, CROSS_FILE_CONNECTIVITY_RULE);
+        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
+        assert!(!finding.is_gating());
+        assert_eq!(finding.location.file, dir.join("Cargo.toml"));
+        let evidence = finding.evidence.as_ref().unwrap();
+        assert_eq!(evidence["co_touch_count"], 6);
+    }
+
+    #[test]
+    fn cross_file_connectivity_does_not_fire_below_the_minimum_sample() {
+        let dir = TempDir::new("cross-file-connectivity-below-sample");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "touch both once"]);
+
+        let outliers = cross_file_connectivity(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(
+            outliers.is_empty(),
+            "expected no outliers below MIN_FILE_CO_CHANGE_SAMPLE, got {outliers:?}"
+        );
+    }
+
+    #[test]
+    fn cross_file_connectivity_does_not_fire_below_the_ratio_threshold() {
+        let dir = TempDir::new("cross-file-connectivity-below-ratio");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        // Each file's own scaffolding commit is a *solo* touch — deliberately
+        // separate commits, so they don't themselves count as a co-change
+        // and skew the ratio this test asserts on below.
+        std::fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add a.rs"]);
+        std::fs::write(dir.join("b.rs"), "fn b() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "add b.rs"]);
+
+        // 5 co-change commits clear MIN_FILE_CO_CHANGE_SAMPLE, but 4 solo
+        // touches of each file (5 solo touches apiece) pull the ratio
+        // (5 / 10) comfortably under FILE_CO_CHANGE_RATIO_THRESHOLD (0.6).
+        for i in 0..5 {
+            std::fs::write(dir.join("a.rs"), format!("fn a{i}() {{}}\n")).unwrap();
+            std::fs::write(dir.join("b.rs"), format!("fn b{i}() {{}}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", &format!("touch both {i}")]);
+        }
+        for i in 0..4 {
+            std::fs::write(dir.join("a.rs"), format!("fn solo_a{i}() {{}}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", &format!("touch a only {i}")]);
+            std::fs::write(dir.join("b.rs"), format!("fn solo_b{i}() {{}}\n")).unwrap();
+            git(&dir, &["add", "."]);
+            git(&dir, &["commit", "-q", "-m", &format!("touch b only {i}")]);
+        }
+
+        let outliers = cross_file_connectivity(&dir, DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(
+            outliers.is_empty(),
+            "expected no outliers below FILE_CO_CHANGE_RATIO_THRESHOLD, got {outliers:?}"
         );
     }
 

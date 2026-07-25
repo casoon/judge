@@ -798,6 +798,10 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             judge::git::LONG_TERM_UPDATE_SHARE_RULE_REVISION,
         ),
         (
+            judge::git::CROSS_FILE_CONNECTIVITY_RULE.to_string(),
+            judge::git::CROSS_FILE_CONNECTIVITY_RULE_REVISION,
+        ),
+        (
             judge::duplication::DUPLICATE_RULE.to_string(),
             judge::duplication::DUPLICATE_RULE_REVISION,
         ),
@@ -997,6 +1001,14 @@ fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFin
             outliers
                 .iter()
                 .map(judge::git::LongTermUpdateShareOutlier::to_finding),
+        ),
+        Err(err) => analysis_errors.push(err.to_string()),
+    }
+    match judge::git::cross_file_connectivity(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
+        Ok(outliers) => findings.extend(
+            outliers
+                .iter()
+                .map(|outlier| outlier.to_finding(&workspace.root)),
         ),
         Err(err) => analysis_errors.push(err.to_string()),
     }

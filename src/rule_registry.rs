@@ -769,6 +769,15 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         verdict_effect: VerdictEffect::AdvisoryOnly,
         example: None,
     },
+    RuleMetadata {
+        id: "cross-file-connectivity",
+        evidence_class: EvidenceClass::Heuristic,
+        preconditions: "Always evaluated (Fast Tier, needs real git history over `DEFAULT_WINDOW_DAYS` (365) days; part of bare `cargo judge` and `audit`). Unlike `change-coupling-signal` (its crate-pair-granularity counterpart), this needs no `judge.toml` `[layers]` config at all — 'these two files tend to change together' is a plain descriptive/statistical fact, not an architectural claim, the same unconditional posture as `churn-hotspot`/`size-distribution`/`move-ratio`.",
+        exclusions: "A direct generalization of `change-coupling-signal` from crate-pair to file-pair granularity: co-change is counted per commit at file-path granularity (a file pair co-touches if a commit's diff includes both paths). `MIN_FILE_CO_CHANGE_SAMPLE` (5) and `FILE_CO_CHANGE_RATIO_THRESHOLD` (0.6) are first-cut, adjustable constants — same values as `change-coupling-signal`'s analogous constants for consistency, declared separately so the two rules' tuning can diverge independently — not calibrated against a corpus of known-related vs. known-independent file pairs. A large repo-wide commit (a rename, a formatting pass) can make unrelated files look connected for one window. This rule does not distinguish a co-located pair that is unsurprising (e.g. a module and its test file, or a `mod.rs` and its main file) from one that is surprising given the files' directory distance or the absence of an obvious structural relationship — both are reported identically, and co-located pairs appearing here often is expected, not a defect.",
+        allowed_wording: "State only the co-touch count and ratio for this file pair within the examined git window — never that the files 'are coupled', 'belong together', or 'violate the architecture' as settled fact (todo.md §17.4).",
+        verdict_effect: VerdictEffect::AdvisoryOnly,
+        example: None,
+    },
     // -- module_graph.rs ------------------------------------------------
     RuleMetadata {
         id: "unlinked-file",
@@ -1477,6 +1486,10 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
         "long-term-update-share",
         "needs a file's full recorded commit history spanning at least MIN_BUCKETS_FOR_LONG_TERM_UPDATE_SHARE (6) 30-day buckets — not expressible as a single source snippet",
     ),
+    (
+        "cross-file-connectivity",
+        "needs real git co-change history across commits for a file pair — not expressible as a single source snippet",
+    ),
 ];
 
 #[cfg(test)]
@@ -1538,6 +1551,7 @@ mod tests {
             crate::git::MOVE_RATIO_RULE,
             crate::git::COPY_PASTE_RATIO_RULE,
             crate::git::LONG_TERM_UPDATE_SHARE_RULE,
+            crate::git::CROSS_FILE_CONNECTIVITY_RULE,
             crate::module_graph::UNLINKED_FILE_RULE,
             crate::module_graph::ORPHAN_MODULE_RULE,
             crate::mutants::MUTATION_SURVIVOR_RULE,
