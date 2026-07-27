@@ -289,10 +289,7 @@ fn several_args(a: i32, b: i32, c: i32) {}
 
         assert_eq!(
             counts,
-            vec![
-                ("no_args".to_string(), 0),
-                ("several_args".to_string(), 3),
-            ]
+            vec![("no_args".to_string(), 0), ("several_args".to_string(), 3),]
         );
     }
 

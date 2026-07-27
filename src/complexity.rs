@@ -1397,8 +1397,8 @@ where
         );
     }
 
-    /// `a + b` gives exactly one distinct operator (`bin +`, `n1` = 1, `N1` =
-    /// 1) and two distinct operands (`a`, `b`; `n2` = 2, `N2` = 2), so
+    /// `a + b` gives exactly one distinct operator (`bin +`, `n1` = 1,
+    /// `N1` = 1) and two distinct operands (`a`, `b`; `n2` = 2, `N2` = 2), so
     /// Halstead Volume and the resulting Maintainability Index can be
     /// computed by hand from the same formula [`maintainability_index`] uses
     /// and checked for an exact match — mirrors this crate's

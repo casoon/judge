@@ -3797,7 +3797,12 @@ fn run_dead_code_deep(
         .map(ToString::to_string)
         .collect();
     analysis_errors.extend(feature_matrix_report.errors.iter().map(ToString::to_string));
-    analysis_errors.extend(dead_trait_impl_report.errors.iter().map(ToString::to_string));
+    analysis_errors.extend(
+        dead_trait_impl_report
+            .errors
+            .iter()
+            .map(ToString::to_string),
+    );
     analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
     analysis_errors.extend(ownership_report.errors.iter().map(ToString::to_string));
     analysis_errors.extend(complexity.errors.iter().map(ToString::to_string));

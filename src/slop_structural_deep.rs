@@ -1408,8 +1408,8 @@ fn calls_it() {
     /// module doesn't yet have is separate follow-up work, not a "clearly
     /// fixable" bug within this fixture task's scope.
     #[test]
-    fn duplicative_reinvention_flags_a_family_whose_only_caller_is_invisible_proc_macro_generated_code(
-    ) {
+    fn duplicative_reinvention_flags_a_family_whose_only_caller_is_invisible_proc_macro_generated_code()
+     {
         let dir = TempDir::new("duplicative-reinvention-proc-macro-blind-spot");
         std::fs::create_dir_all(dir.join("macros/src")).unwrap();
         std::fs::write(

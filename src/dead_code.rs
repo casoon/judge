@@ -448,7 +448,9 @@ fn file_constructs_variant(ast: &syn::File, variant_name: &str) -> bool {
     }
 
     fn path_ends_with(path: &syn::Path, name: &str) -> bool {
-        path.segments.last().is_some_and(|segment| segment.ident == name)
+        path.segments
+            .last()
+            .is_some_and(|segment| segment.ident == name)
     }
 
     impl<'a, 'ast> Visit<'ast> for ConstructionVisitor<'a> {
@@ -1272,8 +1274,7 @@ pub fn analyze_workspace(
                 // comment) — ambiguous whether it belongs on the `pub` or
                 // non-`pub` side of this split, so it's left unchecked by
                 // both, same as today.
-                if let Some(syn::Visibility::Inherited | syn::Visibility::Restricted(_)) =
-                    site.vis
+                if let Some(syn::Visibility::Inherited | syn::Visibility::Restricted(_)) = site.vis
                 {
                     check_unreachable_from_entry(
                         &analysis,
@@ -2843,8 +2844,7 @@ edition = "2021"
     }
 
     #[test]
-    fn a_pub_fn_used_by_another_workspace_crate_is_not_flagged_test_only_pub_even_if_also_tested()
-     {
+    fn a_pub_fn_used_by_another_workspace_crate_is_not_flagged_test_only_pub_even_if_also_tested() {
         let dir = TempDir::new("dead-code-test-only-pub-cross-crate");
         write_crate(
             &dir,

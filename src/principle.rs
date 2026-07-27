@@ -103,10 +103,10 @@ pub const LAW_OF_DEMETER_CHAIN_THRESHOLD: usize = 3;
 pub const API_EVOLVABILITY_MIN_FIELDS: usize = 2;
 
 /// Minimum count of `Option<T>` fields [`make_illegal_states_unrepresentable_
-/// candidates`] treats as "a struct with several candidate fields" (signal
-/// 1) — below this, there is nothing for signal 2's mutual-exclusivity check
-/// to corroborate (a single `Option<T>` field is never a "which one is set"
-/// question).
+/// candidates`] treats as "a struct with several candidate fields"
+/// (signal 1) — below this, there is nothing for signal 2's mutual-exclusivity
+/// check to corroborate (a single `Option<T>` field is never a "which one is
+/// set" question).
 pub const MISU_MIN_OPTION_FIELDS: usize = 2;
 
 /// Minimum count of usable struct-literal construction sites (sites that
