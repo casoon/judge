@@ -115,4 +115,7 @@ Optional Cargo feature:
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+Business Source License 1.1, see [LICENSE](LICENSE). Free for any use,
+including production, except offering `cargo-judge` (or a modified version)
+to third parties as a hosted/managed service or a competing product.
+Converts to Apache License 2.0 four years after each version's release.
