@@ -260,16 +260,33 @@ pub struct PrincipleHeuristic {
     pub related_findings: Vec<FindingId>,
 }
 
+/// `CodeScope` naming a single module/item within `krate` — the shape every
+/// detector in this module builds its scope with, whether via
+/// [`item_context`] (function/expression-level heuristics) or directly
+/// (struct/trait-level heuristics that have no separate "location" to pair
+/// it with).
+fn single_module_scope(krate: &CrateInfo, module: impl Into<String>) -> CodeScope {
+    CodeScope {
+        krate: krate.name.clone(),
+        modules: vec![module.into()],
+    }
+}
+
+/// `EvidenceLocation` naming one item in `file` by its qualified path — the
+/// same `{file, item_path: Some(name)}` shape [`item_context`] pairs with a
+/// [`CodeScope`], factored out for call sites (struct-field collectors,
+/// signature checks) that only need the location, not the scope.
+fn item_location(file: &Path, item_path: &str) -> EvidenceLocation {
+    EvidenceLocation {
+        file: file.to_path_buf(),
+        item_path: Some(item_path.to_string()),
+    }
+}
+
 fn item_context(krate: &CrateInfo, file: &Path, item_path: &str) -> (CodeScope, EvidenceLocation) {
     (
-        CodeScope {
-            krate: krate.name.clone(),
-            modules: vec![item_path.to_string()],
-        },
-        EvidenceLocation {
-            file: file.to_path_buf(),
-            item_path: Some(item_path.to_string()),
-        },
+        single_module_scope(krate, item_path),
+        item_location(file, item_path),
     )
 }
 
@@ -363,6 +380,33 @@ pub fn analyze_workspace(
 ///    different evidence source from signal 1: an independently computed
 ///    metric, not a second reading of the same AST pattern.
 ///
+/// Parses every source file in every crate of `workspace`, calling `visit`
+/// with the crate, the file's path, its raw text, and its already-parsed AST
+/// — the shared "walk every already-parsed file" outer loop several
+/// detectors in this module need before diverging into their own,
+/// per-detector per-file logic. `text` is available for detectors that need
+/// the raw source alongside the AST (e.g. [`unsafe_containment_candidates`]'s
+/// comment scan); detectors that only need the AST simply ignore it. Files
+/// that fail to read or parse are silently skipped, the same accepted
+/// limitation every detector in this module already documents for its own
+/// scan.
+fn for_each_parsed_file<'a>(
+    workspace: &'a Workspace,
+    mut visit: impl FnMut(&'a CrateInfo, &'a Path, &str, &syn::File),
+) {
+    for krate in &workspace.crates {
+        for source in &krate.source_files {
+            let Ok(text) = std::fs::read_to_string(&source.path) else {
+                continue;
+            };
+            let Ok(ast) = syn::parse_file(&text) else {
+                continue;
+            };
+            visit(krate, &source.path, &text, &ast);
+        }
+    }
+}
+
 /// Only functions satisfying both produce a heuristic — exactly one per
 /// function.
 fn functional_core_imperative_shell_candidates(
@@ -372,37 +416,29 @@ fn functional_core_imperative_shell_candidates(
     let cyclomatic_by_function = cyclomatic_by_function_map(complexity);
 
     let mut heuristics = Vec::new();
-    for krate in &workspace.crates {
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
+    for_each_parsed_file(workspace, |krate, file, _text, ast| {
+        walk_functions(ast, |site| {
+            let Some(&cyclomatic) =
+                cyclomatic_by_function.get(&(file.to_path_buf(), site.qualified_name.clone()))
+            else {
+                return;
             };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            walk_functions(&ast, |site| {
-                let Some(&cyclomatic) =
-                    cyclomatic_by_function.get(&(source.path.clone(), site.qualified_name.clone()))
-                else {
-                    return;
-                };
-                if cyclomatic < FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD {
-                    return;
-                }
-                let io_hits = io_call_hits(site.block);
-                if io_hits.is_empty() {
-                    return;
-                }
-                heuristics.push(build_functional_core_imperative_shell_heuristic(
-                    krate,
-                    &source.path,
-                    &site.qualified_name,
-                    cyclomatic,
-                    &io_hits,
-                ));
-            });
-        }
-    }
+            if cyclomatic < FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD {
+                return;
+            }
+            let io_hits = io_call_hits(site.block);
+            if io_hits.is_empty() {
+                return;
+            }
+            heuristics.push(build_functional_core_imperative_shell_heuristic(
+                krate,
+                file,
+                &site.qualified_name,
+                cyclomatic,
+                &io_hits,
+            ));
+        });
+    });
     heuristics
 }
 
@@ -439,16 +475,38 @@ const IO_METHOD_NAMES: &[&str] = &[
     "flush",
 ];
 
+/// `path`'s segments rendered as plain identifier strings — the shared
+/// starting point for every purely-syntactic, no-type-resolution path match
+/// in this module (matching by segment text rather than resolving the path
+/// to a real item, the same accepted limitation [`path_matches_io_prefix`]
+/// documents for itself).
+fn path_segment_strings(path: &syn::Path) -> Vec<String> {
+    path.segments.iter().map(|s| s.ident.to_string()).collect()
+}
+
+/// Whether `path`'s segments contain, anywhere, a consecutive pair matching
+/// one of `pairs` — the shared "windows(2)" scan [`path_matches_io_prefix`]
+/// and [`path_matches_process_exit`] both use for their own fixed pair list.
+fn path_contains_consecutive_pair(path: &syn::Path, pairs: &[(&str, &str)]) -> bool {
+    path_segment_strings(path)
+        .windows(2)
+        .any(|pair| pairs.iter().any(|(a, b)| pair[0] == *a && pair[1] == *b))
+}
+
+/// Whether `path`'s last segment is literally `name` — the same
+/// accepted-limitation, no-type-resolution matching used throughout this
+/// module wherever a call/expression is recognized purely by the name it
+/// ends with (a recursive call to a known function name, a `Some`/`None`
+/// constructor).
+fn path_ends_with(path: &syn::Path, name: &str) -> bool {
+    path.segments.last().is_some_and(|s| s.ident == name)
+}
+
 /// Whether `path` contains the consecutive segment pair `std::fs`,
 /// `std::env`, `std::process`, or `std::io` anywhere (see
 /// [`functional_core_imperative_shell_candidates`]'s signal 1).
 fn path_matches_io_prefix(path: &syn::Path) -> bool {
-    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    segments.windows(2).any(|pair| {
-        IO_PATH_PREFIX_PAIRS
-            .iter()
-            .any(|(a, b)| pair[0] == *a && pair[1] == *b)
-    })
+    path_contains_consecutive_pair(path, IO_PATH_PREFIX_PAIRS)
 }
 
 /// Rendered source text of every call in `block` matching
@@ -713,10 +771,7 @@ fn build_interface_segregation_heuristic(
     first: &TraitImplementation,
     second: &TraitImplementation,
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![trait_decl.name.clone()],
-    };
+    let scope = single_module_scope(krate, trait_decl.name.clone());
 
     let structural = Evidence {
         description: format!(
@@ -859,22 +914,27 @@ struct LeakedSignature {
 /// `boundaries::segments_match_forbidden`'s own accepted-limitation approach
 /// but restricted to signature types. Returns the rendered type text and the
 /// matched `forbidden` entry on a hit.
-fn leaked_type_in(ty: &syn::Type, forbidden: &[String]) -> Option<(String, String)> {
-    use quote::ToTokens;
-
+/// `ty`, unwrapped one layer of `&`/`&mut` reference if present, then as a
+/// `syn::TypePath` — the shared starting point [`leaked_type_in`] and
+/// [`primitive_scalar_kind`] both need before diverging into their own
+/// segment logic (a `crate::<forbidden>` prefix match vs. a fixed
+/// primitive/string identifier list).
+fn unwrap_reference_type_path(ty: &syn::Type) -> Option<&syn::TypePath> {
     let inner = match ty {
         syn::Type::Reference(reference) => reference.elem.as_ref(),
         other => other,
     };
-    let syn::Type::Path(type_path) = inner else {
-        return None;
-    };
-    let segments: Vec<String> = type_path
-        .path
-        .segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect();
+    match inner {
+        syn::Type::Path(type_path) => Some(type_path),
+        _ => None,
+    }
+}
+
+fn leaked_type_in(ty: &syn::Type, forbidden: &[String]) -> Option<(String, String)> {
+    use quote::ToTokens;
+
+    let type_path = unwrap_reference_type_path(ty)?;
+    let segments = path_segment_strings(&type_path.path);
     if segments.first().map(String::as_str) != Some("crate") {
         return None;
     }
@@ -917,10 +977,7 @@ fn check_signature(
                 item_path: item_path.to_string(),
                 leaked_type,
                 forbidden,
-                location: EvidenceLocation {
-                    file: file.to_path_buf(),
-                    item_path: Some(item_path.to_string()),
-                },
+                location: item_location(file, item_path),
             });
         }
     }
@@ -1053,10 +1110,7 @@ fn build_dependency_inversion_heuristic(
     related_findings: &[&Finding],
     leaks: &[LeakedSignature],
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![rule.from.clone()],
-    };
+    let scope = single_module_scope(krate, rule.from.clone());
 
     let call_level = Evidence {
         description: format!(
@@ -1232,35 +1286,36 @@ struct DeclaredItemCollector {
 impl DeclaredItemCollector {
     fn push(&mut self, name: String) {
         self.items.push(FileItem {
-            location: EvidenceLocation {
-                file: self.file.clone(),
-                item_path: Some(name.clone()),
-            },
+            location: item_location(&self.file, &name),
             name,
             categories: Vec::new(),
         });
+    }
+
+    /// Pushes `ident` if `vis` is `pub` — the shared "is this declaration
+    /// public" gate [`Visit::visit_item_struct`], [`Visit::visit_item_enum`],
+    /// and [`Visit::visit_item_trait`] all apply before delegating to
+    /// [`Self::push`], differing only in which `syn` item kind called them.
+    fn push_if_public(&mut self, vis: &syn::Visibility, ident: &syn::Ident) {
+        if matches!(vis, syn::Visibility::Public(_)) {
+            self.push(ident.to_string());
+        }
     }
 }
 
 impl<'ast> Visit<'ast> for DeclaredItemCollector {
     fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            self.push(node.ident.to_string());
-        }
+        self.push_if_public(&node.vis, &node.ident);
         syn::visit::visit_item_struct(self, node);
     }
 
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            self.push(node.ident.to_string());
-        }
+        self.push_if_public(&node.vis, &node.ident);
         syn::visit::visit_item_enum(self, node);
     }
 
     fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            self.push(node.ident.to_string());
-        }
+        self.push_if_public(&node.vis, &node.ident);
         syn::visit::visit_item_trait(self, node);
     }
 }
@@ -1312,10 +1367,7 @@ fn collect_file_items(
         }
 
         items.push(FileItem {
-            location: EvidenceLocation {
-                file: file.to_path_buf(),
-                item_path: Some(site.qualified_name.clone()),
-            },
+            location: item_location(file, &site.qualified_name),
             name: site.qualified_name,
             categories,
         });
@@ -1385,24 +1437,15 @@ fn cohesion_candidates(
     let cyclomatic_by_function = cyclomatic_by_function_map(complexity);
 
     let mut heuristics = Vec::new();
-    for krate in &workspace.crates {
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-
-            let items = collect_file_items(&ast, &source.path, &cyclomatic_by_function);
-            if items.len() < COHESION_ITEM_THRESHOLD {
-                continue;
-            }
-            if first_differing_category_pair(&items).is_some() {
-                heuristics.push(build_cohesion_heuristic(krate, &source.path, &items));
-            }
+    for_each_parsed_file(workspace, |krate, file, _text, ast| {
+        let items = collect_file_items(ast, file, &cyclomatic_by_function);
+        if items.len() < COHESION_ITEM_THRESHOLD {
+            return;
         }
-    }
+        if first_differing_category_pair(&items).is_some() {
+            heuristics.push(build_cohesion_heuristic(krate, file, &items));
+        }
+    });
     heuristics
 }
 
@@ -1413,10 +1456,7 @@ fn build_cohesion_heuristic(
 ) -> PrincipleHeuristic {
     let module =
         module_path_for_file(&krate.root, file).unwrap_or_else(|| file.display().to_string());
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![module],
-    };
+    let scope = single_module_scope(krate, module);
 
     let item_names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
     let structural = Evidence {
@@ -1543,12 +1583,7 @@ fn chain_base_is_excluded(expr: &syn::Expr) -> bool {
             let syn::Expr::Path(func_path) = call.func.as_ref() else {
                 return false;
             };
-            let segments: Vec<String> = func_path
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect();
+            let segments = path_segment_strings(&func_path.path);
             if segments.first().map(String::as_str) == Some("Self") {
                 return true;
             }
@@ -1677,31 +1712,39 @@ fn law_of_demeter_chain_hits(block: &syn::Block) -> Vec<ChainHit> {
 /// `Type::default(...)`, `Type::builder(...)`) are excluded before either
 /// signal is even checked (see [`chain_base_is_excluded`]).
 ///
+/// Runs `hits_in_block` over every function body in every already-parsed
+/// source file in `workspace`, building one heuristic per hit via `build` —
+/// the shared "one heuristic per per-function AST hit" detection-loop shape
+/// [`law_of_demeter_candidates`] and [`bounded_resources_loop_candidates`]
+/// both use. Detectors whose hit type needs extra context beyond a function's
+/// own block (e.g. [`functional_core_imperative_shell_candidates`]'s
+/// cyclomatic-complexity lookup, or [`bounded_resources_recursion_candidates`]'s
+/// visibility gate) write their own loop instead of forcing that context
+/// through this narrower signature.
+fn site_level_candidates<H>(
+    workspace: &Workspace,
+    hits_in_block: impl Fn(&syn::Block) -> Vec<H>,
+    build: impl Fn(&CrateInfo, &Path, &str, &H) -> PrincipleHeuristic,
+) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for_each_parsed_file(workspace, |krate, file, _text, ast| {
+        walk_functions(ast, |site| {
+            for hit in hits_in_block(site.block) {
+                heuristics.push(build(krate, file, &site.qualified_name, &hit));
+            }
+        });
+    });
+    heuristics
+}
+
 /// At most one heuristic per matching chain expression — a function may
 /// contribute more than one if it contains several qualifying chains.
 fn law_of_demeter_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
-    let mut heuristics = Vec::new();
-    for krate in &workspace.crates {
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            walk_functions(&ast, |site| {
-                for hit in law_of_demeter_chain_hits(site.block) {
-                    heuristics.push(build_law_of_demeter_heuristic(
-                        krate,
-                        &source.path,
-                        &site.qualified_name,
-                        &hit,
-                    ));
-                }
-            });
-        }
-    }
-    heuristics
+    site_level_candidates(
+        workspace,
+        law_of_demeter_chain_hits,
+        build_law_of_demeter_heuristic,
+    )
 }
 
 fn build_law_of_demeter_heuristic(
@@ -1799,10 +1842,7 @@ struct LoopHit {
 /// [`path_matches_io_prefix`] uses, applied to `std::process::exit`
 /// specifically (also matches a `use`-imported bare `process::exit`).
 fn path_matches_process_exit(path: &syn::Path) -> bool {
-    let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
-    segments
-        .windows(2)
-        .any(|pair| pair[0] == "process" && pair[1] == "exit")
+    path_contains_consecutive_pair(path, &[("process", "exit")])
 }
 
 /// Whether `body` (a `loop { ... }`'s own block) contains, anywhere within
@@ -1885,28 +1925,11 @@ fn bounded_resources_loop_hits(block: &syn::Block) -> Vec<LoopHit> {
 }
 
 fn bounded_resources_loop_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
-    let mut heuristics = Vec::new();
-    for krate in &workspace.crates {
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            walk_functions(&ast, |site| {
-                for hit in bounded_resources_loop_hits(site.block) {
-                    heuristics.push(build_bounded_resources_loop_heuristic(
-                        krate,
-                        &source.path,
-                        &site.qualified_name,
-                        &hit,
-                    ));
-                }
-            });
-        }
-    }
-    heuristics
+    site_level_candidates(
+        workspace,
+        bounded_resources_loop_hits,
+        build_bounded_resources_loop_heuristic,
+    )
 }
 
 fn build_bounded_resources_loop_heuristic(
@@ -2041,25 +2064,28 @@ fn direct_recursive_calls(block: &syn::Block, name: &str) -> Vec<(usize, String)
         name: &'a str,
         hits: Vec<(usize, String)>,
     }
+    impl Finder<'_> {
+        /// Records one call site — shared by [`Self::visit_expr_call`] and
+        /// [`Self::visit_expr_method_call`], which differ only in how they
+        /// recognize a call to `self.name` (a path's last segment vs. a
+        /// method call's own identifier).
+        fn record(&mut self, line: usize, rendered: String) {
+            self.hits.push((line, rendered));
+        }
+    }
     impl<'ast> Visit<'ast> for Finder<'_> {
         fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
             if let syn::Expr::Path(path) = node.func.as_ref()
-                && path
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|s| s.ident == self.name)
+                && path_ends_with(&path.path, self.name)
             {
-                self.hits
-                    .push((node.span().start().line, node.to_token_stream().to_string()));
+                self.record(node.span().start().line, node.to_token_stream().to_string());
             }
             syn::visit::visit_expr_call(self, node);
         }
 
         fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
             if node.method == self.name {
-                self.hits
-                    .push((node.span().start().line, node.to_token_stream().to_string()));
+                self.record(node.span().start().line, node.to_token_stream().to_string());
             }
             syn::visit::visit_expr_method_call(self, node);
         }
@@ -2075,20 +2101,11 @@ fn direct_recursive_calls(block: &syn::Block, name: &str) -> Vec<(usize, String)
     finder.hits
 }
 
-/// Parameter identifiers of `sig` — simple `Pat::Ident` patterns only
-/// (destructuring patterns are skipped, an accepted limitation), excluding
-/// the receiver.
+/// Parameter identifiers of `sig` — the names half of [`typed_params`] (see
+/// that function's doc comment for the simple-`Pat::Ident`-only limitation
+/// both share), for call sites that don't need the parameter types.
 fn param_names(sig: &syn::Signature) -> Vec<String> {
-    sig.inputs
-        .iter()
-        .filter_map(|arg| match arg {
-            syn::FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
-                syn::Pat::Ident(pat_ident) => Some(pat_ident.ident.to_string()),
-                _ => None,
-            },
-            syn::FnArg::Receiver(_) => None,
-        })
-        .collect()
+    typed_params(sig).into_iter().map(|(name, _)| name).collect()
 }
 
 /// Whether `block` contains an `if`/`match` whose condition/scrutinee
@@ -2158,37 +2175,26 @@ fn bounded_resources_recursion_hit(
 
 fn bounded_resources_recursion_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
-    for krate in &workspace.crates {
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            let mut hits: Vec<(String, RecursionHit)> = Vec::new();
-            walk_functions(&ast, |site| {
-                // Trait default methods have no `vis` of their own — skip
-                // them, matching the pre-migration hand-rolled visitor,
-                // which never visited `TraitItemFn` bodies for this check.
-                if site.vis.is_none() {
-                    return;
-                }
-                let name = site.sig.ident.to_string();
-                if let Some(hit) = bounded_resources_recursion_hit(&name, site.sig, site.block) {
-                    hits.push((site.qualified_name.clone(), hit));
-                }
-            });
-            for (item_path, hit) in hits {
-                heuristics.push(build_bounded_resources_recursion_heuristic(
-                    krate,
-                    &source.path,
-                    &item_path,
-                    &hit,
-                ));
+    for_each_parsed_file(workspace, |krate, file, _text, ast| {
+        let mut hits: Vec<(String, RecursionHit)> = Vec::new();
+        walk_functions(ast, |site| {
+            // Trait default methods have no `vis` of their own — skip
+            // them, matching the pre-migration hand-rolled visitor,
+            // which never visited `TraitItemFn` bodies for this check.
+            if site.vis.is_none() {
+                return;
             }
+            let name = site.sig.ident.to_string();
+            if let Some(hit) = bounded_resources_recursion_hit(&name, site.sig, site.block) {
+                hits.push((site.qualified_name.clone(), hit));
+            }
+        });
+        for (item_path, hit) in hits {
+            heuristics.push(build_bounded_resources_recursion_heuristic(
+                krate, file, &item_path, &hit,
+            ));
         }
-    }
+    });
     heuristics
 }
 
@@ -2324,13 +2330,7 @@ const PRIMITIVE_SCALAR_IDENTS: &[&str] = &[
 /// "textual, not yet parsed into a distinct shape" family for
 /// [`parse_dont_validate_candidates`]'s purposes.
 fn primitive_scalar_kind(ty: &syn::Type) -> Option<String> {
-    let inner = match ty {
-        syn::Type::Reference(reference) => reference.elem.as_ref(),
-        other => other,
-    };
-    let syn::Type::Path(type_path) = inner else {
-        return None;
-    };
+    let type_path = unwrap_reference_type_path(ty)?;
     let ident = type_path.path.segments.last()?.ident.to_string();
     if !PRIMITIVE_SCALAR_IDENTS.contains(&ident.as_str()) {
         return None;
@@ -2862,10 +2862,7 @@ impl<'ast> Visit<'ast> for EvolvableStructCollector {
                 self.candidates.push(EvolvableStructCandidate {
                     name: node.ident.to_string(),
                     field_count: count,
-                    location: EvidenceLocation {
-                        file: self.file.clone(),
-                        item_path: Some(node.ident.to_string()),
-                    },
+                    location: item_location(&self.file, &node.ident.to_string()),
                 });
             }
         }
@@ -2952,34 +2949,60 @@ impl<'ast> Visit<'ast> for StructConstructionCollector {
 /// candidates` use for their own name matching. At most one heuristic per
 /// struct: the first qualifying construction site found, in file-then-line
 /// order.
+/// Parses every source file in `krate`, running `collect` once per file to
+/// produce a `(declaration candidates, usage sites)` pair, and concatenates
+/// both halves across all files — the shared "gather structural candidates
+/// and their independent crate-wide usage evidence" loop
+/// [`api_evolvability_candidates`] ([`EvolvableStructCollector`] +
+/// [`StructConstructionCollector`]) and
+/// [`make_illegal_states_unrepresentable_candidates`]
+/// ([`MisuStructCollector`] + [`MisuConstructionCollector`]) both need before
+/// diverging into their own, differently-shaped candidate-to-site matching.
+/// Each file is parsed once and handed to both collectors via `collect`,
+/// rather than parsed once per collector. Files that fail to read or parse
+/// are silently skipped, the same accepted limitation every detector in this
+/// module already documents for its own scan.
+fn collect_crate_wide_pair<A, B>(
+    krate: &CrateInfo,
+    collect: impl Fn(PathBuf, &syn::File) -> (Vec<A>, Vec<B>),
+) -> (Vec<A>, Vec<B>) {
+    let mut candidates = Vec::new();
+    let mut sites = Vec::new();
+    for source in &krate.source_files {
+        let Ok(text) = std::fs::read_to_string(&source.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&text) else {
+            continue;
+        };
+        let (file_candidates, file_sites) = collect(source.path.clone(), &ast);
+        candidates.extend(file_candidates);
+        sites.extend(file_sites);
+    }
+    (candidates, sites)
+}
+
 fn api_evolvability_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
     for krate in &workspace.crates {
-        let mut candidates: Vec<EvolvableStructCandidate> = Vec::new();
-        let mut construction_sites: Vec<StructConstructionSite> = Vec::new();
-
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-
+        let (candidates, mut construction_sites): (
+            Vec<EvolvableStructCandidate>,
+            Vec<StructConstructionSite>,
+        ) = collect_crate_wide_pair(krate, |file, ast| {
             let mut struct_collector = EvolvableStructCollector {
-                file: source.path.clone(),
+                file: file.clone(),
                 candidates: Vec::new(),
             };
-            struct_collector.visit_file(&ast);
-            candidates.extend(struct_collector.candidates);
+            struct_collector.visit_file(ast);
 
             let mut construction_collector = StructConstructionCollector {
-                file: source.path.clone(),
+                file,
                 sites: Vec::new(),
             };
-            construction_collector.visit_file(&ast);
-            construction_sites.extend(construction_collector.sites);
-        }
+            construction_collector.visit_file(ast);
+
+            (struct_collector.candidates, construction_collector.sites)
+        });
         construction_sites
             .sort_by(|a, b| (&a.location.file, a.line).cmp(&(&b.location.file, b.line)));
 
@@ -3001,10 +3024,7 @@ fn build_api_evolvability_heuristic(
     candidate: &EvolvableStructCandidate,
     site: &StructConstructionSite,
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![candidate.name.clone()],
-    };
+    let scope = single_module_scope(krate, candidate.name.clone());
 
     let structural = Evidence {
         description: format!(
@@ -3189,10 +3209,7 @@ fn unsafe_containment_file_sites(
         if matches!(site.vis, Some(syn::Visibility::Public(_))) && site.sig.unsafety.is_some() {
             pub_unsafe_fns.push(PubUnsafeFnSite {
                 qualified_name: site.qualified_name.clone(),
-                location: EvidenceLocation {
-                    file: file.to_path_buf(),
-                    item_path: Some(site.qualified_name.clone()),
-                },
+                location: item_location(file, &site.qualified_name),
                 line: site.span.start().line,
                 has_safety_doc_section: has_safety_doc_section(site.attrs),
             });
@@ -3206,10 +3223,7 @@ fn unsafe_containment_file_sites(
         if let Some(line) = finder.first_line {
             safety_wrappers.push(SafetyWrapperSite {
                 qualified_name: site.qualified_name.clone(),
-                location: EvidenceLocation {
-                    file: file.to_path_buf(),
-                    item_path: Some(site.qualified_name.clone()),
-                },
+                location: item_location(file, &site.qualified_name),
                 line,
             });
         }
@@ -3266,36 +3280,24 @@ fn unsafe_containment_file_sites(
 /// same file.
 fn unsafe_containment_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
-    for krate in &workspace.crates {
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            let comments = extract_comments(&text);
-            let (pub_unsafe_fns, safety_wrappers) =
-                unsafe_containment_file_sites(&source.path, &ast, &comments);
-            if safety_wrappers.is_empty() {
-                continue;
-            }
-            for candidate in &pub_unsafe_fns {
-                if candidate.has_safety_doc_section {
-                    continue;
-                }
-                let Some(wrapper) = safety_wrappers.first() else {
-                    continue;
-                };
-                heuristics.push(build_unsafe_containment_heuristic(
-                    krate,
-                    &source.path,
-                    candidate,
-                    wrapper,
-                ));
-            }
+    for_each_parsed_file(workspace, |krate, file, text, ast| {
+        let comments = extract_comments(text);
+        let (pub_unsafe_fns, safety_wrappers) = unsafe_containment_file_sites(file, ast, &comments);
+        if safety_wrappers.is_empty() {
+            return;
         }
-    }
+        for candidate in &pub_unsafe_fns {
+            if candidate.has_safety_doc_section {
+                continue;
+            }
+            let Some(wrapper) = safety_wrappers.first() else {
+                continue;
+            };
+            heuristics.push(build_unsafe_containment_heuristic(
+                krate, file, candidate, wrapper,
+            ));
+        }
+    });
     heuristics
 }
 
@@ -3305,10 +3307,7 @@ fn build_unsafe_containment_heuristic(
     candidate: &PubUnsafeFnSite,
     wrapper: &SafetyWrapperSite,
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![candidate.qualified_name.clone()],
-    };
+    let scope = single_module_scope(krate, candidate.qualified_name.clone());
 
     let structural = Evidence {
         description: format!(
@@ -3449,10 +3448,7 @@ impl<'ast> Visit<'ast> for MisuStructCollector {
                 self.candidates.push(MisuStructCandidate {
                     name: node.ident.to_string(),
                     option_fields,
-                    location: EvidenceLocation {
-                        file: self.file.clone(),
-                        item_path: Some(node.ident.to_string()),
-                    },
+                    location: item_location(&self.file, &node.ident.to_string()),
                 });
             }
         }
@@ -3482,16 +3478,12 @@ enum FieldSetting {
 fn field_setting(expr: &syn::Expr) -> FieldSetting {
     match expr {
         syn::Expr::Call(call) => match &*call.func {
-            syn::Expr::Path(path)
-                if path.path.segments.last().is_some_and(|s| s.ident == "Some") =>
-            {
+            syn::Expr::Path(path) if path_ends_with(&path.path, "Some") => {
                 FieldSetting::SomeShaped
             }
             _ => FieldSetting::Ambiguous,
         },
-        syn::Expr::Path(path) if path.path.segments.last().is_some_and(|s| s.ident == "None") => {
-            FieldSetting::NoneShaped
-        }
+        syn::Expr::Path(path) if path_ends_with(&path.path, "None") => FieldSetting::NoneShaped,
         _ => FieldSetting::Ambiguous,
     }
 }
@@ -3587,31 +3579,24 @@ fn make_illegal_states_unrepresentable_candidates(
 ) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
     for krate in &workspace.crates {
-        let mut candidates: Vec<MisuStructCandidate> = Vec::new();
-        let mut construction_sites: Vec<MisuConstructionSite> = Vec::new();
-
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-
+        let (candidates, construction_sites): (
+            Vec<MisuStructCandidate>,
+            Vec<MisuConstructionSite>,
+        ) = collect_crate_wide_pair(krate, |file, ast| {
             let mut struct_collector = MisuStructCollector {
-                file: source.path.clone(),
+                file: file.clone(),
                 candidates: Vec::new(),
             };
-            struct_collector.visit_file(&ast);
-            candidates.extend(struct_collector.candidates);
+            struct_collector.visit_file(ast);
 
             let mut construction_collector = MisuConstructionCollector {
-                file: source.path.clone(),
+                file,
                 sites: Vec::new(),
             };
-            construction_collector.visit_file(&ast);
-            construction_sites.extend(construction_collector.sites);
-        }
+            construction_collector.visit_file(ast);
+
+            (struct_collector.candidates, construction_collector.sites)
+        });
 
         for candidate in &candidates {
             let mut usable_sites: Vec<&MisuConstructionSite> = Vec::new();
@@ -3656,10 +3641,7 @@ fn build_misu_heuristic(
     candidate: &MisuStructCandidate,
     usable_sites: &[&MisuConstructionSite],
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![candidate.name.clone()],
-    };
+    let scope = single_module_scope(krate, candidate.name.clone());
 
     let structural = Evidence {
         description: format!(
