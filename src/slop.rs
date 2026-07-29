@@ -73,7 +73,8 @@ use syn::{
     ReturnType, Stmt, Token, TraitItemFn, Type, TypeParamBound, Visibility,
 };
 
-use crate::finding::{Finding, Location, Origin, Severity};
+use crate::api_surface::{build_finding, has_doc_comment, is_test_attributed};
+use crate::finding::{Finding, Severity};
 use crate::functions::{read_and_parse_source, type_name};
 use crate::ingest::SourceFile;
 
@@ -354,32 +355,56 @@ impl SlopVisitor<'_> {
         item_path: String,
         evidence: Option<serde_json::Value>,
     ) {
-        let start = span.start();
-        let rule = crate::finding::RuleId::from(rule);
-        let evidence_class = crate::finding::evidence_class_for_rule(&rule);
-        self.findings.push(Finding {
-            id: format!(
-                "{rule}:{}:{}:{}",
-                self.file.display(),
-                start.line,
-                start.column
-            )
-            .into(),
-            rule,
-            severity,
-            location: Location {
-                file: self.file.to_path_buf(),
-                line: crate::finding::OneBasedLine::new(start.line)
-                    .expect("proc-macro2 span lines are 1-based"),
-                item_path,
-            },
-            evidence_class,
-            origin: Origin::Code,
-            evidence,
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
+        self.findings.push(build_finding(
+            self.file, rule, span, severity, item_path, evidence,
+        ));
+    }
+
+    /// Whether `attrs` gate their item on `#[cfg(feature = ...)]`,
+    /// incrementing [`Self::feature_gated_depth`] when they do — pairs with
+    /// [`Self::exit_feature_gated`], called once per visited item so
+    /// `merged-stub` can tell whether it's currently inside such a scope
+    /// (see [`has_feature_cfg`]).
+    fn enter_feature_gated(&mut self, attrs: &[Attribute]) -> bool {
+        let gated = has_feature_cfg(attrs);
+        if gated {
+            self.feature_gated_depth += 1;
+        }
+        gated
+    }
+
+    /// Undoes [`Self::enter_feature_gated`]'s increment, if any.
+    fn exit_feature_gated(&mut self, gated: bool) {
+        if gated {
+            self.feature_gated_depth -= 1;
+        }
+    }
+
+    /// Bookkeeping shared verbatim by `visit_item_fn` and
+    /// `visit_impl_item_fn`: records this fn/method's [`ItemSpan`] and runs
+    /// the checks whose call shape doesn't differ between a free fn and a
+    /// method (see [`Self::check_catch_all_error`],
+    /// [`Self::check_doc_restates_signature`], [`Self::check_silent_default`],
+    /// [`Self::check_context_free_propagation`]). Returns whether `attrs` is
+    /// `#[cfg(feature = ...)]`-gated (see [`Self::enter_feature_gated`]).
+    fn enter_fn(
+        &mut self,
+        vis: &Visibility,
+        attrs: &[Attribute],
+        sig: &syn::Signature,
+        block: &Block,
+        span: proc_macro2::Span,
+    ) -> bool {
+        self.item_spans.push(ItemSpan {
+            start_line: span.start().line,
+            end_line: span.end().line,
+            item_path: self.current_item_path(),
         });
+        self.check_catch_all_error(vis, sig, block, span);
+        self.check_doc_restates_signature(attrs, sig, span);
+        self.check_silent_default(block);
+        self.check_context_free_propagation(sig, block, span);
+        self.enter_feature_gated(attrs)
     }
 
     fn check_catch_all_error(
@@ -392,7 +417,7 @@ impl SlopVisitor<'_> {
         if !matches!(vis, Visibility::Public(_)) {
             return;
         }
-        let syn::ReturnType::Type(_, ty) = &sig.output else {
+        let Some(ty) = return_type(&sig.output) else {
             return;
         };
         if !contains_catch_all_error(ty, self.allow_anyhow_at_boundary) {
@@ -420,7 +445,7 @@ impl SlopVisitor<'_> {
     /// A `#[test]` fn (without `#[should_panic]`) whose body has no visible
     /// assertion path (see todo.md §G2 `assertion-free-test`).
     fn check_assertion_free_test(&mut self, node: &ItemFn) {
-        if !node.attrs.iter().any(|attr| attr.path().is_ident("test"))
+        if !is_test_attributed(&node.attrs)
             || node
                 .attrs
                 .iter()
@@ -468,6 +493,24 @@ impl SlopVisitor<'_> {
         }
     }
 
+    /// A `pub` named item (fn, struct, or enum) whose own name is exactly a
+    /// generic placeholder word (see todo.md §G3 `generic-naming`) — the
+    /// identical "is this `pub` name generic" check shared by
+    /// [`check_generic_naming_item_fn`](Self::check_generic_naming_item_fn),
+    /// [`check_generic_naming_item_struct`](Self::check_generic_naming_item_struct),
+    /// and [`check_generic_naming_item_enum`](Self::check_generic_naming_item_enum).
+    fn check_generic_naming_named_item(
+        &mut self,
+        vis: &Visibility,
+        ident: &syn::Ident,
+        span: proc_macro2::Span,
+    ) {
+        if matches!(vis, Visibility::Public(_)) && is_generic_word(&ident.to_string()) {
+            let item_path = self.current_item_path();
+            self.record(GENERIC_NAMING_RULE, span, Severity::Info, item_path);
+        }
+    }
+
     /// A top-level `pub fn` whose name is exactly a generic placeholder word
     /// (see todo.md §G3 `generic-naming`). Scoped to free `pub fn`s only —
     /// not called from `visit_impl_item_fn`, since a method's name reads
@@ -476,29 +519,16 @@ impl SlopVisitor<'_> {
     /// free-standing API surface is where a generic name is the clearest
     /// naming problem.
     fn check_generic_naming_item_fn(&mut self, node: &ItemFn) {
-        if !matches!(node.vis, Visibility::Public(_)) {
-            return;
-        }
-        if is_generic_word(&node.sig.ident.to_string()) {
-            let item_path = self.current_item_path();
-            self.record(GENERIC_NAMING_RULE, node.span(), Severity::Info, item_path);
-        }
+        self.check_generic_naming_named_item(&node.vis, &node.sig.ident, node.span());
     }
 
     /// A `pub struct` whose name, or one of whose `pub` field names, is
     /// exactly a generic placeholder word (see todo.md §G3 `generic-naming`).
     fn check_generic_naming_item_struct(&mut self, node: &syn::ItemStruct) {
-        if matches!(node.vis, Visibility::Public(_)) && is_generic_word(&node.ident.to_string()) {
-            let item_path = self.current_item_path();
-            self.record(GENERIC_NAMING_RULE, node.span(), Severity::Info, item_path);
-        }
+        self.check_generic_naming_named_item(&node.vis, &node.ident, node.span());
         for field in &node.fields {
-            if matches!(field.vis, Visibility::Public(_))
-                && let Some(ident) = &field.ident
-                && is_generic_word(&ident.to_string())
-            {
-                let item_path = self.current_item_path();
-                self.record(GENERIC_NAMING_RULE, field.span(), Severity::Info, item_path);
+            if let Some(ident) = &field.ident {
+                self.check_generic_naming_named_item(&field.vis, ident, field.span());
             }
         }
     }
@@ -506,10 +536,7 @@ impl SlopVisitor<'_> {
     /// A `pub enum` whose name is exactly a generic placeholder word (see
     /// todo.md §G3 `generic-naming`).
     fn check_generic_naming_item_enum(&mut self, node: &syn::ItemEnum) {
-        if matches!(node.vis, Visibility::Public(_)) && is_generic_word(&node.ident.to_string()) {
-            let item_path = self.current_item_path();
-            self.record(GENERIC_NAMING_RULE, node.span(), Severity::Info, item_path);
-        }
+        self.check_generic_naming_named_item(&node.vis, &node.ident, node.span());
     }
 
     /// A doc comment that is a pure echo of the fn's signature — e.g.
@@ -599,7 +626,7 @@ impl SlopVisitor<'_> {
         block: &Block,
         span: proc_macro2::Span,
     ) {
-        let ReturnType::Type(_, ty) = &sig.output else {
+        let Some(ty) = return_type(&sig.output) else {
             return;
         };
         if !is_opaque_error_return_type(ty) {
@@ -631,10 +658,7 @@ impl SlopVisitor<'_> {
 
 impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     fn visit_item_mod(&mut self, node: &'ast ItemMod) {
-        let gated = has_feature_cfg(&node.attrs);
-        if gated {
-            self.feature_gated_depth += 1;
-        }
+        let gated = self.enter_feature_gated(&node.attrs);
         if node.content.is_some() {
             self.path.push(node.ident.to_string());
             visit::visit_item_mod(self, node);
@@ -642,16 +666,11 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         } else {
             visit::visit_item_mod(self, node);
         }
-        if gated {
-            self.feature_gated_depth -= 1;
-        }
+        self.exit_feature_gated(gated);
     }
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
-        let gated = has_feature_cfg(&node.attrs);
-        if gated {
-            self.feature_gated_depth += 1;
-        }
+        let gated = self.enter_feature_gated(&node.attrs);
         let type_ident = type_name(&node.self_ty);
         self.path.push(type_ident.clone());
         let is_display_impl = is_display_trait_impl(node);
@@ -668,9 +687,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
             self.display_impl_type_stack.pop();
         }
         self.path.pop();
-        if gated {
-            self.feature_gated_depth -= 1;
-        }
+        self.exit_feature_gated(gated);
     }
 
     fn visit_item_trait(&mut self, node: &'ast ItemTrait) {
@@ -695,37 +712,17 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         self.path.push(node.sig.ident.to_string());
-        self.item_spans.push(ItemSpan {
-            start_line: node.span().start().line,
-            end_line: node.span().end().line,
-            item_path: self.current_item_path(),
-        });
-        self.check_catch_all_error(&node.vis, &node.sig, &node.block, node.span());
         self.check_empty_impl(&node.attrs, &node.block, node.span());
         self.check_assertion_free_test(node);
         self.check_generic_naming_item_fn(node);
-        self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
-        self.check_silent_default(&node.block);
-        self.check_context_free_propagation(&node.sig, &node.block, node.span());
-        let gated = has_feature_cfg(&node.attrs);
-        if gated {
-            self.feature_gated_depth += 1;
-        }
+        let gated = self.enter_fn(&node.vis, &node.attrs, &node.sig, &node.block, node.span());
         visit::visit_item_fn(self, node);
-        if gated {
-            self.feature_gated_depth -= 1;
-        }
+        self.exit_feature_gated(gated);
         self.path.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         self.path.push(node.sig.ident.to_string());
-        self.item_spans.push(ItemSpan {
-            start_line: node.span().start().line,
-            end_line: node.span().end().line,
-            item_path: self.current_item_path(),
-        });
-        self.check_catch_all_error(&node.vis, &node.sig, &node.block, node.span());
         let is_visitor_trait_override = self
             .visitor_trait_impl_stack
             .last()
@@ -734,22 +731,14 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         if !is_visitor_trait_override {
             self.check_empty_impl(&node.attrs, &node.block, node.span());
         }
-        self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
-        self.check_silent_default(&node.block);
-        self.check_context_free_propagation(&node.sig, &node.block, node.span());
-        let gated = has_feature_cfg(&node.attrs);
-        if gated {
-            self.feature_gated_depth += 1;
-        }
+        let gated = self.enter_fn(&node.vis, &node.attrs, &node.sig, &node.block, node.span());
         let is_drop_drop =
             self.drop_impl_stack.last().copied().unwrap_or(false) && node.sig.ident == "drop";
         let prev_in_drop_drop_body = self.in_drop_drop_body;
         self.in_drop_drop_body = is_drop_drop;
         visit::visit_impl_item_fn(self, node);
         self.in_drop_drop_body = prev_in_drop_drop_body;
-        if gated {
-            self.feature_gated_depth -= 1;
-        }
+        self.exit_feature_gated(gated);
         self.path.pop();
     }
 
@@ -819,11 +808,10 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     /// `if let Err(_) = ... { }` with no `else` — the `if let` sibling of
     /// `empty-error-arm`.
     fn visit_expr(&mut self, expr: &'ast Expr) {
-        if let Expr::If(if_expr) = expr
+        if let Some((if_expr, pat)) = if_let_cond_pat(expr)
             && if_expr.else_branch.is_none()
             && if_expr.then_branch.stmts.is_empty()
-            && let Expr::Let(let_expr) = if_expr.cond.as_ref()
-            && is_err_wildcard_pat(&let_expr.pat)
+            && is_err_wildcard_pat(pat)
         {
             let item_path = self.current_item_path();
             self.record(
@@ -861,16 +849,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 item_path,
             );
         } else if attr.path().is_ident("ignore") {
-            let reason = match &attr.meta {
-                Meta::NameValue(name_value) => match &name_value.value {
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Str(reason),
-                        ..
-                    }) => Some(reason.value()),
-                    _ => None,
-                },
-                _ => None,
-            };
+            let reason = meta_name_value_str(&attr.meta);
             let item_path = self.current_item_path();
             self.record_with_evidence(
                 IGNORED_TEST_ACCUMULATION_RULE,
@@ -893,7 +872,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
             let item_path = self.current_item_path();
             self.record(MERGED_STUB_RULE, mac.span(), Severity::Warn, item_path);
         } else if mac.path.is_ident("assert") {
-            if let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+            if let Some(args) = parse_macro_expr_args(mac)
                 && let Some(Expr::Lit(ExprLit {
                     lit: Lit::Bool(value),
                     ..
@@ -909,7 +888,7 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
                 );
             }
         } else if mac.path.is_ident("assert_eq")
-            && let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+            && let Some(args) = parse_macro_expr_args(mac)
             && let (Some(lhs), Some(rhs)) = (args.first(), args.get(1))
             // Token-string comparison, not `Expr: PartialEq` (`syn`'s
             // `extra-traits` feature isn't enabled here). This is an
@@ -954,25 +933,50 @@ fn path_to_string(path: &SynPath) -> String {
         .join("::")
 }
 
-/// Whether `pat` is `Err(_)` or `Err(..)`.
-fn is_err_wildcard_pat(pat: &Pat) -> bool {
+/// Whether `pat` is any `Err(..)` tuple-struct pattern, regardless of the
+/// inner pattern — the shared match both [`is_err_wildcard_pat`] (which
+/// additionally requires a wildcard/rest inner pattern) and [`is_err_pat`]
+/// build on.
+fn as_err_tuple_struct(pat: &Pat) -> Option<&syn::PatTupleStruct> {
     match pat {
-        Pat::TupleStruct(tuple_struct) => {
-            tuple_struct
+        Pat::TupleStruct(tuple_struct)
+            if tuple_struct
                 .path
                 .segments
                 .last()
-                .is_some_and(|segment| segment.ident == "Err")
-                && tuple_struct.elems.len() == 1
-                && matches!(tuple_struct.elems[0], Pat::Wild(_) | Pat::Rest(_))
+                .is_some_and(|segment| segment.ident == "Err") =>
+        {
+            Some(tuple_struct)
         }
-        _ => false,
+        _ => None,
     }
+}
+
+/// Whether `pat` is `Err(_)` or `Err(..)`.
+fn is_err_wildcard_pat(pat: &Pat) -> bool {
+    as_err_tuple_struct(pat).is_some_and(|tuple_struct| {
+        tuple_struct.elems.len() == 1 && matches!(tuple_struct.elems[0], Pat::Wild(_) | Pat::Rest(_))
+    })
 }
 
 /// Whether `expr` is a literally empty block (`{}`).
 fn is_empty_block_expr(expr: &Expr) -> bool {
     matches!(expr, Expr::Block(block) if block.block.stmts.is_empty())
+}
+
+/// Whether `expr` is `if let <pat> = .. { .. }`, returning the `if`'s own
+/// `Expr::If` node and the condition's pattern when it matches — the shared
+/// `if let` destructuring both `SlopVisitor::visit_expr`'s `empty-error-arm`
+/// check and [`error_observation_present`]'s `ErrorObservationScanner::visit_expr`
+/// check start from.
+fn if_let_cond_pat(expr: &Expr) -> Option<(&syn::ExprIf, &Pat)> {
+    let Expr::If(if_expr) = expr else {
+        return None;
+    };
+    let Expr::Let(let_expr) = if_expr.cond.as_ref() else {
+        return None;
+    };
+    Some((if_expr, &let_expr.pat))
 }
 
 /// Whether `ty`, written syntactically, is or contains `Box<dyn ... Error
@@ -1049,11 +1053,7 @@ fn discards_error_via_map_err(block: &Block) -> bool {
 
     impl<'ast> Visit<'ast> for MapErrDiscardVisitor {
         fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
-            if node.method == "map_err"
-                && let Some(Expr::Closure(closure)) = node.args.first()
-                && closure.inputs.len() == 1
-                && pat_is_wildcard(&closure.inputs[0])
-            {
+            if node.method == "map_err" && first_arg_is_wildcard_closure(&node.args).is_some() {
                 self.found = true;
             }
             visit::visit_expr_method_call(self, node);
@@ -1076,6 +1076,21 @@ fn pat_is_wildcard(pat: &Pat) -> bool {
         Pat::Wild(_) => true,
         Pat::Type(pat_type) => pat_is_wildcard(&pat_type.pat),
         _ => false,
+    }
+}
+
+/// Whether `args`' first argument is a closure taking exactly one wildcard
+/// parameter (`_` or `_: T`) — the "closure discards the bound value" call
+/// shape shared by [`discards_error_via_map_err`]'s `.map_err(|_| ..)` match
+/// and [`SilentDefaultVisitor`]'s `.unwrap_or_else(|_| ..)` match.
+fn first_arg_is_wildcard_closure(args: &Punctuated<Expr, Token![,]>) -> Option<&syn::ExprClosure> {
+    let Some(Expr::Closure(closure)) = args.first() else {
+        return None;
+    };
+    if closure.inputs.len() == 1 && pat_is_wildcard(&closure.inputs[0]) {
+        Some(closure)
+    } else {
+        None
     }
 }
 
@@ -1121,9 +1136,7 @@ impl<'ast> Visit<'ast> for SilentDefaultVisitor {
         if node.method == "unwrap_or_default" && node.args.is_empty() {
             self.sites.push((node.span(), "unwrap_or_default"));
         } else if node.method == "unwrap_or_else"
-            && let Some(Expr::Closure(closure)) = node.args.first()
-            && closure.inputs.len() == 1
-            && pat_is_wildcard(&closure.inputs[0])
+            && let Some(closure) = first_arg_is_wildcard_closure(&node.args)
             && is_default_call(&closure.body)
         {
             self.sites.push((node.span(), "unwrap_or_else"));
@@ -1171,9 +1184,8 @@ fn error_observation_present(block: &Block) -> bool {
         }
 
         fn visit_expr(&mut self, expr: &'ast Expr) {
-            if let Expr::If(if_expr) = expr
-                && let Expr::Let(let_expr) = if_expr.cond.as_ref()
-                && is_err_pat(&let_expr.pat)
+            if let Some((_, pat)) = if_let_cond_pat(expr)
+                && is_err_pat(pat)
             {
                 self.found = true;
             }
@@ -1194,14 +1206,7 @@ fn error_observation_present(block: &Block) -> bool {
 /// and uses the error as an observation attempt too, not just the
 /// `empty-error-arm`-shaped wildcard case.
 fn is_err_pat(pat: &Pat) -> bool {
-    match pat {
-        Pat::TupleStruct(tuple_struct) => tuple_struct
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "Err"),
-        _ => false,
-    }
+    as_err_tuple_struct(pat).is_some()
 }
 
 /// Whether `ty`, written syntactically, is a recognized opaque-error return
@@ -1304,18 +1309,26 @@ impl<'ast> Visit<'ast> for TrySiteScanner {
     fn visit_item_fn(&mut self, _node: &'ast ItemFn) {}
 }
 
-/// Whether `node` is a manual `impl std::fmt::Display for T` block (matched
-/// on the trait path's last segment, so both `impl Display for T` and `impl
-/// std::fmt::Display for T` match; `impl Debug for T` never does) — see
-/// todo.md §K2 `debug-format-leak`.
-fn is_display_trait_impl(node: &ItemImpl) -> bool {
+/// Whether `node`'s trait path's last segment satisfies `predicate` (and the
+/// impl isn't a negative `impl !Trait for T`) — the shared "is this impl a
+/// `impl SomeTrait for T`" check behind [`is_display_trait_impl`],
+/// [`is_ast_visitor_trait_impl`], and [`is_drop_trait_impl`].
+fn impl_trait_ident_matches(node: &ItemImpl, predicate: impl Fn(&str) -> bool) -> bool {
     node.trait_.as_ref().is_some_and(|(bang, path, _)| {
         bang.is_none()
             && path
                 .segments
                 .last()
-                .is_some_and(|segment| segment.ident == "Display")
+                .is_some_and(|segment| predicate(&segment.ident.to_string()))
     })
+}
+
+/// Whether `node` is a manual `impl std::fmt::Display for T` block (matched
+/// on the trait path's last segment, so both `impl Display for T` and `impl
+/// std::fmt::Display for T` match; `impl Debug for T` never does) — see
+/// todo.md §K2 `debug-format-leak`.
+fn is_display_trait_impl(node: &ItemImpl) -> bool {
+    impl_trait_ident_matches(node, |ident| ident == "Display")
 }
 
 /// Whether `node` implements one of the standard `syn` AST-visitor traits
@@ -1326,15 +1339,7 @@ fn is_display_trait_impl(node: &ItemImpl) -> bool {
 /// type" choice constrained by the trait's own contract, not a stub — see
 /// todo.md §G2 `empty-impl`'s registry `exclusions`.
 fn is_ast_visitor_trait_impl(node: &ItemImpl) -> bool {
-    node.trait_.as_ref().is_some_and(|(bang, path, _)| {
-        bang.is_none()
-            && path.segments.last().is_some_and(|segment| {
-                matches!(
-                    segment.ident.to_string().as_str(),
-                    "Visit" | "VisitMut" | "Fold"
-                )
-            })
-    })
+    impl_trait_ident_matches(node, |ident| matches!(ident, "Visit" | "VisitMut" | "Fold"))
 }
 
 /// Whether `node` is `impl Drop for _` — matched on the trait path's last
@@ -1343,13 +1348,41 @@ fn is_ast_visitor_trait_impl(node: &ItemImpl) -> bool {
 /// fallible();` is the only correct idiom since `drop` cannot return a
 /// `Result` (see todo.md §G1 `swallowed-result`'s registry `exclusions`).
 fn is_drop_trait_impl(node: &ItemImpl) -> bool {
-    node.trait_.as_ref().is_some_and(|(bang, path, _)| {
-        bang.is_none()
-            && path
-                .segments
-                .last()
-                .is_some_and(|segment| segment.ident == "Drop")
-    })
+    impl_trait_ident_matches(node, |ident| ident == "Drop")
+}
+
+/// Parses `mac`'s body as a comma-separated expression list — the
+/// `assert!(..)`/`assert_eq!(..)`/`write!`/`format!` argument-list shape
+/// [`SlopVisitor::visit_macro`] and [`macro_format_string_has_debug_placeholder`]
+/// both parse identically.
+fn parse_macro_expr_args(mac: &Macro) -> Option<Punctuated<Expr, Token![,]>> {
+    mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+        .ok()
+}
+
+/// Whether `expr` is a string-literal expression, returning its value —
+/// shared by [`macro_format_string_has_debug_placeholder`]'s search for a
+/// macro's string-literal format-string argument and
+/// [`meta_name_value_str`]'s `#[name = "..."]` attribute-value extraction.
+fn expr_str_lit(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Str(text),
+            ..
+        }) => Some(text.value()),
+        _ => None,
+    }
+}
+
+/// Extracts the string-literal value from a `#[name = "value"]` attribute
+/// (a `Meta::NameValue` whose value is a string-literal expression) — shared
+/// by `#[ignore = "..."]`'s reason extraction in `visit_attribute` and
+/// [`doc_comment_text`]'s `#[doc = "..."]` extraction.
+fn meta_name_value_str(meta: &Meta) -> Option<String> {
+    match meta {
+        Meta::NameValue(name_value) => expr_str_lit(&name_value.value),
+        _ => None,
+    }
 }
 
 /// Whether `mac`'s first string-literal argument (the format string, for
@@ -1359,25 +1392,12 @@ fn is_drop_trait_impl(node: &ItemImpl) -> bool {
 /// `{value:?}`/`{0:?}` is not recognized, only the literal `{:?}`/`{:#?}`
 /// tokens are.
 fn macro_format_string_has_debug_placeholder(mac: &Macro) -> bool {
-    let Ok(args) = mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) else {
+    let Some(args) = parse_macro_expr_args(mac) else {
         return false;
     };
     args.iter()
-        .find_map(|arg| match arg {
-            Expr::Lit(ExprLit {
-                lit: Lit::Str(text),
-                ..
-            }) => Some(text.value()),
-            _ => None,
-        })
+        .find_map(expr_str_lit)
         .is_some_and(|text| text.contains("{:?}") || text.contains("{:#?}"))
-}
-
-/// Whether any attribute in `attrs` is a `#[doc = ...]` (covers both `///`
-/// doc comments and explicit `#[doc]` attributes — `syn` desugars both the
-/// same way).
-fn has_doc_comment(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attr| attr.path().is_ident("doc"))
 }
 
 /// Whether any attribute in `attrs` is a `#[cfg(...)]` whose contents
@@ -1390,14 +1410,25 @@ fn has_feature_cfg(attrs: &[Attribute]) -> bool {
         .any(|attr| attr.path().is_ident("cfg") && quote!(#attr).to_string().contains("feature"))
 }
 
+/// The `T` in a fn's `-> T` return type, or `None` for `-> ()` (no arrow) —
+/// shared by [`SlopVisitor::check_catch_all_error`],
+/// [`SlopVisitor::check_context_free_propagation`], and
+/// [`returns_result_type`].
+fn return_type(output: &ReturnType) -> Option<&Type> {
+    match output {
+        ReturnType::Type(_, ty) => Some(ty.as_ref()),
+        ReturnType::Default => None,
+    }
+}
+
 /// Whether a fn's return type's last path segment is `Result` (mirrors how
 /// [`contains_catch_all_error`] inspects types, but shallow — no need to
 /// recurse into generic arguments here).
 fn returns_result_type(output: &ReturnType) -> bool {
-    let ReturnType::Type(_, ty) = output else {
+    let Some(ty) = return_type(output) else {
         return false;
     };
-    let Type::Path(type_path) = ty.as_ref() else {
+    let Type::Path(type_path) = ty else {
         return false;
     };
     type_path
@@ -1437,23 +1468,14 @@ fn strip_trailing_digits(name: &str) -> &str {
 /// Collects every `#[doc = "..."]` attribute's string literal (covers both
 /// `///` doc comments and explicit `#[doc]` attributes, which `syn` desugars
 /// the same way — see [`has_doc_comment`]), joins them with spaces, and
-/// trims. `None` if there's no doc comment at all. Reuses the exact
-/// `Meta::NameValue`/`Lit::Str` extraction pattern already used for
+/// trims. `None` if there's no doc comment at all. Reuses
+/// [`meta_name_value_str`], the same extraction already used for
 /// `#[ignore = "..."]` in `visit_attribute`.
 fn doc_comment_text(attrs: &[Attribute]) -> Option<String> {
     let parts: Vec<String> = attrs
         .iter()
         .filter(|attr| attr.path().is_ident("doc"))
-        .filter_map(|attr| match &attr.meta {
-            Meta::NameValue(name_value) => match &name_value.value {
-                Expr::Lit(ExprLit {
-                    lit: Lit::Str(text),
-                    ..
-                }) => Some(text.value()),
-                _ => None,
-            },
-            _ => None,
-        })
+        .filter_map(|attr| meta_name_value_str(&attr.meta))
         .collect();
     if parts.is_empty() {
         return None;

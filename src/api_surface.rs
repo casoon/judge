@@ -313,33 +313,15 @@ impl ApiSurfaceVisitor<'_> {
         span: proc_macro2::Span,
         evidence: Option<serde_json::Value>,
     ) {
-        let start = span.start();
-        let rule = crate::finding::RuleId::from(rule_id);
-        let evidence_class = crate::finding::evidence_class_for_rule(&rule);
         let item_path = self.current_item_path();
-        self.findings.push(Finding {
-            id: format!(
-                "{rule}:{}:{}:{}",
-                self.file.display(),
-                start.line,
-                start.column
-            )
-            .into(),
-            rule,
-            severity: Severity::Info,
-            location: Location {
-                file: self.file.to_path_buf(),
-                line: crate::finding::OneBasedLine::new(start.line)
-                    .expect("proc-macro2 span lines are 1-based"),
-                item_path,
-            },
-            evidence_class,
-            origin: Origin::Code,
+        self.findings.push(build_finding(
+            self.file,
+            rule_id,
+            span,
+            Severity::Info,
+            item_path,
             evidence,
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
+        ));
     }
 
     /// Whether an item is `pub` and not gated by `#[cfg(test)]` (on itself or
@@ -352,6 +334,29 @@ impl ApiSurfaceVisitor<'_> {
             return false;
         }
         matches!(vis, Visibility::Public(_))
+    }
+
+    /// Shared `cfg_test_depth`/`path` bookkeeping around `visit_item_fn`,
+    /// `visit_impl_item_fn`, and `visit_item_impl` — identical in each except
+    /// which name is pushed onto `path`, whether/how
+    /// [`check_doc_fn`](Self::check_doc_fn) is called, and which
+    /// `syn::visit` traversal function walks the children. Returns whether
+    /// `attrs` is `#[cfg(test)]`-gated, to be undone by [`Self::exit_scope`].
+    fn enter_scope(&mut self, attrs: &[Attribute], path_segment: String) -> bool {
+        let gated = attrs_have_cfg_test(attrs);
+        if gated {
+            self.cfg_test_depth += 1;
+        }
+        self.path.push(path_segment);
+        gated
+    }
+
+    /// Undoes [`Self::enter_scope`]'s `path`/`cfg_test_depth` bookkeeping.
+    fn exit_scope(&mut self, gated: bool) {
+        self.path.pop();
+        if gated {
+            self.cfg_test_depth -= 1;
+        }
     }
 
     /// A `pub` item with no `#[doc = ...]` attribute (see [`has_doc_comment`]),
@@ -388,7 +393,7 @@ impl ApiSurfaceVisitor<'_> {
         span: proc_macro2::Span,
         ident_span: proc_macro2::Span,
     ) {
-        if attrs.iter().any(|attr| attr.path().is_ident("test")) {
+        if is_test_attributed(attrs) {
             return;
         }
         if self.is_checkable_pub_item(vis, attrs) {
@@ -409,10 +414,7 @@ impl ApiSurfaceVisitor<'_> {
     /// scope section — a lone variant is usually deliberate, e.g. a wrapper
     /// pattern).
     fn check_semver_hazard_enum(&mut self, node: &ItemEnum) {
-        if self.cfg_test_depth > 0 || attrs_have_cfg_test(&node.attrs) {
-            return;
-        }
-        if !matches!(node.vis, Visibility::Public(_)) {
+        if !self.is_checkable_pub_item(&node.vis, &node.attrs) {
             return;
         }
         if node.variants.len() < 2 || has_non_exhaustive(&node.attrs) {
@@ -435,10 +437,7 @@ impl ApiSurfaceVisitor<'_> {
     /// layout and is not checked. Same `#[cfg(test)]` exemption as
     /// [`check_doc`](Self::check_doc).
     fn check_semver_hazard_struct(&mut self, node: &ItemStruct) {
-        if self.cfg_test_depth > 0 || attrs_have_cfg_test(&node.attrs) {
-            return;
-        }
-        if !matches!(node.vis, Visibility::Public(_)) {
+        if !self.is_checkable_pub_item(&node.vis, &node.attrs) {
             return;
         }
         if has_non_exhaustive(&node.attrs) {
@@ -466,8 +465,51 @@ impl ApiSurfaceVisitor<'_> {
 /// Whether any attribute in `attrs` is a `#[doc = ...]` (covers both `///`
 /// doc comments and explicit `#[doc]` attributes — `syn` desugars both the
 /// same way).
-fn has_doc_comment(attrs: &[Attribute]) -> bool {
+pub(crate) fn has_doc_comment(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("doc"))
+}
+
+/// Whether `attrs` contains a `#[test]` attribute — shared by this module's
+/// own `check_doc_fn` (a `#[test]`-attributed `pub fn` is exempt from
+/// `undocumented-public-item`, see the module doc comment's "Scope" section)
+/// and [`crate::slop::SlopVisitor::check_assertion_free_test`] (only a
+/// `#[test]` fn is in scope for `assertion-free-test`).
+pub(crate) fn is_test_attributed(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("test"))
+}
+
+/// Builds the `Finding` both this module's [`ApiSurfaceVisitor::record`] and
+/// [`crate::slop::SlopVisitor::record_with_evidence`] push onto their own
+/// `findings` vec — the identical `Finding` literal construction each
+/// otherwise duplicated verbatim.
+pub(crate) fn build_finding(
+    file: &Path,
+    rule_id: &str,
+    span: proc_macro2::Span,
+    severity: Severity,
+    item_path: String,
+    evidence: Option<serde_json::Value>,
+) -> Finding {
+    let start = span.start();
+    let rule = crate::finding::RuleId::from(rule_id);
+    let evidence_class = crate::finding::evidence_class_for_rule(&rule);
+    Finding {
+        id: format!("{rule}:{}:{}:{}", file.display(), start.line, start.column).into(),
+        rule,
+        severity,
+        location: Location {
+            file: file.to_path_buf(),
+            line: crate::finding::OneBasedLine::new(start.line)
+                .expect("proc-macro2 span lines are 1-based"),
+            item_path,
+        },
+        evidence_class,
+        origin: Origin::Code,
+        evidence,
+        limitations: None,
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
 }
 
 /// Whether any attribute in `attrs` is `#[non_exhaustive]` — the exact
@@ -575,18 +617,11 @@ impl<'ast> Visit<'ast> for ApiSurfaceVisitor<'_> {
     }
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
-        let gated = attrs_have_cfg_test(&node.attrs);
-        if gated {
-            self.cfg_test_depth += 1;
-        }
-        self.path.push(type_name(&node.self_ty));
+        let gated = self.enter_scope(&node.attrs, type_name(&node.self_ty));
         self.in_trait_impl.push(node.trait_.is_some());
         visit::visit_item_impl(self, node);
         self.in_trait_impl.pop();
-        self.path.pop();
-        if gated {
-            self.cfg_test_depth -= 1;
-        }
+        self.exit_scope(gated);
     }
 
     visit_documented_scoped_item!(visit_item_trait, ItemTrait, visit_item_trait);
@@ -607,33 +642,19 @@ impl<'ast> Visit<'ast> for ApiSurfaceVisitor<'_> {
     visit_documented_leaf_item!(visit_item_type, ItemType, visit_item_type);
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        let gated = attrs_have_cfg_test(&node.attrs);
-        if gated {
-            self.cfg_test_depth += 1;
-        }
-        self.path.push(node.sig.ident.to_string());
+        let gated = self.enter_scope(&node.attrs, node.sig.ident.to_string());
         self.check_doc_fn(&node.vis, &node.attrs, node.span(), node.sig.ident.span());
         visit::visit_item_fn(self, node);
-        self.path.pop();
-        if gated {
-            self.cfg_test_depth -= 1;
-        }
+        self.exit_scope(gated);
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        let gated = attrs_have_cfg_test(&node.attrs);
-        if gated {
-            self.cfg_test_depth += 1;
-        }
-        self.path.push(node.sig.ident.to_string());
+        let gated = self.enter_scope(&node.attrs, node.sig.ident.to_string());
         if !self.current_in_trait_impl() {
             self.check_doc_fn(&node.vis, &node.attrs, node.span(), node.sig.ident.span());
         }
         visit::visit_impl_item_fn(self, node);
-        self.path.pop();
-        if gated {
-            self.cfg_test_depth -= 1;
-        }
+        self.exit_scope(gated);
     }
 }
 
