@@ -81,35 +81,24 @@ pub enum PatternBaselineError {
 
 impl std::fmt::Display for PatternBaselineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(path, err) => write!(f, "{}: {err}", path.display()),
-            Self::Serialize(err) => write!(f, "failed to serialize pattern baseline: {err}"),
-            Self::Deserialize(path, err) => {
-                write!(
-                    f,
-                    "{}: failed to parse pattern baseline: {err}",
-                    path.display()
-                )
-            }
+        let error = match self {
+            Self::Io(path, err) => crate::baseline::StoreErrorRef::Io(path, err),
+            Self::Serialize(err) => crate::baseline::StoreErrorRef::Serialize(err),
+            Self::Deserialize(path, err) => crate::baseline::StoreErrorRef::Deserialize(path, err),
             Self::UnsupportedSchemaVersion { path, found } => {
-                match found {
-                    Some(found) => write!(
-                        f,
-                        "{}: unsupported pattern baseline schema_version {found} (this judge supports version {SCHEMA_VERSION})",
-                        path.display()
-                    )?,
-                    None => write!(
-                        f,
-                        "{}: pattern baseline has no schema_version (this judge supports version {SCHEMA_VERSION})",
-                        path.display()
-                    )?,
+                crate::baseline::StoreErrorRef::UnsupportedSchemaVersion {
+                    path,
+                    found: *found,
                 }
-                write!(
-                    f,
-                    " — re-save it with a matching judge via `cargo judge patterns --save-pattern-baseline`"
-                )
             }
-        }
+        };
+        crate::baseline::fmt_store_error(
+            f,
+            "pattern baseline",
+            SCHEMA_VERSION,
+            "cargo judge patterns --save-pattern-baseline",
+            error,
+        )
     }
 }
 
@@ -118,25 +107,25 @@ impl std::error::Error for PatternBaselineError {}
 /// Writes `baseline` to `path` as pretty-printed JSON, creating parent
 /// directories (e.g. `.judge/`) as needed.
 pub fn save(path: &Path, baseline: &PatternBaseline) -> Result<(), PatternBaselineError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| PatternBaselineError::Io(parent.to_path_buf(), err))?;
-    }
-    let json = serde_json::to_string_pretty(baseline).map_err(PatternBaselineError::Serialize)?;
-    std::fs::write(path, json).map_err(|err| PatternBaselineError::Io(path.to_path_buf(), err))
+    crate::baseline::write_json_pretty(
+        path,
+        baseline,
+        PatternBaselineError::Io,
+        PatternBaselineError::Serialize,
+    )
 }
 
 pub fn load(path: &Path) -> Result<PatternBaseline, PatternBaselineError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|err| PatternBaselineError::Io(path.to_path_buf(), err))?;
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|err| PatternBaselineError::Deserialize(path.to_path_buf(), err))?;
-    let found = value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64);
+    let value = crate::baseline::read_json_value(
+        path,
+        PatternBaselineError::Io,
+        PatternBaselineError::Deserialize,
+    )?;
+    let found = crate::baseline::schema_version_of(&value);
     match found {
-        Some(version) if version == u64::from(SCHEMA_VERSION) => serde_json::from_value(value)
-            .map_err(|err| PatternBaselineError::Deserialize(path.to_path_buf(), err)),
+        Some(version) if version == u64::from(SCHEMA_VERSION) => {
+            crate::baseline::deserialize_value(path, value, PatternBaselineError::Deserialize)
+        }
         _ => Err(PatternBaselineError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             found,

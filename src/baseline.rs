@@ -138,54 +138,144 @@ pub enum BaselineError {
     },
 }
 
+/// One arm of the shared Io/Serialize/Deserialize/UnsupportedSchemaVersion
+/// error shape (see [`fmt_store_error`]).
+pub(crate) enum StoreErrorRef<'a> {
+    Io(&'a Path, &'a std::io::Error),
+    Serialize(&'a serde_json::Error),
+    Deserialize(&'a Path, &'a serde_json::Error),
+    UnsupportedSchemaVersion {
+        path: &'a Path,
+        found: Option<u64>,
+    },
+}
+
+/// Shared `Display` rendering for baseline-family store errors —
+/// [`BaselineError`] and [`crate::pattern_baseline::PatternBaselineError`]
+/// have the same four-variant shape and differ only in the noun used in
+/// messages, the active schema version, and the resave command hint.
+pub(crate) fn fmt_store_error(
+    f: &mut std::fmt::Formatter<'_>,
+    noun: &str,
+    schema_version: u32,
+    resave_command: &str,
+    error: StoreErrorRef<'_>,
+) -> std::fmt::Result {
+    match error {
+        StoreErrorRef::Io(path, err) => write!(f, "{}: {err}", path.display()),
+        StoreErrorRef::Serialize(err) => write!(f, "failed to serialize {noun}: {err}"),
+        StoreErrorRef::Deserialize(path, err) => {
+            write!(f, "{}: failed to parse {noun}: {err}", path.display())
+        }
+        StoreErrorRef::UnsupportedSchemaVersion { path, found } => {
+            match found {
+                Some(found) => write!(
+                    f,
+                    "{}: unsupported {noun} schema_version {found} (this judge supports version {schema_version})",
+                    path.display()
+                )?,
+                None => write!(
+                    f,
+                    "{}: {noun} has no schema_version (this judge supports version {schema_version})",
+                    path.display()
+                )?,
+            }
+            write!(f, " — re-save it with a matching judge via `{resave_command}`")
+        }
+    }
+}
+
 impl std::fmt::Display for BaselineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(path, err) => write!(f, "{}: {err}", path.display()),
-            Self::Serialize(err) => write!(f, "failed to serialize baseline: {err}"),
-            Self::Deserialize(path, err) => {
-                write!(f, "{}: failed to parse baseline: {err}", path.display())
-            }
+        let error = match self {
+            Self::Io(path, err) => StoreErrorRef::Io(path, err),
+            Self::Serialize(err) => StoreErrorRef::Serialize(err),
+            Self::Deserialize(path, err) => StoreErrorRef::Deserialize(path, err),
             Self::UnsupportedSchemaVersion { path, found } => {
-                match found {
-                    Some(found) => write!(
-                        f,
-                        "{}: unsupported baseline schema_version {found} (this judge supports version {SCHEMA_VERSION})",
-                        path.display()
-                    )?,
-                    None => write!(
-                        f,
-                        "{}: baseline has no schema_version (this judge supports version {SCHEMA_VERSION})",
-                        path.display()
-                    )?,
+                StoreErrorRef::UnsupportedSchemaVersion {
+                    path,
+                    found: *found,
                 }
-                write!(
-                    f,
-                    " — re-save it with a matching judge via `cargo judge --save-baseline`"
-                )
             }
-        }
+        };
+        fmt_store_error(
+            f,
+            "baseline",
+            SCHEMA_VERSION,
+            "cargo judge --save-baseline",
+            error,
+        )
     }
 }
 
 impl std::error::Error for BaselineError {}
 
+/// Extracts the `schema_version` field to inspect it before deciding how to
+/// deserialize the rest of the document — shared by [`migrate`] and
+/// [`crate::pattern_baseline::load`], which both gate deserialization on this
+/// same probe.
+pub(crate) fn schema_version_of(value: &serde_json::Value) -> Option<u64> {
+    value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+}
+
+/// Reads `path` as UTF-8 text and parses it as JSON, routing I/O and parse
+/// failures through the caller's own error type — shared by [`load`] and
+/// [`crate::pattern_baseline::load`], which otherwise differ only in their
+/// error enum (see `pattern_baseline` module docs for why the two stores
+/// don't share a domain type).
+pub(crate) fn read_json_value<E>(
+    path: &Path,
+    io_err: impl FnOnce(PathBuf, std::io::Error) -> E,
+    parse_err: impl FnOnce(PathBuf, serde_json::Error) -> E,
+) -> Result<serde_json::Value, E> {
+    let content = std::fs::read_to_string(path).map_err(|err| io_err(path.to_path_buf(), err))?;
+    serde_json::from_str(&content).map_err(|err| parse_err(path.to_path_buf(), err))
+}
+
+/// Deserializes an already-parsed JSON value into `T`, routing failures
+/// through the caller's own error type — shared by [`migrate`]'s two
+/// current-shape arms and [`crate::pattern_baseline::load`].
+pub(crate) fn deserialize_value<T, E>(
+    path: &Path,
+    value: serde_json::Value,
+    err: impl FnOnce(PathBuf, serde_json::Error) -> E,
+) -> Result<T, E>
+where
+    T: serde::de::DeserializeOwned,
+{
+    serde_json::from_value(value).map_err(|inner| err(path.to_path_buf(), inner))
+}
+
+/// Writes `value` to `path` as pretty-printed JSON, creating parent
+/// directories (e.g. `.judge/`) as needed and routing I/O/serialize failures
+/// through the caller's own error type — shared by [`save`] and
+/// [`crate::pattern_baseline::save`].
+pub(crate) fn write_json_pretty<T, E>(
+    path: &Path,
+    value: &T,
+    io_err: impl Fn(PathBuf, std::io::Error) -> E,
+    serialize_err: impl FnOnce(serde_json::Error) -> E,
+) -> Result<(), E>
+where
+    T: Serialize,
+{
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| io_err(parent.to_path_buf(), err))?;
+    }
+    let json = serde_json::to_string_pretty(value).map_err(serialize_err)?;
+    std::fs::write(path, json).map_err(|err| io_err(path.to_path_buf(), err))
+}
+
 /// Writes `baseline` to `path` as pretty-printed JSON, creating parent
 /// directories (e.g. `.judge/`) as needed.
 pub fn save(path: &Path, baseline: &Baseline) -> Result<(), BaselineError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| BaselineError::Io(parent.to_path_buf(), err))?;
-    }
-    let json = serde_json::to_string_pretty(baseline).map_err(BaselineError::Serialize)?;
-    std::fs::write(path, json).map_err(|err| BaselineError::Io(path.to_path_buf(), err))
+    write_json_pretty(path, baseline, BaselineError::Io, BaselineError::Serialize)
 }
 
 pub fn load(path: &Path) -> Result<Baseline, BaselineError> {
-    let content =
-        std::fs::read_to_string(path).map_err(|err| BaselineError::Io(path.to_path_buf(), err))?;
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))?;
+    let value = read_json_value(path, BaselineError::Io, BaselineError::Deserialize)?;
     migrate(path, value)
 }
 
@@ -201,9 +291,7 @@ pub fn load(path: &Path) -> Result<Baseline, BaselineError> {
 /// [`evidence_class_for_rule`]; unknown rule ids conservatively become
 /// `heuristic`.
 fn migrate(path: &Path, mut value: serde_json::Value) -> Result<Baseline, BaselineError> {
-    let found = value
-        .get("schema_version")
-        .and_then(serde_json::Value::as_u64);
+    let found = schema_version_of(&value);
     match found {
         Some(1) | Some(2) => {
             if let Some(findings) = value
@@ -234,11 +322,11 @@ fn migrate(path: &Path, mut value: serde_json::Value) -> Result<Baseline, Baseli
                 .expect("baseline must be an object")
                 .remove("commit");
             value["schema_version"] = serde_json::json!(SCHEMA_VERSION);
-            serde_json::from_value(value)
-                .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))
+            deserialize_value(path, value, BaselineError::Deserialize)
         }
-        Some(version) if version == u64::from(SCHEMA_VERSION) => serde_json::from_value(value)
-            .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err)),
+        Some(version) if version == u64::from(SCHEMA_VERSION) => {
+            deserialize_value(path, value, BaselineError::Deserialize)
+        }
         _ => Err(BaselineError::UnsupportedSchemaVersion {
             path: path.to_path_buf(),
             found,
@@ -271,6 +359,25 @@ pub struct Delta {
 pub struct SeverityChange {
     pub before: BaselineFinding,
     pub after: Finding,
+}
+
+impl SeverityChange {
+    /// The rule id plus the severity transition — the fields every delta
+    /// renderer (TTY, Markdown) prints identically before appending its own
+    /// location column.
+    pub fn transition(&self) -> (&RuleId, Severity, Severity) {
+        (&self.after.rule, self.before.severity, self.after.severity)
+    }
+}
+
+/// Splits findings into (gating, advisory) — the shared split behind every
+/// "advisory (heuristic) — no verdict effect" section (TTY, Markdown, and the
+/// `health` slop block); see [`Finding::is_gating`].
+pub fn partition_gating<'a, I>(findings: I) -> (Vec<&'a Finding>, Vec<&'a Finding>)
+where
+    I: IntoIterator<Item = &'a Finding>,
+{
+    findings.into_iter().partition(|finding| finding.is_gating())
 }
 
 /// Compares `current` findings against a recorded project state. The legacy
@@ -326,6 +433,18 @@ pub fn diff(
 pub enum Verdict {
     Pass,
     Fail,
+}
+
+impl Verdict {
+    /// The lower-case label used identically by every human-facing render
+    /// (TTY, Markdown) — kept on the type so wording can't drift between
+    /// formats.
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::Fail => "fail",
+        }
+    }
 }
 
 /// A three-way verdict distinguishing `Warn` from `Fail` among

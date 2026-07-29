@@ -7,16 +7,12 @@
 
 use std::fmt::Write;
 
-use crate::baseline::{Delta, Verdict};
+use crate::baseline::{Delta, Verdict, partition_gating};
 use crate::finding::{Finding, Severity};
 
 /// An artifact baseline comparison as a compact Markdown delta.
 pub fn render_delta(delta: &Delta, verdict: Verdict) -> String {
-    let verdict_label = match verdict {
-        Verdict::Pass => "pass",
-        Verdict::Fail => "fail",
-    };
-    let mut out = format!("**verdict: {verdict_label}**\n\n");
+    let mut out = format!("**verdict: {}**\n\n", verdict.label());
     push_delta_body(&mut out, delta);
     out
 }
@@ -30,10 +26,7 @@ fn push_delta_body(out: &mut String, delta: &Delta) {
         delta.severity_changed.len(),
     )
     .unwrap();
-    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
-        .introduced
-        .iter()
-        .partition(|finding| finding.is_gating());
+    let (gating, advisory) = partition_gating(&delta.introduced);
     push_section(out, "introduced", &gating);
     push_section(
         out,
@@ -49,12 +42,13 @@ fn push_delta_body(out: &mut String, delta: &Delta) {
         .unwrap();
         out.push_str("\n| rule | previous | current | location | item |\n|---|---|---|---|---|\n");
         for change in &delta.severity_changed {
+            let (rule, before, after) = change.transition();
             writeln!(
                 out,
                 "| {} | {} | {} | {}:{} | {} |",
-                change.after.rule,
-                severity_label(change.before.severity),
-                severity_label(change.after.severity),
+                rule,
+                severity_label(before),
+                severity_label(after),
                 crate::sarif::artifact_uri(&change.after.location.file),
                 change.after.location.line,
                 change.after.location.item_path

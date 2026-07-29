@@ -254,38 +254,45 @@ pub(super) fn handle_baseline_with_trend(
     Ok(CommandOutcome::Clean)
 }
 
+/// The `unchanged`/`resolved` count header shared by [`print_delta`] and
+/// [`print_pattern_delta_tty`], before either lists its own resolved items.
+fn write_unchanged_resolved(
+    out: &mut dyn Write,
+    unchanged_count: usize,
+    resolved_count: usize,
+) -> std::io::Result<()> {
+    writeln!(out, "unchanged: {unchanged_count}")?;
+    writeln!(out, "resolved: {resolved_count}")?;
+    Ok(())
+}
+
+/// One `rule  file:line` finding line, shared by [`print_delta`]'s gating and
+/// advisory sections.
+fn write_finding_line(out: &mut dyn Write, finding: &Finding) -> std::io::Result<()> {
+    writeln!(
+        out,
+        "  {}  {}:{}",
+        finding.rule,
+        finding.location.file.display(),
+        finding.location.line
+    )
+}
+
 fn print_delta(
     out: &mut dyn Write,
     delta: &judge::baseline::Delta,
     verdict: Verdict,
 ) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "verdict: {}",
-        match verdict {
-            Verdict::Pass => "pass",
-            Verdict::Fail => "fail",
-        }
-    )?;
-    writeln!(out, "unchanged: {}", delta.unchanged_count)?;
-    writeln!(out, "resolved: {}", delta.resolved.len())?;
+    writeln!(out, "verdict: {}", verdict.label())?;
+    write_unchanged_resolved(out, delta.unchanged_count, delta.resolved.len())?;
     for finding in &delta.resolved {
         writeln!(out, "  {}  {}", finding.rule, finding.file.display())?;
     }
 
-    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
-        .introduced
-        .iter()
-        .partition(|finding| finding.is_gating());
+    let (gating, advisory) = judge::baseline::partition_gating(&delta.introduced);
     writeln!(out, "introduced: {}", gating.len())?;
     for finding in &gating {
-        writeln!(
-            out,
-            "  {}  {}:{}",
-            finding.rule,
-            finding.location.file.display(),
-            finding.location.line
-        )?;
+        write_finding_line(out, finding)?;
     }
 
     writeln!(
@@ -294,23 +301,18 @@ fn print_delta(
         advisory.len()
     )?;
     for finding in &advisory {
-        writeln!(
-            out,
-            "  {}  {}:{}",
-            finding.rule,
-            finding.location.file.display(),
-            finding.location.line
-        )?;
+        write_finding_line(out, finding)?;
     }
 
     writeln!(out, "severity changed: {}", delta.severity_changed.len())?;
     for change in &delta.severity_changed {
+        let (rule, before, after) = change.transition();
         writeln!(
             out,
             "  {}  {} -> {}  {}:{}",
-            change.after.rule,
-            severity_label(change.before.severity),
-            severity_label(change.after.severity),
+            rule,
+            severity_label(before),
+            severity_label(after),
             change.after.location.file.display(),
             change.after.location.line
         )?;
@@ -327,8 +329,7 @@ pub(super) fn print_pattern_delta_tty(
     out: &mut dyn Write,
     delta: &judge::pattern_baseline::PatternDelta,
 ) -> std::io::Result<()> {
-    writeln!(out, "unchanged: {}", delta.unchanged_count)?;
-    writeln!(out, "resolved: {}", delta.resolved.len())?;
+    write_unchanged_resolved(out, delta.unchanged_count, delta.resolved.len())?;
     for candidate in &delta.resolved {
         writeln!(
             out,

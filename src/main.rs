@@ -1158,8 +1158,7 @@ fn print_slop(
         return Ok(());
     }
 
-    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) =
-        shown.iter().partition(|finding| finding.is_gating());
+    let (gating, advisory) = judge::baseline::partition_gating(shown.iter().copied());
     writeln!(
         out,
         "slop signals: {} ({} advisory)",
