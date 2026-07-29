@@ -371,6 +371,126 @@ fn crate_for_file<'a>(workspace: &'a Workspace, file: &Path) -> Option<&'a Crate
         .find(|krate| krate.source_files.iter().any(|source| source.path == file))
 }
 
+/// Reads and parses every source file in `krate` with `syn`, calling `visit`
+/// with each file's path and parsed AST. A file that fails to read or parse
+/// is silently skipped rather than surfaced as an analyzer error — every
+/// rule in this module treats its `syn`-derived facts as best-effort
+/// corroborating evidence, not ground truth, so skipping an unreadable file
+/// just means one less place a signal could have come from. Shared by every
+/// per-crate rule below instead of each repeating the same read/parse/skip
+/// loop.
+fn for_each_parsed_source(krate: &CrateInfo, mut visit: impl FnMut(&Path, &syn::File)) {
+    for source in &krate.source_files {
+        let Ok(text) = std::fs::read_to_string(&source.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&text) else {
+            continue;
+        };
+        visit(&source.path, &ast);
+    }
+}
+
+impl EvidenceLocation {
+    /// An evidence location with a known item path — the shape every
+    /// `build_X_candidate`/visitor in this module constructs once it has
+    /// both a file and a qualified item path (as opposed to a file-only
+    /// location, which uses the struct literal directly with `item_path:
+    /// None`).
+    fn new(file: PathBuf, item_path: impl Into<String>) -> Self {
+        Self {
+            file,
+            item_path: Some(item_path.into()),
+        }
+    }
+}
+
+/// Sorts `locations` by `(file, item_path)` — the ordering discipline every
+/// `build_X_candidate` applies to its evidence locations so output stays
+/// deterministic across runs.
+fn sort_evidence_locations(locations: &mut [EvidenceLocation]) {
+    locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+}
+
+/// A [`CodeScope`] for `krate` with `modules` sorted and deduplicated — the
+/// scope-construction step every crate-scoped `build_X_candidate` performs
+/// before filling in its own evidence-specific fields.
+fn crate_scope(krate: &CrateInfo, mut modules: Vec<String>) -> CodeScope {
+    modules.sort();
+    modules.dedup();
+    CodeScope {
+        krate: krate.name.clone(),
+        modules,
+    }
+}
+
+impl CorroboratedEvidence {
+    /// Corroborated evidence with no additional (beyond primary/independent)
+    /// signal yet — every `build_X_candidate` in this module starts here;
+    /// some (e.g. [`boolean_state_cluster_candidates`]) push a further
+    /// `Evidence` onto `additional` afterwards.
+    fn new(primary: Evidence, independent: Evidence) -> Self {
+        Self {
+            primary,
+            independent,
+            additional: Vec::new(),
+        }
+    }
+}
+
+/// Evidence identities in the `"file:item_path"` shape
+/// [`PatternCandidateId::compute`] hashes over, one per location.
+fn location_identities(locations: &[EvidenceLocation]) -> Vec<String> {
+    locations
+        .iter()
+        .map(|location| {
+            format!(
+                "{}:{}",
+                location.file.display(),
+                location.item_path.as_deref().unwrap_or("")
+            )
+        })
+        .collect()
+}
+
+/// The qualified item path for a function found while visiting: `Self::name`
+/// inside an `impl` block (using the block's resolved self type), or just
+/// `name` for a free function. Shared by every pattern visitor that tracks
+/// `self_type` while walking `impl` blocks (see
+/// `visit_item_impl_with_self_type!`).
+fn qualified_item_path(self_type: Option<&str>, name: &str) -> String {
+    match self_type {
+        Some(self_type) => format!("{self_type}::{name}"),
+        None => name.to_string(),
+    }
+}
+
+/// The `(name, type)` of `input` if it's a `pat: Type`-shaped typed argument
+/// with a plain identifier pattern (not `self`, not a destructuring
+/// pattern) — the common shape every pattern visitor here extracts function
+/// parameters through, whether it goes on to check the type
+/// ([`primitive_type_name`]/[`is_bool_type`]) or just needs the name.
+fn typed_ident_arg(input: &syn::FnArg) -> Option<(String, &syn::Type)> {
+    let syn::FnArg::Typed(pat_type) = input else {
+        return None;
+    };
+    let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+        return None;
+    };
+    Some((pat_ident.ident.to_string(), &pat_type.ty))
+}
+
+/// Whether `node` is an `impl <trait> for ...` block whose trait path's last
+/// segment is `ident` (matched structurally, no type resolution — same
+/// caveat as [`primitive_type_name`]).
+fn impl_trait_is(node: &syn::ItemImpl, ident: &str) -> bool {
+    node.trait_.as_ref().is_some_and(|(_, path, _)| {
+        path.segments
+            .last()
+            .is_some_and(|segment| segment.ident == ident)
+    })
+}
+
 fn build_candidate(
     krate: &CrateInfo,
     crate_findings: &[&Finding],
@@ -382,26 +502,17 @@ fn build_candidate(
         .collect();
     related_findings.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
-    let mut modules: Vec<String> = crate_findings
+    let modules: Vec<String> = crate_findings
         .iter()
         .map(|finding| finding.location.item_path.clone())
         .collect();
-    modules.sort();
-    modules.dedup();
-
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules,
-    };
+    let scope = crate_scope(krate, modules);
 
     let mut primary_locations: Vec<EvidenceLocation> = crate_findings
         .iter()
-        .map(|finding| EvidenceLocation {
-            file: finding.location.file.clone(),
-            item_path: Some(finding.location.item_path.clone()),
-        })
+        .map(|finding| EvidenceLocation::new(finding.location.file.clone(), finding.location.item_path.clone()))
         .collect();
-    primary_locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+    sort_evidence_locations(&mut primary_locations);
 
     let mut affected_paths: Vec<PathBuf> = crate_findings
         .iter()
@@ -430,11 +541,7 @@ fn build_candidate(
         scope,
         evidence_identities,
         {
-        evidence: CorroboratedEvidence {
-            primary,
-            independent,
-            additional: Vec::new(),
-        },
+        evidence: CorroboratedEvidence::new(primary, independent),
         preconditions: vec![Precondition {
             description: format!(
                 "Mehrere Boundary-Funktionen in Crate `{}` wandeln unterschiedliche \
@@ -494,21 +601,15 @@ fn build_candidate(
 /// from.
 fn crate_defines_typed_error(krate: &CrateInfo) -> Option<Evidence> {
     let mut hits = Vec::new();
-    for source in &krate.source_files {
-        let Ok(text) = std::fs::read_to_string(&source.path) else {
-            continue;
-        };
-        let Ok(ast) = syn::parse_file(&text) else {
-            continue;
-        };
+    for_each_parsed_source(krate, |file, ast| {
         let mut visitor = TypedErrorVisitor {
-            file: &source.path,
+            file,
             path: Vec::new(),
             hits: Vec::new(),
         };
-        visitor.visit_file(&ast);
+        visitor.visit_file(ast);
         hits.append(&mut visitor.hits);
-    }
+    });
     if hits.is_empty() {
         return None;
     }
@@ -545,10 +646,8 @@ impl TypedErrorVisitor<'_> {
     }
 
     fn record(&mut self) {
-        self.hits.push(EvidenceLocation {
-            file: self.file.to_path_buf(),
-            item_path: Some(self.current_item_path()),
-        });
+        self.hits
+            .push(EvidenceLocation::new(self.file.to_path_buf(), self.current_item_path()));
     }
 }
 
@@ -574,12 +673,7 @@ impl<'ast> Visit<'ast> for TypedErrorVisitor<'_> {
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         use quote::ToTokens;
         self.path.push(node.self_ty.to_token_stream().to_string());
-        if let Some((_, path, _)) = &node.trait_
-            && path
-                .segments
-                .last()
-                .is_some_and(|segment| segment.ident == "Error")
-        {
+        if impl_trait_is(node, "Error") {
             self.record();
         }
         syn::visit::visit_item_impl(self, node);
@@ -639,21 +733,15 @@ fn primitive_domain_value_candidates(workspace: &Workspace) -> Vec<PatternCandid
     let mut candidates = Vec::new();
     for krate in &workspace.crates {
         let mut facts: Vec<SignatureParamFact> = Vec::new();
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
+        for_each_parsed_source(krate, |file, ast| {
             let mut visitor = PrimitiveDomainValueVisitor {
-                file: &source.path,
+                file,
                 self_type: None,
                 facts: Vec::new(),
             };
-            visitor.visit_file(&ast);
+            visitor.visit_file(ast);
             facts.append(&mut visitor.facts);
-        }
+        });
 
         let mut by_param: BTreeMap<(String, String), Vec<SignatureParamFact>> = BTreeMap::new();
         for fact in facts {
@@ -694,32 +782,21 @@ fn build_primitive_domain_value_candidate(
     type_name: &str,
     group: &[SignatureParamFact],
 ) -> PatternCandidate {
-    let mut modules: Vec<String> = group.iter().map(|fact| fact.item_path.clone()).collect();
-    modules.sort();
-    modules.dedup();
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules,
-    };
+    let modules: Vec<String> = group.iter().map(|fact| fact.item_path.clone()).collect();
+    let scope = crate_scope(krate, modules);
 
     let mut primary_locations: Vec<EvidenceLocation> = group
         .iter()
-        .map(|fact| EvidenceLocation {
-            file: fact.file.clone(),
-            item_path: Some(fact.item_path.clone()),
-        })
+        .map(|fact| EvidenceLocation::new(fact.file.clone(), fact.item_path.clone()))
         .collect();
-    primary_locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+    sort_evidence_locations(&mut primary_locations);
 
     let mut guard_locations: Vec<EvidenceLocation> = group
         .iter()
         .filter(|fact| fact.has_guard)
-        .map(|fact| EvidenceLocation {
-            file: fact.file.clone(),
-            item_path: Some(fact.item_path.clone()),
-        })
+        .map(|fact| EvidenceLocation::new(fact.file.clone(), fact.item_path.clone()))
         .collect();
-    guard_locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+    sort_evidence_locations(&mut guard_locations);
 
     let primary = Evidence {
         description: format!(
@@ -739,17 +816,7 @@ fn build_primitive_domain_value_candidate(
         locations: guard_locations,
     };
 
-    let evidence_identities: Vec<String> = primary
-        .locations
-        .iter()
-        .map(|location| {
-            format!(
-                "{}:{}",
-                location.file.display(),
-                location.item_path.as_deref().unwrap_or("")
-            )
-        })
-        .collect();
+    let evidence_identities: Vec<String> = location_identities(&primary.locations);
     let mut affected_paths: Vec<PathBuf> = group.iter().map(|fact| fact.file.clone()).collect();
     affected_paths.sort();
     affected_paths.dedup();
@@ -759,11 +826,7 @@ fn build_primitive_domain_value_candidate(
         scope,
         evidence_identities,
         {
-        evidence: CorroboratedEvidence {
-            primary,
-            independent,
-            additional: Vec::new(),
-        },
+        evidence: CorroboratedEvidence::new(primary, independent),
         preconditions: vec![Precondition {
             description: format!(
                 "Crate `{}` verwendet `{param}: {type_name}` wiederholt als Parametername/-typ, \
@@ -874,23 +937,38 @@ macro_rules! visit_item_impl_with_self_type {
     };
 }
 
+/// Shared `visit_item_fn`/`visit_impl_item_fn` pair for pattern visitors
+/// that only record `pub fn`s and delegate to a `record_fn(name, sig,
+/// block)` method — used by [`PrimitiveDomainValueVisitor`] and
+/// [`ConstructorVisitor`].
+macro_rules! visit_pub_fns_via_record_fn {
+    () => {
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            if matches!(node.vis, syn::Visibility::Public(_)) {
+                self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+            }
+            syn::visit::visit_item_fn(self, node);
+        }
+
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            if matches!(node.vis, syn::Visibility::Public(_)) {
+                self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
+            }
+            syn::visit::visit_impl_item_fn(self, node);
+        }
+    };
+}
+
 impl PrimitiveDomainValueVisitor<'_> {
     fn record_fn(&mut self, name: &str, sig: &syn::Signature, block: &syn::Block) {
-        let item_path = match &self.self_type {
-            Some(self_type) => format!("{self_type}::{name}"),
-            None => name.to_string(),
-        };
+        let item_path = qualified_item_path(self.self_type.as_deref(), name);
         for input in &sig.inputs {
-            let syn::FnArg::Typed(pat_type) = input else {
+            let Some((param, ty)) = typed_ident_arg(input) else {
                 continue;
             };
-            let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
+            let Some(type_name) = primitive_type_name(ty) else {
                 continue;
             };
-            let Some(type_name) = primitive_type_name(&pat_type.ty) else {
-                continue;
-            };
-            let param = pat_ident.ident.to_string();
             let has_guard = body_has_validation_guard_for(block, &param);
             self.facts.push(SignatureParamFact {
                 file: self.file.to_path_buf(),
@@ -904,21 +982,8 @@ impl PrimitiveDomainValueVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for PrimitiveDomainValueVisitor<'_> {
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
-        }
-        syn::visit::visit_item_fn(self, node);
-    }
-
+    visit_pub_fns_via_record_fn!();
     visit_item_impl_with_self_type!();
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
-        }
-        syn::visit::visit_impl_item_fn(self, node);
-    }
 }
 
 /// Whether `expr` references identifier `ident` anywhere within it (used to
@@ -1065,19 +1130,13 @@ fn boolean_state_cluster_candidates(
 ) -> Vec<PatternCandidate> {
     let mut candidates = Vec::new();
     for krate in &workspace.crates {
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
+        for_each_parsed_source(krate, |file, ast| {
             let mut visitor = BooleanStateClusterVisitor {
-                file: &source.path,
+                file,
                 self_type: None,
                 facts: Vec::new(),
             };
-            visitor.visit_file(&ast);
+            visitor.visit_file(ast);
             for fact in visitor.facts {
                 let mut candidate = build_boolean_state_cluster_candidate(krate, &fact);
                 if let Some(hit) = clippy_hits
@@ -1091,15 +1150,12 @@ fn boolean_state_cluster_candidates(
                              separate tool.",
                             fact.item_path, hit.line_start, hit.line_end
                         ),
-                        locations: vec![EvidenceLocation {
-                            file: fact.file.clone(),
-                            item_path: Some(fact.item_path.clone()),
-                        }],
+                        locations: vec![EvidenceLocation::new(fact.file.clone(), fact.item_path.clone())],
                     });
                 }
                 candidates.push(candidate);
             }
-        }
+        });
     }
     candidates
 }
@@ -1143,15 +1199,9 @@ fn build_boolean_state_cluster_candidate(
     krate: &CrateInfo,
     fact: &BoolClusterFact,
 ) -> PatternCandidate {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![fact.item_path.clone()],
-    };
+    let scope = crate_scope(krate, vec![fact.item_path.clone()]);
 
-    let location = EvidenceLocation {
-        file: fact.file.clone(),
-        item_path: Some(fact.item_path.clone()),
-    };
+    let location = EvidenceLocation::new(fact.file.clone(), fact.item_path.clone());
 
     let bool_params: Vec<&String> = fact.bool_params.iter().collect();
     let primary = Evidence {
@@ -1185,11 +1235,7 @@ fn build_boolean_state_cluster_candidate(
         scope,
         evidence_identities,
         {
-        evidence: CorroboratedEvidence {
-            primary,
-            independent,
-            additional: Vec::new(),
-        },
+        evidence: CorroboratedEvidence::new(primary, independent),
         preconditions: vec![Precondition {
             description: format!(
                 "`{}` nimmt mehrere Bool-Parameter entgegen und prüft mindestens eine \
@@ -1268,24 +1314,13 @@ impl BooleanStateClusterVisitor<'_> {
         block: &syn::Block,
         span: proc_macro2::Span,
     ) {
-        let item_path = match &self.self_type {
-            Some(self_type) => format!("{self_type}::{name}"),
-            None => name.to_string(),
-        };
+        let item_path = qualified_item_path(self.self_type.as_deref(), name);
         let bool_params: BTreeSet<String> = sig
             .inputs
             .iter()
             .filter_map(|input| {
-                let syn::FnArg::Typed(pat_type) = input else {
-                    return None;
-                };
-                if !is_bool_type(&pat_type.ty) {
-                    return None;
-                }
-                let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
-                    return None;
-                };
-                Some(pat_ident.ident.to_string())
+                let (name, ty) = typed_ident_arg(input)?;
+                is_bool_type(ty).then_some(name)
             })
             .collect();
         if bool_params.len() < 3 {
@@ -1415,43 +1450,31 @@ fn public_invariant_bypass_candidates(workspace: &Workspace) -> Vec<PatternCandi
     let mut candidates = Vec::new();
     for krate in &workspace.crates {
         let mut structs: BTreeMap<String, PubStructFact> = BTreeMap::new();
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
+        for_each_parsed_source(krate, |file, ast| {
             let mut visitor = PubStructVisitor {
-                file: &source.path,
+                file,
                 structs: BTreeMap::new(),
             };
-            visitor.visit_file(&ast);
+            visitor.visit_file(ast);
             structs.extend(visitor.structs);
-        }
+        });
         if structs.is_empty() {
             continue;
         }
 
         let mut constructor_hits: BTreeMap<String, Vec<ConstructorFact>> = BTreeMap::new();
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
+        for_each_parsed_source(krate, |file, ast| {
             let mut visitor = ConstructorVisitor {
-                file: &source.path,
+                file,
                 self_type: None,
                 structs: &structs,
                 hits: BTreeMap::new(),
             };
-            visitor.visit_file(&ast);
+            visitor.visit_file(ast);
             for (name, mut facts) in visitor.hits {
                 constructor_hits.entry(name).or_default().append(&mut facts);
             }
-        }
+        });
 
         for (name, fact) in &structs {
             let Some(ctor_facts) = constructor_hits.get(name) else {
@@ -1546,15 +1569,7 @@ impl ConstructorVisitor<'_> {
         let param_names: BTreeSet<String> = sig
             .inputs
             .iter()
-            .filter_map(|input| {
-                let syn::FnArg::Typed(pat_type) = input else {
-                    return None;
-                };
-                let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref() else {
-                    return None;
-                };
-                Some(pat_ident.ident.to_string())
-            })
+            .filter_map(|input| typed_ident_arg(input).map(|(name, _)| name))
             .collect();
         let matching_params: BTreeSet<String> =
             param_names.intersection(&fact.fields).cloned().collect();
@@ -1565,10 +1580,7 @@ impl ConstructorVisitor<'_> {
         if hits.is_empty() {
             return;
         }
-        let item_path = match &self.self_type {
-            Some(self_type) => format!("{self_type}::{name}"),
-            None => name.to_string(),
-        };
+        let item_path = qualified_item_path(self.self_type.as_deref(), name);
         self.hits
             .entry(struct_name)
             .or_default()
@@ -1581,21 +1593,8 @@ impl ConstructorVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for ConstructorVisitor<'_> {
-    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
-        }
-        syn::visit::visit_item_fn(self, node);
-    }
-
+    visit_pub_fns_via_record_fn!();
     visit_item_impl_with_self_type!();
-
-    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if matches!(node.vis, syn::Visibility::Public(_)) {
-            self.record_fn(&node.sig.ident.to_string(), &node.sig, &node.block);
-        }
-        syn::visit::visit_impl_item_fn(self, node);
-    }
 }
 
 /// The struct name `ty` resolves to, if any: `Self` (resolved via
@@ -1692,18 +1691,12 @@ fn build_public_invariant_bypass_candidate(
     fact: &PubStructFact,
     ctor_facts: &[ConstructorFact],
 ) -> PatternCandidate {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![fact.name.clone()],
-    };
+    let scope = crate_scope(krate, vec![fact.name.clone()]);
 
     let primary_locations: Vec<EvidenceLocation> = fact
         .fields
         .iter()
-        .map(|field| EvidenceLocation {
-            file: fact.file.clone(),
-            item_path: Some(format!("{}::{field}", fact.name)),
-        })
+        .map(|field| EvidenceLocation::new(fact.file.clone(), format!("{}::{field}", fact.name)))
         .collect();
     let field_list: Vec<&str> = fact.fields.iter().map(String::as_str).collect();
 
@@ -1721,12 +1714,9 @@ fn build_public_invariant_bypass_candidate(
 
     let mut independent_locations: Vec<EvidenceLocation> = ctor_facts
         .iter()
-        .map(|ctor| EvidenceLocation {
-            file: ctor.file.clone(),
-            item_path: Some(ctor.item_path.clone()),
-        })
+        .map(|ctor| EvidenceLocation::new(ctor.file.clone(), ctor.item_path.clone()))
         .collect();
-    independent_locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+    sort_evidence_locations(&mut independent_locations);
 
     let combo_texts: Vec<&str> = ctor_facts
         .iter()
@@ -1758,11 +1748,7 @@ fn build_public_invariant_bypass_candidate(
         scope,
         evidence_identities,
         {
-        evidence: CorroboratedEvidence {
-            primary,
-            independent,
-            additional: Vec::new(),
-        },
+        evidence: CorroboratedEvidence::new(primary, independent),
         preconditions: vec![Precondition {
             description: format!(
                 "`{}` hat mindestens zwei öffentliche Felder und mindestens ein Konstruktor \
@@ -1844,24 +1830,18 @@ fn manual_resource_lifecycle_candidates(workspace: &Workspace) -> Vec<PatternCan
     for krate in &workspace.crates {
         let mut has_drop_impl = false;
         let mut hits: Vec<EvidenceLocation> = Vec::new();
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            if file_has_drop_impl(&ast) {
+        for_each_parsed_source(krate, |file, ast| {
+            if file_has_drop_impl(ast) {
                 has_drop_impl = true;
             }
             let mut visitor = ResourceLifecycleVisitor {
-                file: &source.path,
+                file,
                 self_type: None,
                 hits: Vec::new(),
             };
-            visitor.visit_file(&ast);
+            visitor.visit_file(ast);
             hits.append(&mut visitor.hits);
-        }
+        });
         if has_drop_impl || hits.is_empty() {
             continue;
         }
@@ -1900,12 +1880,7 @@ fn file_has_drop_impl(ast: &syn::File) -> bool {
     }
     impl<'ast> Visit<'ast> for DropFinder {
         fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-            if let Some((_, path, _)) = &node.trait_
-                && path
-                    .segments
-                    .last()
-                    .is_some_and(|segment| segment.ident == "Drop")
-            {
+            if impl_trait_is(node, "Drop") {
                 self.found = true;
             }
             syn::visit::visit_item_impl(self, node);
@@ -1972,14 +1947,9 @@ impl ResourceLifecycleVisitor<'_> {
         if !has_acquire || !has_release {
             return;
         }
-        let item_path = match &self.self_type {
-            Some(self_type) => format!("{self_type}::{name}"),
-            None => name.to_string(),
-        };
-        self.hits.push(EvidenceLocation {
-            file: self.file.to_path_buf(),
-            item_path: Some(item_path),
-        });
+        let item_path = qualified_item_path(self.self_type.as_deref(), name);
+        self.hits
+            .push(EvidenceLocation::new(self.file.to_path_buf(), item_path));
     }
 }
 
@@ -2001,19 +1971,11 @@ fn build_manual_resource_lifecycle_candidate(
     krate: &CrateInfo,
     hits: &[EvidenceLocation],
 ) -> PatternCandidate {
-    let mut modules: Vec<String> = hits
-        .iter()
-        .filter_map(|hit| hit.item_path.clone())
-        .collect();
-    modules.sort();
-    modules.dedup();
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules,
-    };
+    let modules: Vec<String> = hits.iter().filter_map(|hit| hit.item_path.clone()).collect();
+    let scope = crate_scope(krate, modules);
 
     let mut primary_locations = hits.to_vec();
-    primary_locations.sort_by(|a, b| (&a.file, &a.item_path).cmp(&(&b.file, &b.item_path)));
+    sort_evidence_locations(&mut primary_locations);
 
     let primary = Evidence {
         description: format!(
@@ -2036,16 +1998,7 @@ fn build_manual_resource_lifecycle_candidate(
         locations: Vec::new(),
     };
 
-    let evidence_identities: Vec<String> = hits
-        .iter()
-        .map(|hit| {
-            format!(
-                "{}:{}",
-                hit.file.display(),
-                hit.item_path.as_deref().unwrap_or("")
-            )
-        })
-        .collect();
+    let evidence_identities: Vec<String> = location_identities(hits);
     let mut affected_paths: Vec<PathBuf> = hits.iter().map(|hit| hit.file.clone()).collect();
     affected_paths.sort();
     affected_paths.dedup();
@@ -2055,11 +2008,7 @@ fn build_manual_resource_lifecycle_candidate(
         scope,
         evidence_identities,
         {
-        evidence: CorroboratedEvidence {
-            primary,
-            independent,
-            additional: Vec::new(),
-        },
+        evidence: CorroboratedEvidence::new(primary, independent),
         preconditions: vec![Precondition {
             description: format!(
                 "Crate `{}` enthält mindestens ein Acquire-/Release-Aufrufpaar innerhalb einer \
