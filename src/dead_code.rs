@@ -686,12 +686,12 @@ fn check_item(
     // used_externally == false (unused-pub-workspace/unused-pub-api still
     // want it flagged) or == true (which returns early, right after this).
     for referencing_file in &referencing {
-        if let Some(&referencing_crate) = crate_of_file.get(referencing_file) {
-            if referencing_crate != krate_name {
-                *edge_counts
-                    .entry((krate_name.to_string(), referencing_crate.to_string()))
-                    .or_insert(0) += 1;
-            }
+        if let Some(&referencing_crate) = crate_of_file.get(referencing_file)
+            && referencing_crate != krate_name
+        {
+            *edge_counts
+                .entry((krate_name.to_string(), referencing_crate.to_string()))
+                .or_insert(0) += 1;
         }
         // `module-coupling`'s edge accumulation (see [`MODULE_COUPLING_RULE`]):
         // the item's own module (this call's `file_id`, looked up in

@@ -1225,7 +1225,7 @@ pub(super) fn run_api_surface(
             .map_err(|err| CliError::Analyzer(err.to_string()))?;
             deep_checked = Some(deep_report.checked);
             findings.extend(deep_report.findings);
-            deep_errors = analysis_errors(&deep_report.errors);
+            deep_errors = super::baseline_output::analysis_errors(&deep_report.errors);
             analysis_errors.extend(deep_errors.iter().cloned());
         }
         #[cfg(not(feature = "deep"))]

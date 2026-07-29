@@ -3168,6 +3168,8 @@ dependencies = [
 [[package]]
 name = "runemark"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec1b987e9cf427794c2eed20ca30339f8b66b67bd477613788747115b02a29c6"
 
 [[package]]
 name = "rustc-hash"
