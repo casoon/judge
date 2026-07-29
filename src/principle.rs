@@ -842,11 +842,10 @@ fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Option<String> {
     let last = components.last().cloned()?;
     if last == "mod.rs" {
         components.pop();
-    } else if let Some(stem) = last.strip_suffix(".rs") {
+    } else {
+        let stem = last.strip_suffix(".rs")?;
         let stem = stem.to_string();
         *components.last_mut().expect("just checked non-empty") = stem;
-    } else {
-        return None;
     }
     Some(components.join("::"))
 }

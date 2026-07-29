@@ -188,12 +188,14 @@ fn run_dead_code_deep(
         ]);
         return baseline_request
             .handle(
-                &workspace.root,
-                &findings,
-                &analysis_errors,
-                rule_revisions,
-                Path::new(DEFAULT_BASELINE_DEAD_CODE),
-                judge::health_score::total_authored_loc(&workspace),
+                BaselineInput {
+                    workspace_root: &workspace.root,
+                    findings: &findings,
+                    analysis_errors: &analysis_errors,
+                    rule_revisions,
+                    default_save_path: Path::new(DEFAULT_BASELINE_DEAD_CODE),
+                    total_loc: judge::health_score::total_authored_loc(&workspace),
+                },
                 out,
             )
             .expect("baseline request was checked above");

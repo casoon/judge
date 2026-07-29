@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-judge"
-version = "0.2.0"
+version = "0.5.2"
 dependencies = [
  "cargo_metadata 0.19.2",
  "clap",
@@ -196,6 +196,7 @@ dependencies = [
  "ra_ap_project_model",
  "ra_ap_syntax",
  "ra_ap_vfs",
+ "runemark",
  "semver",
  "serde",
  "serde_json",
@@ -3163,6 +3164,12 @@ dependencies = [
  "rustc-hash 1.1.0",
  "text-size",
 ]
+
+[[package]]
+name = "runemark"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ec1b987e9cf427794c2eed20ca30339f8b66b67bd477613788747115b02a29c6"
 
 [[package]]
 name = "rustc-hash"

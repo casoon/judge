@@ -1,12 +1,48 @@
 # judge
 
-> Codebase intelligence for Rust workspaces — deterministic findings, no server, no telemetry.
+> Deterministic post-refactoring analysis for Rust workspaces.
 
 ## Overview
 
-`judge` analyzes Rust workspaces for complexity, duplication, dependency hygiene, architecture boundaries, ownership, slop signals, and git-derived hotspots. It's built as a Cargo subcommand (binary `cargo-judge`), runnable both as `cargo judge` and standalone as `cargo-judge`.
+`judge` analyzes the current Rust source tree, workspace structure, public APIs,
+and dependency graph. It turns repeatable post-refactoring checks into
+deterministic, evidence-backed findings. It is built as a Cargo subcommand
+(binary `cargo-judge`), runnable both as `cargo judge` and standalone as
+`cargo-judge`.
 
-The guiding rule: anything the compiler or Clippy already tells you, `judge` doesn't repeat. It covers what sits above the crate boundary, across git history, or aggregated over multiple tools.
+The guiding rule: anything the compiler or Clippy already tells you, `judge`
+doesn't repeat. It covers structural and cross-file concerns that only become
+visible across a workspace.
+
+judge does not inspect authorship, commit history, telemetry, or code
+provenance. Its results apply equally to human-written, generated, and
+agent-refactored code.
+
+Human-readable TTY reports use [runemark](https://github.com/casoon/runemark)
+for consistent verdicts, evidence groups, source locations, color policy, and
+next steps. JSON, SARIF, and Markdown remain explicit machine or handoff
+contracts owned by judge.
+
+## 0.5.2 highlights
+
+- TTY reports now use `runemark` 0.1.1 for consistent verdicts, compact
+  evidence groups, source locations, color policy, and actionable next steps.
+- `structure`, `complexity`, `refactor`, `api`, `errors`, `tests`, `unsafe`,
+  and `slop` provide focused views of the current project state.
+- Baselines compare recorded artifacts with the current workspace through
+  `cargo judge compare`, without requiring Git history.
+
+## 0.5.1 highlights
+
+- The bare `cargo judge` report is now a compact, deterministic decision
+  summary: evidence-backed and advisory findings are grouped by rule with a
+  representative location. `--details` retains the complete terminal list.
+- `cargo judge --format markdown` writes a review-ready summary to
+  `.judge/judge.md` by default, or to `--output PATH` for PR and issue
+  handoffs.
+- A shared human-readable report model now keeps the combined TTY and
+  Markdown views structurally consistent while JSON remains the exhaustive
+  automation contract.
 
 ## 0.2.0 highlights
 
@@ -22,10 +58,12 @@ The guiding rule: anything the compiler or Clippy already tells you, `judge` doe
 
 ## Status
 
-Early stage. The Fast Tier (no build required, `syn`- and `gix`-based) and a first slice of the Deep Tier (rust-analyzer-based, behind the `deep` Cargo feature) are implemented:
+Early stage. The Fast Tier (no build required, `syn`-, Cargo-metadata-, and manifest-based) and a first slice of the Deep Tier (rust-analyzer-based, behind the `deep` Cargo feature) are implemented:
 
-- `cargo judge` — combined findings from every detector that does not require opt-in configuration, worst first
+- `cargo judge` — combined findings from every detector that does not require opt-in configuration; the default view is grouped for triage and `--details` lists every finding
 - `cargo judge inspect` — crates, source files, and entry points detected via `cargo metadata`
+- `cargo judge structure` — crates, targets, internal dependency edges, and measured structural concentration
+- `cargo judge complexity` — current production/test complexity rankings from the checked-out source tree
 - `cargo judge map` — compact workspace facts for refactoring plans: crates and
   files ordered by measured aggregate cyclomatic complexity; production and
   test-only code stay separate, and `--include-tests` opts tests into the
@@ -34,15 +72,17 @@ Early stage. The Fast Tier (no build required, `syn`- and `gix`-based) and a fir
 - `cargo judge impact PATH` — deterministic change context for one discovered
   Rust source file: crate targets and judge commands that read it directly;
   it does not predict individual findings or reachability
-- `cargo judge health [--score]` — cyclomatic complexity, git hotspots, syntax-level slop signals, and an optional health score (see below)
+- `cargo judge health [--score]` — current-state complexity, syntax-level slop signals, and an optional health score (see below)
 - `cargo judge dupes --mode strict|mild|weak|semantic [--include-tests]` — duplicated token spans grouped into clone families; test-only code is opt-in
 - `cargo judge deps [--check-crates-io] [--audit-json PATH]` — dependency-kind hygiene plus local name-collision checks; the crates.io lookups (`phantom-crate`, `phantom-version`, `fresh-low-reputation-dep`, `yanked-dependency`, `dep-single-maintainer`) are opt-in because judge makes no network calls otherwise; `--audit-json` cross-references an already-generated `cargo audit --json` report against the resolved dependency graph (`known-vulnerability`) — judge never runs `cargo-audit` itself
+- `cargo judge api` — focused public API surface analysis (the existing `api-surface` name remains available during migration)
 - `cargo judge boundaries` — opt-in crate boundaries from `judge.toml`, plus dependency cycles; `--graph dot|mermaid` prints the crate dependency graph itself instead of checking rules
-- `cargo judge distribution` — ownership and bus-factor findings from git blame
-- `cargo judge audit --since REF` — pass/warn/fail verdict scoped to findings introduced since a commit; requires a previously saved baseline
+- `cargo judge errors`, `tests`, `unsafe`, `slop` — focused current-state projections with concrete locations and stated Fast-Tier limits
+- `cargo judge refactor [PATH]` — deterministic, evidence-backed refactoring review queue; it never invents a patch
+- `cargo judge compare BASELINE` — compares the current project state with a saved findings artifact; works without Git
 - `cargo judge dead-code [--include-tests]` — Deep Tier, needs `--features deep` (see below)
 - `cargo judge explain <item-path> --why-live` — Deep Tier, needs `--features deep` (see below)
-- `--format json|sarif|markdown` — versioned JSON on every report command (written by default to `.judge/<command>.json`, or to `--output PATH`), SARIF 2.1.0 on the report-producing commands, Markdown for the `audit`/`--baseline` delta (PR comments)
+- `--format json|sarif|markdown` — versioned JSON on every report command (written by default to `.judge/<command>.json`, or to `--output PATH`), SARIF 2.1.0 on the report-producing commands, and Markdown for the combined review summary as well as the `audit`/`--baseline` delta
 - `--save-baseline` / `--baseline PATH` — save or compare findings against a baseline
 
 Every written JSON artifact starts with a `header`, followed by the command payload. It
@@ -106,8 +146,14 @@ cargo install --path . --force
 ## Usage
 
 ```bash
-cargo judge                    # combined findings, worst first
+cargo judge                    # compact, structured combined triage report
+cargo judge --color always     # force terminal colors (even with NO_COLOR set)
+cargo judge --details          # every combined finding and source location
+cargo judge --format markdown  # review report, written to .judge/judge.md
 cargo judge inspect            # crates, entry points, detected tiers
+cargo judge structure          # current workspace architecture
+cargo judge complexity         # measured complexity concentrations
+cargo judge refactor           # ranked evidence-backed review queue
 cargo judge map --format json  # writes compact facts to .judge/map.json
 cargo judge dupes --format json --output reports/dupes.json
 cargo judge map --include-tests # include test-only code in map ranking
@@ -118,7 +164,7 @@ cargo judge deps --format json # dependency findings as JSON
 cargo judge health --score     # health score, 0-100 + letter grade
 cargo judge --save-baseline    # save .judge/baseline.json
 cargo judge --baseline .judge/baseline.json
-cargo judge audit --since origin/main  # pass/warn/fail verdict for a PR
+cargo judge compare .judge/baseline.json  # current project state versus saved baseline
 cargo judge dead-code          # Deep Tier — binary must be built with --features deep
 ```
 
@@ -128,6 +174,19 @@ to `.judge/judge.json` by default (or `--output PATH`), while TTY/SARIF stay
 on stdout. Each record has `schema_version`, `sequence`,
 `event` (`phase_started`/`phase_completed`), and `phase`; it reports analysis
 lifecycle only, never provisional findings.
+
+The normal `cargo judge` terminal view is deliberately compact: it groups
+evidence-backed findings and advisory heuristics by rule and shows a
+representative location for each group. Use `cargo judge --details` for every
+location, or `cargo judge --format json` for the complete versioned artifact.
+Its TTY view uses color only on an interactive terminal and honours `NO_COLOR`;
+use `--color always` or `--color never` to override that policy.
+
+`cargo judge --format markdown` renders the same grouped summary as Markdown
+for pull-request descriptions, issue comments, or other review handoffs: an
+executive summary, evidence-backed and advisory groups with counts and
+representative locations, and a next-steps section — never a raw per-finding
+dump. It is written to `.judge/judge.md` by default, or to `--output PATH`.
 
 ## Intentional Duplicate Code
 
@@ -154,24 +213,6 @@ analysis.
 
 The `map`, `impact`, and progress JSON contracts are covered by CLI tests, so
 tooling can rely on their schema versions and their separation from stdout.
-
-Historical signals are advisory context. Source files not yet present in
-`HEAD` are listed as `history_unavailable` and receive no blame-derived facts;
-they do not make the code analysis incomplete.
-
-## Provenance Attribution
-
-`cargo judge provenance` breaks churn, duplication, and suppression debt down
-by heuristically classified author class (commit trailers/markers like
-`Co-authored-by: Claude`, or a configured `[[provenance_label]]`), and flags
-`dep-added-by-agent`: a dependency declared in an agent-classified commit
-with no same-commit reference to it found in any other touched file. It is
-opt-in — not part of bare `cargo judge` — and always prints this caveat:
-
-> Provenance labels are a distribution trend, not a judgment on any single
-> commit or person. Trailers and metadata are incomplete and can be
-> manipulated; the heuristics are weak. Valid as a trend, not valid as a
-> gate. Using this to evaluate individual people is a misuse of this tool.
 
 ## Development
 

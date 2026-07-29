@@ -25,20 +25,7 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     let mut functions = report.functions;
     functions.sort_by_key(|function| std::cmp::Reverse(function.cyclomatic));
 
-    let (hotspots, hotspot_error) =
-        match judge::git::hotspots(&workspace.root, &functions, judge::git::DEFAULT_WINDOW_DAYS) {
-            Ok(hotspots) => (hotspots, None),
-            Err(err) => {
-                let error = err.to_string();
-                analysis_errors.push(error.clone());
-                (Vec::new(), Some(error))
-            }
-        };
-    let mut findings: Vec<_> = hotspots
-        .iter()
-        .take(HOTSPOT_LIMIT)
-        .map(judge::git::Hotspot::to_finding)
-        .collect();
+    let mut findings = Vec::new();
 
     // AI-slop signals (see todo.md §G "AI-Slop-Signale", §12 "Entscheidungen":
     // "Der Slop-Block ist Teil von `health`, kein eigener Sub-Command") — a
@@ -63,12 +50,6 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     findings.extend(judge::slop_structural::complexity_inflation(&functions));
     findings.extend(judge::complexity::signature_complexity(&functions));
     findings.extend(judge::complexity::maintainability_index(&functions));
-    match judge::git::churn(&workspace.root, 14) {
-        Ok(two_week_churn) => {
-            findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
-        }
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
     let abstraction_source_files = workspace
         .crates
         .iter()
@@ -134,10 +115,6 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     if save_baseline || baseline.is_some() {
         let rule_revisions = std::collections::HashMap::from([
             (
-                judge::git::HOTSPOT_RULE.to_string(),
-                judge::git::HOTSPOT_RULE_REVISION,
-            ),
-            (
                 judge::slop::SWALLOWED_RESULT_RULE.to_string(),
                 judge::slop::SWALLOWED_RESULT_RULE_REVISION,
             ),
@@ -192,10 +169,6 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
             (
                 judge::slop::DOC_RESTATES_SIGNATURE_RULE.to_string(),
                 judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::CHURN_HOTSPOT_RULE.to_string(),
-                judge::slop_structural::CHURN_HOTSPOT_RULE_REVISION,
             ),
             (
                 judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
@@ -332,13 +305,6 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
                     function.line,
                     function.qualified_name
                 )?;
-            }
-
-            writeln!(out)?;
-            if let Some(error) = hotspot_error {
-                writeln!(out, "hotspots: unavailable ({error})")?;
-            } else {
-                print_hotspots(out, &hotspots, &findings, show_cascades)?;
             }
 
             writeln!(out)?;

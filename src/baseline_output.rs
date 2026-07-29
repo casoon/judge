@@ -14,6 +14,18 @@ pub(super) struct BaselineRequest<'a> {
     format: OutputFormat,
 }
 
+/// Data produced by a report command before the shared baseline decision is
+/// applied. Keeping it together makes the baseline hand-off an explicit
+/// boundary instead of a long positional argument list.
+pub(super) struct BaselineInput<'a> {
+    pub(super) workspace_root: &'a Path,
+    pub(super) findings: &'a [Finding],
+    pub(super) analysis_errors: &'a [String],
+    pub(super) rule_revisions: std::collections::HashMap<String, u32>,
+    pub(super) default_save_path: &'a Path,
+    pub(super) total_loc: usize,
+}
+
 impl<'a> BaselineRequest<'a> {
     pub(super) fn new(save: bool, compare_path: Option<&'a Path>, format: OutputFormat) -> Self {
         Self {
@@ -31,14 +43,17 @@ impl<'a> BaselineRequest<'a> {
     /// should continue with its normal report rendering.
     pub(super) fn handle(
         &self,
-        workspace_root: &Path,
-        findings: &[Finding],
-        analysis_errors: &[String],
-        rule_revisions: std::collections::HashMap<String, u32>,
-        default_save_path: &Path,
-        total_loc: usize,
+        input: BaselineInput<'_>,
         out: &mut dyn Write,
     ) -> Option<Result<CommandOutcome, CliError>> {
+        let BaselineInput {
+            workspace_root,
+            findings,
+            analysis_errors,
+            rule_revisions,
+            default_save_path,
+            total_loc,
+        } = input;
         self.is_requested().then(|| {
             handle_baseline(
                 workspace_root,
@@ -172,11 +187,10 @@ pub(super) fn handle_baseline_with_trend(
     }
 
     if save {
-        let commit = judge::git::head_commit(workspace_root)?;
         let config = load_judge_toml(workspace_root)?;
         let mut baseline = judge::baseline::Baseline::new(
             &findings,
-            commit,
+            String::new(),
             rule_revisions,
             total_loc,
             judge::health_score::ScoreContext::from_profiles(&config.crate_profiles),
@@ -201,10 +215,12 @@ pub(super) fn handle_baseline_with_trend(
     };
     let mut baseline = judge::baseline::load(path)?;
     baseline.relativize_paths(workspace_root);
-    let touched: std::collections::HashSet<PathBuf> =
-        judge::git::changed_files_since(workspace_root, &baseline.commit)?;
-
-    let delta = judge::baseline::diff(&findings, &baseline, &touched, &rule_revisions);
+    let delta = judge::baseline::diff(
+        &findings,
+        &baseline,
+        &std::collections::HashSet::new(),
+        &rule_revisions,
+    );
     let verdict = delta.verdict();
     match format {
         OutputFormat::Json => {
@@ -258,10 +274,10 @@ fn print_delta(
     }
 
     let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
-        .code_introduced
+        .introduced
         .iter()
         .partition(|finding| finding.is_gating());
-    writeln!(out, "code-introduced: {}", gating.len())?;
+    writeln!(out, "introduced: {}", gating.len())?;
     for finding in &gating {
         writeln!(
             out,
@@ -274,7 +290,7 @@ fn print_delta(
 
     writeln!(
         out,
-        "code-introduced advisory (heuristic — no verdict effect): {}",
+        "introduced advisory (heuristic — no verdict effect): {}",
         advisory.len()
     )?;
     for finding in &advisory {
@@ -287,18 +303,16 @@ fn print_delta(
         )?;
     }
 
-    writeln!(
-        out,
-        "rule-introduced (protected, does not fail): {}",
-        delta.rule_introduced.len()
-    )?;
-    for finding in &delta.rule_introduced {
+    writeln!(out, "severity changed: {}", delta.severity_changed.len())?;
+    for change in &delta.severity_changed {
         writeln!(
             out,
-            "  {}  {}:{}",
-            finding.rule,
-            finding.location.file.display(),
-            finding.location.line
+            "  {}  {} -> {}  {}:{}",
+            change.after.rule,
+            severity_label(change.before.severity),
+            severity_label(change.after.severity),
+            change.after.location.file.display(),
+            change.after.location.line
         )?;
     }
     Ok(())

@@ -443,10 +443,8 @@ pub enum FidelityStatus {
 /// part of this type.
 #[derive(Debug, Clone, Serialize)]
 pub struct AnalysisUniverse {
-    /// Full hex object id of `HEAD` at analysis time — the source snapshot
-    /// the claims are about. `None` outside a git repository (or when the
-    /// workspace root is not itself the repository root, matching how
-    /// `crate::git` opens repositories everywhere else).
+    /// Reserved source-snapshot identity. judge's current-state analysis
+    /// does not inspect Git, so this is always `None`.
     pub commit: Option<String>,
     /// Cargo target kinds discovered in the workspace, deduped and sorted —
     /// the ingest layer's labels: `lib`, `bin`, `example`, `test`, `bench`,
@@ -546,7 +544,7 @@ impl AnalysisUniverse {
         targets.sort();
         targets.dedup();
         Self {
-            commit: crate::git::head_commit(&workspace.root).ok(),
+            commit: None,
             targets,
             features: Vec::new(),
             platform: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),

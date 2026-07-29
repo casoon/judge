@@ -82,6 +82,8 @@ pub(super) fn run(
     save_baseline: bool,
     baseline: Option<PathBuf>,
     progress_path: Option<&Path>,
+    details: bool,
+    color: bool,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let workspace = judge::ingest::load(None)?;
@@ -107,12 +109,14 @@ pub(super) fn run(
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
     if let Some(result) = baseline_request.handle(
-        &workspace.root,
-        &collected.findings,
-        &collected.analysis_errors,
-        collected.rule_revisions,
-        Path::new(DEFAULT_BASELINE_ALL),
-        judge::health_score::total_authored_loc(&workspace),
+        BaselineInput {
+            workspace_root: &workspace.root,
+            findings: &collected.findings,
+            analysis_errors: &collected.analysis_errors,
+            rule_revisions: collected.rule_revisions,
+            default_save_path: Path::new(DEFAULT_BASELINE_ALL),
+            total_loc: judge::health_score::total_authored_loc(&workspace),
+        },
         out,
     ) {
         return result;
@@ -124,8 +128,7 @@ pub(super) fn run(
             // (excluded — see `collect_findings`), so the universe says so.
             let report = Report::with_errors(collected.findings, collected.analysis_errors)
                 .with_universe(judge::finding::AnalysisUniverse::fast(&workspace, false))
-                .with_suppressed_inline(collected.suppressed_inline)
-                .with_history_unavailable(collected.history_unavailable);
+                .with_suppressed_inline(collected.suppressed_inline);
             write_json(out, &report)?;
         }
         OutputFormat::Sarif => {
@@ -138,85 +141,96 @@ pub(super) fn run(
             )?;
         }
         OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`cargo judge`",
-                format,
-                "tty, json, sarif",
-            ));
+            let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = collected
+                .findings
+                .iter()
+                .partition(|finding| finding.is_gating());
+            let markdown = build_report(
+                &gating,
+                &advisory,
+                &collected.analysis_errors,
+                collected.boundary_rules_checked,
+                collected.boundaries_config_path.exists(),
+                collected.suppressed_inline,
+                &workspace.root,
+            )
+            .write_markdown(&workspace.root);
+            write!(out, "{markdown}")?;
         }
         OutputFormat::Tty => {
             let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = collected
                 .findings
                 .iter()
                 .partition(|finding| finding.is_gating());
-            writeln!(
-                out,
-                "findings: {} (worst first), {} advisory",
-                gating.len(),
-                advisory.len()
-            )?;
-            if !collected.analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", collected.analysis_errors.len())?;
-                for error in &collected.analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            if !collected.history_unavailable.is_empty() {
-                writeln!(
-                    out,
-                    "history unavailable for {} uncommitted files:",
-                    collected.history_unavailable.len()
-                )?;
-                for file in &collected.history_unavailable {
-                    writeln!(out, "  {}", file.display())?;
-                }
-            }
-            writeln!(
-                out,
-                "boundary rules checked: {}{}",
+            build_report(
+                &gating,
+                &advisory,
+                &collected.analysis_errors,
                 collected.boundary_rules_checked,
-                if collected.boundaries_config_path.exists() {
-                    ""
-                } else {
-                    " (no judge.toml — boundaries skipped)"
-                }
-            )?;
-            if collected.suppressed_inline > 0 {
-                writeln!(
-                    out,
-                    "suppressed (inline judge-ignore): {}",
-                    collected.suppressed_inline
-                )?;
-            }
-            writeln!(out)?;
-            for finding in &gating {
-                write_finding(out, finding)?;
-            }
-            if !advisory.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "advisory (heuristic) — no verdict effect: {}",
-                    advisory.len()
-                )?;
-                for finding in &advisory {
-                    write_finding(out, finding)?;
-                }
-            }
+                collected.boundaries_config_path.exists(),
+                collected.suppressed_inline,
+                &workspace.root,
+            )
+            .write_tty_colored(out, &workspace.root, details, color)?;
         }
     }
     Ok(CommandOutcome::Clean)
 }
 
-/// One finding line of the bare `cargo judge` TTY report.
-fn write_finding(out: &mut dyn Write, finding: &Finding) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "  [{}] {:<28} {}:{}  {}",
-        severity_label(finding.severity),
-        finding.rule,
-        finding.location.file.display(),
-        finding.location.line,
-        finding.location.item_path
-    )
+/// Builds the shared presentation model (issue #12) for the combined
+/// command's terminal view. The previous exhaustive listing remains
+/// available through `--details`; JSON is always exhaustive and therefore
+/// remains the automation contract.
+#[allow(clippy::too_many_arguments)]
+fn build_report<'a>(
+    gating: &[&'a Finding],
+    advisory: &[&'a Finding],
+    analysis_errors: &'a [String],
+    boundary_rules_checked: usize,
+    boundaries_config_exists: bool,
+    suppressed_inline: usize,
+    _workspace_root: &Path,
+) -> judge::report::Report<'a> {
+    let mut status_lines = vec![
+        "Judge summary".to_string(),
+        format!(
+            "  {} evidence-backed findings · {} advisory heuristics",
+            gating.len(),
+            advisory.len()
+        ),
+        format!(
+            "  boundary rules: {}{}",
+            boundary_rules_checked,
+            if boundaries_config_exists {
+                " checked"
+            } else {
+                " not checked (no judge.toml)"
+            }
+        ),
+    ];
+    if suppressed_inline > 0 {
+        status_lines.push(format!("  inline suppressions: {suppressed_inline}"));
+    }
+
+    let analysis_error_items = analysis_errors
+        .iter()
+        .map(|error| std::borrow::Cow::Borrowed(error.as_str()))
+        .collect();
+    judge::report::Report::new(status_lines)
+        .with_scope_note(
+            format!("Analysis incomplete: {} error(s)", analysis_errors.len()),
+            analysis_error_items,
+        )
+        .with_group("Evidence-backed findings", gating.to_vec(), false)
+        .with_group(
+            "Advisory heuristics (no verdict or score effect)",
+            advisory.to_vec(),
+            true,
+        )
+        .with_next_steps(vec![
+            "cargo judge dupes              clone families, grouped and prioritized".to_string(),
+            "cargo judge --details          every finding and location".to_string(),
+            "cargo judge --format json      full machine-readable report in .judge/judge.json"
+                .to_string(),
+        ])
 }
