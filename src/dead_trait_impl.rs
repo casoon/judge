@@ -82,7 +82,7 @@ use std::path::{Path, PathBuf};
 use proc_macro2::Span;
 use ra_ap_hir::{AsAssocItem, AssocItemContainer, Semantics};
 use ra_ap_ide::RootDatabase;
-use ra_ap_syntax::{AstNode, TextRange, ast};
+use ra_ap_syntax::{AstNode, ast};
 use serde_json::json;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
@@ -228,78 +228,37 @@ impl<'ast> Visit<'ast> for ImplWalker<'_> {
 }
 
 /// Collects every `impl Trait for Type` candidate once, across the whole
-/// workspace (see the module docs, step 1). A per-file read/parse failure is
-/// a non-fatal, reported error — matching `crate::dead_code`'s own "skip this
-/// file, keep going" handling, not a hard stop for the whole run.
+/// workspace (see the module docs, step 1), via
+/// [`crate::dead_code::for_each_parsed_file`] — the same shared walk
+/// [`crate::feature_matrix::collect_candidates`] uses for its own candidate
+/// collection. A per-file read/parse failure is a non-fatal, reported error,
+/// not a hard stop for the whole run.
 fn collect_candidates(workspace: &Workspace) -> (Vec<ImplCandidate>, Vec<DeadCodeError>) {
     let mut candidates = Vec::new();
     let mut errors = Vec::new();
 
-    for krate in &workspace.crates {
-        for file in &krate.source_files {
-            if !file.kind.is_locally_reportable() {
-                continue;
-            }
-
-            let source = match std::fs::read_to_string(&file.path) {
-                Ok(source) => source,
-                Err(err) => {
-                    errors.push(DeadCodeError::Io(file.path.clone(), err));
-                    continue;
-                }
-            };
-            let ast = match syn::parse_file(&source) {
-                Ok(ast) => ast,
-                Err(err) => {
-                    errors.push(DeadCodeError::Parse(file.path.clone(), err));
-                    continue;
-                }
-            };
-
-            let mut walker = ImplWalker {
-                cfg_test_depth: 0,
-                file_path: &file.path,
-                candidates: Vec::new(),
-            };
-            walker.visit_file(&ast);
-            candidates.extend(walker.candidates);
-        }
-    }
+    crate::dead_code::for_each_parsed_file(workspace, &mut errors, |file, ast| {
+        let mut walker = ImplWalker {
+            cfg_test_depth: 0,
+            file_path: &file.path,
+            candidates: Vec::new(),
+        };
+        walker.visit_file(ast);
+        candidates.extend(walker.candidates);
+    });
 
     (candidates, errors)
 }
 
 /// Resolves `impl_token_span` (an [`ImplCandidate::impl_token_span`]) to the
-/// enclosing [`ast::Impl`] syntax node in the Deep Tier's own parse of
-/// `file_id` — the same "step from a `syn` position down to `ra_ap_syntax`"
-/// move `crate::api_surface_deep::resolve_fn_node` makes for a function
-/// candidate. `None` when the position doesn't line up with a token at all,
-/// skipped rather than reported as an error (same "im Zweifel nicht melden"
-/// stance).
+/// enclosing [`ast::Impl`] syntax node — see
+/// [`crate::api_surface_deep::resolve_span_node`].
 fn resolve_impl_node(
     sema: &Semantics<'_, RootDatabase>,
     file_id: FileId,
     impl_token_span: Span,
 ) -> Option<ast::Impl> {
-    let byte_range = impl_token_span.byte_range();
-    let text_range = TextRange::new(
-        (byte_range.start as u32).into(),
-        (byte_range.end as u32).into(),
-    );
-    let source_file = sema.parse_guess_edition(file_id);
-    let token = source_file
-        .syntax()
-        .token_at_offset(text_range.start())
-        .find(|token| token.text_range() == text_range)?;
-    token.parent()?.ancestors().find_map(ast::Impl::cast)
-}
-
-/// The `to_string()` of a crate's own display name, or `"?"` if it has none
-/// (mirrors `crate::api_surface_deep`'s own private `crate_display_name`).
-fn crate_display_name(krate: ra_ap_hir::Crate, db: &RootDatabase) -> String {
-    krate
-        .display_name(db)
-        .map_or_else(|| "?".to_string(), |name| name.to_string())
+    crate::api_surface_deep::resolve_span_node(sema, file_id, impl_token_span)
 }
 
 /// Whether `trait_def`'s own defining crate is one of the analyzed
@@ -316,7 +275,7 @@ fn is_workspace_local_trait(
     workspace_crate_names: &HashSet<String>,
 ) -> bool {
     let krate = trait_def.module(db).krate(db);
-    workspace_crate_names.contains(&crate_display_name(krate, db))
+    workspace_crate_names.contains(&crate::api_surface_deep::crate_display_name(krate, db))
 }
 
 fn finding_for(candidate: &ImplCandidate) -> Finding {

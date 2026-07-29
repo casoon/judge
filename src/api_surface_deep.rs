@@ -303,11 +303,35 @@ fn name_matches(name: Option<ast::Name>, target: &str) -> bool {
     name.is_some_and(|name| name.text() == target)
 }
 
+/// The introduced name and target path of `use_item`, if it's a plain,
+/// non-glob, non-braced `pub use` (see [`ast::UseTree::is_simple_path`]).
+/// `None` for a non-`pub`/restricted-`pub` use, a glob or braced group, or one
+/// with no resolvable introduced name — shared by [`find_named_top_level_item`]
+/// (matching one name inside a target module) and [`re_export_chain_findings`]
+/// (scanning every `pub use` in a file), which otherwise repeated this exact
+/// extraction.
+fn simple_pub_use(use_item: &ast::Use) -> Option<(String, ast::Path)> {
+    if !is_plain_pub(use_item.visibility()) {
+        return None;
+    }
+    let tree = use_item.use_tree()?;
+    if !tree.is_simple_path() {
+        return None;
+    }
+    let use_path = tree.path()?;
+    let introduced = tree
+        .rename()
+        .and_then(|rename| rename.name())
+        .map(|name| name.text().to_string())
+        .or_else(|| leaf_name(&use_path))?;
+    Some((introduced, use_path))
+}
+
 /// Scans `source_file`'s own top-level items (module-root level only — see
 /// [`re_export_chain_findings`]'s "Ehrliche Grenze" scope note) for the one
 /// that introduces `name` into this module's namespace, classifying it as
 /// [`NamedTopLevelItem::ReExport`] (a plain, non-glob, non-braced `pub use`
-/// — see [`ast::UseTree::is_simple_path`]) or [`NamedTopLevelItem::Original`]
+/// — see [`simple_pub_use`]) or [`NamedTopLevelItem::Original`]
 /// (a genuine `fn`/`struct`/`enum`/
 /// `trait`/`const`/`static`/`type`/`union` definition). `None` when no
 /// top-level item matches, or the matching `use` is a form this rule
@@ -321,27 +345,9 @@ fn find_named_top_level_item(
     for item in source_file.items() {
         match &item {
             ast::Item::Use(use_item) => {
-                if !is_plain_pub(use_item.visibility()) {
-                    continue;
-                }
-                let Some(tree) = use_item.use_tree() else {
-                    continue;
-                };
-                if !tree.is_simple_path() {
-                    continue;
-                }
-                let Some(use_path) = tree.path() else {
-                    continue;
-                };
-                let introduced = tree
-                    .rename()
-                    .and_then(|rename| rename.name())
-                    .map(|name| name.text().to_string())
-                    .or_else(|| leaf_name(&use_path));
-                let Some(introduced) = introduced else {
-                    continue;
-                };
-                if introduced == name {
+                if let Some((introduced, use_path)) = simple_pub_use(use_item)
+                    && introduced == name
+                {
                     return Some(NamedTopLevelItem::ReExport(use_path));
                 }
             }
@@ -510,24 +516,7 @@ fn re_export_chain_findings(
             let ast::Item::Use(use_item) = &item else {
                 continue;
             };
-            if !is_plain_pub(use_item.visibility()) {
-                continue;
-            }
-            let Some(tree) = use_item.use_tree() else {
-                continue;
-            };
-            if !tree.is_simple_path() {
-                continue;
-            }
-            let Some(use_path) = tree.path() else {
-                continue;
-            };
-            let introduced = tree
-                .rename()
-                .and_then(|rename| rename.name())
-                .map(|name| name.text().to_string())
-                .or_else(|| leaf_name(&use_path));
-            let Some(introduced) = introduced else {
+            let Some((introduced, use_path)) = simple_pub_use(use_item) else {
                 continue;
             };
 
@@ -609,27 +598,31 @@ fn leaked_type(
     })
 }
 
-fn crate_display_name(krate: ra_ap_hir::Crate, db: &RootDatabase) -> String {
+/// The `to_string()` of a crate's own display name, or `"?"` if it has none.
+/// `pub(crate)` so [`crate::dead_trait_impl`] can reuse it for its own,
+/// unrelated workspace-local-trait check instead of duplicating the same
+/// one-line fallback.
+pub(crate) fn crate_display_name(krate: ra_ap_hir::Crate, db: &RootDatabase) -> String {
     krate
         .display_name(db)
         .map_or_else(|| "?".to_string(), |name| name.to_string())
 }
 
-/// Resolves `ident_span` (a [`PubFnCandidate::ident_span`]) to the enclosing
-/// `ast::Fn` syntax node in the Deep Tier's own parse of `file_id` — the same
-/// "step from a `syn` position down to `ra_ap_syntax`" move
-/// [`crate::reachability::classify_call_kind`] makes for a call site.
-/// `None` when the position doesn't line up with a token at all (an edge
-/// case `token_at_offset` can't resolve) or that token isn't inside a
-/// function — skipped rather than reported as an error, the same "im
-/// Zweifel nicht melden" stance `classify_call_kind`'s own `CallKind::Unknown`
-/// fallback takes (todo.md §3.A).
-fn resolve_fn_node(
+/// Resolves `span` to the enclosing `N` syntax node in the Deep Tier's own
+/// parse of `file_id` — the shared "step from a `syn` position down to
+/// `ra_ap_syntax`" move behind [`resolve_fn_node`] (a function candidate) and
+/// [`crate::dead_trait_impl::resolve_impl_node`] (an impl candidate). `None`
+/// when the position doesn't line up with a token at all (an edge case
+/// `token_at_offset` can't resolve) or no ancestor casts to `N` — skipped
+/// rather than reported as an error, the same "im Zweifel nicht melden"
+/// stance [`crate::reachability::classify_call_kind`]'s own
+/// `CallKind::Unknown` fallback takes (todo.md §3.A).
+pub(crate) fn resolve_span_node<N: AstNode>(
     sema: &Semantics<'_, RootDatabase>,
     file_id: FileId,
-    ident_span: proc_macro2::Span,
-) -> Option<ast::Fn> {
-    let byte_range = ident_span.byte_range();
+    span: proc_macro2::Span,
+) -> Option<N> {
+    let byte_range = span.byte_range();
     let text_range = TextRange::new(
         (byte_range.start as u32).into(),
         (byte_range.end as u32).into(),
@@ -639,7 +632,17 @@ fn resolve_fn_node(
         .syntax()
         .token_at_offset(text_range.start())
         .find(|token| token.text_range() == text_range)?;
-    token.parent()?.ancestors().find_map(ast::Fn::cast)
+    token.parent()?.ancestors().find_map(N::cast)
+}
+
+/// Resolves `ident_span` (a [`PubFnCandidate::ident_span`]) to the enclosing
+/// `ast::Fn` syntax node — see [`resolve_span_node`].
+fn resolve_fn_node(
+    sema: &Semantics<'_, RootDatabase>,
+    file_id: FileId,
+    ident_span: proc_macro2::Span,
+) -> Option<ast::Fn> {
+    resolve_span_node(sema, file_id, ident_span)
 }
 
 /// Every parameter type plus the return type (if any) of `fn_node`, each
@@ -661,31 +664,44 @@ fn checked_types(fn_node: &ast::Fn) -> Vec<(String, ast::Type)> {
     types
 }
 
-fn leak_finding(candidate: &PubFnCandidate, site: &str, leak: &LeakedType) -> Finding {
+/// Builds a leaked-type [`Finding`] — the shared shape [`leak_finding`]
+/// (`semver-hazard`'s `leaked_dependency_type` sub-case) and
+/// [`internal_leak_finding`] (`internal-leak`) both produce, differing only
+/// in `rule_id`, `severity`, and the evidence `kind` label.
+fn leak_type_finding(
+    candidate: &PubFnCandidate,
+    site: &str,
+    leak: &LeakedType,
+    rule_id: &str,
+    severity: Severity,
+    kind: &str,
+) -> Finding {
     Finding {
         id: format!(
-            "{SEMVER_HAZARD_RULE}:{}:{}:{site}:{}",
+            "{rule_id}:{}:{}:{site}:{}",
             candidate.file.display(),
             candidate.item_path,
             leak.type_name,
         )
         .into(),
-        rule: SEMVER_HAZARD_RULE.into(),
-        severity: Severity::Info,
+        rule: rule_id.into(),
+        severity,
         location: Location {
             file: candidate.file.clone(),
             line: OneBasedLine::new(candidate.ident_span.start().line)
                 .expect("proc-macro2 span lines are 1-based"),
             item_path: candidate.item_path.clone(),
         },
-        // Overrides the rule-level `derived_fact` default (see
+        // Overrides `semver-hazard`'s rule-level `derived_fact` default (see
         // `evidence_class_for_rule`'s doc comment) — see the module docs'
         // "Evidence class" section for why this sub-case alone is
-        // `bounded_semantic`.
+        // `bounded_semantic`; `internal-leak` (no Fast-Tier counterpart) has
+        // no rule-level default to override in the first place, but is
+        // `bounded_semantic` for the identical reason.
         evidence_class: EvidenceClass::BoundedSemantic,
         origin: Origin::Code,
         evidence: Some(json!({
-            "kind": "leaked_dependency_type",
+            "kind": kind,
             "type_name": leak.type_name,
             "defining_crate": leak.defining_crate,
             "site": site,
@@ -694,6 +710,17 @@ fn leak_finding(candidate: &PubFnCandidate, site: &str, leak: &LeakedType) -> Fi
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
+}
+
+fn leak_finding(candidate: &PubFnCandidate, site: &str, leak: &LeakedType) -> Finding {
+    leak_type_finding(
+        candidate,
+        site,
+        leak,
+        SEMVER_HAZARD_RULE,
+        Severity::Info,
+        "leaked_dependency_type",
+    )
 }
 
 /// Every `(site, LeakedType)` pair found among `candidate`'s resolved
@@ -751,34 +778,14 @@ fn leaked_types_for_candidate(
 /// `leak.defining_crate` internal, so crossing it is a real, user-asserted
 /// boundary violation, not merely an observation about signature shape.
 fn internal_leak_finding(candidate: &PubFnCandidate, site: &str, leak: &LeakedType) -> Finding {
-    Finding {
-        id: format!(
-            "{INTERNAL_LEAK_RULE}:{}:{}:{site}:{}",
-            candidate.file.display(),
-            candidate.item_path,
-            leak.type_name,
-        )
-        .into(),
-        rule: INTERNAL_LEAK_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
-            file: candidate.file.clone(),
-            line: OneBasedLine::new(candidate.ident_span.start().line)
-                .expect("proc-macro2 span lines are 1-based"),
-            item_path: candidate.item_path.clone(),
-        },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(json!({
-            "kind": "internal_leak",
-            "type_name": leak.type_name,
-            "defining_crate": leak.defining_crate,
-            "site": site,
-        })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    leak_type_finding(
+        candidate,
+        site,
+        leak,
+        INTERNAL_LEAK_RULE,
+        Severity::Warn,
+        "internal_leak",
+    )
 }
 
 /// Runs the `leaked_dependency_type` `semver-hazard` sub-case over every

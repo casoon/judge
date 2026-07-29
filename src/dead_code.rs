@@ -194,14 +194,40 @@ impl std::fmt::Display for DeadCodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Deep(err) => write!(f, "{err}"),
-            Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
-            Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
+            Self::Io(path, err) => fmt_io_error(f, path, err),
+            Self::Parse(path, err) => fmt_parse_error(f, path, err),
             Self::Metadata(err) => write!(f, "failed to read cargo metadata: {err}"),
         }
     }
 }
 
 impl std::error::Error for DeadCodeError {}
+
+/// Renders a failed-file-read error the same way every Deep-Tier error enum
+/// in this crate does — [`DeadCodeError::Io`],
+/// [`crate::reachability::ReachabilityError::Io`], and
+/// [`crate::boundaries_deep::BoundaryDeepError::Io`] all wrap the same
+/// `(path, std::io::Error)` pair and render it identically; only their other,
+/// rule-specific variants differ.
+pub(crate) fn fmt_io_error(
+    f: &mut std::fmt::Formatter<'_>,
+    path: &Path,
+    err: &std::io::Error,
+) -> std::fmt::Result {
+    write!(f, "{}: failed to read file: {err}", path.display())
+}
+
+/// Renders a failed-parse error — see [`fmt_io_error`]'s doc comment; the
+/// same sharing rationale applies to [`DeadCodeError::Parse`],
+/// [`crate::reachability::ReachabilityError::Parse`], and
+/// [`crate::boundaries_deep::BoundaryDeepError::Parse`].
+pub(crate) fn fmt_parse_error(
+    f: &mut std::fmt::Formatter<'_>,
+    path: &Path,
+    err: &syn::Error,
+) -> std::fmt::Result {
+    write!(f, "{}: failed to parse: {err}", path.display())
+}
 
 #[derive(Debug, Default)]
 pub struct WorkspaceDeadCode {
@@ -451,6 +477,18 @@ fn file_constructs_variant(ast: &syn::File, variant_name: &str) -> bool {
             .is_some_and(|segment| segment.ident == name)
     }
 
+    impl<'a> ConstructionVisitor<'a> {
+        /// Marks `found` if `path` is a construction-position occurrence of
+        /// `variant_name` (see this function's doc comment) — shared by
+        /// `visit_expr_path` and `visit_expr_struct`, the two node kinds a
+        /// construction can appear as.
+        fn mark_if_constructs_variant(&mut self, path: &syn::Path) {
+            if !self.in_pattern && path_ends_with(path, self.variant_name) {
+                self.found = true;
+            }
+        }
+    }
+
     impl<'a, 'ast> Visit<'ast> for ConstructionVisitor<'a> {
         fn visit_pat(&mut self, node: &'ast syn::Pat) {
             let previously_in_pattern = self.in_pattern;
@@ -467,16 +505,12 @@ fn file_constructs_variant(ast: &syn::File, variant_name: &str) -> bool {
         }
 
         fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
-            if !self.in_pattern && path_ends_with(&node.path, self.variant_name) {
-                self.found = true;
-            }
+            self.mark_if_constructs_variant(&node.path);
             visit::visit_expr_path(self, node);
         }
 
         fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-            if !self.in_pattern && path_ends_with(&node.path, self.variant_name) {
-                self.found = true;
-            }
+            self.mark_if_constructs_variant(&node.path);
             visit::visit_expr_struct(self, node);
         }
     }
@@ -625,6 +659,125 @@ fn top_level_module_bucket(
     Some(format!("{krate_name}::{top_level_segment}"))
 }
 
+/// Byte offset and 1-based line number of `span`'s start — the shared
+/// "convert an ident's proc-macro2 span into a queryable position" step
+/// every per-item walk closure in this crate repeats before building a
+/// [`ra_ap_ide::FilePosition`]. `pub(crate)` so [`crate::boundaries_deep`]
+/// can reuse it for its own, unrelated `walk_functions` callback instead of
+/// re-deriving the same two-field extraction.
+pub(crate) fn offset_and_line(span: Span) -> (u32, usize) {
+    (span.byte_range().start as u32, span.start().line)
+}
+
+/// Reads and parses `path` with `syn`, mapping a failure to the matching
+/// [`DeadCodeError`] variant — the shared "read this file, translate a
+/// missing/malformed one into a reportable error" step behind
+/// [`analyze_workspace`]'s own per-file walk, [`check_enum_variant`]'s
+/// re-parse of a referencing file, and (via [`for_each_parsed_file`])
+/// [`crate::dead_trait_impl`]'s and [`crate::feature_matrix`]'s own
+/// candidate-collection passes.
+pub(crate) fn read_and_parse_file(path: &Path) -> Result<syn::File, DeadCodeError> {
+    let source =
+        std::fs::read_to_string(path).map_err(|err| DeadCodeError::Io(path.to_path_buf(), err))?;
+    syn::parse_file(&source).map_err(|err| DeadCodeError::Parse(path.to_path_buf(), err))
+}
+
+/// Walks every locally-reportable source file across `workspace`'s crates,
+/// reading and parsing each with [`read_and_parse_file`] and calling
+/// `on_file` with the result. A per-file read/parse failure is pushed onto
+/// `errors` and that file is skipped — a non-fatal, reported error, not a
+/// hard stop for the whole run. Shared by
+/// [`crate::dead_trait_impl::collect_candidates`] and
+/// [`crate::feature_matrix::collect_candidates`], which otherwise repeated
+/// this exact walk verbatim.
+pub(crate) fn for_each_parsed_file(
+    workspace: &Workspace,
+    errors: &mut Vec<DeadCodeError>,
+    mut on_file: impl FnMut(&SourceFile, &syn::File),
+) {
+    for krate in &workspace.crates {
+        for file in &krate.source_files {
+            if !file.kind.is_locally_reportable() {
+                continue;
+            }
+            match read_and_parse_file(&file.path) {
+                Ok(ast) => on_file(file, &ast),
+                Err(err) => errors.push(err),
+            }
+        }
+    }
+}
+
+/// Increments `report.checked` and builds the [`ra_ap_ide::FilePosition`] for
+/// `file_id`/`offset` — the shared prologue [`check_item`],
+/// [`check_enum_variant`], [`check_test_only_pub`], and
+/// [`check_unreachable_from_entry`] each start with.
+fn checked_position(
+    report: &mut WorkspaceDeadCode,
+    file_id: FileId,
+    offset: u32,
+) -> ra_ap_ide::FilePosition {
+    report.checked += 1;
+    ra_ap_ide::FilePosition {
+        file_id,
+        offset: offset.into(),
+    }
+}
+
+/// Calls [`crate::deep::referencing_files`], recording a non-fatal
+/// [`DeadCodeError::Deep`] and returning `None` on failure — the shared
+/// "resolve referencing files, or give up on this item" step behind
+/// [`check_item`], [`check_enum_variant`], and [`check_test_only_pub`].
+fn referencing_files_or_bail(
+    analysis: &ra_ap_ide::Analysis,
+    position: ra_ap_ide::FilePosition,
+    include_tests: bool,
+    report: &mut WorkspaceDeadCode,
+) -> Option<HashSet<FileId>> {
+    match crate::deep::referencing_files(analysis, position, include_tests) {
+        Ok(referencing) => Some(referencing),
+        Err(err) => {
+            report.errors.push(DeadCodeError::Deep(err));
+            None
+        }
+    }
+}
+
+/// Builds the shared [`Finding`] shape every per-item dead-code check in this
+/// module produces: the same `id` format (`rule:file:qualified_name`), the
+/// same [`Location`], [`Origin::Code`], and empty `caused_by`/`causes` — only
+/// `rule_id`, `severity`, `evidence_class`, `evidence`, and `limitations`
+/// vary per rule/call site. Shared by [`check_item`], [`check_enum_variant`],
+/// [`check_test_only_pub`], and [`check_unreachable_from_entry`].
+#[allow(clippy::too_many_arguments)]
+fn dead_code_finding(
+    rule_id: &str,
+    severity: Severity,
+    evidence_class: EvidenceClass,
+    file: &SourceFile,
+    line: usize,
+    qualified_name: &str,
+    evidence: serde_json::Value,
+    limitations: Option<Vec<String>>,
+) -> Finding {
+    Finding {
+        id: format!("{rule_id}:{}:{qualified_name}", file.path.display()).into(),
+        rule: rule_id.into(),
+        severity,
+        location: Location {
+            file: file.path.clone(),
+            line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
+            item_path: qualified_name.to_string(),
+        },
+        evidence_class,
+        origin: Origin::Code,
+        evidence: Some(evidence),
+        limitations,
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
 /// Checks one `pub` item for cross-crate usage and records a finding if
 /// neither that nor entry-point reachability found it live — the shared
 /// logic both [`walk_functions`]'s and [`walk_type_items`]'s callbacks
@@ -666,18 +819,11 @@ fn check_item(
     module_edge_counts: &mut HashMap<(String, String), u32>,
     report: &mut WorkspaceDeadCode,
 ) {
-    report.checked += 1;
-    let position = ra_ap_ide::FilePosition {
-        file_id,
-        offset: offset.into(),
-    };
+    let position = checked_position(report, file_id, offset);
 
-    let referencing = match crate::deep::referencing_files(analysis, position, include_tests) {
-        Ok(referencing) => referencing,
-        Err(err) => {
-            report.errors.push(DeadCodeError::Deep(err));
-            return;
-        }
+    let Some(referencing) = referencing_files_or_bail(analysis, position, include_tests, report)
+    else {
+        return;
     };
     // `crate-coupling`'s edge accumulation (see [`CRATE_COUPLING_RULE`]):
     // done here, over the *full* `referencing` set and before the
@@ -737,22 +883,16 @@ fn check_item(
             let limitations = proc_macro_exposed
                 .contains(krate_name)
                 .then(|| vec!["proc_macro_expansion_disabled".to_string()]);
-            report.findings.push(Finding {
-                id: format!("{rule_id}:{}:{qualified_name}", file.path.display()).into(),
-                rule: rule_id.into(),
+            report.findings.push(dead_code_finding(
+                rule_id,
                 severity,
-                location: Location {
-                    file: file.path.clone(),
-                    line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
-                    item_path: qualified_name.to_string(),
-                },
                 evidence_class,
-                origin: Origin::Code,
-                evidence: Some(evidence),
+                file,
+                line,
+                qualified_name,
+                evidence,
                 limitations,
-                caused_by: Vec::new(),
-                causes: Vec::new(),
-            });
+            ));
         }
         Err(err) => report.errors.push(reachability_error(err)),
     }
@@ -821,18 +961,11 @@ fn check_enum_variant(
     include_tests: bool,
     report: &mut WorkspaceDeadCode,
 ) {
-    report.checked += 1;
-    let position = ra_ap_ide::FilePosition {
-        file_id,
-        offset: offset.into(),
-    };
+    let position = checked_position(report, file_id, offset);
 
-    let referencing = match crate::deep::referencing_files(analysis, position, include_tests) {
-        Ok(referencing) => referencing,
-        Err(err) => {
-            report.errors.push(DeadCodeError::Deep(err));
-            return;
-        }
+    let Some(referencing) = referencing_files_or_bail(analysis, position, include_tests, report)
+    else {
+        return;
     };
 
     let mut construction_found = false;
@@ -840,17 +973,10 @@ fn check_enum_variant(
         let Some(path) = file_path_by_id.get(referencing_file_id) else {
             continue;
         };
-        let source = match std::fs::read_to_string(path) {
-            Ok(source) => source,
-            Err(err) => {
-                report.errors.push(DeadCodeError::Io(path.clone(), err));
-                continue;
-            }
-        };
-        let ast = match syn::parse_file(&source) {
+        let ast = match read_and_parse_file(path) {
             Ok(ast) => ast,
             Err(err) => {
-                report.errors.push(DeadCodeError::Parse(path.clone(), err));
+                report.errors.push(err);
                 continue;
             }
         };
@@ -869,26 +995,38 @@ fn check_enum_variant(
         "referencing_files": referencing.len(),
         "reason": "no construction site found in the examined workspace view",
     });
-    report.findings.push(Finding {
-        id: format!(
-            "{DEAD_ENUM_VARIANT_RULE}:{}:{qualified_name}",
-            file.path.display()
-        )
-        .into(),
-        rule: DEAD_ENUM_VARIANT_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
-            file: file.path.clone(),
-            line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
-            item_path: qualified_name.to_string(),
-        },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(evidence),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    });
+    report.findings.push(dead_code_finding(
+        DEAD_ENUM_VARIANT_RULE,
+        Severity::Warn,
+        EvidenceClass::BoundedSemantic,
+        file,
+        line,
+        qualified_name,
+        evidence,
+        None,
+    ));
+}
+
+/// Calls [`crate::reachability::is_reachable_from_entry`], recording a
+/// non-fatal [`reachability_error`] and returning `None` on failure — the
+/// shared "check reachability, or give up on this item" step behind
+/// [`check_test_only_pub`]'s two reachability queries (production, then
+/// all), which otherwise repeated this exact match verbatim.
+fn reachable_or_bail(
+    analysis: &ra_ap_ide::Analysis,
+    entry_keys: &std::collections::HashSet<(FileId, u32)>,
+    position: ra_ap_ide::FilePosition,
+    include_tests: bool,
+    report: &mut WorkspaceDeadCode,
+) -> Option<bool> {
+    match crate::reachability::is_reachable_from_entry(analysis, entry_keys, position, include_tests)
+    {
+        Ok(reachable) => Some(reachable),
+        Err(err) => {
+            report.errors.push(reachability_error(err));
+            None
+        }
+    }
 }
 
 /// Checks one `pub` item for `test-only-pub`: reachable only through
@@ -920,22 +1058,14 @@ fn check_test_only_pub(
     line: usize,
     report: &mut WorkspaceDeadCode,
 ) {
-    report.checked += 1;
-    let position = ra_ap_ide::FilePosition {
-        file_id,
-        offset: offset.into(),
-    };
+    let position = checked_position(report, file_id, offset);
 
     // The cross-crate check uses the "all" search — a reference from another
     // workspace crate's test code is still evidence this item has a life
     // outside its own crate, the same disqualifying condition `check_item`
     // applies.
-    let referencing = match crate::deep::referencing_files(analysis, position, true) {
-        Ok(referencing) => referencing,
-        Err(err) => {
-            report.errors.push(DeadCodeError::Deep(err));
-            return;
-        }
+    let Some(referencing) = referencing_files_or_bail(analysis, position, true, report) else {
+        return;
     };
     let used_externally = referencing.iter().any(|referencing_file| {
         crate_of_file
@@ -946,34 +1076,19 @@ fn check_test_only_pub(
         return;
     }
 
-    let production_reachable = match crate::reachability::is_reachable_from_entry(
-        analysis,
-        entry_keys_production,
-        position,
-        false,
-    ) {
-        Ok(reachable) => reachable,
-        Err(err) => {
-            report.errors.push(reachability_error(err));
-            return;
-        }
+    let Some(production_reachable) =
+        reachable_or_bail(analysis, entry_keys_production, position, false, report)
+    else {
+        return;
     };
     if production_reachable {
         // Reachable in production already — not test-only.
         return;
     }
 
-    let all_reachable = match crate::reachability::is_reachable_from_entry(
-        analysis,
-        entry_keys_all,
-        position,
-        true,
-    ) {
-        Ok(reachable) => reachable,
-        Err(err) => {
-            report.errors.push(reachability_error(err));
-            return;
-        }
+    let Some(all_reachable) = reachable_or_bail(analysis, entry_keys_all, position, true, report)
+    else {
+        return;
     };
     if !all_reachable {
         // Unreachable even with tests counted — `unused-pub-workspace`'s/
@@ -992,26 +1107,16 @@ fn check_test_only_pub(
         "reason": "reachable only through #[cfg(test)]/test-target code in the examined \
             workspace view",
     });
-    report.findings.push(Finding {
-        id: format!(
-            "{TEST_ONLY_PUB_RULE}:{}:{qualified_name}",
-            file.path.display()
-        )
-        .into(),
-        rule: TEST_ONLY_PUB_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
-            file: file.path.clone(),
-            line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
-            item_path: qualified_name.to_string(),
-        },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(evidence),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    });
+    report.findings.push(dead_code_finding(
+        TEST_ONLY_PUB_RULE,
+        Severity::Warn,
+        EvidenceClass::BoundedSemantic,
+        file,
+        line,
+        qualified_name,
+        evidence,
+        None,
+    ));
 }
 
 /// `check_unreachable_from_entry`'s `reason` text (see
@@ -1042,11 +1147,7 @@ fn check_unreachable_from_entry(
     include_tests: bool,
     report: &mut WorkspaceDeadCode,
 ) {
-    report.checked += 1;
-    let position = ra_ap_ide::FilePosition {
-        file_id,
-        offset: offset.into(),
-    };
+    let position = checked_position(report, file_id, offset);
 
     match crate::reachability::is_reachable_from_entry(
         analysis,
@@ -1064,26 +1165,16 @@ fn check_unreachable_from_entry(
             let limitations = proc_macro_exposed
                 .contains(krate_name)
                 .then(|| vec!["proc_macro_expansion_disabled".to_string()]);
-            report.findings.push(Finding {
-                id: format!(
-                    "{UNREACHABLE_FROM_ENTRY_RULE}:{}:{qualified_name}",
-                    file.path.display()
-                )
-                .into(),
-                rule: UNREACHABLE_FROM_ENTRY_RULE.into(),
-                severity: Severity::Warn,
-                location: Location {
-                    file: file.path.clone(),
-                    line: OneBasedLine::new(line).expect("source line numbers are 1-based"),
-                    item_path: qualified_name.to_string(),
-                },
-                evidence_class: EvidenceClass::BoundedSemantic,
-                origin: Origin::Code,
-                evidence: Some(evidence),
+            report.findings.push(dead_code_finding(
+                UNREACHABLE_FROM_ENTRY_RULE,
+                Severity::Warn,
+                EvidenceClass::BoundedSemantic,
+                file,
+                line,
+                qualified_name,
+                evidence,
                 limitations,
-                caused_by: Vec::new(),
-                causes: Vec::new(),
-            });
+            ));
         }
         Err(err) => report.errors.push(reachability_error(err)),
     }
@@ -1130,16 +1221,10 @@ pub fn analyze_workspace(
 
     let entries_production = crate::reachability::entry_point_positions(workspace, &ctx, false)
         .map_err(reachability_error)?;
-    let entry_keys_production: std::collections::HashSet<(FileId, u32)> = entries_production
-        .iter()
-        .map(|(_, position)| crate::reachability::position_key(*position))
-        .collect();
+    let entry_keys_production = crate::reachability::entry_keys_from(&entries_production);
     let entries_all = crate::reachability::entry_point_positions(workspace, &ctx, true)
         .map_err(reachability_error)?;
-    let entry_keys_all: std::collections::HashSet<(FileId, u32)> = entries_all
-        .iter()
-        .map(|(_, position)| crate::reachability::position_key(*position))
-        .collect();
+    let entry_keys_all = crate::reachability::entry_keys_from(&entries_all);
     let entry_keys = if include_tests {
         &entry_keys_all
     } else {
@@ -1208,28 +1293,16 @@ pub fn analyze_workspace(
                 continue;
             };
 
-            let source = match std::fs::read_to_string(&file.path) {
-                Ok(source) => source,
-                Err(err) => {
-                    report
-                        .errors
-                        .push(DeadCodeError::Io(file.path.clone(), err));
-                    continue;
-                }
-            };
-            let ast = match syn::parse_file(&source) {
+            let ast = match read_and_parse_file(&file.path) {
                 Ok(ast) => ast,
                 Err(err) => {
-                    report
-                        .errors
-                        .push(DeadCodeError::Parse(file.path.clone(), err));
+                    report.errors.push(err);
                     continue;
                 }
             };
 
             walk_functions(&ast, |site| {
-                let offset = site.ident_span.byte_range().start as u32;
-                let line = site.ident_span.start().line;
+                let (offset, line) = offset_and_line(site.ident_span);
                 if let Some(syn::Visibility::Public(_)) = site.vis {
                     check_item(
                         &analysis,
@@ -1291,8 +1364,7 @@ pub fn analyze_workspace(
             });
 
             walk_type_items(&ast, |site| {
-                let offset = site.ident_span.byte_range().start as u32;
-                let line = site.ident_span.start().line;
+                let (offset, line) = offset_and_line(site.ident_span);
                 if matches!(site.vis, syn::Visibility::Public(_)) {
                     check_item(
                         &analysis,

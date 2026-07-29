@@ -19,7 +19,7 @@
 //! calls dead is never reported "live" here just because it's `pub`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ra_ap_hir::{InFile, Semantics};
 use ra_ap_ide::{
@@ -52,8 +52,8 @@ impl std::fmt::Display for ReachabilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Deep(err) => write!(f, "{err}"),
-            Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
-            Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
+            Self::Io(path, err) => crate::dead_code::fmt_io_error(f, path, err),
+            Self::Parse(path, err) => crate::dead_code::fmt_parse_error(f, path, err),
             Self::UnknownItem(item_path) => {
                 write!(f, "no function named `{item_path}` found in the workspace")
             }
@@ -247,6 +247,30 @@ pub(crate) fn has_attr_ending_in(attrs: &[syn::Attribute], ident: &str) -> bool 
     attrs.iter().any(|attr| meta_ends_in(&attr.meta, ident))
 }
 
+/// Resolves, reads, and parses each of `krate`'s source files, then walks its
+/// functions via [`walk_functions`] — the identical per-file loop shared by
+/// [`entry_point_positions`] and [`find_item_position`]: resolve a file's
+/// [`FileId`] (skipping files the loader didn't index), read and parse it
+/// with `syn`, and call `on_site` for every function-like item found.
+fn walk_crate_functions(
+    krate: &crate::ingest::CrateInfo,
+    ctx: &DeepContext,
+    mut on_site: impl FnMut(FileId, &Path, crate::functions::FunctionSite<'_>),
+) -> Result<(), ReachabilityError> {
+    for file in &krate.source_files {
+        let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? else {
+            continue;
+        };
+        let source = std::fs::read_to_string(&file.path)
+            .map_err(|err| ReachabilityError::Io(file.path.clone(), err))?;
+        let ast = syn::parse_file(&source)
+            .map_err(|err| ReachabilityError::Parse(file.path.clone(), err))?;
+
+        walk_functions(&ast, |site| on_site(file_id, &file.path, site));
+    }
+    Ok(())
+}
+
 /// Finds every recognized entry point (see module docs): `fn main` in a
 /// `[[bin]]`/`[[example]]` target, `#[test]`/`#[bench]`-like functions when
 /// `include_tests` is set, and `#[no_mangle]`/`#[export_name]`/
@@ -274,42 +298,45 @@ pub(crate) fn entry_point_positions(
             }
         }
 
-        for file in &krate.source_files {
-            let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? else {
-                continue;
+        walk_crate_functions(krate, ctx, |file_id, _path, site| {
+            let offset = site.ident_span.byte_range().start as u32;
+            let position = FilePosition {
+                file_id,
+                offset: offset.into(),
             };
-            let source = std::fs::read_to_string(&file.path)
-                .map_err(|err| ReachabilityError::Io(file.path.clone(), err))?;
-            let ast = syn::parse_file(&source)
-                .map_err(|err| ReachabilityError::Parse(file.path.clone(), err))?;
 
-            walk_functions(&ast, |site| {
-                let offset = site.ident_span.byte_range().start as u32;
-                let position = FilePosition {
-                    file_id,
-                    offset: offset.into(),
-                };
+            if let Some(entry_name) = bin_or_example_name.get(&file_id)
+                && site.qualified_name == "main"
+            {
+                entries.push((format!("{entry_name}::main"), position));
+                return;
+            }
 
-                if let Some(entry_name) = bin_or_example_name.get(&file_id)
-                    && site.qualified_name == "main"
-                {
-                    entries.push((format!("{entry_name}::main"), position));
-                    return;
-                }
-
-                let recognized = (include_tests
-                    && (has_attr_ending_in(site.attrs, "test")
-                        || has_attr_ending_in(site.attrs, "bench")))
-                    || has_attr_ending_in(site.attrs, "no_mangle")
-                    || has_attr_ending_in(site.attrs, "export_name")
-                    || has_attr_ending_in(site.attrs, "wasm_bindgen");
-                if recognized {
-                    entries.push((format!("{}::{}", krate.name, site.qualified_name), position));
-                }
-            });
-        }
+            let recognized = (include_tests
+                && (has_attr_ending_in(site.attrs, "test")
+                    || has_attr_ending_in(site.attrs, "bench")))
+                || has_attr_ending_in(site.attrs, "no_mangle")
+                || has_attr_ending_in(site.attrs, "export_name")
+                || has_attr_ending_in(site.attrs, "wasm_bindgen");
+            if recognized {
+                entries.push((format!("{}::{}", krate.name, site.qualified_name), position));
+            }
+        })?;
     }
     Ok(entries)
+}
+
+/// Converts [`entry_point_positions`]' output into position keys ([`position_key`]),
+/// deduplicated via `HashSet` — the shared "materialize the deterministic-
+/// comparison form of the entry-point set" step every [`is_reachable_from_entry`]
+/// caller repeats, computed once per analysis run (or per feature
+/// combination, for [`crate::feature_matrix`]) and reused across every
+/// queried item.
+pub(crate) fn entry_keys_from(entries: &[(String, FilePosition)]) -> HashSet<(FileId, u32)> {
+    entries
+        .iter()
+        .map(|(_, position)| position_key(*position))
+        .collect()
 }
 
 /// Resolves a qualified name (as produced by
@@ -340,29 +367,19 @@ fn find_item_position(
 
     let mut matches: Vec<(FilePosition, PathBuf, usize)> = Vec::new();
     for krate in crates {
-        for file in &krate.source_files {
-            let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? else {
-                continue;
-            };
-            let source = std::fs::read_to_string(&file.path)
-                .map_err(|err| ReachabilityError::Io(file.path.clone(), err))?;
-            let ast = syn::parse_file(&source)
-                .map_err(|err| ReachabilityError::Parse(file.path.clone(), err))?;
-
-            walk_functions(&ast, |site| {
-                if site.qualified_name == name {
-                    let offset = site.ident_span.byte_range().start as u32;
-                    matches.push((
-                        FilePosition {
-                            file_id,
-                            offset: offset.into(),
-                        },
-                        file.path.clone(),
-                        site.ident_span.start().line,
-                    ));
-                }
-            });
-        }
+        walk_crate_functions(krate, ctx, |file_id, path, site| {
+            if site.qualified_name == name {
+                let offset = site.ident_span.byte_range().start as u32;
+                matches.push((
+                    FilePosition {
+                        file_id,
+                        offset: offset.into(),
+                    },
+                    path.to_path_buf(),
+                    site.ident_span.start().line,
+                ));
+            }
+        })?;
     }
 
     matches.sort_by(|(_, path_a, line_a), (_, path_b, line_b)| {
@@ -504,10 +521,7 @@ pub fn why_live(
     }
 
     let entries = entry_point_positions(workspace, &ctx, include_tests)?;
-    let entry_keys: HashSet<(FileId, u32)> = entries
-        .iter()
-        .map(|(_, position)| position_key(*position))
-        .collect();
+    let entry_keys = entry_keys_from(&entries);
 
     let target = find_item_position(workspace, &ctx, item_path)?;
     let (target_file, target_line) = describe_position(workspace, &ctx, target);

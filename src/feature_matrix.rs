@@ -40,13 +40,12 @@
 //! rule checks reachability only, a different axis visibility does not
 //! affect.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 
 use ra_ap_ide::FilePosition;
 
 use crate::dead_code::{DeadCodeError, reachability_error, walk_type_items};
-use crate::deep::{CargoFeatures, DeepContext, DeepError, FileId};
+use crate::deep::{CargoFeatures, DeepContext, DeepError};
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::walk_functions;
 use crate::ingest::Workspace;
@@ -87,53 +86,33 @@ struct Candidate {
 
 /// Collects every candidate item once, via the same [`walk_functions`]/
 /// [`walk_type_items`] walkers `crate::dead_code::analyze_workspace` uses,
-/// scoped to both `pub` and non-`pub` items alike (see module docs). A
-/// per-file read/parse failure is a non-fatal, reported error — matching
-/// `crate::dead_code::analyze_workspace`'s own "skip this file, keep going"
-/// handling — not a hard stop for the whole run.
+/// scoped to both `pub` and non-`pub` items alike (see module docs), reading
+/// and parsing each file via [`crate::dead_code::for_each_parsed_file`] — the
+/// same shared walk [`crate::dead_trait_impl::collect_candidates`] uses for
+/// its own candidate collection. A per-file read/parse failure is a
+/// non-fatal, reported error, not a hard stop for the whole run.
 fn collect_candidates(workspace: &Workspace) -> (Vec<Candidate>, Vec<DeadCodeError>) {
     let mut candidates = Vec::new();
     let mut errors = Vec::new();
 
-    for krate in &workspace.crates {
-        for file in &krate.source_files {
-            if !file.kind.is_locally_reportable() {
-                continue;
-            }
-
-            let source = match std::fs::read_to_string(&file.path) {
-                Ok(source) => source,
-                Err(err) => {
-                    errors.push(DeadCodeError::Io(file.path.clone(), err));
-                    continue;
-                }
-            };
-            let ast = match syn::parse_file(&source) {
-                Ok(ast) => ast,
-                Err(err) => {
-                    errors.push(DeadCodeError::Parse(file.path.clone(), err));
-                    continue;
-                }
-            };
-
-            walk_functions(&ast, |site| {
-                candidates.push(Candidate {
-                    file_path: file.path.clone(),
-                    qualified_name: site.qualified_name,
-                    offset: site.ident_span.byte_range().start as u32,
-                    line: site.ident_span.start().line,
-                });
+    crate::dead_code::for_each_parsed_file(workspace, &mut errors, |file, ast| {
+        walk_functions(ast, |site| {
+            candidates.push(Candidate {
+                file_path: file.path.clone(),
+                qualified_name: site.qualified_name,
+                offset: site.ident_span.byte_range().start as u32,
+                line: site.ident_span.start().line,
             });
-            walk_type_items(&ast, |site| {
-                candidates.push(Candidate {
-                    file_path: file.path.clone(),
-                    qualified_name: site.qualified_name,
-                    offset: site.ident_span.byte_range().start as u32,
-                    line: site.ident_span.start().line,
-                });
+        });
+        walk_type_items(ast, |site| {
+            candidates.push(Candidate {
+                file_path: file.path.clone(),
+                qualified_name: site.qualified_name,
+                offset: site.ident_span.byte_range().start as u32,
+                line: site.ident_span.start().line,
             });
-        }
-    }
+        });
+    });
 
     (candidates, errors)
 }
@@ -218,10 +197,7 @@ pub fn analyze_workspace(
                 continue;
             }
         };
-        let entry_keys: HashSet<(FileId, u32)> = entries
-            .iter()
-            .map(|(_, position)| reachability::position_key(*position))
-            .collect();
+        let entry_keys = reachability::entry_keys_from(&entries);
 
         for (index, candidate) in candidates.iter().enumerate() {
             report.checked += 1;

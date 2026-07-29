@@ -59,8 +59,8 @@ impl std::fmt::Display for BoundaryDeepError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Deep(err) => write!(f, "{err}"),
-            Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
-            Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
+            Self::Io(path, err) => crate::dead_code::fmt_io_error(f, path, err),
+            Self::Parse(path, err) => crate::dead_code::fmt_parse_error(f, path, err),
         }
     }
 }
@@ -153,8 +153,7 @@ pub fn analyze_workspace(
                 if deep_error.is_some() {
                     return;
                 }
-                let offset = site.ident_span.byte_range().start as u32;
-                let line = site.ident_span.start().line;
+                let (offset, line) = crate::dead_code::offset_and_line(site.ident_span);
                 let position = ra_ap_ide::FilePosition {
                     file_id,
                     offset: offset.into(),
