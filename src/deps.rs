@@ -121,6 +121,7 @@ use syn::visit::{self, Visit};
 use syn::{ItemUse, UseTree};
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
+use crate::functions::read_and_parse_source;
 use crate::ingest::{CrateInfo, DependencyKind, Workspace};
 
 /// Rule id used for misplaced-dependency-kind findings (see todo.md §3.B).
@@ -482,26 +483,23 @@ fn unused_dev_dependency_finding(
     krate: &CrateInfo,
     dep: &crate::ingest::DeclaredDependency,
 ) -> Finding {
-    Finding {
-        id: format!("{UNUSED_DEV_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: UNUSED_DEV_DEPENDENCY_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{UNUSED_DEV_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name),
+        UNUSED_DEV_DEPENDENCY_RULE,
+        Severity::Warn,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::BoundedSemantic,
+        Origin::Code,
+        Some(serde_json::json!({
             "searched": ["tests/", "examples/", "benches/", "#[cfg(test)] modules in src/"],
             "reason": "no use found in the examined view (tests/examples/benches of this \
                 package, and #[cfg(test)] modules in its src files; doctests are not scanned)",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Renders one `unused-feature-flag` finding per feature name declared by
@@ -556,25 +554,22 @@ fn default_features_unused_finding(
     krate: &CrateInfo,
     dep: &crate::ingest::DeclaredDependency,
 ) -> Finding {
-    Finding {
-        id: format!("{DEFAULT_FEATURES_UNUSED_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: DEFAULT_FEATURES_UNUSED_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{DEFAULT_FEATURES_UNUSED_RULE}:{}:{}", krate.name, dep.name),
+        DEFAULT_FEATURES_UNUSED_RULE,
+        Severity::Warn,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::DerivedFact,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::DerivedFact,
+        Origin::Code,
+        Some(serde_json::json!({
             "reason": "no other usage of this dependency was found in the examined view, and \
                 the manifest explicitly sets default-features = true",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// This crate's own declared `[features]` names (see module docs
@@ -622,26 +617,23 @@ fn feature_is_referenced(krate: &CrateInfo, feature_name: &str) -> bool {
 /// implication list, and the absence of a textual reference in the examined
 /// source are all read directly from the declared inputs, not interpreted.
 fn unused_feature_finding(krate: &CrateInfo, feature_name: &str) -> Finding {
-    Finding {
-        id: format!("{UNUSED_FEATURE_RULE}:{}:{feature_name}", krate.name).into(),
-        rule: UNUSED_FEATURE_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{UNUSED_FEATURE_RULE}:{}:{feature_name}", krate.name),
+        UNUSED_FEATURE_RULE,
+        Severity::Warn,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: feature_name.to_string(),
         },
-        evidence_class: EvidenceClass::DerivedFact,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::DerivedFact,
+        Origin::Code,
+        Some(serde_json::json!({
             "feature": feature_name,
             "reason": "no `cfg(feature = \"...\")`/`cfg!(feature = \"...\")` reference to this \
                 declared feature was found anywhere in the crate's own authored source",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Whether a dependency counts as heavy: more than
@@ -725,26 +717,23 @@ fn heavy_dependency_finding(
     examples.sort();
     examples.truncate(5);
 
-    Finding {
-        id: format!("{HEAVY_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: HEAVY_DEPENDENCY_RULE.into(),
-        severity: Severity::Info,
-        location: Location {
+    Finding::new(
+        format!("{HEAVY_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name),
+        HEAVY_DEPENDENCY_RULE,
+        Severity::Info,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(serde_json::json!({
             "transitive_deps": transitive_deps,
             "used_items": used_items.len(),
             "examples": examples,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Renders a `dep-without-repo` finding (todo.md §F). `Severity::Info`,
@@ -752,24 +741,21 @@ fn heavy_dependency_finding(
 /// `repository` field is not inherently a defect — private/internal crates
 /// legitimately omit it. Same `location` convention as [`misplaced_finding`].
 fn dep_without_repo_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency) -> Finding {
-    Finding {
-        id: format!("{DEP_WITHOUT_REPO_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: DEP_WITHOUT_REPO_RULE.into(),
-        severity: Severity::Info,
-        location: Location {
+    Finding::new(
+        format!("{DEP_WITHOUT_REPO_RULE}:{}:{}", krate.name, dep.name),
+        DEP_WITHOUT_REPO_RULE,
+        Severity::Info,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::DerivedFact,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::DerivedFact,
+        Origin::Code,
+        Some(serde_json::json!({
             "reason": "no `repository` field found in this dependency's own manifest",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Package metadata read from a single full (non `--no-deps`)
@@ -1074,28 +1060,25 @@ fn unused_dependency_finding(
     dep: &crate::ingest::DeclaredDependency,
     targets_checked: &[&String],
 ) -> Finding {
-    Finding {
-        id: format!("{UNUSED_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: UNUSED_DEPENDENCY_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{UNUSED_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name),
+        UNUSED_DEPENDENCY_RULE,
+        Severity::Warn,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::BoundedSemantic,
+        Origin::Code,
+        Some(serde_json::json!({
             "source": "rustc:unused_crate_dependencies",
             "targets_checked": targets_checked,
             "package": krate.name,
             "reason": "no use found by rustc's unused_crate_dependencies lint \
                 across all targets of this package",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Distinct next-level path segments referenced under `target` (a
@@ -1236,9 +1219,11 @@ fn collect_crate_usage(
 /// to identifiers referenced only inside `#[cfg(test)]`-attributed modules
 /// (see [`CfgTestIdentCollector`]).
 fn collect_identifiers(path: &Path) -> Result<(HashSet<String>, HashSet<String>), DepsError> {
-    let source =
-        std::fs::read_to_string(path).map_err(|err| DepsError::Io(path.to_path_buf(), err))?;
-    let ast = syn::parse_file(&source).map_err(|err| DepsError::Parse(path.to_path_buf(), err))?;
+    let (_, ast) = read_and_parse_source(
+        path,
+        |err| DepsError::Io(path.to_path_buf(), err),
+        |err| DepsError::Parse(path.to_path_buf(), err),
+    )?;
 
     let mut collector = PathIdentCollector::default();
     collector.visit_file(&ast);

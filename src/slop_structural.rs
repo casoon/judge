@@ -37,7 +37,7 @@ use syn::{
 
 use crate::complexity::FunctionInfo;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::walk_functions;
+use crate::functions::{type_name, walk_functions};
 use crate::ingest::{SourceFile, SourceKind};
 
 /// Rule id for a file reworked often within a short window (see todo.md
@@ -271,21 +271,6 @@ struct FileCollector<'ast> {
     trait_impls: Vec<(String, String, usize)>,
     /// Inherent (non-trait) impl methods, keyed by the `Self` type name.
     inherent_methods: HashMap<String, Vec<&'ast ImplItemFn>>,
-}
-
-/// The last path segment's name, or `"?"` for a type this doesn't
-/// recognize (mirrors `crate::functions::type_name`, kept local so this
-/// module doesn't need to reach into the private helper of an unrelated
-/// detector — same rationale as `crate::slop`'s own copy).
-fn type_name(ty: &Type) -> String {
-    match ty {
-        Type::Path(type_path) => type_path
-            .path
-            .segments
-            .last()
-            .map_or_else(|| "?".to_string(), |segment| segment.ident.to_string()),
-        _ => "?".to_string(),
-    }
 }
 
 impl<'ast> Visit<'ast> for FileCollector<'ast> {
@@ -724,30 +709,26 @@ fn fragile_substring_classification_finding(
     line: usize,
     item_path: String,
 ) -> Finding {
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{FRAGILE_SUBSTRING_CLASSIFICATION_RULE}:{}:{line}:{item_path}",
             file.display()
-        )
-        .into(),
-        rule: FRAGILE_SUBSTRING_CLASSIFICATION_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
+        Severity::Warn,
+        Location {
             file: file.to_path_buf(),
             line: OneBasedLine::new(line).expect("proc-macro2 span lines are 1-based"),
             item_path,
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(json!({
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(json!({
             "reason": "this if/else chain classifies via `.contains()` on a short string \
                 literal with no word-boundary check found in the condition — this can \
                 misclassify if the string appears as a substring of something unrelated",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Flags an if/else-if chain that classifies via `.contains("literal")` with
@@ -922,6 +903,7 @@ mod tests {
             qualified_name: "f".to_string(),
             file: PathBuf::from("src/lib.rs"),
             line: 1,
+            is_test_context: false,
             cyclomatic,
             cognitive,
             lines_of_code,
@@ -947,6 +929,7 @@ mod tests {
             qualified_name: "f".to_string(),
             file: PathBuf::from("src/lib.rs"),
             line: 1,
+            is_test_context: false,
             cyclomatic,
             cognitive: 0,
             lines_of_code,

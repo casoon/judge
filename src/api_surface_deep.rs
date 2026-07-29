@@ -456,33 +456,29 @@ fn line_number(source_text: &str, offset: usize) -> usize {
 }
 
 fn re_export_chain_finding(file: &Path, line: OneBasedLine, chain: &ReExportChain) -> Finding {
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{RE_EXPORT_CHAIN_RULE}:{}:{}",
             file.display(),
             chain.exported_path
-        )
-        .into(),
-        rule: RE_EXPORT_CHAIN_RULE.into(),
-        severity: Severity::Info,
-        location: Location {
+        ),
+        RE_EXPORT_CHAIN_RULE,
+        Severity::Info,
+        Location {
             file: file.to_path_buf(),
             line,
             item_path: chain.exported_path.clone(),
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(json!({
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(json!({
             "kind": "re_export_chain",
             "exported_path": chain.exported_path,
             "defining_path": chain.defining_path,
             "hop_count": chain.hop_count,
             "capped": chain.hop_count == RE_EXPORT_CHAIN_MAX_HOPS,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Every `re-export-chain` finding across the whole workspace (see

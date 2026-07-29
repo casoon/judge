@@ -184,7 +184,7 @@ use syn::{
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::{type_name, walk_functions};
+use crate::functions::{read_and_parse_source, type_name, walk_functions};
 use crate::ingest::SourceFile;
 use crate::slop_text::{CommentSpan, extract_comments};
 
@@ -315,6 +315,7 @@ pub enum SecurityError {
 }
 
 impl std::fmt::Display for SecurityError {
+    // judge-dupe-ignore: explicit per-domain error rendering; variants and messages are intentionally distinct
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
@@ -348,10 +349,11 @@ pub struct WorkspaceSecurity {
 /// `unsafe-density`/`integer-cast-risk`/`panic-in-lib`/`hardcoded-secret`
 /// finding in it.
 pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
-    let source =
-        std::fs::read_to_string(path).map_err(|err| SecurityError::Io(path.to_path_buf(), err))?;
-    let ast =
-        syn::parse_file(&source).map_err(|err| SecurityError::Parse(path.to_path_buf(), err))?;
+    let (source, ast) = read_and_parse_source(
+        path,
+        |err| SecurityError::Io(path.to_path_buf(), err),
+        |err| SecurityError::Parse(path.to_path_buf(), err),
+    )?;
     let comments = extract_comments(&source);
 
     let mut findings = Vec::new();
@@ -506,30 +508,26 @@ fn classify_index_kind(index: &Expr) -> &'static str {
 /// from the parsed file, not interpreted.
 fn unsafe_surface_finding(file: &Path, span: proc_macro2::Span, item_path: &str) -> Finding {
     let start = span.start();
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{UNSAFE_SURFACE_RULE}:{}:{}:{}",
             file.display(),
             start.line,
             start.column
-        )
-        .into(),
-        rule: UNSAFE_SURFACE_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        UNSAFE_SURFACE_RULE,
+        Severity::Warn,
+        Location {
             file: file.to_path_buf(),
             line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
             item_path: item_path.to_string(),
         },
-        evidence_class: EvidenceClass::DerivedFact,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::DerivedFact,
+        Origin::Code,
+        Some(serde_json::json!({
             "reason": "no `SAFETY:` comment found adjacent to this unsafe block",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Builds an `integer-cast-risk` finding. Its evidence class is `heuristic`
@@ -545,33 +543,29 @@ fn integer_cast_risk_finding(
     target_type: &str,
 ) -> Finding {
     let start = span.start();
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{INTEGER_CAST_RISK_RULE}:{}:{}:{}",
             file.display(),
             start.line,
             start.column
-        )
-        .into(),
-        rule: INTEGER_CAST_RISK_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        INTEGER_CAST_RISK_RULE,
+        Severity::Warn,
+        Location {
             file: file.to_path_buf(),
             line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
             item_path: item_path.to_string(),
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(serde_json::json!({
             "target_type": target_type,
             "reason": "a possible truncation candidate based on the cast's target type; the \
                 source expression's real type is not resolved at the Fast Tier, so this is a \
                 syntax-only proxy, not a truncation proof",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Builds a `panic-in-lib` finding. Its evidence class is `derived_fact`
@@ -587,32 +581,28 @@ fn panic_in_lib_finding(
     kind: &str,
 ) -> Finding {
     let start = span.start();
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{PANIC_IN_LIB_RULE}:{}:{}:{}",
             file.display(),
             start.line,
             start.column
-        )
-        .into(),
-        rule: PANIC_IN_LIB_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        PANIC_IN_LIB_RULE,
+        Severity::Warn,
+        Location {
             file: file.to_path_buf(),
             line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
             item_path: item_path.to_string(),
         },
-        evidence_class: EvidenceClass::DerivedFact,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::DerivedFact,
+        Origin::Code,
+        Some(serde_json::json!({
             "kind": kind,
             "reason": "a panicking construct reachable from a `pub` path; not a claim that it \
                 will panic at runtime",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Visits a single function body for `unsafe { .. }` expression blocks (see

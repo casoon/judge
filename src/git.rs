@@ -1454,6 +1454,7 @@ mod tests {
             qualified_name: "f".to_string(),
             file,
             line: 1,
+            is_test_context: false,
             cyclomatic,
             cognitive: 0,
             lines_of_code: 1,

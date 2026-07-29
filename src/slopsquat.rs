@@ -183,25 +183,22 @@ fn name_collision_finding(
     nearest_popular_crate: &str,
     edit_distance: usize,
 ) -> Finding {
-    Finding {
-        id: format!("{NAME_COLLISION_RISK_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: NAME_COLLISION_RISK_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{NAME_COLLISION_RISK_RULE}:{}:{}", krate.name, dep.name),
+        NAME_COLLISION_RISK_RULE,
+        Severity::Warn,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(serde_json::json!({
             "nearest_popular_crate": nearest_popular_crate,
             "edit_distance": edit_distance,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -796,25 +793,22 @@ pub fn analyze_phantom_dependencies(
 }
 
 fn phantom_crate_finding(krate: &CrateInfo, dep: &DeclaredDependency) -> Finding {
-    Finding {
-        id: format!("{PHANTOM_CRATE_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: PHANTOM_CRATE_RULE.into(),
-        severity: Severity::Fail,
-        location: Location {
+    Finding::new(
+        format!("{PHANTOM_CRATE_RULE}:{}:{}", krate.name, dep.name),
+        PHANTOM_CRATE_RULE,
+        Severity::Fail,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::ExternalMeasurement,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::ExternalMeasurement,
+        Origin::Code,
+        Some(serde_json::json!({
             "lookup": "sparse-index",
             "result": "not_found",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// `None` if the declared requirement is satisfied by some published,
@@ -978,30 +972,26 @@ fn fresh_low_reputation_finding(
     dep: &DeclaredDependency,
     metadata: &CrateMetadata,
 ) -> Finding {
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{FRESH_LOW_REPUTATION_DEP_RULE}:{}:{}",
             krate.name, dep.name
-        )
-        .into(),
-        rule: FRESH_LOW_REPUTATION_DEP_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        FRESH_LOW_REPUTATION_DEP_RULE,
+        Severity::Warn,
+        Location {
             file: krate.manifest_path.clone(),
             line: OneBasedLine::FIRST,
             item_path: dep.name.clone(),
         },
-        evidence_class: EvidenceClass::ExternalMeasurement,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::ExternalMeasurement,
+        Origin::Code,
+        Some(serde_json::json!({
             "created_at": metadata.created_at,
             "downloads": metadata.downloads,
             "repository": metadata.repository,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Parses an RFC 3339 timestamp's date/time portion (`YYYY-MM-DDTHH:MM:SS`,
@@ -1134,25 +1124,22 @@ fn yanked_dependency_finding(
     crate_name: &str,
     resolved_version: &str,
 ) -> Finding {
-    Finding {
-        id: format!("{YANKED_DEPENDENCY_RULE}:{crate_name}:{resolved_version}").into(),
-        rule: YANKED_DEPENDENCY_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{YANKED_DEPENDENCY_RULE}:{crate_name}:{resolved_version}"),
+        YANKED_DEPENDENCY_RULE,
+        Severity::Warn,
+        Location {
             file: manifest_path.to_path_buf(),
             line: OneBasedLine::FIRST,
             item_path: crate_name.to_string(),
         },
-        evidence_class: EvidenceClass::ExternalMeasurement,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::ExternalMeasurement,
+        Origin::Code,
+        Some(serde_json::json!({
             "lookup": "sparse-index",
             "resolved_version": resolved_version,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 // ---------------------------------------------------------------------

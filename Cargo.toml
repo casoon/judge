@@ -1,13 +1,17 @@
 [package]
 name = "cargo-judge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Codebase intelligence for Rust workspaces"
 license-file = "LICENSE"
+readme = "README.md"
 repository = "https://github.com/casoon/judge"
+homepage = "https://github.com/casoon/judge"
+documentation = "https://docs.rs/cargo-judge"
 keywords = ["cargo-plugin", "static-analysis", "code-quality", "complexity", "duplication"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+exclude = [".claude/**", ".judge/**", "judge-mcp/**", "todo.md"]
 publish = true
 
 [lib]

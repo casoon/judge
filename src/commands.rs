@@ -60,6 +60,10 @@ pub(super) enum Command {
     Init,
     /// Show detected entry points, tiers, and cache status.
     Inspect,
+    /// Show a compact, deterministic map of refactoring-relevant workspace facts.
+    Map(MapOptions),
+    /// Show the analysis and Cargo-target context of one workspace source file.
+    Impact(ImpactOptions),
     /// Imports an externally generated `cargo-llvm-cov` LCOV report and
     /// flags `untested-hotspot` functions: high complexity, high churn, and
     /// mostly uncovered lines (see todo.md §J). judge never measures
@@ -105,6 +109,37 @@ pub(super) enum Command {
 }
 
 impl Command {
+    /// Returns the selected JSON format and its stable default artifact name.
+    /// Commands that render a non-JSON projection regardless of `--format`
+    /// (currently `boundaries --graph`) deliberately have no JSON artifact.
+    pub(super) fn json_artifact(&self) -> Option<(OutputFormat, &'static str)> {
+        match self {
+            Self::Dupes(options) => Some((options.baseline_args.format, "dupes")),
+            Self::Health(options) => Some((options.baseline_args.format, "health")),
+            Self::Deps(options) => Some((options.baseline_args.format, "deps")),
+            Self::Boundaries(options) if options.graph.is_none() => {
+                Some((options.baseline_args.format, "boundaries"))
+            }
+            Self::Distribution(options) => Some((options.baseline_args.format, "distribution")),
+            Self::Provenance(options) => Some((options.baseline_args.format, "provenance")),
+            Self::DeadCode(options) => Some((options.baseline_args.format, "dead-code")),
+            Self::Explain(options) => Some((options.format, "explain")),
+            Self::Audit(options) => Some((options.format, "audit")),
+            Self::Coverage(options) => Some((options.baseline_args.format, "coverage")),
+            Self::Patterns(options) => Some((options.format, "patterns")),
+            Self::Principles(options) => Some((options.format, "principles")),
+            Self::ExplainPattern(options) => Some((options.format, "explain-pattern")),
+            Self::ExplainPrinciple(options) => Some((options.format, "explain-principle")),
+            Self::FixPreview(options) => Some((options.format, "fix-preview")),
+            Self::ExplainRule(options) => Some((options.format, "explain-rule")),
+            Self::ApiSurface(options) => Some((options.baseline_args.format, "api-surface")),
+            Self::ModuleGraph(options) => Some((options.baseline_args.format, "module-graph")),
+            Self::Map(options) => Some((options.format, "map")),
+            Self::Impact(options) => Some((options.format, "impact")),
+            Self::Init | Self::Inspect | Self::Boundaries(_) => None,
+        }
+    }
+
     /// Dispatches a parsed subcommand to its handler.
     pub(super) fn run(self, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         match self {
@@ -122,6 +157,8 @@ impl Command {
                 Ok(CommandOutcome::Clean)
             }
             Self::Inspect => run_inspect(out),
+            Self::Map(options) => run_map(options, out),
+            Self::Impact(options) => run_impact(options, out),
             Self::Coverage(options) => run_coverage(options, out),
             Self::Patterns(options) => run_patterns(options, out),
             Self::Principles(options) => run_principles(options, out),

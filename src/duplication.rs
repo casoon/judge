@@ -47,23 +47,24 @@
 //! Spans fully contained in a larger reported span for the same function are
 //! dropped — only the maximal match is worth reporting.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use quote::ToTokens;
+use serde::Serialize;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::walk_functions;
+use crate::functions::{read_and_parse_source, walk_functions};
 use crate::ingest::SourceFile;
 
 /// Rule id used for duplicate-code findings (see todo.md §3.D).
 pub const DUPLICATE_RULE: &str = "duplicate-code";
 /// Bump when the duplication rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
-pub const DUPLICATE_RULE_REVISION: u32 = 1;
+pub const DUPLICATE_RULE_REVISION: u32 = 2;
 
 /// How aggressively two token spans must match to count as duplicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,14 +205,48 @@ pub struct CloneFamily {
     pub members: Vec<CloneMember>,
 }
 
+/// Compact, deterministic duplication facts for refactoring triage. A clone
+/// family is evidence of repeated tokens, not a prescription to merge code:
+/// callers still need to judge whether the repeated shape has one shared
+/// responsibility.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RefactoringSummary {
+    pub schema_version: u32,
+    pub clone_families: usize,
+    pub clone_members: usize,
+    pub top_families: Vec<CloneFamilySummary>,
+}
+
+/// One highest-volume clone family in [`RefactoringSummary`].
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct CloneFamilySummary {
+    /// One-based rank by member count, then duplicated-token mass.
+    pub rank: usize,
+    pub members: usize,
+    /// Token span length shared by the family members.
+    pub tokens_per_member: usize,
+    /// Exact repeated-token volume (`members × tokens_per_member`), not a
+    /// quality score or an estimate of refactoring benefit.
+    pub duplicated_token_mass: usize,
+    /// Workspace-relative files participating in this family.
+    pub files: Vec<PathBuf>,
+    /// Up to three representative function paths; the complete membership
+    /// remains available through the regular findings report.
+    pub representative_items: Vec<String>,
+}
+
 #[derive(Debug)]
 pub enum DuplicationError {
     Io(PathBuf, std::io::Error),
     Parse(PathBuf, syn::Error),
-    /// A `// judge-dupe-off:` comment with no reason after the colon. An
+    /// A duplication-suppression comment with no reason after the colon. An
     /// unjustified suppression is itself a slop signal (see todo.md §3.D),
     /// so this is a hard error rather than a silently ignored range.
     MissingSuppressionReason(PathBuf, usize),
+    /// An item-level suppression must immediately precede a function-like
+    /// item. Otherwise it may be a stale or misspelled directive and must
+    /// not silently hide future code.
+    DanglingItemSuppression(PathBuf, usize),
 }
 
 impl std::fmt::Display for DuplicationError {
@@ -221,7 +256,12 @@ impl std::fmt::Display for DuplicationError {
             Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
             Self::MissingSuppressionReason(path, line) => write!(
                 f,
-                "{}:{line}: `judge-dupe-off` requires a reason, e.g. `// judge-dupe-off: <why>`",
+                "{}:{line}: duplication suppression requires a reason (`judge-dupe-ignore: <why>`)",
+                path.display()
+            ),
+            Self::DanglingItemSuppression(path, line) => write!(
+                f,
+                "{}:{line}: `judge-dupe-ignore` must immediately precede a function item",
                 path.display()
             ),
         }
@@ -233,7 +273,7 @@ impl std::error::Error for DuplicationError {
         match self {
             Self::Io(_, err) => Some(err),
             Self::Parse(_, err) => Some(err),
-            Self::MissingSuppressionReason(_, _) => None,
+            Self::MissingSuppressionReason(_, _) | Self::DanglingItemSuppression(_, _) => None,
         }
     }
 }
@@ -257,6 +297,92 @@ impl WorkspaceDuplication {
             .flat_map(|family| family.members.iter().map(CloneMember::to_finding))
             .collect()
     }
+
+    /// Summarizes the highest-volume clone families without losing the full
+    /// per-member findings contract. This is deliberately a separate view:
+    /// it helps choose where to inspect first while avoiding a claim that a
+    /// clone family should automatically become one abstraction.
+    pub fn refactoring_summary(&self, workspace_root: &Path, limit: usize) -> RefactoringSummary {
+        let mut families: Vec<CloneFamilySummary> = self
+            .families
+            .iter()
+            .map(|family| family_summary(family, workspace_root))
+            .collect();
+        families.sort_by(compare_refactoring_priority);
+        for (index, family) in families.iter_mut().enumerate() {
+            family.rank = index + 1;
+        }
+        let clone_members = self
+            .families
+            .iter()
+            .map(|family| family.members.len())
+            .sum();
+        families.truncate(limit);
+        RefactoringSummary {
+            schema_version: 1,
+            clone_families: self.families.len(),
+            clone_members,
+            top_families: families,
+        }
+    }
+
+    /// Returns every family in the same deterministic priority order as
+    /// [`Self::refactoring_summary`]. TTY detail output uses this so its
+    /// `family #N` labels always refer to the summary's `#N` candidates.
+    pub fn refactoring_order(&self, workspace_root: &Path) -> Vec<&CloneFamily> {
+        let mut families: Vec<&CloneFamily> = self.families.iter().collect();
+        families.sort_by(|left, right| {
+            compare_refactoring_priority(
+                &family_summary(left, workspace_root),
+                &family_summary(right, workspace_root),
+            )
+        });
+        families
+    }
+}
+
+fn family_summary(family: &CloneFamily, workspace_root: &Path) -> CloneFamilySummary {
+    let tokens_per_member = family
+        .members
+        .first()
+        .map_or(0, |member| member.token_count);
+    let files = family
+        .members
+        .iter()
+        .map(|member| relative_path(workspace_root, &member.file))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let representative_items = family
+        .members
+        .iter()
+        .take(3)
+        .map(|member| member.qualified_name.clone())
+        .collect();
+    CloneFamilySummary {
+        rank: 0,
+        members: family.members.len(),
+        tokens_per_member,
+        duplicated_token_mass: family.members.len() * tokens_per_member,
+        files,
+        representative_items,
+    }
+}
+
+fn compare_refactoring_priority(
+    left: &CloneFamilySummary,
+    right: &CloneFamilySummary,
+) -> std::cmp::Ordering {
+    right
+        .members
+        .cmp(&left.members)
+        .then_with(|| right.duplicated_token_mass.cmp(&left.duplicated_token_mass))
+        .then_with(|| left.files.cmp(&right.files))
+        .then_with(|| left.representative_items.cmp(&right.representative_items))
+}
+
+fn relative_path(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
 /// A single token in a function's flattened body stream.
@@ -315,6 +441,7 @@ struct FuncTokens {
     source: Rc<str>,
     tokens: Vec<TokenUnit>,
     suppressed: Rc<Vec<(usize, usize)>>,
+    item_suppressed: bool,
 }
 
 /// Runs duplication detection over `source_files` in the given `mode`,
@@ -328,6 +455,20 @@ pub fn analyze_workspace<'a>(
     min_tokens: usize,
     include_generated: bool,
 ) -> WorkspaceDuplication {
+    analyze_workspace_with_options(source_files, mode, min_tokens, include_generated, true)
+}
+
+/// Like [`analyze_workspace`], with explicit control over test-only code.
+/// The compatibility wrapper above keeps the library's historical behavior;
+/// CLI callers opt in to test duplication because fixture bodies otherwise
+/// dominate production refactoring signals.
+pub fn analyze_workspace_with_options<'a>(
+    source_files: impl IntoIterator<Item = &'a SourceFile>,
+    mode: DupeMode,
+    min_tokens: usize,
+    include_generated: bool,
+    include_tests: bool,
+) -> WorkspaceDuplication {
     let min_tokens = min_tokens.max(1);
     let mut functions = Vec::new();
     let mut errors = Vec::new();
@@ -338,7 +479,10 @@ pub fn analyze_workspace<'a>(
             excluded_generated += 1;
             continue;
         }
-        match collect_function_tokens(&file.path, min_tokens) {
+        if !include_tests && is_test_source_path(&file.path) {
+            continue;
+        }
+        match collect_function_tokens(&file.path, min_tokens, include_tests) {
             Ok(mut found) => functions.append(&mut found),
             Err(err) => errors.push(err),
         }
@@ -355,16 +499,23 @@ pub fn analyze_workspace<'a>(
 fn collect_function_tokens(
     path: &Path,
     min_tokens: usize,
+    include_tests: bool,
 ) -> Result<Vec<FuncTokens>, DuplicationError> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|err| DuplicationError::Io(path.to_path_buf(), err))?;
-    let ast =
-        syn::parse_file(&source).map_err(|err| DuplicationError::Parse(path.to_path_buf(), err))?;
+    let (source, ast) = read_and_parse_source(
+        path,
+        |err| DuplicationError::Io(path.to_path_buf(), err),
+        |err| DuplicationError::Parse(path.to_path_buf(), err),
+    )?;
     let suppressed = Rc::new(suppressed_ranges(path, &source)?);
+    let mut item_suppressions = item_suppression_lines(path, &source)?;
     let source: Rc<str> = Rc::from(source.into_boxed_str());
 
     let mut functions = Vec::new();
     walk_functions(&ast, |site| {
+        let item_suppressed = item_suppressions.remove(&site.span.start().line).is_some();
+        if !include_tests && site.is_test_context {
+            return;
+        }
         let mut nested_functions = NestedFunctionRanges::default();
         nested_functions.visit_block(site.block);
         let mut tokens = Vec::new();
@@ -383,14 +534,33 @@ fn collect_function_tokens(
             source: Rc::clone(&source),
             tokens,
             suppressed: Rc::clone(&suppressed),
+            item_suppressed,
         });
     });
+    if let Some((&_, &directive_line)) = item_suppressions.iter().next() {
+        return Err(DuplicationError::DanglingItemSuppression(
+            path.to_path_buf(),
+            directive_line,
+        ));
+    }
     Ok(functions)
+}
+
+fn is_test_source_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name) if name == "tests" || name == "benches")
+    })
 }
 
 /// Flattens a token stream into a linear sequence, unwrapping `{}`/`()`/`[]`
 /// groups into explicit open/close tokens so windows can cross brace
 /// boundaries. Invisible (`Delimiter::None`) groups are transparent.
+///
+/// A brace-delimited macro invocation whose top-level input starts with a
+/// named field is omitted as declarative configuration rather than executable
+/// duplicate code. This covers builder/DSL calls such as `candidate! { value:
+/// ..., migration: ... }`; ordinary macro calls keep their existing token
+/// treatment (including the documented semantic-mode limitation).
 #[derive(Default)]
 struct NestedFunctionRanges {
     ranges: Vec<std::ops::Range<usize>>,
@@ -417,7 +587,15 @@ fn flatten_tokens(
     out: &mut Vec<TokenUnit>,
     excluded_ranges: &[std::ops::Range<usize>],
 ) {
-    for tt in stream {
+    let tokens: Vec<_> = stream.into_iter().collect();
+    let mut index = 0;
+    while index < tokens.len() {
+        if named_macro_argument_count(&tokens, index).is_some() {
+            index += 3;
+            continue;
+        }
+        let tt = tokens[index].clone();
+        index += 1;
         let token_range = tt.span().byte_range();
         if excluded_ranges
             .iter()
@@ -463,6 +641,32 @@ fn flatten_tokens(
             }
         }
     }
+}
+
+/// Returns the number of token trees in a simple `name! { field: value }`
+/// invocation. These named brace inputs are declarative macro configuration,
+/// not a source-level copy of the implementation the macro expands to.
+fn named_macro_argument_count(tokens: &[proc_macro2::TokenTree], index: usize) -> Option<usize> {
+    let [
+        proc_macro2::TokenTree::Ident(_),
+        proc_macro2::TokenTree::Punct(bang),
+        proc_macro2::TokenTree::Group(group),
+    ] = tokens.get(index..index + 3)?
+    else {
+        return None;
+    };
+    if bang.as_char() != '!' || group.delimiter() != proc_macro2::Delimiter::Brace {
+        return None;
+    }
+    let mut input = group.stream().into_iter();
+    matches!(
+        (input.next(), input.next()),
+        (
+            Some(proc_macro2::TokenTree::Ident(_)),
+            Some(proc_macro2::TokenTree::Punct(colon))
+        ) if colon.as_char() == ':'
+    )
+    .then_some(3)
 }
 
 fn delimiter_chars(delimiter: proc_macro2::Delimiter) -> (&'static str, &'static str) {
@@ -646,6 +850,37 @@ fn suppressed_ranges(path: &Path, source: &str) -> Result<Vec<(usize, usize)>, D
         ranges.push((start, usize::MAX));
     }
     Ok(ranges)
+}
+
+/// Returns the function-start line targeted by every narrowly scoped
+/// `judge-dupe-ignore` comment. The directive is deliberately line-adjacent:
+/// it can suppress only the following function-like item, never an arbitrary
+/// trailing source range. The caller rejects every target line that no walked
+/// function consumes.
+fn item_suppression_lines(
+    path: &Path,
+    source: &str,
+) -> Result<HashMap<usize, usize>, DuplicationError> {
+    // Keep the literal directive out of this source file: this module's own
+    // raw-text scanner must not treat its parser implementation as a user
+    // suppression.
+    let ignore = ["// judge", "-dupe-ignore:"].concat();
+
+    let mut targets = HashMap::new();
+    for (index, line) in source.lines().enumerate() {
+        let line_number = index + 1;
+        let Some(at) = line.find(&ignore) else {
+            continue;
+        };
+        if line[at + ignore.len()..].trim().is_empty() {
+            return Err(DuplicationError::MissingSuppressionReason(
+                path.to_path_buf(),
+                line_number,
+            ));
+        }
+        targets.insert(line_number + 1, line_number);
+    }
+    Ok(targets)
 }
 
 /// Multiplier for the polynomial rolling hash (an odd 64-bit constant, the
@@ -1031,6 +1266,9 @@ fn backward_step_matches(
 }
 
 fn is_suppressed(func: &FuncTokens, start: usize, end: usize) -> bool {
+    if func.item_suppressed {
+        return true;
+    }
     let start_line = func.tokens[start].start_line;
     let end_line = func.tokens[end - 1].end_line;
     func.suppressed
@@ -1202,6 +1440,79 @@ fn dup_two(x: i32) -> i32 {
         let members = &report.families[0].members;
         let names: Vec<_> = members.iter().map(|m| m.qualified_name.as_str()).collect();
         assert_eq!(names, ["dup_one", "dup_two"]);
+    }
+
+    #[test]
+    fn refactoring_summary_is_compact_and_workspace_relative() {
+        let dir = TempDir::new("dup-summary");
+        let (file_a, file_b) = write_duplicate_fixtures(&dir);
+        let files = authored([file_a, file_b]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+
+        let summary = report.refactoring_summary(&dir, 5);
+
+        assert_eq!(summary.schema_version, 1);
+        assert_eq!(summary.clone_families, 1);
+        assert_eq!(summary.clone_members, 2);
+        assert_eq!(summary.top_families.len(), 1);
+        assert_eq!(summary.top_families[0].rank, 1);
+        assert_eq!(
+            summary.top_families[0].files,
+            vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")]
+        );
+        assert_eq!(
+            summary.top_families[0].representative_items,
+            vec!["dup_one", "dup_two"]
+        );
+    }
+
+    #[test]
+    fn test_only_functions_are_excluded_unless_requested() {
+        let dir = TempDir::new("dup-test-context");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            r#"
+fn production() {}
+
+#[cfg(test)]
+mod tests {
+    fn first() {
+        let mut total = 0;
+        for value in 0..10 { total += value; }
+        if total > 0 { total -= 1; }
+        let _ = total;
+    }
+
+    fn second() {
+        let mut total = 0;
+        for value in 0..10 { total += value; }
+        if total > 0 { total -= 1; }
+        let _ = total;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let excluded = analyze_workspace_with_options(
+            files.iter(),
+            DupeMode::Mild,
+            DEFAULT_MIN_TOKENS,
+            false,
+            false,
+        );
+        let included = analyze_workspace_with_options(
+            files.iter(),
+            DupeMode::Mild,
+            DEFAULT_MIN_TOKENS,
+            false,
+            true,
+        );
+
+        assert!(excluded.families.is_empty());
+        assert_eq!(included.families.len(), 1);
     }
 
     #[test]
@@ -1414,11 +1725,16 @@ fn dup_two(x: i32) -> i32 {
     fn judge_dupe_off_without_a_reason_is_a_hard_error() {
         let dir = TempDir::new("dup-missing-reason");
         let file = dir.join("bad_suppression.rs");
+        // Keep the intentionally malformed directive out of this source
+        // file's own text: the fixture must exercise the parser, while a
+        // self-analysis of judge must not mistake a test input for a live
+        // suppression directive.
+        let missing_reason_marker = ["// judge", "-dupe-off:"].concat();
         std::fs::write(
             &file,
-            r#"
+            (r#"
 fn dup_one(x: i32) -> i32 {
-    // judge-dupe-off:
+    MISSING_REASON_MARKER
     let mut total = 0;
     for i in 0..x {
         total += i;
@@ -1426,7 +1742,8 @@ fn dup_one(x: i32) -> i32 {
     total
     // judge-dupe-on
 }
-"#,
+"#)
+            .replace("MISSING_REASON_MARKER", &missing_reason_marker),
         )
         .unwrap();
 
@@ -1438,6 +1755,124 @@ fn dup_one(x: i32) -> i32 {
             DuplicationError::MissingSuppressionReason(_, line) => assert_eq!(*line, 3),
             other => panic!("expected a missing-reason error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn judge_dupe_ignore_suppresses_only_the_immediately_following_function() {
+        let dir = TempDir::new("dup-item-suppressed");
+        let file_a = dir.join("a.rs");
+        let file_b = dir.join("b.rs");
+        // Build the directive dynamically so judge's own raw-text scanner
+        // does not mistake this fixture for a live suppression.
+        let item_suppression_marker =
+            ["// judge", "-dupe-ignore: required external protocol shape"].concat();
+        std::fs::write(
+            &file_a,
+            r#"
+ITEM_SUPPRESSION_MARKER
+fn protocol_one(x: i32) -> i32 {
+    let mut total = 0;
+    for i in 0..x {
+        total += i;
+    }
+    total
+}
+"#
+            .replace("ITEM_SUPPRESSION_MARKER", &item_suppression_marker),
+        )
+        .unwrap();
+        std::fs::write(
+            &file_b,
+            r#"
+fn protocol_two(x: i32) -> i32 {
+    let mut total = 0;
+    for i in 0..x {
+        total += i;
+    }
+    total
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file_a, file_b]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.families.is_empty());
+    }
+
+    #[test]
+    fn judge_dupe_ignore_without_a_reason_is_a_hard_error() {
+        let dir = TempDir::new("dup-item-missing-reason");
+        let file = dir.join("bad_item_suppression.rs");
+        let missing_reason_marker = ["// judge", "-dupe-ignore:"].concat();
+        std::fs::write(
+            &file,
+            (r#"
+MISSING_REASON_MARKER
+fn dup_one() {}
+"#)
+            .replace("MISSING_REASON_MARKER", &missing_reason_marker),
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+
+        assert!(matches!(
+            report.errors.as_slice(),
+            [DuplicationError::MissingSuppressionReason(_, 2)]
+        ));
+    }
+
+    #[test]
+    fn judge_dupe_ignore_requires_an_immediately_following_function() {
+        let dir = TempDir::new("dup-item-dangling");
+        let file = dir.join("dangling_item_suppression.rs");
+        let item_suppression_marker = ["// judge", "-dupe-ignore: protocol shape"].concat();
+        std::fs::write(
+            &file,
+            r#"
+ITEM_SUPPRESSION_MARKER
+
+fn dup_one() {}
+"#
+            .replace("ITEM_SUPPRESSION_MARKER", &item_suppression_marker),
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+
+        assert!(matches!(
+            report.errors.as_slice(),
+            [DuplicationError::DanglingItemSuppression(_, 2)]
+        ));
+    }
+
+    #[test]
+    fn judge_dupe_ignore_before_a_test_function_is_valid_when_tests_are_excluded() {
+        let dir = TempDir::new("dup-item-test-suppression");
+        let file = dir.join("test_suppression.rs");
+        let item_suppression_marker = ["// judge", "-dupe-ignore: fixture protocol shape"].concat();
+        std::fs::write(
+            &file,
+            r#"
+#[cfg(test)]
+mod tests {
+    ITEM_SUPPRESSION_MARKER
+    fn fixture_helper() {}
+}
+"#
+            .replace("ITEM_SUPPRESSION_MARKER", &item_suppression_marker),
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]
@@ -1884,6 +2319,40 @@ fn calls_foo_two(c: i32, d: i32) -> i32 {
             .map(|m| m.qualified_name.as_str())
             .collect();
         assert_eq!(names, ["calls_foo_one", "calls_foo_two"]);
+    }
+
+    #[test]
+    fn named_brace_macro_arguments_are_treated_as_declarative_configuration() {
+        let dir = TempDir::new("dup-named-macro-arguments");
+        let file = dir.join("macro_calls.rs");
+        std::fs::write(
+            &file,
+            r#"
+macro_rules! candidate {
+    ($($input:tt)*) => { () };
+}
+
+fn first() {
+    candidate! {
+        evidence: make_evidence(alpha, beta, gamma),
+        migration: vec![one, two, three],
+    }
+}
+
+fn second() {
+    candidate! {
+        evidence: make_evidence(delta, epsilon, zeta),
+        migration: vec![four, five, six],
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, 10, false);
+
+        assert!(report.families.is_empty(), "{:?}", report.families);
     }
 
     /// Undecidable fixture (todo.md §17.5): `judge-dupe-off`/`-on` markers

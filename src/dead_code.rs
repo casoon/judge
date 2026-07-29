@@ -227,6 +227,18 @@ pub(crate) struct TypeItemSite<'ast> {
     pub(crate) vis: &'ast syn::Visibility,
 }
 
+/// Generates the standard visitor callback for declaration kinds that only
+/// need to be emitted and then traversed. Module, trait, and impl callbacks
+/// intentionally remain explicit because they additionally manage `path`.
+macro_rules! visit_emitted_type_item {
+    ($method:ident, $node:ty, $traverse:ident) => {
+        fn $method(&mut self, node: &'ast $node) {
+            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
+            visit::$traverse(self, node);
+        }
+    };
+}
+
 /// Visits every top-level `struct`, `enum`, `trait`, `const`, and `static` in
 /// `file`, plus every associated const/type inside an `impl` block, tracking
 /// the enclosing `mod`/`impl`/`trait` path the same way
@@ -278,15 +290,8 @@ pub(crate) fn walk_type_items<'ast>(
             }
         }
 
-        fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
-            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
-            visit::visit_item_struct(self, node);
-        }
-
-        fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
-            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
-            visit::visit_item_enum(self, node);
-        }
+        visit_emitted_type_item!(visit_item_struct, syn::ItemStruct, visit_item_struct);
+        visit_emitted_type_item!(visit_item_enum, syn::ItemEnum, visit_item_enum);
 
         fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
             self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
@@ -301,25 +306,18 @@ pub(crate) fn walk_type_items<'ast>(
             self.path.pop();
         }
 
-        fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
-            visit::visit_item_const(self, node);
-        }
-
-        fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
-            visit::visit_item_static(self, node);
-        }
-
-        fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
-            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
-            visit::visit_impl_item_const(self, node);
-        }
-
-        fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
-            self.emit(&node.ident.to_string(), node.ident.span(), &node.vis);
-            visit::visit_impl_item_type(self, node);
-        }
+        visit_emitted_type_item!(visit_item_const, syn::ItemConst, visit_item_const);
+        visit_emitted_type_item!(visit_item_static, syn::ItemStatic, visit_item_static);
+        visit_emitted_type_item!(
+            visit_impl_item_const,
+            syn::ImplItemConst,
+            visit_impl_item_const
+        );
+        visit_emitted_type_item!(
+            visit_impl_item_type,
+            syn::ImplItemType,
+            visit_impl_item_type
+        );
     }
 
     let mut walker = Walker {

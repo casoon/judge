@@ -7,6 +7,7 @@
 //! traversal logic.
 
 use proc_macro2::Span;
+use std::path::Path;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Block, ImplItemFn, ItemFn, ItemImpl, ItemMod, ItemTrait, TraitItemFn, Type};
@@ -53,6 +54,24 @@ pub struct FunctionSite<'ast> {
     /// can't see. Same conditional allow as `ident_span`.
     #[cfg_attr(not(feature = "deep"), allow(dead_code))]
     pub in_trait_impl: bool,
+    /// Whether this function is only compiled for tests. This is true for a
+    /// `#[test]` function and for every function nested in a `#[cfg(test)]`
+    /// item such as an inline module, impl block, or trait (including helpers
+    /// that do not carry `#[test]` themselves).
+    pub is_test_context: bool,
+}
+
+/// Reads and parses one Rust source file while leaving each analyzer in
+/// control of its own error type. The returned source is kept alongside the
+/// AST because several callers also inspect comments or source spans.
+pub(crate) fn read_and_parse_source<E>(
+    path: &Path,
+    io_error: impl FnOnce(std::io::Error) -> E,
+    parse_error: impl FnOnce(syn::Error) -> E,
+) -> Result<(String, syn::File), E> {
+    let source = std::fs::read_to_string(path).map_err(io_error)?;
+    let ast = syn::parse_file(&source).map_err(parse_error)?;
+    Ok((source, ast))
 }
 
 /// Visits every `fn`, impl method, and default trait-method body in `file`,
@@ -61,6 +80,7 @@ pub fn walk_functions<'ast>(file: &'ast syn::File, on_function: impl FnMut(Funct
     let mut walker = Walker {
         path: Vec::new(),
         in_trait_impl: Vec::new(),
+        test_context: Vec::new(),
         on_function,
     };
     walker.visit_file(file);
@@ -72,6 +92,10 @@ struct Walker<F> {
     /// mirrors `path`'s push/pop shape. A stack rather than a single flag
     /// because an `impl` can (rarely) be nested inside a function body.
     in_trait_impl: Vec<bool>,
+    /// Scoped test-only context for inline modules and functions. Keeping it
+    /// as a stack makes nested function items inherit their enclosing test
+    /// context without relying on naming conventions.
+    test_context: Vec<bool>,
     on_function: F,
 }
 
@@ -87,6 +111,23 @@ impl<F> Walker<F> {
     fn current_in_trait_impl(&self) -> bool {
         self.in_trait_impl.last().copied().unwrap_or(false)
     }
+
+    fn current_test_context(&self) -> bool {
+        self.test_context.last().copied().unwrap_or(false)
+    }
+}
+
+fn has_test_cfg(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|condition| condition == "test")
+    })
+}
+
+fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().is_ident("test"))
 }
 
 impl<'ast, F> Walker<F>
@@ -104,6 +145,7 @@ where
         vis: Option<&'ast syn::Visibility>,
         attrs: &'ast [syn::Attribute],
         in_trait_impl: bool,
+        is_test_context: bool,
         sig: &'ast syn::Signature,
     ) {
         let qualified_name = self.qualified_name(name);
@@ -116,6 +158,7 @@ where
             vis,
             attrs,
             in_trait_impl,
+            is_test_context,
             sig,
         });
     }
@@ -138,8 +181,11 @@ where
 {
     fn visit_item_mod(&mut self, node: &'ast ItemMod) {
         if node.content.is_some() {
+            let is_test_context = self.current_test_context() || has_test_cfg(&node.attrs);
             self.path.push(node.ident.to_string());
+            self.test_context.push(is_test_context);
             visit::visit_item_mod(self, node);
+            self.test_context.pop();
             self.path.pop();
         } else {
             visit::visit_item_mod(self, node);
@@ -147,20 +193,28 @@ where
     }
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
+        let is_test_context = self.current_test_context() || has_test_cfg(&node.attrs);
         self.path.push(type_name(&node.self_ty));
         self.in_trait_impl.push(node.trait_.is_some());
+        self.test_context.push(is_test_context);
         visit::visit_item_impl(self, node);
+        self.test_context.pop();
         self.in_trait_impl.pop();
         self.path.pop();
     }
 
     fn visit_item_trait(&mut self, node: &'ast ItemTrait) {
+        let is_test_context = self.current_test_context() || has_test_cfg(&node.attrs);
         self.path.push(node.ident.to_string());
+        self.test_context.push(is_test_context);
         visit::visit_item_trait(self, node);
+        self.test_context.pop();
         self.path.pop();
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        let is_test_context =
+            self.current_test_context() || has_test_cfg(&node.attrs) || has_test_attr(&node.attrs);
         self.emit(
             &node.sig.ident.to_string(),
             node,
@@ -170,13 +224,18 @@ where
             Some(&node.vis),
             &node.attrs,
             false,
+            is_test_context,
             &node.sig,
         );
+        self.test_context.push(is_test_context);
         visit::visit_item_fn(self, node);
+        self.test_context.pop();
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         let in_trait_impl = self.current_in_trait_impl();
+        let is_test_context =
+            self.current_test_context() || has_test_cfg(&node.attrs) || has_test_attr(&node.attrs);
         self.emit(
             &node.sig.ident.to_string(),
             node,
@@ -186,12 +245,17 @@ where
             Some(&node.vis),
             &node.attrs,
             in_trait_impl,
+            is_test_context,
             &node.sig,
         );
+        self.test_context.push(is_test_context);
         visit::visit_impl_item_fn(self, node);
+        self.test_context.pop();
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast TraitItemFn) {
+        let is_test_context =
+            self.current_test_context() || has_test_cfg(&node.attrs) || has_test_attr(&node.attrs);
         if let Some(block) = &node.default {
             self.emit(
                 &node.sig.ident.to_string(),
@@ -202,10 +266,13 @@ where
                 None,
                 &node.attrs,
                 false,
+                is_test_context,
                 &node.sig,
             );
         }
+        self.test_context.push(is_test_context);
         visit::visit_trait_item_fn(self, node);
+        self.test_context.pop();
     }
 }
 
@@ -311,5 +378,45 @@ fn sibling() {}
         walk_functions(&file, |site| names.push(site.qualified_name));
 
         assert_eq!(names, vec!["sibling".to_string()]);
+    }
+
+    #[test]
+    fn tracks_test_context_for_test_modules_and_helpers() {
+        let file: syn::File = syn::parse_str(
+            r#"
+fn production() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn verifies_behavior() {}
+
+    fn helper() {}
+}
+
+struct Fixture;
+
+#[cfg(test)]
+impl Fixture {
+    fn impl_helper() {}
+}
+"#,
+        )
+        .unwrap();
+
+        let mut contexts = Vec::new();
+        walk_functions(&file, |site| {
+            contexts.push((site.qualified_name, site.is_test_context))
+        });
+
+        assert_eq!(
+            contexts,
+            vec![
+                ("production".to_string(), false),
+                ("tests::verifies_behavior".to_string(), true),
+                ("tests::helper".to_string(), true),
+                ("Fixture::impl_helper".to_string(), true),
+            ]
+        );
     }
 }

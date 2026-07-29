@@ -7,10 +7,40 @@ use judge::AnalysisTier;
 use judge::baseline::{TriVerdict, Verdict};
 use judge::duplication::DupeMode;
 use judge::finding::{Finding, Report};
+use serde::Serialize;
+use serde::ser::SerializeMap;
 
+mod advisory_commands;
+mod analysis_commands;
+mod audit_command;
+mod baseline_output;
+mod combined;
+mod combined_analysis;
 mod commands;
+mod deep_commands;
+mod health_command;
+mod workspace_commands;
 
+use advisory_commands::{
+    run_explain_pattern, run_explain_principle, run_explain_rule, run_fix_preview, run_patterns,
+    run_principles,
+};
+use analysis_commands::{
+    run_api_surface, run_boundaries, run_coverage, run_deps, run_distribution, run_dupes,
+    run_module_graph, run_provenance,
+};
+#[cfg(test)]
+use audit_command::combine_verdict;
+use audit_command::run as run_audit;
+use baseline_output::{
+    BaselineOptions, BaselineRequest, analysis_errors, append_analysis_errors,
+    handle_baseline_with_trend, print_pattern_delta_tty, write_json,
+};
+use combined_analysis::{collect_findings, collect_findings_with_progress};
 use commands::{BaselineArgs, Command};
+use deep_commands::{run_dead_code, run_explain};
+use health_command::run as run_health;
+use workspace_commands::{run_impact, run_inspect, run_map};
 
 const DEFAULT_BASELINE_HEALTH: &str = ".judge/baseline-health.json";
 const DEFAULT_BASELINE_DUPES: &str = ".judge/baseline-dupes.json";
@@ -48,7 +78,12 @@ const HOTSPOT_LIMIT: usize = 15;
 const DUPE_FAMILY_TTY_LIMIT: usize = 15;
 
 #[derive(Debug, Parser)]
-#[command(name = "cargo judge", version, about)]
+#[command(
+    name = "cargo judge",
+    version,
+    about = "Codebase intelligence for Rust workspaces",
+    long_about = "Codebase intelligence for Rust workspaces"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -56,6 +91,15 @@ struct Cli {
     /// detector; see todo.md §4 "Decision Surface", §8).
     #[command(flatten)]
     baseline_args: BaselineArgs,
+    /// Write versioned JSON Lines progress events for a bare combined run.
+    /// The final report remains on stdout; this separate file is flushed
+    /// after every phase event so agents can observe long-running analysis.
+    #[arg(long, value_name = "PATH")]
+    progress: Option<PathBuf>,
+    /// Write JSON output to this path. With `--format json`, the default is
+    /// `.judge/<command>.json`; this option selects a different artifact.
+    #[arg(long, global = true, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -74,6 +118,10 @@ struct DupesOptions {
     /// authored code.
     #[arg(long)]
     include_generated: bool,
+    /// Include test-only functions and integration-test targets. Off by
+    /// default so fixture duplication does not dominate refactoring signals.
+    #[arg(long)]
+    include_tests: bool,
 }
 
 #[derive(Debug, Args)]
@@ -329,6 +377,27 @@ struct ModuleGraphOptions {
     include_generated: bool,
 }
 
+#[derive(Debug, Args)]
+struct MapOptions {
+    /// Output format. JSON is intended for tooling; TTY shows the highest
+    /// complexity-ranked authored files with their measured facts.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+    /// Include test-only functions in the complexity attention ranking.
+    /// Production and test metrics remain separate in every output format.
+    #[arg(long)]
+    include_tests: bool,
+}
+
+#[derive(Debug, Args)]
+struct ImpactOptions {
+    /// Workspace-relative or absolute path to a discovered Rust source file.
+    target: PathBuf,
+    /// Output format. JSON is intended for deterministic agent tooling.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
 /// Output format shared by commands that emit findings (see todo.md §7).
 /// Not every command supports every format: SARIF exists for the
 /// report-producing commands, Markdown only for the audit/baseline delta
@@ -577,7 +646,7 @@ fn main() -> ExitCode {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let result = run(cli, &mut out).and_then(|outcome| {
+    let result = run_with_json_output(cli, &mut out).and_then(|outcome| {
         out.flush()?;
         Ok(outcome)
     });
@@ -592,3705 +661,240 @@ fn main() -> ExitCode {
 /// [`main`] translates the result into a process exit code.
 fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
     match cli.command {
-        None => run_all(
+        None => combined::run(
             cli.baseline_args.format,
             cli.baseline_args.save_baseline,
             cli.baseline_args.baseline,
+            cli.progress.as_deref(),
             out,
         ),
-        Some(command) => command.run(out),
+        Some(command) => {
+            if cli.progress.is_some() {
+                return Err(CliError::Config(
+                    "--progress is available only for the bare `cargo judge` combined run"
+                        .to_string(),
+                ));
+            }
+            command.run(out)
+        }
     }
 }
 
-/// Everything [`collect_findings`] produces — the analyzer set shared by
-/// bare `cargo judge` ([`run_all`]) and `cargo judge audit --since`
-/// ([`run_audit`]), so the latter's analyzer set stays mechanically
-/// identical to the former's (see todo.md §5 "audit --since").
-struct CollectedFindings {
-    findings: Vec<Finding>,
-    analysis_errors: Vec<String>,
-    rule_revisions: std::collections::HashMap<String, u32>,
-    boundary_rules_checked: usize,
-    boundaries_config_path: PathBuf,
-    /// How many findings an inline `// judge-ignore: <rule> — <reason>`
-    /// comment dropped (see [`judge::suppression::apply_inline_suppressions`]).
-    suppressed_inline: usize,
+/// Runs a JSON-formatted command into its artifact file while keeping the
+/// internal command handlers stream-oriented. Non-JSON formats keep their
+/// existing stdout behavior; `--output` is deliberately rejected for them so
+/// a file extension never silently changes a rendering contract.
+fn run_with_json_output(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
+    let Some((path, command)) = cli.json_output_artifact()? else {
+        return run(cli, out);
+    };
+
+    let mut rendered = Vec::new();
+    let result = run(cli, &mut rendered);
+    if !rendered.is_empty() {
+        let artifact = add_json_header(&rendered, &path, command, &result)?;
+        write_json_artifact(&path, &artifact)?;
+        writeln!(out, "JSON written to {}", path.display())?;
+    }
+    result
 }
 
-/// Runs every detector that doesn't need extra opt-in config (complexity +
-/// hotspots, duplication, dependency hygiene, ownership) plus boundaries if
-/// a `judge.toml` exists, and merges their findings. This is deliberately
-/// *not* the numeric 0-100 health score from §4 — that needs crate-type
-/// profiles and a weighting scheme that don't exist yet; merging findings
-/// doesn't require either. Findings are returned unsorted; callers that show
-/// them worst-first must sort explicitly (see [`judge::finding::sort_by_severity_desc`]).
-fn collect_findings(workspace: &judge::ingest::Workspace) -> Result<CollectedFindings, CliError> {
-    let mut findings = Vec::new();
-    let mut analysis_errors = Vec::new();
-    let mut rule_revisions = std::collections::HashMap::from([
-        (
-            judge::git::HOTSPOT_RULE.to_string(),
-            judge::git::HOTSPOT_RULE_REVISION,
-        ),
-        (
-            judge::git::SIZE_DISTRIBUTION_RULE.to_string(),
-            judge::git::SIZE_DISTRIBUTION_RULE_REVISION,
-        ),
-        (
-            judge::git::COMPLEXITY_CONCENTRATION_RULE.to_string(),
-            judge::git::COMPLEXITY_CONCENTRATION_RULE_REVISION,
-        ),
-        (
-            judge::git::CROSS_FILE_CONNECTIVITY_RULE.to_string(),
-            judge::git::CROSS_FILE_CONNECTIVITY_RULE_REVISION,
-        ),
-        (
-            judge::duplication::DUPLICATE_RULE.to_string(),
-            judge::duplication::DUPLICATE_RULE_REVISION,
-        ),
-        (
-            judge::deps::MISPLACED_DEPENDENCY_KIND_RULE.to_string(),
-            judge::deps::MISPLACED_DEPENDENCY_KIND_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_DEV_DEPENDENCY_RULE.to_string(),
-            judge::deps::UNUSED_DEV_DEPENDENCY_RULE_REVISION,
-        ),
-        (
-            judge::deps::HEAVY_DEPENDENCY_RULE.to_string(),
-            judge::deps::HEAVY_DEPENDENCY_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_FEATURE_FLAG_RULE.to_string(),
-            judge::deps::UNUSED_FEATURE_FLAG_RULE_REVISION,
-        ),
-        (
-            judge::deps::DEFAULT_FEATURES_UNUSED_RULE.to_string(),
-            judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_FEATURE_RULE.to_string(),
-            judge::deps::UNUSED_FEATURE_RULE_REVISION,
-        ),
-        (
-            judge::deps::DEP_WITHOUT_REPO_RULE.to_string(),
-            judge::deps::DEP_WITHOUT_REPO_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
-            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::MSRV_DRIFT_RULE.to_string(),
-            judge::dep_graph::MSRV_DRIFT_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE.to_string(),
-            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE_REVISION,
-        ),
-        (
-            judge::slop::SWALLOWED_RESULT_RULE.to_string(),
-            judge::slop::SWALLOWED_RESULT_RULE_REVISION,
-        ),
-        (
-            judge::slop::EMPTY_ERROR_ARM_RULE.to_string(),
-            judge::slop::EMPTY_ERROR_ARM_RULE_REVISION,
-        ),
-        (
-            judge::slop::CATCH_ALL_ERROR_RULE.to_string(),
-            judge::slop::CATCH_ALL_ERROR_RULE_REVISION,
-        ),
-        (
-            judge::slop::SUPPRESSION_DEBT_RULE.to_string(),
-            judge::slop::SUPPRESSION_DEBT_RULE_REVISION,
-        ),
-        (
-            judge::slop::MERGED_STUB_RULE.to_string(),
-            judge::slop::MERGED_STUB_RULE_REVISION,
-        ),
-        (
-            judge::slop::EMPTY_IMPL_RULE.to_string(),
-            judge::slop::EMPTY_IMPL_RULE_REVISION,
-        ),
-        (
-            judge::slop::ASSERTION_FREE_TEST_RULE.to_string(),
-            judge::slop::ASSERTION_FREE_TEST_RULE_REVISION,
-        ),
-        (
-            judge::slop::TAUTOLOGICAL_TEST_RULE.to_string(),
-            judge::slop::TAUTOLOGICAL_TEST_RULE_REVISION,
-        ),
-        (
-            judge::slop::IGNORED_TEST_ACCUMULATION_RULE.to_string(),
-            judge::slop::IGNORED_TEST_ACCUMULATION_RULE_REVISION,
-        ),
-        (
-            judge::slop::CONVERSATIONAL_ARTIFACT_RULE.to_string(),
-            judge::slop::CONVERSATIONAL_ARTIFACT_RULE_REVISION,
-        ),
-        (
-            judge::slop::RESTATING_COMMENT_RULE.to_string(),
-            judge::slop::RESTATING_COMMENT_RULE_REVISION,
-        ),
-        (
-            judge::slop::STEP_COMMENT_INFLATION_RULE.to_string(),
-            judge::slop::STEP_COMMENT_INFLATION_RULE_REVISION,
-        ),
-        (
-            judge::slop::GENERIC_NAMING_RULE.to_string(),
-            judge::slop::GENERIC_NAMING_RULE_REVISION,
-        ),
-        (
-            judge::slop::DOC_RESTATES_SIGNATURE_RULE.to_string(),
-            judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
-        ),
-        (
-            judge::ownership::LOW_BUS_FACTOR_RULE.to_string(),
-            judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
-        ),
-        (
-            judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
-            judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
-        ),
-        (
-            judge::slop_structural::CHURN_HOTSPOT_RULE.to_string(),
-            judge::slop_structural::CHURN_HOTSPOT_RULE_REVISION,
-        ),
-        (
-            judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
-            judge::slop_structural::COMPLEXITY_INFLATION_RULE_REVISION,
-        ),
-        (
-            judge::complexity::SIGNATURE_COMPLEXITY_RULE.to_string(),
-            judge::complexity::SIGNATURE_COMPLEXITY_RULE_REVISION,
-        ),
-        (
-            judge::complexity::MAINTAINABILITY_INDEX_RULE.to_string(),
-            judge::complexity::MAINTAINABILITY_INDEX_RULE_REVISION,
-        ),
-        (
-            judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
-            judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
-        ),
-        (
-            judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE.to_string(),
-            judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE_REVISION,
-        ),
-        (
-            judge::security::UNSAFE_SURFACE_RULE.to_string(),
-            judge::security::UNSAFE_SURFACE_RULE_REVISION,
-        ),
-        (
-            judge::security::UNSAFE_DENSITY_RULE.to_string(),
-            judge::security::UNSAFE_DENSITY_RULE_REVISION,
-        ),
-        (
-            judge::security::INTEGER_CAST_RISK_RULE.to_string(),
-            judge::security::INTEGER_CAST_RISK_RULE_REVISION,
-        ),
-        (
-            judge::security::PANIC_IN_LIB_RULE.to_string(),
-            judge::security::PANIC_IN_LIB_RULE_REVISION,
-        ),
-        (
-            judge::security::HARDCODED_SECRET_RULE.to_string(),
-            judge::security::HARDCODED_SECRET_RULE_REVISION,
-        ),
-    ]);
-
-    let complexity_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let complexity = judge::complexity::analyze_workspace(complexity_source_files, false);
-    analysis_errors.extend(complexity.errors.iter().map(ToString::to_string));
-    match judge::git::hotspots(
-        &workspace.root,
-        &complexity.functions,
-        judge::git::DEFAULT_WINDOW_DAYS,
-    ) {
-        Ok(hotspots) => findings.extend(
-            hotspots
-                .iter()
-                .take(HOTSPOT_LIMIT)
-                .map(judge::git::Hotspot::to_finding),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-    findings.extend(
-        judge::git::size_distribution(workspace)
-            .iter()
-            .map(judge::git::SizeDistributionOutlier::to_finding),
-    );
-    findings.extend(
-        judge::git::complexity_concentration(workspace, &complexity.functions)
-            .iter()
-            .map(judge::git::ComplexityConcentrationOutlier::to_finding),
-    );
-    match judge::git::cross_file_connectivity(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
-        Ok(outliers) => findings.extend(
-            outliers
-                .iter()
-                .map(|outlier| outlier.to_finding(&workspace.root)),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-    findings.extend(judge::slop_structural::complexity_inflation(
-        &complexity.functions,
-    ));
-    findings.extend(judge::complexity::signature_complexity(
-        &complexity.functions,
-    ));
-    findings.extend(judge::complexity::maintainability_index(
-        &complexity.functions,
-    ));
-
-    // G4 structural slop: `churn-hotspot` needs its own [`judge::git::churn`]
-    // call at a different window (2 weeks) than [`judge::git::hotspots`]'s
-    // internal one above.
-    match judge::git::churn(&workspace.root, 14) {
-        Ok(two_week_churn) => {
-            findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
-        }
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-
-    let slop_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let rules_config = load_judge_toml(&workspace.root)?.rules;
-    let slop = judge::slop::analyze_workspace(
-        slop_source_files,
-        false,
-        rules_config.catch_all_error.allow_anyhow_at_boundary,
-    );
-    analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
-    findings.extend(slop.findings);
-
-    let dupes_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let dupes = judge::duplication::analyze_workspace(
-        dupes_source_files,
-        DupeMode::Mild,
-        judge::duplication::DEFAULT_MIN_TOKENS,
-        false,
-    );
-    analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
-    findings.extend(dupes.to_findings());
-
-    let abstraction_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    findings.extend(judge::slop_structural::analyze_workspace_structural(
-        abstraction_source_files,
-    ));
-
-    let fragile_substring_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    findings.extend(judge::slop_structural::fragile_substring_classification(
-        fragile_substring_source_files,
-    ));
-
-    let security_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let security = judge::security::analyze_workspace(security_source_files, false);
-    analysis_errors.extend(security.errors.iter().map(ToString::to_string));
-    findings.extend(security.findings);
-
-    let deps = judge::deps::analyze_workspace(workspace);
-    analysis_errors.extend(deps.errors.iter().map(ToString::to_string));
-    findings.extend(deps.findings);
-
-    let dep_graph = judge::dep_graph::analyze_workspace(workspace);
-    analysis_errors.extend(dep_graph.errors.iter().map(ToString::to_string));
-    findings.extend(dep_graph.findings);
-
-    // `name-collision-risk` is fully local (no network), so it runs in the
-    // combined bare `cargo judge`/`audit` pass too. The other three G5
-    // rules (`phantom-crate`/`phantom-version`/`fresh-low-reputation-dep`)
-    // need real crates.io network access and are opt-in only via
-    // `cargo judge deps --check-crates-io` (see `run_deps`).
-    findings.extend(judge::slopsquat::analyze_name_collision(workspace));
-
-    let ownership =
-        judge::ownership::analyze_workspace(workspace, judge::git::DEFAULT_WINDOW_DAYS)?;
-    analysis_errors.extend(ownership.errors.iter().map(ToString::to_string));
-    findings.extend(ownership.findings);
-
-    let boundaries_config_path = workspace.root.join("judge.toml");
-    let mut boundary_rules_checked = 0;
-    if boundaries_config_path.exists() {
-        let config_text = std::fs::read_to_string(&boundaries_config_path).map_err(|err| {
-            CliError::Config(format!("{}: {err}", boundaries_config_path.display()))
-        })?;
-        let config: judge::boundaries::BoundaryConfig =
-            toml::from_str(&config_text).map_err(|err| {
-                CliError::Config(format!(
-                    "{}: failed to parse: {err}",
-                    boundaries_config_path.display()
-                ))
-            })?;
-        boundary_rules_checked = config.boundaries.len();
-        let evaluated = judge::boundaries::evaluate(workspace, &config)?;
-        findings.extend(evaluated.findings);
-        rule_revisions.insert(
-            judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
-            judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
-        );
-        rule_revisions.insert(
-            judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
-            judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
-        );
-
-        match judge::boundaries::change_coupling_signals(
-            workspace,
-            &config,
-            judge::git::DEFAULT_WINDOW_DAYS,
-        ) {
-            Ok(coupling_findings) => {
-                findings.extend(coupling_findings);
-                rule_revisions.insert(
-                    judge::boundaries::CHANGE_COUPLING_SIGNAL_RULE.to_string(),
-                    judge::boundaries::CHANGE_COUPLING_SIGNAL_RULE_REVISION,
-                );
-            }
-            Err(err) => analysis_errors.push(err.to_string()),
-        }
-    }
-
-    // `feature-graph-cycle` is always-on, unlike the `judge.toml`-gated
-    // boundary rules above — see `judge::boundaries` module docs
-    // "`feature-graph-cycle`" for why: a `[features]` table is either
-    // cyclic or it isn't, a fact needing no project-intent config to
-    // interpret.
-    let feature_graph_manifest = workspace.root.join("Cargo.toml");
-    match judge::boundaries::feature_graph_cycles(Some(&feature_graph_manifest)) {
-        Ok(cycle_findings) => {
-            findings.extend(cycle_findings);
-            rule_revisions.insert(
-                judge::boundaries::FEATURE_GRAPH_CYCLE_RULE.to_string(),
-                judge::boundaries::FEATURE_GRAPH_CYCLE_RULE_REVISION,
-            );
-        }
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-
-    // Inline `judge-ignore` suppression (todo.md §5): a generic, per-rule
-    // post-filter applied after every detector above has merged its
-    // findings in, so a suppressed finding never reaches baseline diff,
-    // verdict, or score computation for either of this function's callers
-    // (bare `cargo judge` and `audit`).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    Ok(CollectedFindings {
-        findings,
-        analysis_errors,
-        rule_revisions,
-        boundary_rules_checked,
-        boundaries_config_path,
-        suppressed_inline,
-    })
-}
-
-/// Bare `cargo judge` (see todo.md §4 "Decision Surface", §8 "Vollanalyse"):
-/// runs [`collect_findings`], sorts the result worst-first, then either
-/// saves/compares a baseline or prints the merged report.
-fn run_all(
-    format: OutputFormat,
-    save_baseline: bool,
-    baseline: Option<PathBuf>,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
-
-    let mut collected = collect_findings(&workspace)?;
-    judge::finding::sort_by_severity_desc(&mut collected.findings);
-
-    if save_baseline || baseline.is_some() {
-        return handle_baseline(
-            &workspace.root,
-            &collected.findings,
-            &collected.analysis_errors,
-            BaselineOptions {
-                rule_revisions: collected.rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_ALL),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            // Bare `cargo judge` analyzes with the generated-code default
-            // (excluded — see `collect_findings`), so the universe says so.
-            let report = Report::with_errors(collected.findings, collected.analysis_errors)
-                .with_universe(judge::finding::AnalysisUniverse::fast(&workspace, false))
-                .with_suppressed_inline(collected.suppressed_inline);
-            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(
-                out,
-                &workspace.root,
-                collected.findings,
-                collected.analysis_errors,
-                Some(judge::finding::AnalysisUniverse::fast(&workspace, false)),
-            )?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`cargo judge`",
-                format,
-                "tty, json, sarif",
-            ));
-        }
-        OutputFormat::Tty => {
-            let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = collected
-                .findings
-                .iter()
-                .partition(|finding| finding.is_gating());
-            writeln!(
-                out,
-                "findings: {} (worst first), {} advisory",
-                gating.len(),
-                advisory.len()
-            )?;
-            if !collected.analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", collected.analysis_errors.len())?;
-                for error in &collected.analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            writeln!(
-                out,
-                "boundary rules checked: {}{}",
-                collected.boundary_rules_checked,
-                if collected.boundaries_config_path.exists() {
-                    ""
-                } else {
-                    " (no judge.toml — boundaries skipped)"
-                }
-            )?;
-            if collected.suppressed_inline > 0 {
-                writeln!(
-                    out,
-                    "suppressed (inline judge-ignore): {}",
-                    collected.suppressed_inline
-                )?;
-            }
-            writeln!(out)?;
-            for finding in &gating {
-                write_combined_finding(out, finding)?;
-            }
-            if !advisory.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "advisory (heuristic) — no verdict effect: {}",
-                    advisory.len()
-                )?;
-                for finding in &advisory {
-                    write_combined_finding(out, finding)?;
-                }
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// One finding line of the bare `cargo judge` TTY report.
-fn write_combined_finding(out: &mut dyn Write, finding: &Finding) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "  [{}] {:<28} {}:{}  {}",
-        severity_label(finding.severity),
-        finding.rule,
-        finding.location.file.display(),
-        finding.location.line,
-        finding.location.item_path
-    )
-}
-
-/// Saves `findings` as a new baseline, or compares them against one and
-/// writes the delta (see todo.md §5, §14.2 P0#5). Only called when one of
-/// the two applies (`--save-baseline`/`--baseline`); a failing compare
-/// verdict becomes [`CommandOutcome::FindingsFound`].
-struct BaselineOptions<'a> {
-    rule_revisions: std::collections::HashMap<String, u32>,
-    save: bool,
-    compare_path: Option<&'a Path>,
-    default_save_path: &'a Path,
-    format: OutputFormat,
-    /// Authored LOC analyzed this run (see `judge::health_score`) — stored on
-    /// a saved baseline so a later run can recompute its historical score.
-    total_loc: usize,
-}
-
-fn handle_baseline(
-    workspace_root: &Path,
-    findings: &[Finding],
-    analysis_errors: &[String],
-    options: BaselineOptions<'_>,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    handle_baseline_with_trend(
-        workspace_root,
-        findings,
-        analysis_errors,
-        options,
-        None,
-        None,
-        out,
-    )
-}
-
-/// Like [`handle_baseline`], but embeds the health score and its trend into
-/// the JSON delta envelope when `score_trend` is given (only `health --score
-/// --baseline` computes one — see todo.md §15.1: the trend is emitted in
-/// JSON too, with an explicit `comparable: false` reason instead of a false
-/// delta). TTY trend output stays in `run_health`, written before this runs.
-///
-/// `api_surface_size` is `Some` only for `cargo judge api-surface
-/// --save-baseline` — it's attached to the saved [`judge::baseline::Baseline`]
-/// (see [`judge::baseline::Baseline::with_api_surface_size`]). The
-/// api-surface-size *trend* against a compared baseline is computed and
-/// printed by `run_api_surface` itself, before this runs, the same way
-/// `run_health` handles the health-score trend for TTY.
-fn handle_baseline_with_trend(
-    workspace_root: &Path,
-    findings: &[Finding],
-    analysis_errors: &[String],
-    options: BaselineOptions<'_>,
-    score_trend: Option<&judge::health_score::Trend>,
-    api_surface_size: Option<&std::collections::HashMap<String, usize>>,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let BaselineOptions {
-        rule_revisions,
-        save,
-        compare_path,
-        default_save_path,
-        format,
-        total_loc,
-    } = options;
-    let mut findings = findings.to_vec();
-    judge::finding::relativize_paths(&mut findings, workspace_root);
-
-    if !analysis_errors.is_empty() {
-        return match format {
-            OutputFormat::Json => {
-                let report = Report::with_errors(findings, analysis_errors.to_vec());
-                writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-                Err(CliError::Reported)
-            }
-            OutputFormat::Tty | OutputFormat::Sarif | OutputFormat::Markdown => {
-                Err(CliError::AnalysisIncomplete {
-                    context: "baseline was not evaluated",
-                    errors: analysis_errors.to_vec(),
-                })
-            }
+impl Cli {
+    fn json_output_artifact(&self) -> Result<Option<(PathBuf, &'static str)>, CliError> {
+        let format_and_name = match &self.command {
+            Some(command) => command.json_artifact(),
+            None => Some((self.baseline_args.format, "judge")),
         };
-    }
-
-    if save {
-        let commit = judge::git::head_commit(workspace_root)?;
-        let config = load_judge_toml(workspace_root)?;
-        let mut baseline = judge::baseline::Baseline::new(
-            &findings,
-            commit,
-            rule_revisions,
-            total_loc,
-            judge::health_score::ScoreContext::from_profiles(&config.crate_profiles),
-        );
-        if let Some(size) = api_surface_size {
-            baseline = baseline.with_api_surface_size(size.clone());
-        }
-        let save_path = workspace_root.join(default_save_path);
-        judge::baseline::save(&save_path, &baseline)?;
-        writeln!(
-            out,
-            "baseline saved: {} ({} findings)",
-            save_path.display(),
-            findings.len()
-        )?;
-        return Ok(CommandOutcome::Clean);
-    }
-
-    let Some(path) = compare_path else {
-        // Callers only invoke baseline handling when saving or comparing.
-        return Ok(CommandOutcome::Clean);
-    };
-    let mut baseline = judge::baseline::load(path)?;
-    baseline.relativize_paths(workspace_root);
-    let touched: std::collections::HashSet<PathBuf> =
-        judge::git::changed_files_since(workspace_root, &baseline.commit)?;
-
-    let delta = judge::baseline::diff(&findings, &baseline, &touched, &rule_revisions);
-    let verdict = delta.verdict();
-    match format {
-        OutputFormat::Json => {
-            let mut envelope = serde_json::json!({
-                "schema_version": judge::finding::SCHEMA_VERSION,
-                "verdict": verdict,
-                "delta": delta,
+        let is_json = matches!(format_and_name, Some((OutputFormat::Json, _)));
+        if !is_json {
+            return self.output.is_none().then_some(None).ok_or_else(|| {
+                CliError::Config("--output requires a command using `--format json`".to_string())
             });
-            if let Some(trend) = score_trend {
-                envelope["score"] = serde_json::to_value(trend.current()).unwrap();
-                envelope["trend"] = trend_json(trend);
-            }
-            writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
         }
-        OutputFormat::Markdown => {
-            write!(out, "{}", judge::markdown::render_delta(&delta, verdict))?;
-        }
-        OutputFormat::Sarif => {
-            return Err(unsupported_format(
-                "baseline comparison",
-                format,
-                "tty, json, markdown",
-            ));
-        }
-        OutputFormat::Tty => print_delta(out, &delta, verdict)?,
+        let (_, name) = format_and_name.expect("JSON format has an artifact name");
+        let path = self
+            .output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".judge").join(format!("{name}.json")));
+        Ok(Some((path, name)))
     }
-
-    if verdict == Verdict::Fail {
-        return Ok(CommandOutcome::FindingsFound);
-    }
-    Ok(CommandOutcome::Clean)
 }
 
-fn print_delta(
-    out: &mut dyn Write,
-    delta: &judge::baseline::Delta,
-    verdict: Verdict,
-) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "verdict: {}",
-        match verdict {
-            Verdict::Pass => "pass",
-            Verdict::Fail => "fail",
-        }
-    )?;
-    writeln!(out, "unchanged: {}", delta.unchanged_count)?;
-    writeln!(out, "resolved: {}", delta.resolved.len())?;
-    for finding in &delta.resolved {
-        writeln!(out, "  {}  {}", finding.rule, finding.file.display())?;
+fn write_json_artifact(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
     }
-
-    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
-        .code_introduced
-        .iter()
-        .partition(|finding| finding.is_gating());
-    writeln!(out, "code-introduced: {}", gating.len())?;
-    for finding in &gating {
-        writeln!(
-            out,
-            "  {}  {}:{}",
-            finding.rule,
-            finding.location.file.display(),
-            finding.location.line
-        )?;
-    }
-
-    writeln!(
-        out,
-        "code-introduced advisory (heuristic — no verdict effect): {}",
-        advisory.len()
-    )?;
-    for finding in &advisory {
-        writeln!(
-            out,
-            "  {}  {}:{}",
-            finding.rule,
-            finding.location.file.display(),
-            finding.location.line
-        )?;
-    }
-
-    writeln!(
-        out,
-        "rule-introduced (protected, does not fail): {}",
-        delta.rule_introduced.len()
-    )?;
-    for finding in &delta.rule_introduced {
-        writeln!(
-            out,
-            "  {}  {}:{}",
-            finding.rule,
-            finding.location.file.display(),
-            finding.location.line
-        )?;
-    }
+    std::fs::write(path, contents)?;
     Ok(())
 }
 
-/// TTY rendering of a [`judge::pattern_baseline::PatternDelta`] — the
-/// pattern-candidate analog of [`print_delta`], but without a verdict line
-/// (pattern candidates never gate — see `judge::pattern_baseline`'s module
-/// docs) and without the `code_introduced`/`rule_introduced` split (patterns
-/// use a flat new/resolved/unchanged classification instead).
-fn print_pattern_delta_tty(
-    out: &mut dyn Write,
-    delta: &judge::pattern_baseline::PatternDelta,
-) -> std::io::Result<()> {
-    writeln!(out, "unchanged: {}", delta.unchanged_count)?;
-    writeln!(out, "resolved: {}", delta.resolved.len())?;
-    for candidate in &delta.resolved {
-        writeln!(
-            out,
-            "  [{}] {}  crate: {}",
-            candidate.id, candidate.pattern, candidate.krate
-        )?;
-    }
-    writeln!(out, "new: {}", delta.new.len())?;
-    for candidate in &delta.new {
-        writeln!(
-            out,
-            "  [{}] {}  crate: {}",
-            candidate.id, candidate.pattern, candidate.scope.krate
-        )?;
-    }
-    Ok(())
-}
-
-/// `cargo judge audit --since <ref>` (see todo.md §5 "audit --since"): one
-/// combined pass/warn/fail PR verdict reflecting only findings introduced
-/// since `<ref>`. Reuses the already-persisted `.judge/baseline.json` the
-/// same way `--baseline <path>` works for every other command — `<ref>` is
-/// only the boundary [`judge::git::changed_files_since`] measures "what
-/// changed" against, not a second analysis target this re-runs analysis on.
-/// Exit codes: `2` for any config/parse/toolchain/ref-resolution/staleness
-/// error, `1` for a `fail` verdict, `0` for `pass`/`warn` (report-only,
-/// matching the GitHub Action's default report-only mode).
-fn run_audit(options: AuditOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let AuditOptions {
-        since,
-        format,
-        baseline: baseline_path,
-        audit_min_sample,
-        max_duplication_ratio,
-        max_suppression_ratio,
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let resolved_since = judge::git::resolve_commit(&workspace.root, &since)?;
-
-    let path = baseline_path.unwrap_or_else(|| workspace.root.join(DEFAULT_BASELINE_ALL));
-    if !path.exists() {
-        return Err(CliError::Config(format!(
-            "{} not found — run `cargo judge --save-baseline` first",
-            path.display()
-        )));
-    }
-    let mut baseline = judge::baseline::load(&path)?;
-    baseline.relativize_paths(&workspace.root);
-
-    if !judge::git::is_ancestor(&workspace.root, &baseline.commit, &resolved_since)? {
-        return Err(CliError::Config(format!(
-            "baseline commit {} is not an ancestor of `{since}` ({resolved_since}) — the baseline has diverged; re-run `cargo judge --save-baseline`",
-            baseline.commit
-        )));
-    }
-
-    let touched = judge::git::changed_files_since(&workspace.root, &resolved_since)?;
-
-    let mut collected = collect_findings(&workspace)?;
-    if !collected.analysis_errors.is_empty() {
-        return Err(CliError::AnalysisIncomplete {
-            context: "audit was not evaluated",
-            errors: collected.analysis_errors,
-        });
-    }
-    judge::finding::relativize_paths(&mut collected.findings, &workspace.root);
-
-    let delta = judge::baseline::diff(
-        &collected.findings,
-        &baseline,
-        &touched,
-        &collected.rule_revisions,
-    );
-
-    // Duplication ratio gate (see todo.md §6 "Kleine Stichproben"): opt-in,
-    // since a fixed ratio threshold is a policy decision judge deliberately
-    // doesn't invent a default for. Numerator prefers duplicated-token count
-    // (carried through `Finding.evidence` by `CloneMember::to_finding`) over
-    // a raw finding count, since it's a more faithful density measure; falls
-    // back to counting findings if a finding's evidence doesn't carry it.
-    let duplication_gate = match (audit_min_sample, max_duplication_ratio) {
-        (Some(minimum_sample), Some(max_ratio)) => {
-            let numerator: u64 = delta
-                .code_introduced
-                .iter()
-                .filter(|finding| finding.rule == judge::duplication::DUPLICATE_RULE)
-                .map(|finding| {
-                    finding
-                        .evidence
-                        .as_ref()
-                        .and_then(|evidence| evidence.get("token_count"))
-                        .and_then(serde_json::Value::as_u64)
-                        .unwrap_or(1)
-                })
-                .sum();
-            let sample_size = judge::health_score::authored_loc_in(&workspace, &touched) as u64;
-            Some(judge::gate::ratio_gate(
-                "duplication-ratio",
-                numerator,
-                sample_size,
-                minimum_sample,
-                max_ratio,
-            ))
-        }
-        _ => None,
-    };
-
-    // Suppression-debt ratio gate (todo.md §0/§6): same opt-in shape as the
-    // duplication gate — no invented default threshold, shared
-    // `--audit-min-sample` minimum — and the same denominator, touched
-    // authored LOC (the size of the change under judgement), so both gate
-    // ratios are densities over one sample. Numerator: code-introduced
-    // `suppression-debt` findings, one per `#[allow]`/`#[expect]` occurrence
-    // (see `judge::slop`) — unlike duplication there is no token-count
-    // evidence to prefer, the attribute itself is the unit of debt.
-    let suppression_gate = match (audit_min_sample, max_suppression_ratio) {
-        (Some(minimum_sample), Some(max_ratio)) => {
-            let numerator = delta
-                .code_introduced
-                .iter()
-                .filter(|finding| finding.rule == judge::slop::SUPPRESSION_DEBT_RULE)
-                .count() as u64;
-            let sample_size = judge::health_score::authored_loc_in(&workspace, &touched) as u64;
-            Some(judge::gate::ratio_gate(
-                "suppression-debt-ratio",
-                numerator,
-                sample_size,
-                minimum_sample,
-                max_ratio,
-            ))
-        }
-        _ => None,
-    };
-
-    let verdict = combine_verdict(
-        combine_verdict(
-            delta.tri_verdict(),
-            duplication_gate.as_ref().map(|gate| gate.verdict),
-        ),
-        suppression_gate.as_ref().map(|gate| gate.verdict),
-    );
-
-    match format {
-        OutputFormat::Json => {
-            let envelope = serde_json::json!({
-                "schema_version": judge::finding::SCHEMA_VERSION,
-                "verdict": verdict,
-                "delta": delta,
-                "gates": duplication_gate
-                    .iter()
-                    .chain(suppression_gate.iter())
-                    .collect::<Vec<_>>(),
-                "suppressed_inline": collected.suppressed_inline,
-            });
-            writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
-        }
-        OutputFormat::Markdown => {
-            let gates = [
-                judge::markdown::GateSlot {
-                    name: "duplication-ratio",
-                    threshold_flag: "--max-duplication-ratio",
-                    gate: duplication_gate.as_ref(),
-                },
-                judge::markdown::GateSlot {
-                    name: "suppression-debt-ratio",
-                    threshold_flag: "--max-suppression-ratio",
-                    gate: suppression_gate.as_ref(),
-                },
-            ];
-            write!(
-                out,
-                "{}",
-                judge::markdown::render_audit(&delta, verdict, &gates)
-            )?;
-        }
-        OutputFormat::Sarif => {
-            return Err(unsupported_format("`audit`", format, "tty, json, markdown"));
-        }
-        OutputFormat::Tty => print_audit(
-            out,
-            &delta,
-            verdict,
-            duplication_gate.as_ref(),
-            suppression_gate.as_ref(),
-            collected.suppressed_inline,
-        )?,
-    }
-
-    if verdict == TriVerdict::Fail {
-        return Ok(CommandOutcome::FindingsFound);
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// Combines the delta's tri-state verdict with a ratio gate's verdict (if
-/// evaluated) into one final verdict: `Fail` wins over everything, `Warn`
-/// wins over `Pass`. With several gates, [`run_audit`] folds this over each
-/// in turn. A gate result of `NotEvaluatedSmallSample` is purely
-/// informational and never forces `Warn`/`Fail` on its own (see todo.md §6).
-fn combine_verdict(tri: TriVerdict, gate: Option<judge::gate::GateVerdict>) -> TriVerdict {
-    let gate_failed = matches!(gate, Some(judge::gate::GateVerdict::Fail));
-    if tri == TriVerdict::Fail || gate_failed {
-        TriVerdict::Fail
-    } else if tri == TriVerdict::Warn {
-        TriVerdict::Warn
-    } else {
-        TriVerdict::Pass
-    }
-}
-
-fn print_audit(
-    out: &mut dyn Write,
-    delta: &judge::baseline::Delta,
-    verdict: TriVerdict,
-    duplication_gate: Option<&judge::gate::RatioGate>,
-    suppression_gate: Option<&judge::gate::RatioGate>,
-    suppressed_inline: usize,
-) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "verdict: {}",
-        match verdict {
-            TriVerdict::Pass => "pass",
-            TriVerdict::Warn => "warn",
-            TriVerdict::Fail => "fail",
-        }
-    )?;
-    if suppressed_inline > 0 {
-        writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-    }
-    writeln!(out, "unchanged: {}", delta.unchanged_count)?;
-    writeln!(out, "resolved: {}", delta.resolved.len())?;
-    for finding in &delta.resolved {
-        writeln!(out, "  {}  {}", finding.rule, finding.file.display())?;
-    }
-
-    let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
-        .code_introduced
-        .iter()
-        .partition(|finding| finding.is_gating());
-    writeln!(out, "code-introduced: {}", gating.len())?;
-    for finding in &gating {
-        write_introduced_finding(out, finding)?;
-    }
-
-    writeln!(
-        out,
-        "code-introduced advisory (heuristic — no verdict effect): {}",
-        advisory.len()
-    )?;
-    for finding in &advisory {
-        write_introduced_finding(out, finding)?;
-    }
-
-    writeln!(
-        out,
-        "rule-introduced (protected, does not fail): {}",
-        delta.rule_introduced.len()
-    )?;
-    for finding in &delta.rule_introduced {
-        writeln!(
-            out,
-            "  {}  {}:{}",
-            finding.rule,
-            finding.location.file.display(),
-            finding.location.line
-        )?;
-    }
-
-    writeln!(out)?;
-    print_gate(
-        out,
-        duplication_gate,
-        "duplication-ratio",
-        "--max-duplication-ratio",
-    )?;
-    print_gate(
-        out,
-        suppression_gate,
-        "suppression-debt-ratio",
-        "--max-suppression-ratio",
-    )?;
-    Ok(())
-}
-
-/// One gate line of the audit TTY report: either the evaluated gate
-/// (including an explicit `not_evaluated_small_sample`, see todo.md §6) or
-/// the hint naming the flags that would enable it — a skipped gate stays
-/// visible either way, never a silent pass.
-fn print_gate(
-    out: &mut dyn Write,
-    gate: Option<&judge::gate::RatioGate>,
-    name: &str,
-    threshold_flag: &str,
-) -> std::io::Result<()> {
-    match gate {
-        Some(gate) => {
-            let gate_verdict = match gate.verdict {
-                judge::gate::GateVerdict::Pass => "pass",
-                judge::gate::GateVerdict::Fail => "fail",
-                judge::gate::GateVerdict::NotEvaluatedSmallSample => "not_evaluated_small_sample",
-            };
-            writeln!(
-                out,
-                "gate: {} — {}/{} ({gate_verdict}, min sample {}, max ratio {})",
-                gate.name, gate.numerator, gate.sample_size, gate.minimum_sample, gate.max_ratio
-            )
-        }
-        None => writeln!(
-            out,
-            "gate: {name} not evaluated (pass --audit-min-sample and {threshold_flag} to enable)"
-        ),
-    }
-}
-
-/// One `code-introduced` finding line of the audit TTY report.
-fn write_introduced_finding(out: &mut dyn Write, finding: &Finding) -> std::io::Result<()> {
-    writeln!(
-        out,
-        "  [{}] {}  {}:{}",
-        severity_label(finding.severity),
-        finding.rule,
-        finding.location.file.display(),
-        finding.location.line
-    )
-}
-
-fn run_dupes(options: DupesOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let DupesOptions {
-        mode,
-        min_tokens,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-        include_generated,
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let report = judge::duplication::analyze_workspace(
-        source_files,
-        mode.into(),
-        min_tokens,
-        include_generated,
-    );
-    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
-
-    // Inline `judge-ignore` suppression (todo.md §5): dropped here, before
-    // baseline diff/verdict or JSON/SARIF output — the TTY clone-family
-    // preview below still lists every family member (see `run_dupes`'s own
-    // scope note at its `Tty` arm), but nothing suppressed reaches a verdict.
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(report.to_findings(), &workspace.root)?;
-
-    if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([(
-            judge::duplication::DUPLICATE_RULE.to_string(),
-            judge::duplication::DUPLICATE_RULE_REVISION,
-        )]);
-        return handle_baseline(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_DUPES),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
-            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format("`dupes`", format, "tty, json, sarif"));
-        }
-        OutputFormat::Tty => {
-            writeln!(
-                out,
-                "mode: {}",
-                match mode {
-                    DupeModeArg::Strict => "strict",
-                    DupeModeArg::Mild => "mild",
-                    DupeModeArg::Weak => "weak",
-                    DupeModeArg::Semantic => "semantic",
-                }
-            )?;
-            writeln!(out, "min tokens: {min_tokens}")?;
-            writeln!(out, "clone families: {}", report.families.len())?;
-            if !report.errors.is_empty() {
-                writeln!(out, "files skipped (parse errors): {}", report.errors.len())?;
-                for err in &report.errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if report.excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {} (see --include-generated)",
-                    report.excluded_generated
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-
-            for (index, family) in report
-                .families
-                .iter()
-                .take(DUPE_FAMILY_TTY_LIMIT)
-                .enumerate()
-            {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "family #{} — {} members",
-                    index + 1,
-                    family.members.len()
-                )?;
-                for member in &family.members {
-                    writeln!(
-                        out,
-                        "  {:>4} tokens  {}:{}-{}  {}",
-                        member.token_count,
-                        member.file.display(),
-                        member.start_line,
-                        member.end_line,
-                        member.qualified_name
-                    )?;
-                }
-            }
-            if report.families.len() > DUPE_FAMILY_TTY_LIMIT {
-                writeln!(
-                    out,
-                    "\n... and {} more families (see --format json for the full list)",
-                    report.families.len() - DUPE_FAMILY_TTY_LIMIT
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// `cargo judge deps`: dependency-hygiene findings (`misplaced-dependency-kind`)
-/// plus the G5 slopsquatting rules (see todo.md §14.2 G5). `name-collision-risk`
-/// is fully local and always runs; `phantom-crate`/`phantom-version`/
-/// `fresh-low-reputation-dep` need real crates.io network access and only run
-/// when `--check-crates-io` is passed — judge makes no network calls by
-/// default (see todo.md §1 "kein SaaS, keine Telemetrie, lokal deterministisch").
-fn run_deps(options: DepsOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let DepsOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-        check_crates_io,
-        check_rustc_lints,
-        audit_json,
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let report = judge::deps::analyze_workspace(&workspace);
-    let mut analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
-    let mut findings = report.findings;
-
-    let mut rule_revisions = std::collections::HashMap::from([
-        (
-            judge::deps::MISPLACED_DEPENDENCY_KIND_RULE.to_string(),
-            judge::deps::MISPLACED_DEPENDENCY_KIND_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_DEV_DEPENDENCY_RULE.to_string(),
-            judge::deps::UNUSED_DEV_DEPENDENCY_RULE_REVISION,
-        ),
-        (
-            judge::deps::HEAVY_DEPENDENCY_RULE.to_string(),
-            judge::deps::HEAVY_DEPENDENCY_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_FEATURE_FLAG_RULE.to_string(),
-            judge::deps::UNUSED_FEATURE_FLAG_RULE_REVISION,
-        ),
-        (
-            judge::deps::DEFAULT_FEATURES_UNUSED_RULE.to_string(),
-            judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_FEATURE_RULE.to_string(),
-            judge::deps::UNUSED_FEATURE_RULE_REVISION,
-        ),
-        (
-            judge::deps::DEP_WITHOUT_REPO_RULE.to_string(),
-            judge::deps::DEP_WITHOUT_REPO_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
-            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::MSRV_DRIFT_RULE.to_string(),
-            judge::dep_graph::MSRV_DRIFT_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE.to_string(),
-            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE_REVISION,
-        ),
-        (
-            judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
-            judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
-        ),
-    ]);
-    findings.extend(judge::slopsquat::analyze_name_collision(&workspace));
-
-    let dep_graph_report = judge::dep_graph::analyze_workspace(&workspace);
-    analysis_errors.extend(dep_graph_report.errors.iter().map(ToString::to_string));
-    findings.extend(dep_graph_report.findings);
-
-    if check_crates_io {
-        let slopsquat_config = load_judge_toml(&workspace.root)?.slopsquat;
-        let cache_root = workspace.root.join("target/judge/slopsquat-cache");
-
-        let index_client = judge::slopsquat::SparseIndexClient::new(cache_root.clone());
-        let phantom_report =
-            judge::slopsquat::analyze_phantom_dependencies(&workspace, &index_client);
-        findings.extend(phantom_report.findings);
-        analysis_errors.extend(phantom_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::PHANTOM_CRATE_RULE.to_string(),
-            judge::slopsquat::PHANTOM_CRATE_RULE_REVISION,
-        );
-        rule_revisions.insert(
-            judge::slopsquat::PHANTOM_VERSION_RULE.to_string(),
-            judge::slopsquat::PHANTOM_VERSION_RULE_REVISION,
-        );
-
-        let metadata_client = judge::slopsquat::RestMetadataClient::new(cache_root.clone());
-        let fresh_report = judge::slopsquat::analyze_fresh_low_reputation(
-            &workspace,
-            &metadata_client,
-            &slopsquat_config,
-        );
-        findings.extend(fresh_report.findings);
-        analysis_errors.extend(fresh_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE.to_string(),
-            judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE_REVISION,
-        );
-
-        let yanked_report =
-            judge::slopsquat::analyze_yanked_dependencies(&workspace, &index_client);
-        findings.extend(yanked_report.findings);
-        analysis_errors.extend(yanked_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::YANKED_DEPENDENCY_RULE.to_string(),
-            judge::slopsquat::YANKED_DEPENDENCY_RULE_REVISION,
-        );
-
-        let owners_client = judge::slopsquat::RestOwnersClient::new(cache_root);
-        let single_maintainer_report =
-            judge::slopsquat::analyze_single_maintainer_dependencies(&workspace, &owners_client);
-        findings.extend(single_maintainer_report.findings);
-        analysis_errors.extend(single_maintainer_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE.to_string(),
-            judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE_REVISION,
-        );
-    }
-
-    if check_rustc_lints {
-        let rustc_lint_report = judge::deps::analyze_rustc_unused_dependencies(&workspace);
-        findings.extend(rustc_lint_report.findings);
-        analysis_errors.extend(rustc_lint_report.errors.iter().map(ToString::to_string));
-        rule_revisions.insert(
-            judge::deps::UNUSED_DEPENDENCY_RULE.to_string(),
-            judge::deps::UNUSED_DEPENDENCY_RULE_REVISION,
-        );
-    }
-
-    if let Some(audit_json_path) = audit_json {
-        let vulnerabilities = judge::advisories::read_audit_report(&audit_json_path)?;
-        let advisory_report =
-            judge::advisories::analyze_vulnerabilities(&workspace, &vulnerabilities);
-        findings.extend(advisory_report.findings);
-        analysis_errors.extend(advisory_report.errors);
-        rule_revisions.insert(
-            judge::advisories::KNOWN_VULNERABILITY_RULE.to_string(),
-            judge::advisories::KNOWN_VULNERABILITY_RULE_REVISION,
-        );
-    }
-
-    // Inline `judge-ignore` suppression (todo.md §5), applied after every
-    // detector above has merged its findings in.
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    if save_baseline || baseline.is_some() {
-        return handle_baseline(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_DEPS),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let envelope = serde_json::json!({
-                "schema_version": judge::finding::SCHEMA_VERSION,
-                "findings": findings,
-                "feature_only_candidates": report.feature_only_candidates,
-                "errors": analysis_errors,
-                "suppressed_inline": suppressed_inline,
-            });
-            writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format("`deps`", format, "tty, json, sarif"));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "dependency findings: {}", findings.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "errors: {}", analysis_errors.len())?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-
-            for finding in &findings {
-                let krate = workspace
-                    .crates
-                    .iter()
-                    .find(|krate| krate.manifest_path == finding.location.file);
-                let crate_name = krate.map_or("?", |krate| krate.name.as_str());
-                if finding.rule == judge::deps::MISPLACED_DEPENDENCY_KIND_RULE {
-                    let is_build_dep = krate.is_some_and(|krate| {
-                        krate.dependencies.iter().any(|dep| {
-                            dep.name == finding.location.item_path
-                                && dep.kind == judge::ingest::DependencyKind::Build
-                        })
-                    });
-                    let direction = if is_build_dep {
-                        "build-dependency appears unused by build.rs"
-                    } else {
-                        "should probably be a dev-dependency"
-                    };
-                    writeln!(
-                        out,
-                        "  {}  {} — {direction}",
-                        crate_name, finding.location.item_path
-                    )?;
-                } else {
-                    writeln!(
-                        out,
-                        "  [{}] {}  {}",
-                        finding.rule, crate_name, finding.location.item_path
-                    )?;
-                }
-            }
-
-            if !report.feature_only_candidates.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "feature-only candidates (no code usage found; see unused-feature-flag findings above for detail): {}",
-                    report.feature_only_candidates.join(", ")
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-fn run_coverage(options: CoverageOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let CoverageOptions {
-        lcov,
-        mutants_json,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let coverage = judge::coverage::read_lcov(&lcov, &workspace.root)?;
-
-    let complexity_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let complexity_report = judge::complexity::analyze_workspace(complexity_source_files, false);
-    let mut analysis_errors: Vec<String> = complexity_report
-        .errors
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    for missing in &coverage.missing_files {
-        analysis_errors.push(format!(
-            "{}: coverage data references this file, but it no longer exists in the workspace",
-            missing.display()
+/// Adds artifact metadata without moving the command's established JSON
+/// payload. Consumers can keep reading existing root fields while people and
+/// agents get enough context to decide whether a follow-up is warranted.
+fn add_json_header(
+    contents: &[u8],
+    output_path: &Path,
+    command: &str,
+    result: &Result<CommandOutcome, CliError>,
+) -> Result<Vec<u8>, CliError> {
+    let mut document: serde_json::Value = serde_json::from_slice(contents).map_err(|err| {
+        CliError::Analyzer(format!("JSON renderer produced an invalid artifact: {err}"))
+    })?;
+    let Some(root) = document.as_object_mut() else {
+        return Err(CliError::Analyzer(
+            "JSON renderer produced a non-object artifact".to_string(),
         ));
-    }
-
-    let churn = match judge::git::churn(
-        &workspace.root,
-        judge::coverage::UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS,
-    ) {
-        Ok(churn) => churn,
-        Err(err) => {
-            analysis_errors.push(err.to_string());
-            std::collections::HashMap::new()
-        }
     };
 
-    let mut findings = judge::coverage::untested_hotspots(
-        &complexity_report.functions,
-        &churn,
-        &coverage,
-        &workspace.root,
-    );
-
-    let mut rule_revisions = std::collections::HashMap::from([(
-        judge::coverage::UNTESTED_HOTSPOT_RULE.to_string(),
-        judge::coverage::UNTESTED_HOTSPOT_RULE_REVISION,
-    )]);
-
-    if let Some(mutants_json_path) = mutants_json {
-        let mutants_report = judge::mutants::read_mutants_report(&mutants_json_path)?;
-        findings.extend(mutants_report.findings);
-        analysis_errors.extend(mutants_report.errors);
-        rule_revisions.insert(
-            judge::mutants::MUTATION_SURVIVOR_RULE.to_string(),
-            judge::mutants::MUTATION_SURVIVOR_RULE_REVISION,
-        );
-    }
-
-    let no_coverage_data_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let no_coverage_data = coverage.files_without_coverage_data(
-        &workspace.root,
-        no_coverage_data_source_files.map(|file| file.path.as_path()),
-    );
-
-    let test_ratios = judge::coverage::test_ratios(&workspace);
-
-    if save_baseline || baseline.is_some() {
-        return handle_baseline(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_COVERAGE),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors);
-            let mut value = serde_json::to_value(&report).unwrap();
-            value["files_without_coverage_data"] = serde_json::to_value(
-                no_coverage_data
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-            value["test_ratios"] = serde_json::to_value(
-                test_ratios
-                    .iter()
-                    .map(|ratio| {
-                        serde_json::json!({
-                            "crate": ratio.crate_name,
-                            "production_loc": ratio.production_loc,
-                            "test_loc": ratio.test_loc,
-                            "ratio": ratio.ratio(),
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-            writeln!(out, "{}", serde_json::to_string_pretty(&value).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format("`coverage`", format, "tty, json, sarif"));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "untested hotspots: {}", findings.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "errors: {}", analysis_errors.len())?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            for finding in &findings {
-                writeln!(
-                    out,
-                    "  {}:{}  {}",
-                    finding.location.file.display(),
-                    finding.location.line,
-                    finding.location.item_path
-                )?;
-            }
-            if !no_coverage_data.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "no coverage data (not asserted as 0%): {}",
-                    no_coverage_data.len()
-                )?;
-                for file in &no_coverage_data {
-                    writeln!(out, "  {}", file.display())?;
-                }
-            }
-            if !test_ratios.is_empty() {
-                writeln!(out)?;
-                writeln!(out, "test-to-code LOC ratio (metric only, no verdict):")?;
-                for ratio in &test_ratios {
-                    match ratio.ratio() {
-                        Some(value) => writeln!(
-                            out,
-                            "  {}: {:.2} (test {} / production {})",
-                            ratio.crate_name, value, ratio.test_loc, ratio.production_loc
-                        )?,
-                        None => writeln!(
-                            out,
-                            "  {}: undefined (test {} / production 0)",
-                            ratio.crate_name, ratio.test_loc
-                        )?,
-                    }
-                }
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-fn run_boundaries(
-    options: BoundariesOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let BoundariesOptions {
-        config: config_path,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-        graph,
-    } = options;
-
-    if let Some(graph_format) = graph {
-        let crate_graph = judge::boundaries::build_crate_graph(None)?;
-        let rendered = match graph_format {
-            GraphFormat::Dot => crate_graph.to_dot(),
-            GraphFormat::Mermaid => crate_graph.to_mermaid(),
-        };
-        write!(out, "{rendered}")?;
-        return Ok(CommandOutcome::Clean);
-    }
-
-    let workspace = judge::ingest::load(None)?;
-
-    let config_path = config_path.unwrap_or_else(|| workspace.root.join("judge.toml"));
-    if !config_path.exists() {
-        writeln!(
-            out,
-            "no judge.toml found — boundaries are opt-in, nothing to check"
-        )?;
-        return Ok(CommandOutcome::Clean);
-    }
-
-    let config_text = std::fs::read_to_string(&config_path)
-        .map_err(|err| CliError::Config(format!("{}: {err}", config_path.display())))?;
-    let config: judge::boundaries::BoundaryConfig =
-        toml::from_str(&config_text).map_err(|err| {
-            CliError::Config(format!("{}: failed to parse: {err}", config_path.display()))
-        })?;
-
-    let boundaries = judge::boundaries::evaluate(&workspace, &config)?;
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut findings = boundaries.findings;
-    // `evaluate()` itself has no per-file soft-error channel (its
-    // `--no-deps` `cargo_metadata` resolve either succeeds outright or
-    // fails via `?` above) — this only ever gets entries from the Deep-Tier
-    // pass below.
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut analysis_errors: Vec<String> = Vec::new();
-
-    // Deep-Tier upgrade to `[[module_boundary]]`: real symbol reference
-    // resolution instead of the Fast Tier's `syn`-based text scan — see
-    // `judge::boundaries_deep` module docs. Only available in a build
-    // compiled with `--features deep`; a Fast Tier build silently skips it
-    // (the Fast-Tier `module-boundary-violation` check above already ran),
-    // matching `run_api_surface`'s same precedent for `semver-hazard`'s
-    // Deep-Tier sub-case.
-    if judge::AnalysisTier::Deep.is_available() {
-        #[cfg(feature = "deep")]
-        {
-            let deep_report = judge::boundaries_deep::analyze_workspace(&workspace, &config)
-                .map_err(|err| CliError::Analyzer(err.to_string()))?;
-            findings.extend(deep_report.findings);
-            analysis_errors.extend(deep_report.errors.iter().map(ToString::to_string));
-        }
-        #[cfg(not(feature = "deep"))]
-        {
-            unreachable!(
-                "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-            );
-        }
-    }
-
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    if save_baseline || baseline.is_some() {
-        #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-        let mut rule_revisions = std::collections::HashMap::from([
-            (
-                judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
-                judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
+    let findings = root
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let candidates = ["candidates", "heuristics"]
+        .into_iter()
+        .filter_map(|key| root.get(key).and_then(serde_json::Value::as_array))
+        .map(Vec::len)
+        .sum::<usize>();
+    let errors = root
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let blocking = matches!(result, Ok(CommandOutcome::FindingsFound));
+    let (assessment, action_required, summary) = if errors > 0 {
+        (
+            "analysis_incomplete",
+            true,
+            format!("Resolve {errors} analysis error(s) before relying on this artifact."),
+        )
+    } else if blocking {
+        (
+            "blocking_findings",
+            true,
+            "The command returned a failing verdict; action is required.".to_string(),
+        )
+    } else if findings + candidates > 0 {
+        (
+            "review_recommended",
+            true,
+            format!(
+                "Review {findings} finding(s) and {candidates} advisory candidate(s); this is not an automatic refactoring instruction."
             ),
-            (
-                judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
-                judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
-            ),
-            (
-                judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE.to_string(),
-                judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
-            ),
-        ]);
-        #[cfg(feature = "deep")]
-        if judge::AnalysisTier::Deep.is_available() {
-            rule_revisions.insert(
-                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE.to_string(),
-                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE_REVISION,
-            );
-        }
-        return handle_baseline(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_BOUNDARIES),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
-            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`boundaries`",
-                format,
-                "tty, json, sarif",
-            ));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "boundary rules: {}", config.boundaries.len())?;
-            writeln!(out, "findings: {}", findings.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-            for finding in &findings {
-                writeln!(
-                    out,
-                    "  [{}] {} — {}",
-                    severity_label(finding.severity),
-                    finding.rule,
-                    finding.location.item_path
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// Ownership/bus-factor findings (see todo.md §3.E, §8). Window is the same
-/// `judge::git::DEFAULT_WINDOW_DAYS` used by hotspots — not a separate CLI
-/// flag, matching how hotspots hardcodes it today.
-fn run_distribution(
-    options: DistributionOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let DistributionOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let report = judge::ownership::analyze_workspace(&workspace, judge::git::DEFAULT_WINDOW_DAYS)?;
-    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
-    let files_analyzed = report.files.len();
-    let blame_errors = report.errors.len();
-
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
-
-    if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::ownership::LOW_BUS_FACTOR_RULE.to_string(),
-                judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
-            ),
-            (
-                judge::ownership::OWNERSHIP_FRAGMENTATION_RULE.to_string(),
-                judge::ownership::OWNERSHIP_FRAGMENTATION_RULE_REVISION,
-            ),
-        ]);
-        return handle_baseline(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_DISTRIBUTION),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
-            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`distribution`",
-                format,
-                "tty, json, sarif",
-            ));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "files analyzed: {files_analyzed}")?;
-            if blame_errors > 0 {
-                writeln!(out, "files skipped (blame errors): {blame_errors}")?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-
-            let (bus_factor, fragmentation): (Vec<&Finding>, Vec<&Finding>) = findings
-                .iter()
-                .partition(|finding| finding.rule == judge::ownership::LOW_BUS_FACTOR_RULE);
-
-            writeln!(out)?;
-            writeln!(out, "low-bus-factor findings: {}", bus_factor.len())?;
-            for finding in &bus_factor {
-                writeln!(
-                    out,
-                    "  [{}] {}  primary author: {}",
-                    severity_label(finding.severity),
-                    finding.location.file.display(),
-                    finding.location.item_path
-                )?;
-            }
-
-            writeln!(out)?;
-            writeln!(
-                out,
-                "ownership-fragmentation findings (advisory, no verdict effect): {}",
-                fragmentation.len()
-            )?;
-            for finding in &fragmentation {
-                writeln!(
-                    out,
-                    "  [{}] {}  {}",
-                    severity_label(finding.severity),
-                    finding.location.file.display(),
-                    finding.location.item_path
-                )?;
-            }
-            if !fragmentation.is_empty() {
-                writeln!(
-                    out,
-                    "  note: {}",
-                    judge::ownership::OWNERSHIP_FRAGMENTATION_NOTE
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// `unlinked-file`/`orphan-module` findings from resolving each crate's real
-/// `mod` tree (see `judge::module_graph`). Subcommand-only, matching
-/// `Distribution`/`Provenance`/`ApiSurface`'s own opt-in precedent — no
-/// config needed, but not part of bare `cargo judge`/`audit`/`health`.
-fn run_module_graph(
-    options: ModuleGraphOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ModuleGraphOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-        include_generated,
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let report = judge::module_graph::analyze_workspace(&workspace, include_generated);
-    let analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
-    let excluded_generated = report.excluded_generated;
-
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
-
-    if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::module_graph::UNLINKED_FILE_RULE.to_string(),
-                judge::module_graph::UNLINKED_FILE_RULE_REVISION,
-            ),
-            (
-                judge::module_graph::ORPHAN_MODULE_RULE.to_string(),
-                judge::module_graph::ORPHAN_MODULE_RULE_REVISION,
-            ),
-        ]);
-        return handle_baseline(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_MODULE_GRAPH),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
-            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`module-graph`",
-                format,
-                "tty, json, sarif",
-            ));
-        }
-        OutputFormat::Tty => {
-            let (unlinked, orphaned): (Vec<&Finding>, Vec<&Finding>) = findings
-                .iter()
-                .partition(|finding| finding.rule == judge::module_graph::UNLINKED_FILE_RULE);
-            if !analysis_errors.is_empty() {
-                writeln!(
-                    out,
-                    "files skipped (parse errors): {}",
-                    analysis_errors.len()
-                )?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {excluded_generated} (see --include-generated)"
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-            writeln!(out, "unlinked-file findings: {}", unlinked.len())?;
-            for finding in &unlinked {
-                writeln!(
-                    out,
-                    "  [{}] {}",
-                    severity_label(finding.severity),
-                    finding.location.item_path
-                )?;
-            }
-            writeln!(out)?;
-            writeln!(out, "orphan-module findings: {}", orphaned.len())?;
-            for finding in &orphaned {
-                writeln!(
-                    out,
-                    "  [{}] {}",
-                    severity_label(finding.severity),
-                    finding.location.item_path
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// Public-API-surface findings (`undocumented-public-item` and
-/// `semver-hazard` — see todo.md §I). Subcommand-only: deliberately not
-/// wired into `collect_findings`/`run_all`/`SLOP_RULES`, matching
-/// `Distribution`/`Provenance`/`DeadCode`'s own opt-in precedent. In a build
-/// compiled with `--features deep`, also runs `semver-hazard`'s
-/// `leaked_dependency_type` sub-case (see `judge::api_surface_deep`) on top
-/// of the two Fast-Tier sub-cases — unlike `dead-code`, this command still
-/// produces useful output without the Deep Tier, so it degrades rather than
-/// erroring when built without it.
-fn run_api_surface(
-    options: ApiSurfaceOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ApiSurfaceOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-        include_generated,
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-    let boundary_config = load_judge_toml(&workspace.root)?;
-    judge::boundaries::validate_internal_crates(&workspace, &boundary_config)?;
-
-    let report = judge::api_surface::analyze_workspace(workspace.crates.iter(), include_generated);
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut findings = report.findings;
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
-
-    // The third `semver-hazard` sub-case (`leaked_dependency_type`) needs
-    // the Deep Tier's type resolution — see `judge::api_surface_deep`'s
-    // module docs. Only available in a build compiled with `--features
-    // deep`; a Fast Tier build silently skips it rather than erroring,
-    // unlike `dead-code` (whose *entire* subcommand needs the Deep Tier),
-    // because the other two `semver-hazard` sub-cases and
-    // `undocumented-public-item` are useful on their own.
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut deep_errors: Vec<String> = Vec::new();
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut deep_checked: Option<usize> = None;
-    if judge::AnalysisTier::Deep.is_available() {
-        #[cfg(feature = "deep")]
-        {
-            let deep_report = judge::api_surface_deep::analyze_workspace(
-                &workspace,
-                &boundary_config.internal_crates,
-            )
-            .map_err(|err| CliError::Analyzer(err.to_string()))?;
-            deep_checked = Some(deep_report.checked);
-            findings.extend(deep_report.findings);
-            deep_errors = deep_report.errors.iter().map(ToString::to_string).collect();
-            analysis_errors.extend(deep_errors.iter().cloned());
-        }
-        #[cfg(not(feature = "deep"))]
-        {
-            unreachable!(
-                "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-            );
-        }
-    }
-
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    // API-surface-size trend against a saved baseline (see todo.md §I
-    // "API-Surface-Größe pro Crate, Trend gegen Baseline") — computed before
-    // `handle_baseline`/`handle_baseline_with_trend` run below, same "trend
-    // vor Absolutwert" ordering `run_health` uses for the health-score
-    // trend, since a failing findings-delta verdict there ends the run
-    // before reaching any code after it. `baseline_size` stays `None` for a
-    // plain run and for `--save-baseline` — every crate's `delta` is then
-    // `None` too, which is exactly what a save needs (only `item_count`
-    // matters there).
-    let baseline_size = if !save_baseline && let Some(path) = &baseline {
-        judge::baseline::load(path)?.api_surface_size
+        )
     } else {
-        None
+        (
+            "informational",
+            false,
+            "No findings or advisory candidates require follow-up.".to_string(),
+        )
     };
-    let size_trend =
-        judge::api_surface::size_trend(&report.api_surface_size, baseline_size.as_ref());
-    if matches!(format, OutputFormat::Tty) {
-        print_api_surface_size(out, &size_trend, baseline.is_some() && !save_baseline)?;
-    }
 
-    if save_baseline || baseline.is_some() {
-        #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-        let mut rule_revisions = std::collections::HashMap::from([
-            (
-                judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE.to_string(),
-                judge::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION,
-            ),
-            (
-                judge::api_surface::SEMVER_HAZARD_RULE.to_string(),
-                judge::api_surface::SEMVER_HAZARD_RULE_REVISION,
-            ),
-        ]);
-        #[cfg(feature = "deep")]
-        rule_revisions.insert(
-            judge::api_surface_deep::INTERNAL_LEAK_RULE.to_string(),
-            judge::api_surface_deep::INTERNAL_LEAK_RULE_REVISION,
-        );
-        #[cfg(feature = "deep")]
-        rule_revisions.insert(
-            judge::api_surface_deep::RE_EXPORT_CHAIN_RULE.to_string(),
-            judge::api_surface_deep::RE_EXPORT_CHAIN_RULE_REVISION,
-        );
-        let current_size: std::collections::HashMap<String, usize> = size_trend
-            .iter()
-            .map(|trend| (trend.crate_name.clone(), trend.item_count))
-            .collect();
-        return handle_baseline_with_trend(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_API_SURFACE),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            None,
-            Some(&current_size),
-            out,
-        );
-    }
+    let generated_at_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|err| CliError::Analyzer(format!("system clock is before Unix epoch: {err}")))?
+        .as_secs();
+    let generated_at_utc = format_utc_timestamp(generated_at_unix_seconds)?;
 
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline)
-                .with_api_surface_size(
-                    size_trend
-                        .iter()
-                        .map(|trend| (trend.crate_name.clone(), trend.item_count))
-                        .collect(),
-                );
-            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`api-surface`",
-                format,
-                "tty, json, sarif",
-            ));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "undocumented public items: {}", findings.len())?;
-            if let Some(checked) = deep_checked {
-                writeln!(out, "pub fns checked (leaked_dependency_type): {checked}")?;
-            }
-            if !report.errors.is_empty() {
-                writeln!(out, "files skipped (parse errors): {}", report.errors.len())?;
-                for err in report.errors.iter().map(ToString::to_string) {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if !deep_errors.is_empty() {
-                writeln!(
-                    out,
-                    "leaked-dependency-type analysis errors: {}",
-                    deep_errors.len()
-                )?;
-                for err in &deep_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if report.excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {} (see --include-generated)",
-                    report.excluded_generated
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-            for finding in &findings {
-                writeln!(
-                    out,
-                    "  [{}] {}:{}  {}",
-                    severity_label(finding.severity),
-                    finding.location.file.display(),
-                    finding.location.line,
-                    finding.location.item_path
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
+    let header = serde_json::json!({
+        "schema_version": 1,
+        "generated_at_utc": generated_at_utc,
+        "generated_at_unix_seconds": generated_at_unix_seconds,
+        "working_directory": std::env::current_dir()?.display().to_string(),
+        "output_path": output_path.display().to_string(),
+        "command": command,
+        "description": json_artifact_description(command),
+        "contains": "The command's normal versioned JSON payload plus this artifact header.",
+        "assessment": {
+            "kind": assessment,
+            "action_required": action_required,
+            "blocking": blocking,
+            "findings": findings,
+            "advisory_candidates": candidates,
+            "analysis_errors": errors,
+            "summary": summary,
+        },
+    });
+    serde_json::to_vec_pretty(&HeaderFirstJson {
+        header: &header,
+        payload: root,
+    })
+    .map_err(|err| CliError::Analyzer(err.to_string()))
 }
 
-/// One `api surface: <crate> <count> items` line per crate (see todo.md §I
-/// "API-Surface-Größe pro Crate, Trend gegen Baseline"). Appends `(Δ<delta>
-/// vs baseline)` when [`judge::api_surface::CrateSizeTrend::delta`] is
-/// comparable; when `--baseline` was given but the loaded baseline recorded
-/// no `api_surface_size` (older schema, or a baseline saved by a different
-/// command) or lacks that particular crate, `baseline_requested` makes this
-/// say so explicitly instead of silently printing a plain count as if no
-/// baseline had been given (mirrors [`print_score_trend`]'s "explicit reason
-/// instead of a false delta" rule).
-fn print_api_surface_size(
-    out: &mut dyn Write,
-    trend: &[judge::api_surface::CrateSizeTrend],
-    baseline_requested: bool,
-) -> std::io::Result<()> {
-    for crate_trend in trend {
-        match crate_trend.delta {
-            Some(delta) => writeln!(
-                out,
-                "api surface: {} {} items (\u{394}{delta:+} vs baseline)",
-                crate_trend.crate_name, crate_trend.item_count
-            )?,
-            None if baseline_requested => writeln!(
-                out,
-                "api surface: {} {} items (not comparable to baseline)",
-                crate_trend.crate_name, crate_trend.item_count
-            )?,
-            None => writeln!(
-                out,
-                "api surface: {} {} items",
-                crate_trend.crate_name, crate_trend.item_count
-            )?,
-        }
-    }
-    Ok(())
+/// Serializes an artifact's context before its established command payload.
+/// JSON object order is semantically irrelevant, but leading with the header
+/// makes the file practical to inspect without scrolling past large findings.
+struct HeaderFirstJson<'a> {
+    header: &'a serde_json::Value,
+    payload: &'a serde_json::Map<String, serde_json::Value>,
 }
 
-/// Heuristic author-class breakdowns of churn, duplication, and suppression
-/// debt (see todo.md §3.G G6). Subcommand-only: deliberately not wired into
-/// `collect_findings`/`run_all`/`SLOP_RULES`, matching `Distribution`/
-/// `DeadCode`'s own opt-in precedent. Reuses `git::DEFAULT_WINDOW_DAYS`, same
-/// as `run_distribution`.
-fn run_provenance(
-    options: ProvenanceOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ProvenanceOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let config = load_judge_toml(&workspace.root)?;
-
-    let breakdown = judge::provenance::analyze_workspace(
-        &workspace,
-        judge::git::DEFAULT_WINDOW_DAYS,
-        &config.provenance.labels,
-    );
-    let analysis_errors: Vec<String> = breakdown.errors.iter().map(ToString::to_string).collect();
-
-    if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::provenance::PROVENANCE_CHURN_RULE.to_string(),
-                judge::provenance::PROVENANCE_CHURN_RULE_REVISION,
-            ),
-            (
-                judge::provenance::PROVENANCE_DUPLICATION_RATE_RULE.to_string(),
-                judge::provenance::PROVENANCE_DUPLICATION_RATE_RULE_REVISION,
-            ),
-            (
-                judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE.to_string(),
-                judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE_REVISION,
-            ),
-            (
-                judge::provenance::DEP_ADDED_BY_AGENT_RULE.to_string(),
-                judge::provenance::DEP_ADDED_BY_AGENT_RULE_REVISION,
-            ),
-        ]);
-        return handle_baseline(
-            &workspace.root,
-            &breakdown.findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_PROVENANCE),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
+impl Serialize for HeaderFirstJson<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let has_existing_header = self.payload.contains_key("header");
+        let mut object = serializer
+            .serialize_map(Some(self.payload.len() + usize::from(!has_existing_header)))?;
+        object.serialize_entry("header", self.header)?;
+        for (key, value) in self.payload {
+            if key != "header" {
+                object.serialize_entry(key, value)?;
+            }
+        }
+        object.end()
     }
-
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(breakdown.findings, analysis_errors);
-            let mut envelope = serde_json::to_value(&report).unwrap();
-            envelope["caveat"] =
-                serde_json::Value::String(judge::provenance::PROVENANCE_CAVEAT.to_string());
-            writeln!(out, "{}", serde_json::to_string_pretty(&envelope).unwrap())?;
-        }
-        // No SARIF: provenance output is inseparable from its caveat (a
-        // distribution trend, never a per-person judgement), and SARIF has
-        // no slot that CI annotators would surface it in.
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            return Err(unsupported_format("`provenance`", format, "tty, json"));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "{}", judge::provenance::PROVENANCE_CAVEAT)?;
-            writeln!(out)?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-                writeln!(out)?;
-            }
-            writeln!(
-                out,
-                "{:<24} {:>8} {:>12} {:>12}",
-                "class", "churn", "duplication", "suppression"
-            )?;
-            for summary in &breakdown.by_class {
-                writeln!(
-                    out,
-                    "{:<24} {:>8} {:>12} {:>12}",
-                    summary.class.key(),
-                    summary.churn,
-                    summary.duplication,
-                    summary.suppression_debt
-                )?;
-            }
-
-            // `dep-added-by-agent` findings are per-instance, not part of
-            // the `by_class` aggregate table above (see `ClassSummary`'s
-            // doc comment: it's a count model, this rule isn't a count).
-            let dep_added_findings: Vec<&Finding> = breakdown
-                .findings
-                .iter()
-                .filter(|finding| finding.rule == judge::provenance::DEP_ADDED_BY_AGENT_RULE)
-                .collect();
-            if !dep_added_findings.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "dependencies added in an agent-classified commit, with no same-commit usage found:"
-                )?;
-                for finding in dep_added_findings {
-                    let evidence = finding.evidence.as_ref().expect("always set");
-                    writeln!(
-                        out,
-                        "  {} (commit {}, {})",
-                        evidence["dependency"].as_str().unwrap_or("?"),
-                        evidence["commit"].as_str().unwrap_or("?"),
-                        evidence["author_class"].as_str().unwrap_or("?")
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
 }
 
-/// Loads the workspace's `catch-all-error` findings (same slop pass and
-/// `judge.toml` config `run_all`/`run_health` use) and runs the pattern
-/// aggregator (`judge::pattern`) over them. Shared by `patterns`,
-/// `explain-pattern`, and `fix-preview` — all three re-run the same
-/// analysis and then match by id, mirroring how `cargo judge explain`
-/// re-runs its own analysis rather than caching a prior run.
-fn collect_pattern_candidates(
-    workspace: &judge::ingest::Workspace,
-    clippy_json: Option<&Path>,
-) -> Result<Vec<judge::pattern::PatternCandidate>, CliError> {
-    let slop_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let rules_config = load_judge_toml(&workspace.root)?.rules;
-    let slop = judge::slop::analyze_workspace(
-        slop_source_files,
-        false,
-        rules_config.catch_all_error.allow_anyhow_at_boundary,
-    );
-    let clippy_hits = match clippy_json {
-        Some(path) => judge::clippy_import::read_clippy_report(path)?,
-        None => Vec::new(),
-    };
-    Ok(judge::pattern::analyze_workspace_with_clippy(
-        workspace,
-        &slop.findings,
-        &clippy_hits,
+fn format_utc_timestamp(unix_seconds: u64) -> Result<String, CliError> {
+    let seconds = i64::try_from(unix_seconds)
+        .map_err(|_| CliError::Analyzer("system timestamp exceeds supported range".to_string()))?;
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
     ))
 }
 
-/// `cargo judge patterns` (todo.md §16.5, §16.6): heuristic Rust
-/// design-pattern recommendations aggregated from projectwide evidence.
-/// Always `CommandOutcome::Clean` — a pattern candidate never fails the
-/// verdict on its own; a real analyzer/config failure still surfaces as a
-/// `CliError` (exit 2), same as every other command.
-fn run_patterns(options: PatternsOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let PatternsOptions {
-        format,
-        clippy_json,
-        save_pattern_baseline,
-        pattern_baseline,
-    } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`patterns`", format, "tty, json"));
-    }
-    let workspace = judge::ingest::load(None)?;
-    let candidates = collect_pattern_candidates(&workspace, clippy_json.as_deref())?;
-
-    if save_pattern_baseline {
-        let baseline = judge::pattern_baseline::PatternBaseline::new(&candidates);
-        let save_path = workspace.root.join(DEFAULT_PATTERN_BASELINE);
-        judge::pattern_baseline::save(&save_path, &baseline)?;
-        writeln!(
-            out,
-            "pattern baseline saved: {} ({} candidates)",
-            save_path.display(),
-            candidates.len()
-        )?;
-        return Ok(CommandOutcome::Clean);
-    }
-
-    if let Some(path) = &pattern_baseline {
-        let baseline = judge::pattern_baseline::load(path)?;
-        let delta = judge::pattern_baseline::diff_patterns(&candidates, &baseline);
-        match format {
-            OutputFormat::Json => {
-                let json = serde_json::json!({ "delta": delta });
-                writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
-            }
-            OutputFormat::Sarif | OutputFormat::Markdown => {
-                unreachable!("rejected above before loading the workspace")
-            }
-            OutputFormat::Tty => print_pattern_delta_tty(out, &delta)?,
-        }
-        return Ok(CommandOutcome::Clean);
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let json = serde_json::json!({ "candidates": candidates });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => {
-            writeln!(
-                out,
-                "heuristic pattern suggestions — advisory, no verdict effect: {}",
-                candidates.len()
-            )?;
-            for candidate in &candidates {
-                writeln!(
-                    out,
-                    "  [{}] {}  crate: {}",
-                    candidate.id, candidate.pattern, candidate.scope.krate
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// Loads the workspace's complexity metrics (same complexity pass
-/// `run_health` uses) and `judge.toml` boundary config, then runs the
-/// principle-heuristic aggregator (`judge::principle`) over them. Shared by
-/// `principles` and `explain-principle`, mirroring how
-/// [`collect_pattern_candidates`] is shared by `patterns`/`explain-
-/// pattern`/`fix-preview`.
-fn collect_principle_heuristics(
-    workspace: &judge::ingest::Workspace,
-) -> Result<Vec<judge::principle::PrincipleHeuristic>, CliError> {
-    let boundary_config = load_judge_toml(&workspace.root)?;
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let complexity = judge::complexity::analyze_workspace(source_files, false);
-    Ok(judge::principle::analyze_workspace(
-        workspace,
-        &complexity,
-        Some(&boundary_config),
-    )?)
-}
-
-/// `cargo judge principles` (todo.md §16.7): heuristic abstract-design-
-/// principle interpretations aggregated from at least two independent
-/// evidence classes per finding. Always `CommandOutcome::Clean` — a
-/// principle heuristic never fails the verdict on its own; a real
-/// analyzer/config failure still surfaces as a `CliError` (exit 2), same as
-/// every other command. Deliberately a separate, standalone output block
-/// from `patterns`, even though both are advisory: todo.md §16.7 treats
-/// concrete pattern recommendations and abstract design-principle
-/// interpretations as different assertion classes.
-fn run_principles(
-    options: PrinciplesOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let PrinciplesOptions { format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`principles`", format, "tty, json"));
-    }
-    let workspace = judge::ingest::load(None)?;
-    let heuristics = collect_principle_heuristics(&workspace)?;
-
-    match format {
-        OutputFormat::Json => {
-            let json = serde_json::json!({ "heuristics": heuristics });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => {
-            writeln!(
-                out,
-                "design principle heuristics — advisory, no verdict effect, always a judgment \
-                 call: {}",
-                heuristics.len()
-            )?;
-            for heuristic in &heuristics {
-                writeln!(
-                    out,
-                    "  [{}] {}  crate: {}",
-                    heuristic.id, heuristic.principle, heuristic.scope.krate
-                )?;
-                for module in &heuristic.scope.modules {
-                    writeln!(out, "    - {module}")?;
-                }
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// Finds the pattern candidate `id` refers to, re-running the same analysis
-/// [`collect_pattern_candidates`] does. Unknown id ⇒ [`CliError::Analyzer`]
-/// (exit 2) — a usage error, not a findings verdict (todo.md §16.6's
-/// `explain-pattern` acceptance criterion).
-fn find_pattern_candidate(
-    workspace: &judge::ingest::Workspace,
-    id: &str,
-) -> Result<judge::pattern::PatternCandidate, CliError> {
-    collect_pattern_candidates(workspace, None)?
-        .into_iter()
-        .find(|candidate| candidate.id.as_str() == id)
-        .ok_or_else(|| CliError::Analyzer(format!("unknown pattern candidate id: {id}")))
-}
-
-/// Finds the principle heuristic `id` refers to, re-running the same
-/// analysis [`collect_principle_heuristics`] does. Unknown id ⇒
-/// [`CliError::Analyzer`] (exit 2) — a usage error, not a findings verdict,
-/// mirroring [`find_pattern_candidate`]'s convention.
-fn find_principle_heuristic(
-    workspace: &judge::ingest::Workspace,
-    id: &str,
-) -> Result<judge::principle::PrincipleHeuristic, CliError> {
-    collect_principle_heuristics(workspace)?
-        .into_iter()
-        .find(|heuristic| heuristic.id.as_str() == id)
-        .ok_or_else(|| CliError::Analyzer(format!("unknown principle heuristic id: {id}")))
-}
-
-/// One [`judge::pattern::Evidence`] entry, TTY-rendered under `label`.
-fn print_evidence_tty(
-    out: &mut dyn Write,
-    label: &str,
-    evidence: &judge::pattern::Evidence,
-) -> std::io::Result<()> {
-    writeln!(out, "  evidence ({label}): {}", evidence.description)?;
-    for location in &evidence.locations {
-        match &location.item_path {
-            Some(item_path) => writeln!(out, "    - {}  {item_path}", location.file.display())?,
-            None => writeln!(out, "    - {}", location.file.display())?,
-        }
-    }
-    Ok(())
-}
-
-/// Full TTY rendering of one pattern candidate: scope, evidence,
-/// preconditions, contraindications, migration plan, and related findings
-/// (todo.md §16.6: `explain-pattern` always shows contraindications, and
-/// generic text without concrete fundstellen is unacceptable).
-fn print_pattern_candidate_tty(
-    out: &mut dyn Write,
-    candidate: &judge::pattern::PatternCandidate,
-) -> std::io::Result<()> {
-    writeln!(out, "pattern candidate: {}", candidate.id)?;
-    writeln!(out, "  pattern: {}", candidate.pattern)?;
-    writeln!(out, "  scope: crate `{}`", candidate.scope.krate)?;
-    if !candidate.scope.modules.is_empty() {
-        writeln!(out, "    modules:")?;
-        for module in &candidate.scope.modules {
-            writeln!(out, "      - {module}")?;
-        }
-    }
-    print_evidence_tty(out, "primary", &candidate.evidence.primary)?;
-    print_evidence_tty(out, "independent", &candidate.evidence.independent)?;
-    for extra in &candidate.evidence.additional {
-        print_evidence_tty(out, "additional", extra)?;
-    }
-    writeln!(out, "  preconditions:")?;
-    for precondition in &candidate.preconditions {
-        writeln!(out, "    - {}", precondition.description)?;
-    }
-    writeln!(out, "  contraindications:")?;
-    for contraindication in &candidate.contraindications {
-        writeln!(out, "    - {}", contraindication.description)?;
-    }
-    writeln!(out, "  migration plan (no patch — text only):")?;
-    for step in &candidate.migration {
-        writeln!(out, "    {}. {}", step.step, step.description)?;
-        for path in &step.affected_paths {
-            writeln!(out, "       - {}", path.display())?;
-        }
-    }
-    writeln!(out, "  related findings:")?;
-    for finding_id in &candidate.related_findings {
-        writeln!(out, "    - {finding_id}")?;
-    }
-    Ok(())
-}
-
-/// `cargo judge explain-pattern <id>` (todo.md §16.5, §16.6): the full
-/// evidence, preconditions, contraindications, and migration plan behind
-/// one pattern candidate.
-fn run_explain_pattern(
-    options: ExplainPatternOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ExplainPatternOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`explain-pattern`", format, "tty, json"));
-    }
-    let workspace = judge::ingest::load(None)?;
-    let candidate = find_pattern_candidate(&workspace, &id)?;
-
-    match format {
-        OutputFormat::Json => {
-            writeln!(out, "{}", serde_json::to_string_pretty(&candidate).unwrap())?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => print_pattern_candidate_tty(out, &candidate)?,
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// Full TTY rendering of one principle heuristic: scope, evidence,
-/// interpretation, contraindications, missing evidence, alternatives, and
-/// related findings — mirrors [`print_pattern_candidate_tty`], adapted for
-/// [`judge::principle::PrincipleHeuristic`]'s fields (no preconditions or
-/// migration plan; those are `PatternCandidate`-only).
-fn print_principle_heuristic_tty(
-    out: &mut dyn Write,
-    heuristic: &judge::principle::PrincipleHeuristic,
-) -> std::io::Result<()> {
-    writeln!(out, "principle heuristic: {}", heuristic.id)?;
-    writeln!(out, "  principle: {}", heuristic.principle)?;
-    writeln!(out, "  scope: crate `{}`", heuristic.scope.krate)?;
-    if !heuristic.scope.modules.is_empty() {
-        writeln!(out, "    modules:")?;
-        for module in &heuristic.scope.modules {
-            writeln!(out, "      - {module}")?;
-        }
-    }
-    for (index, evidence) in heuristic.evidence.iter().enumerate() {
-        print_evidence_tty(out, &(index + 1).to_string(), evidence)?;
-    }
-    writeln!(out, "  interpretation: {}", heuristic.interpretation)?;
-    writeln!(out, "  contraindications:")?;
-    for contraindication in &heuristic.contraindications {
-        writeln!(out, "    - {}", contraindication.description)?;
-    }
-    writeln!(out, "  missing evidence:")?;
-    for missing in &heuristic.missing_evidence {
-        writeln!(out, "    - {}", missing.description)?;
-    }
-    writeln!(out, "  alternatives:")?;
-    for alternative in &heuristic.alternatives {
-        writeln!(out, "    - {}", alternative.description)?;
-    }
-    writeln!(out, "  related findings:")?;
-    for finding_id in &heuristic.related_findings {
-        writeln!(out, "    - {finding_id}")?;
-    }
-    Ok(())
-}
-
-/// `cargo judge explain-principle <id>` (todo.md §16.7, analogous to
-/// `explain-pattern` todo.md §16.5/§16.6): the full evidence, interpretation,
-/// contraindications, missing evidence, and alternatives behind one
-/// principle heuristic.
-fn run_explain_principle(
-    options: ExplainPrincipleOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ExplainPrincipleOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format(
-            "`explain-principle`",
-            format,
-            "tty, json",
-        ));
-    }
-    let workspace = judge::ingest::load(None)?;
-    let heuristic = find_principle_heuristic(&workspace, &id)?;
-
-    match format {
-        OutputFormat::Json => {
-            writeln!(out, "{}", serde_json::to_string_pretty(&heuristic).unwrap())?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => print_principle_heuristic_tty(out, &heuristic)?,
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// `cargo judge fix-preview <id>` (todo.md §16.5): only the migration plan
-/// and the affected call sites (`related_findings`) — deliberately no
-/// patch is generated or applied.
-fn run_fix_preview(
-    options: FixPreviewOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let FixPreviewOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`fix-preview`", format, "tty, json"));
-    }
-    let workspace = judge::ingest::load(None)?;
-    let candidate = find_pattern_candidate(&workspace, &id)?;
-
-    match format {
-        OutputFormat::Json => {
-            let json = serde_json::json!({
-                "id": candidate.id,
-                "pattern": candidate.pattern,
-                "migration": candidate.migration,
-                "related_findings": candidate.related_findings,
-                "patch": serde_json::Value::Null,
-                "note": "migration plan only — no patch is generated (see todo.md §16.5)",
-            });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => {
-            writeln!(
-                out,
-                "fix preview for {} ({}) — no patch is generated, migration plan only:",
-                candidate.id, candidate.pattern
-            )?;
-            for step in &candidate.migration {
-                writeln!(out, "  {}. {}", step.step, step.description)?;
-                for path in &step.affected_paths {
-                    writeln!(out, "     - {}", path.display())?;
-                }
-            }
-            writeln!(out)?;
-            writeln!(
-                out,
-                "related findings (call sites): {}",
-                candidate.related_findings.len()
-            )?;
-            for finding_id in &candidate.related_findings {
-                writeln!(out, "  {finding_id}")?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// `cargo judge explain-rule <id>` (todo.md §17.5): a rule's fixed
-/// documentation from [`judge::rule_registry`] — evidence class,
-/// preconditions, exclusions, allowed wording, and verdict effect. A pure
-/// static lookup: unlike `explain-pattern`/`fix-preview` it never loads the
-/// workspace or runs analysis, so it never fails for an analyzer reason and
-/// never produces `CommandOutcome::FindingsFound`.
-fn run_explain_rule(
-    options: ExplainRuleOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ExplainRuleOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`explain-rule`", format, "tty, json"));
-    }
-    let entry = judge::rule_registry::lookup(&id)
-        .ok_or_else(|| CliError::Analyzer(format!("unknown rule id: {id}")))?;
-
-    match format {
-        OutputFormat::Json => {
-            let example = entry.example.map(|example| {
-                serde_json::json!({
-                    "before": example.before,
-                    "why_it_matters": example.why_it_matters,
-                })
-            });
-            let json = serde_json::json!({
-                "id": entry.id,
-                "evidence_class": entry.evidence_class,
-                "verdict_effect": entry.verdict_effect.label(),
-                "preconditions": entry.preconditions,
-                "exclusions": entry.exclusions,
-                "allowed_wording": entry.allowed_wording,
-                "example": example,
-            });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before looking up the rule")
-        }
-        OutputFormat::Tty => {
-            let evidence_class = serde_json::to_value(entry.evidence_class).unwrap();
-            writeln!(out, "rule: {}", entry.id)?;
-            writeln!(
-                out,
-                "  evidence class: {}",
-                evidence_class.as_str().unwrap_or_default()
-            )?;
-            writeln!(out, "  verdict effect: {}", entry.verdict_effect.label())?;
-            writeln!(out, "  preconditions: {}", entry.preconditions)?;
-            writeln!(out, "  exclusions: {}", entry.exclusions)?;
-            writeln!(out, "  allowed wording: {}", entry.allowed_wording)?;
-            if let Some(example) = entry.example {
-                writeln!(out, "  example:")?;
-                for line in example.before.lines() {
-                    writeln!(out, "    {line}")?;
-                }
-                writeln!(out, "  why it matters: {}", example.why_it_matters)?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// Compact TTY rendering of the analysis universe (see
-/// [`judge::finding::AnalysisUniverse`]) — the JSON report carries the same
-/// data structured; TTY gets the human-readable echo so the Deep Tier's
-/// output always states what it makes a claim about (todo.md §0, §17.5).
-#[cfg(feature = "deep")]
-fn print_universe_tty(
-    out: &mut dyn Write,
-    universe: &judge::finding::AnalysisUniverse,
-) -> std::io::Result<()> {
-    let fidelity = |status: judge::finding::FidelityStatus| match status {
-        judge::finding::FidelityStatus::Enabled => "enabled",
-        judge::finding::FidelityStatus::Disabled => "disabled",
-        judge::finding::FidelityStatus::NotApplicable => "not applicable",
-    };
-    writeln!(
-        out,
-        "analysis universe: {} tier, judge {}, {}, commit {}",
-        universe.tier,
-        universe.judge_version,
-        universe.platform,
-        universe
-            .commit
-            .as_deref()
-            .unwrap_or("none (no git repository)")
-    )?;
-    writeln!(
-        out,
-        "  targets: {}; features: {}; entry points: {}",
-        universe.targets.join(", "),
-        universe.features.join(", "),
-        universe.entry_points.join(", ")
-    )?;
-    writeln!(
-        out,
-        "  include tests: {}; include generated: {}; proc-macro expansion: {}; build scripts: {}",
-        universe.include_tests,
-        universe.include_generated,
-        fidelity(universe.proc_macro_expansion),
-        fidelity(universe.build_scripts)
-    )
-}
-
-/// `unused-pub-workspace` via the Deep Tier (see todo.md §3.A, §14.2 P1).
-/// Only available in a build compiled with `--features deep` — a Fast Tier
-/// build returns a clear error instead of silently doing nothing.
-#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
-fn run_dead_code(
-    options: DeadCodeOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    if !judge::AnalysisTier::Deep.is_available() {
-        return Err(CliError::Analyzer(
-            "dead-code analysis needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)".to_string(),
-        ));
-    }
-
-    #[cfg(feature = "deep")]
-    {
-        run_dead_code_deep(options, out)
-    }
-    #[cfg(not(feature = "deep"))]
-    {
-        unreachable!(
-            "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-        )
-    }
-}
-
-#[cfg(feature = "deep")]
-fn run_dead_code_deep(
-    options: DeadCodeOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let DeadCodeOptions {
-        include_tests,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let dead_code_report = judge::dead_code::analyze_workspace(&workspace, include_tests)?;
-
-    // `feature-gated-dead-code` is opt-in via `judge.toml` `[feature_matrix]`
-    // — with `combinations` absent or empty (the default), this performs no
-    // analysis at all (see `judge::feature_matrix` module docs).
-    let feature_matrix_config = load_judge_toml(&workspace.root)?.feature_matrix;
-    let feature_matrix_report = judge::feature_matrix::analyze_workspace(
-        &workspace,
-        &feature_matrix_config.combinations,
-        include_tests,
-    )?;
-
-    let dead_trait_impl_report = judge::dead_trait_impl::analyze_workspace(&workspace)?;
-
-    // `duplicative-reinvention` needs clone-family membership — cheap,
-    // Fast Tier, same defaults `cargo judge health`/`dupes` already use.
-    let dupes_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let dupes = judge::duplication::analyze_workspace(
-        dupes_source_files,
-        DupeMode::Mild,
-        judge::duplication::DEFAULT_MIN_TOKENS,
-        false,
-    );
-
-    // `orphaned-code` needs a file's dominant blame author and the repo's
-    // active-author set — same Fast Tier, git-blame-based data
-    // `low-bus-factor` already computes (see `judge::ownership` module
-    // docs). Only `.files` is used here; the low-bus-factor/
-    // ownership-fragmentation findings this also computes belong to `cargo
-    // judge distribution`, not this command, so they're discarded.
-    let window_days = judge::git::DEFAULT_WINDOW_DAYS;
-    let active_authors = judge::git::active_authors_since(&workspace.root, window_days)?;
-    let ownership_report = judge::ownership::analyze_workspace(&workspace, window_days)?;
-    let dominant_author_by_file: std::collections::HashMap<std::path::PathBuf, String> =
-        ownership_report
-            .files
-            .iter()
-            .filter_map(|file| {
-                file.authors
-                    .first()
-                    .map(|author| (file.file.clone(), author.email.clone()))
-            })
-            .collect();
-
-    // `monomorphization-load` needs each function's `generic_param_count` —
-    // cheap, Fast Tier, the same `Vec<FunctionInfo>` `signature-complexity`
-    // already computes.
-    let monomorphization_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let complexity = judge::complexity::analyze_workspace(monomorphization_source_files, false);
-
-    // `connectivity-drop`/`duplicative-reinvention`/`orphaned-code` load
-    // their own second `DeepContext` here rather than sharing
-    // `dead_code`'s — `dead_code::analyze_workspace` doesn't expose the
-    // `RootDatabase` it loads internally, and threading one through would
-    // widen that module's public API for a performance-only concern.
-    // Accepted, documented extra cost (a second full workspace load; see
-    // `judge::deep`'s own cost note), not a correctness one.
-    let structural_report = judge::slop_structural_deep::analyze_workspace(
-        &workspace,
-        &dupes,
-        include_tests,
-        &dominant_author_by_file,
-        &active_authors,
-        &complexity.functions,
-    )?;
-
-    let mut findings = dead_code_report.findings;
-    findings.extend(feature_matrix_report.findings);
-    findings.extend(dead_trait_impl_report.findings);
-    findings.extend(structural_report.findings);
-
-    let mut analysis_errors: Vec<String> = dead_code_report
-        .errors
-        .iter()
-        .map(ToString::to_string)
-        .collect();
-    analysis_errors.extend(feature_matrix_report.errors.iter().map(ToString::to_string));
-    analysis_errors.extend(
-        dead_trait_impl_report
-            .errors
-            .iter()
-            .map(ToString::to_string),
-    );
-    analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
-    analysis_errors.extend(ownership_report.errors.iter().map(ToString::to_string));
-    analysis_errors.extend(complexity.errors.iter().map(ToString::to_string));
-    analysis_errors.extend(structural_report.errors.iter().map(ToString::to_string));
-
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::dead_code::UNUSED_PUB_WORKSPACE_RULE.to_string(),
-                judge::dead_code::UNUSED_PUB_WORKSPACE_RULE_REVISION,
-            ),
-            (
-                judge::dead_code::UNUSED_PUB_API_RULE.to_string(),
-                judge::dead_code::UNUSED_PUB_API_RULE_REVISION,
-            ),
-            (
-                judge::dead_code::DEAD_ENUM_VARIANT_RULE.to_string(),
-                judge::dead_code::DEAD_ENUM_VARIANT_RULE_REVISION,
-            ),
-            (
-                judge::dead_code::TEST_ONLY_PUB_RULE.to_string(),
-                judge::dead_code::TEST_ONLY_PUB_RULE_REVISION,
-            ),
-            (
-                judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE.to_string(),
-                judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE_REVISION,
-            ),
-            (
-                judge::dead_code::CRATE_COUPLING_RULE.to_string(),
-                judge::dead_code::CRATE_COUPLING_RULE_REVISION,
-            ),
-            (
-                judge::dead_code::MODULE_COUPLING_RULE.to_string(),
-                judge::dead_code::MODULE_COUPLING_RULE_REVISION,
-            ),
-            (
-                judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE.to_string(),
-                judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE_REVISION,
-            ),
-            (
-                judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE.to_string(),
-                judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural_deep::CONNECTIVITY_DROP_RULE.to_string(),
-                judge::slop_structural_deep::CONNECTIVITY_DROP_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE.to_string(),
-                judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural_deep::ORPHANED_CODE_RULE.to_string(),
-                judge::slop_structural_deep::ORPHANED_CODE_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE.to_string(),
-                judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE_REVISION,
-            ),
-        ]);
-        return handle_baseline(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_DEAD_CODE),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            out,
-        );
-    }
-
-    // §0 demands the Deep Tier fully describes what its claims are
-    // about — JSON carries the structured universe, TTY a compact echo.
-    let universe = judge::finding::AnalysisUniverse::deep(&workspace, include_tests);
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_universe(universe)
-                .with_suppressed_inline(suppressed_inline);
-            writeln!(out, "{}", serde_json::to_string_pretty(&report).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(
-                out,
-                &workspace.root,
-                findings,
-                analysis_errors,
-                Some(universe),
-            )?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`dead-code`",
-                format,
-                "tty, json, sarif",
-            ));
-        }
-        OutputFormat::Tty => {
-            print_universe_tty(out, &universe)?;
-            writeln!(out, "pub items checked: {}", dead_code_report.checked)?;
-            writeln!(
-                out,
-                "functions checked (connectivity-drop): {}",
-                structural_report.checked
-            )?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-            for rule in [
-                judge::dead_code::UNUSED_PUB_WORKSPACE_RULE,
-                judge::dead_code::UNUSED_PUB_API_RULE,
-                judge::dead_code::DEAD_ENUM_VARIANT_RULE,
-                judge::dead_code::TEST_ONLY_PUB_RULE,
-                judge::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
-                judge::dead_code::CRATE_COUPLING_RULE,
-                judge::dead_code::MODULE_COUPLING_RULE,
-                judge::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
-                judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
-                judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
-                judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
-                judge::slop_structural_deep::ORPHANED_CODE_RULE,
-                judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE,
-            ] {
-                let rule_findings: Vec<&Finding> = findings
-                    .iter()
-                    .filter(|finding| finding.rule == rule)
-                    .collect();
-                writeln!(out, "{rule} findings: {}", rule_findings.len())?;
-                for finding in rule_findings {
-                    writeln!(
-                        out,
-                        "  [{}] {}:{}  {}",
-                        severity_label(finding.severity),
-                        finding.location.file.display(),
-                        finding.location.line,
-                        finding.location.item_path
-                    )?;
-                    if let Some(limitations) = &finding.limitations {
-                        writeln!(out, "    limitations: {limitations:?}")?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-/// `judge explain <item-path> --why-live` (see todo.md §7, §14.2 P1).
-/// Only `--why-live` is implemented; other explain modes (e.g. explaining a
-/// finding id) don't exist yet.
-#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
-fn run_explain(options: ExplainOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    // Checked before the tier/mode gates so `explain --format sarif` is the
-    // same clean config error (exit 2) in Fast and Deep Tier builds alike.
-    if matches!(options.format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`explain`", options.format, "tty, json"));
-    }
-    if !options.why_live {
-        return Err(CliError::Analyzer(
-            "`judge explain` currently only supports `--why-live`".to_string(),
-        ));
-    }
-    if !judge::AnalysisTier::Deep.is_available() {
-        return Err(CliError::Analyzer(
-            "--why-live needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)".to_string(),
-        ));
-    }
-
-    #[cfg(feature = "deep")]
-    {
-        run_explain_deep(options, out)
-    }
-    #[cfg(not(feature = "deep"))]
-    {
-        unreachable!(
-            "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-        )
-    }
-}
-
-#[cfg(feature = "deep")]
-fn run_explain_deep(
-    options: ExplainOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ExplainOptions {
-        item_path,
-        why_live: _,
-        include_tests,
-        format,
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let result = judge::reachability::why_live(&workspace, &item_path, include_tests)?;
-
-    match format {
-        OutputFormat::Json => {
-            // Not a `Report` (no findings), but the same §0 obligation
-            // applies: a Deep Tier answer states what it is a claim
-            // about (see `judge::finding::AnalysisUniverse`).
-            let universe = judge::finding::AnalysisUniverse::deep(&workspace, include_tests);
-            let json = match &result {
-                judge::reachability::WhyLive::Path(path) => serde_json::json!({
-                    "item_path": item_path,
-                    "reachable": true,
-                    "path": path.iter().map(|step| serde_json::json!({
-                        "qualified_name": step.qualified_name,
-                        "file": step.file,
-                        "line": step.line,
-                        "call_kind": step.kind.map(|kind| kind.as_str()),
-                    })).collect::<Vec<_>>(),
-                    "analysis_universe": universe,
-                }),
-                judge::reachability::WhyLive::NotReachable => serde_json::json!({
-                    "item_path": item_path,
-                    "reachable": false,
-                    "path": [],
-                    "analysis_universe": universe,
-                }),
-            };
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected in run_explain before the Deep Tier runs")
-        }
-        OutputFormat::Tty => match &result {
-            judge::reachability::WhyLive::Path(path) => {
-                writeln!(out, "{item_path} is live:")?;
-                for (index, step) in path.iter().enumerate() {
-                    let prefix = if index == 0 { "  " } else { "  called by " };
-                    let kind_suffix = step.kind.map_or(String::new(), |kind| format!(" [{kind}]"));
-                    writeln!(
-                        out,
-                        "{prefix}{} ({}:{}){kind_suffix}",
-                        step.qualified_name,
-                        step.file.display(),
-                        step.line
-                    )?;
-                }
-            }
-            judge::reachability::WhyLive::NotReachable => {
-                writeln!(
-                    out,
-                    "{item_path}: not reachable from any recognized entry point (`fn main` in a [[bin]]/[[example]] target, #[test]/#[bench] with --include-tests, or #[no_mangle]/#[export_name]/#[wasm_bindgen])"
-                )?;
-            }
-        },
-    }
-    Ok(CommandOutcome::Clean)
-}
-
-fn run_health(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let HealthOptions {
-        score: show_score,
-        show_cascades,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-        include_generated,
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let report = judge::complexity::analyze_workspace(source_files, include_generated);
-    let mut analysis_errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
-    let mut functions = report.functions;
-    functions.sort_by_key(|function| std::cmp::Reverse(function.cyclomatic));
-
-    let (hotspots, hotspot_error) =
-        match judge::git::hotspots(&workspace.root, &functions, judge::git::DEFAULT_WINDOW_DAYS) {
-            Ok(hotspots) => (hotspots, None),
-            Err(err) => {
-                let error = err.to_string();
-                analysis_errors.push(error.clone());
-                (Vec::new(), Some(error))
-            }
-        };
-    let mut findings: Vec<_> = hotspots
-        .iter()
-        .take(HOTSPOT_LIMIT)
-        .map(judge::git::Hotspot::to_finding)
-        .collect();
-
-    // AI-slop signals (see todo.md §G "AI-Slop-Signale", §12 "Entscheidungen":
-    // "Der Slop-Block ist Teil von `health`, kein eigener Sub-Command") — a
-    // second, fresh iterator over the same source files, since the first one
-    // was consumed by `complexity::analyze_workspace` above.
-    let slop_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let rules_config = load_judge_toml(&workspace.root)?.rules;
-    let slop = judge::slop::analyze_workspace(
-        slop_source_files,
-        include_generated,
-        rules_config.catch_all_error.allow_anyhow_at_boundary,
-    );
-    analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
-    findings.extend(slop.findings);
-
-    // G4 structural slop (see todo.md §3.G): same whole-workspace scope as
-    // the analyzers above, so it's wired in here too rather than left
-    // `health`-only-missing.
-    findings.extend(judge::slop_structural::complexity_inflation(&functions));
-    findings.extend(judge::complexity::signature_complexity(&functions));
-    findings.extend(judge::complexity::maintainability_index(&functions));
-    match judge::git::churn(&workspace.root, 14) {
-        Ok(two_week_churn) => {
-            findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
-        }
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-    let abstraction_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    findings.extend(judge::slop_structural::analyze_workspace_structural(
-        abstraction_source_files,
-    ));
-
-    let fragile_substring_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    findings.extend(judge::slop_structural::fragile_substring_classification(
-        fragile_substring_source_files,
-    ));
-
-    let security_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let security = judge::security::analyze_workspace(security_source_files, include_generated);
-    analysis_errors.extend(security.errors.iter().map(ToString::to_string));
-    findings.extend(security.findings);
-
-    // Inline `judge-ignore` suppression (todo.md §5): applied after every
-    // detector above has merged its findings in, so a suppressed finding
-    // never reaches score, baseline diff, or verdict below.
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    let excluded_generated =
-        report.excluded_generated + slop.excluded_generated + security.excluded_generated;
-
-    // The LOC denominator is only computed — and an unreadable file only
-    // fatal — where a score or a saved baseline depends on it (see todo.md
-    // §15.1: no score on an incomplete basis). Plain `health` keeps
-    // reporting per-file read problems as analysis errors instead.
-    let total_loc = if show_score || save_baseline || baseline.is_some() {
-        judge::health_score::total_authored_loc_checked(&workspace)?
+/// Gregorian civil date for a Unix-day offset, using the public-domain
+/// civil-date algorithm by Howard Hinnant. Kept dependency-free because the
+/// artifact header only needs a stable UTC rendering of `SystemTime`.
+fn civil_date_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
     } else {
-        0 // unused: every consumer below sits behind one of the flags above
+        month_prime - 9
     };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
 
-    // Compute the score trend before `handle_baseline` runs below, since a
-    // failing verdict there ends the run before reaching any code after it
-    // (see todo.md §4 point 4, "Trend vor Absolutwert" — the score is
-    // never shown without this). Written here for TTY; JSON gets it embedded
-    // in the delta envelope by `handle_baseline_with_trend`.
-    let score_trend = if show_score
-        && !save_baseline
-        && let Some(path) = &baseline
-    {
-        Some(compute_score_trend(&workspace, &findings, total_loc, path)?)
-    } else {
-        None
-    };
-    if matches!(format, OutputFormat::Tty)
-        && let Some(trend) = &score_trend
-    {
-        print_score_trend(out, trend)?;
+fn json_artifact_description(command: &str) -> &'static str {
+    match command {
+        "dupes" => "Duplicated token spans grouped into clone families and refactoring priorities.",
+        "map" => "Workspace facts and refactoring attention ranked from measured source metrics.",
+        "impact" => "Direct analysis and Cargo-target context for one source file.",
+        "patterns" => "Advisory Rust pattern candidates aggregated from project evidence.",
+        "principles" => "Advisory design-principle heuristics aggregated from project evidence.",
+        "audit" => "Baseline-relative verdict, delta, and configured quality gates.",
+        "judge" => "Combined Judge findings across the enabled default analyzers.",
+        _ => "Versioned Judge analysis output for the selected command.",
     }
-
-    if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::git::HOTSPOT_RULE.to_string(),
-                judge::git::HOTSPOT_RULE_REVISION,
-            ),
-            (
-                judge::slop::SWALLOWED_RESULT_RULE.to_string(),
-                judge::slop::SWALLOWED_RESULT_RULE_REVISION,
-            ),
-            (
-                judge::slop::EMPTY_ERROR_ARM_RULE.to_string(),
-                judge::slop::EMPTY_ERROR_ARM_RULE_REVISION,
-            ),
-            (
-                judge::slop::CATCH_ALL_ERROR_RULE.to_string(),
-                judge::slop::CATCH_ALL_ERROR_RULE_REVISION,
-            ),
-            (
-                judge::slop::SUPPRESSION_DEBT_RULE.to_string(),
-                judge::slop::SUPPRESSION_DEBT_RULE_REVISION,
-            ),
-            (
-                judge::slop::MERGED_STUB_RULE.to_string(),
-                judge::slop::MERGED_STUB_RULE_REVISION,
-            ),
-            (
-                judge::slop::EMPTY_IMPL_RULE.to_string(),
-                judge::slop::EMPTY_IMPL_RULE_REVISION,
-            ),
-            (
-                judge::slop::ASSERTION_FREE_TEST_RULE.to_string(),
-                judge::slop::ASSERTION_FREE_TEST_RULE_REVISION,
-            ),
-            (
-                judge::slop::TAUTOLOGICAL_TEST_RULE.to_string(),
-                judge::slop::TAUTOLOGICAL_TEST_RULE_REVISION,
-            ),
-            (
-                judge::slop::IGNORED_TEST_ACCUMULATION_RULE.to_string(),
-                judge::slop::IGNORED_TEST_ACCUMULATION_RULE_REVISION,
-            ),
-            (
-                judge::slop::CONVERSATIONAL_ARTIFACT_RULE.to_string(),
-                judge::slop::CONVERSATIONAL_ARTIFACT_RULE_REVISION,
-            ),
-            (
-                judge::slop::RESTATING_COMMENT_RULE.to_string(),
-                judge::slop::RESTATING_COMMENT_RULE_REVISION,
-            ),
-            (
-                judge::slop::STEP_COMMENT_INFLATION_RULE.to_string(),
-                judge::slop::STEP_COMMENT_INFLATION_RULE_REVISION,
-            ),
-            (
-                judge::slop::GENERIC_NAMING_RULE.to_string(),
-                judge::slop::GENERIC_NAMING_RULE_REVISION,
-            ),
-            (
-                judge::slop::DOC_RESTATES_SIGNATURE_RULE.to_string(),
-                judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::CHURN_HOTSPOT_RULE.to_string(),
-                judge::slop_structural::CHURN_HOTSPOT_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
-                judge::slop_structural::COMPLEXITY_INFLATION_RULE_REVISION,
-            ),
-            (
-                judge::complexity::SIGNATURE_COMPLEXITY_RULE.to_string(),
-                judge::complexity::SIGNATURE_COMPLEXITY_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
-                judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE.to_string(),
-                judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE_REVISION,
-            ),
-            (
-                judge::security::UNSAFE_SURFACE_RULE.to_string(),
-                judge::security::UNSAFE_SURFACE_RULE_REVISION,
-            ),
-            (
-                judge::security::UNSAFE_DENSITY_RULE.to_string(),
-                judge::security::UNSAFE_DENSITY_RULE_REVISION,
-            ),
-            (
-                judge::security::INTEGER_CAST_RISK_RULE.to_string(),
-                judge::security::INTEGER_CAST_RISK_RULE_REVISION,
-            ),
-            (
-                judge::security::PANIC_IN_LIB_RULE.to_string(),
-                judge::security::PANIC_IN_LIB_RULE_REVISION,
-            ),
-            (
-                judge::security::HARDCODED_SECRET_RULE.to_string(),
-                judge::security::HARDCODED_SECRET_RULE_REVISION,
-            ),
-        ]);
-        return handle_baseline_with_trend(
-            &workspace.root,
-            &findings,
-            &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_HEALTH),
-                format,
-                total_loc,
-            },
-            score_trend.as_ref(),
-            None,
-            out,
-        );
-    }
-
-    match format {
-        OutputFormat::Json => {
-            // With `--score`, the score is embedded next to the report
-            // fields (additive, so the plain report shape stays intact) —
-            // an unavailable score is already an error above instead of
-            // being silently omitted (see todo.md §15.1).
-            let score = if show_score {
-                let config = load_judge_toml(&workspace.root)?;
-                Some(require_score(judge::health_score::compute(
-                    &findings,
-                    total_loc,
-                    &workspace,
-                    &config.crate_profiles,
-                ))?)
-            } else {
-                None
-            };
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_universe(judge::finding::AnalysisUniverse::fast(
-                    &workspace,
-                    include_generated,
-                ))
-                .with_suppressed_inline(suppressed_inline);
-            let mut value = serde_json::to_value(&report).unwrap();
-            if let Some(score) = score {
-                value["score"] = serde_json::to_value(&score).unwrap();
-            }
-            writeln!(out, "{}", serde_json::to_string_pretty(&value).unwrap())?;
-        }
-        OutputFormat::Sarif => {
-            if show_score {
-                // SARIF has no result slot a numeric score would surface in
-                // — rejected rather than silently dropped.
-                return Err(CliError::Config(
-                    "--score is not supported with --format sarif; use --format json".to_string(),
-                ));
-            }
-            write_sarif(
-                out,
-                &workspace.root,
-                findings,
-                analysis_errors,
-                Some(judge::finding::AnalysisUniverse::fast(
-                    &workspace,
-                    include_generated,
-                )),
-            )?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format("`health`", format, "tty, json, sarif"));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "functions analyzed: {}", functions.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            if excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {excluded_generated} (see --include-generated)"
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-
-            writeln!(out)?;
-            writeln!(out, "top complexity (cyclomatic):")?;
-            for function in functions.iter().take(15) {
-                writeln!(
-                    out,
-                    "  {:>3}  {}:{}  {}",
-                    function.cyclomatic,
-                    function.file.display(),
-                    function.line,
-                    function.qualified_name
-                )?;
-            }
-
-            writeln!(out)?;
-            if let Some(error) = hotspot_error {
-                writeln!(out, "hotspots: unavailable ({error})")?;
-            } else {
-                print_hotspots(out, &hotspots, &findings, show_cascades)?;
-            }
-
-            writeln!(out)?;
-            print_slop(out, &findings, show_cascades)?;
-
-            if show_score {
-                writeln!(out)?;
-                let config = load_judge_toml(&workspace.root)?;
-                let score = require_score(judge::health_score::compute(
-                    &findings,
-                    total_loc,
-                    &workspace,
-                    &config.crate_profiles,
-                ))?;
-                let advisory_count = findings
-                    .iter()
-                    .filter(|finding| !finding.is_gating())
-                    .count();
-                writeln!(
-                    out,
-                    "health score: {:.1} ({}) — {} authored LOC, {} fail, {} warn, {} advisory (not scored)",
-                    score.score,
-                    score.grade.label(),
-                    score.total_loc,
-                    score.fail_count,
-                    score.warn_count,
-                    advisory_count,
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
 }
 
 /// Loads `judge.toml`'s `[[boundary]]`/`[[crate_profile]]` config, if
@@ -4556,49 +1160,6 @@ fn severity_label(severity: judge::finding::Severity) -> &'static str {
         judge::finding::Severity::Warn => "warn",
         judge::finding::Severity::Info => "info",
     }
-}
-
-fn run_inspect(out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
-
-    writeln!(out, "workspace root: {}", workspace.root.display())?;
-    writeln!(out, "crates: {}", workspace.crates.len())?;
-    for krate in &workspace.crates {
-        writeln!(out)?;
-        writeln!(out, "  {} {}", krate.name, krate.version)?;
-        writeln!(out, "    manifest: {}", krate.manifest_path.display())?;
-        writeln!(out, "    source files: {}", krate.source_files.len())?;
-        if krate.entry_points.is_empty() {
-            writeln!(out, "    entry points: none")?;
-        } else {
-            writeln!(out, "    entry points:")?;
-            for entry in &krate.entry_points {
-                writeln!(
-                    out,
-                    "      [{}] {} — {}",
-                    entry.kind.label(),
-                    entry.name,
-                    entry.path.display()
-                )?;
-            }
-        }
-    }
-
-    writeln!(out)?;
-    writeln!(out, "tiers:")?;
-    writeln!(out, "  fast: available")?;
-    writeln!(
-        out,
-        "  deep: {}",
-        if AnalysisTier::Deep.is_available() {
-            "available"
-        } else {
-            "not available (build with --features deep)"
-        }
-    )?;
-    writeln!(out)?;
-    writeln!(out, "cache: not implemented yet")?;
-    Ok(CommandOutcome::Clean)
 }
 
 #[cfg(test)]
@@ -5025,10 +1586,25 @@ fn dup_two(x: i32) -> i32 {
         result
     }
 
+    fn run_json_in_dir(
+        dir: &Path,
+        cli: Cli,
+        out: &mut dyn Write,
+    ) -> Result<CommandOutcome, CliError> {
+        let _guard = lock_cwd();
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = run_with_json_output(cli, out);
+        std::env::set_current_dir(original).unwrap();
+        result
+    }
+
     fn cli_with(command: Command) -> Cli {
         Cli {
             command: Some(command),
             baseline_args: baseline_args(OutputFormat::Tty, false, None),
+            progress: None,
+            output: None,
         }
     }
 
@@ -5050,6 +1626,7 @@ fn dup_two(x: i32) -> i32 {
             min_tokens: judge::duplication::DEFAULT_MIN_TOKENS,
             baseline_args: baseline_args(format, save_baseline, baseline),
             include_generated: false,
+            include_tests: false,
         }))
     }
 
@@ -5069,6 +1646,8 @@ fn dup_two(x: i32) -> i32 {
         Cli {
             command: None,
             baseline_args: baseline_args(OutputFormat::Tty, save_baseline, baseline),
+            progress: None,
+            output: None,
         }
     }
 
@@ -5114,6 +1693,25 @@ fn dup_two(x: i32) -> i32 {
         assert!(
             text.contains("clone families: 0"),
             "unexpected output: {text}"
+        );
+    }
+
+    #[test]
+    fn dupes_json_includes_a_compact_refactoring_summary() {
+        let dir = TempDir::new("dupes-refactoring-summary");
+        write_fixture_crate(&dir);
+
+        let mut out = Vec::new();
+        run_in_dir(&dir, dupes_cli(OutputFormat::Json, false, None), &mut out)
+            .expect("dupes must run");
+        let json: serde_json::Value = serde_json::from_slice(&out).expect("dupes JSON");
+
+        assert_eq!(json["refactoring_summary"]["schema_version"], 1);
+        assert_eq!(json["refactoring_summary"]["clone_families"], 0);
+        assert_eq!(json["refactoring_summary"]["clone_members"], 0);
+        assert_eq!(
+            json["refactoring_summary"]["top_families"],
+            serde_json::json!([])
         );
     }
 
@@ -6561,6 +3159,214 @@ pub fn quiet_three() -> u32 {
                 "expected the higher-complexity {file:?} to survive the cap"
             );
         }
+    }
+
+    #[test]
+    fn refactoring_commands_keep_their_cli_contracts() {
+        let map = Cli::try_parse_from(["judge", "map", "--format", "json", "--include-tests"])
+            .expect("map arguments must parse");
+        let Some(Command::Map(options)) = map.command else {
+            panic!("expected map command");
+        };
+        assert!(matches!(options.format, OutputFormat::Json));
+        assert!(options.include_tests);
+
+        let impact = Cli::try_parse_from(["judge", "impact", "src/lib.rs", "--format", "json"])
+            .expect("impact arguments must parse");
+        let Some(Command::Impact(options)) = impact.command else {
+            panic!("expected impact command");
+        };
+        assert_eq!(options.target, PathBuf::from("src/lib.rs"));
+        assert!(matches!(options.format, OutputFormat::Json));
+
+        let combined = Cli::try_parse_from(["judge", "--progress", "progress.jsonl"])
+            .expect("combined progress arguments must parse");
+        assert_eq!(combined.progress, Some(PathBuf::from("progress.jsonl")));
+
+        let output = Cli::try_parse_from([
+            "judge",
+            "dupes",
+            "--format",
+            "json",
+            "--output",
+            "report.json",
+        ])
+        .expect("JSON output arguments must parse");
+        assert_eq!(output.output, Some(PathBuf::from("report.json")));
+    }
+
+    #[test]
+    fn json_artifacts_use_a_command_default_or_an_explicit_output_path() {
+        let dir = TempDir::new("json-artifacts");
+        write_fixture_crate(&dir);
+
+        let mut default_out = Vec::new();
+        let outcome = run_json_in_dir(
+            &dir,
+            dupes_cli(OutputFormat::Json, false, None),
+            &mut default_out,
+        )
+        .expect("default JSON artifact must be written");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        assert_eq!(
+            String::from_utf8(default_out).unwrap(),
+            "JSON written to .judge/dupes.json\n"
+        );
+        let default_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(".judge/dupes.json")).unwrap())
+                .expect("default artifact JSON");
+        let default_json_text = std::fs::read_to_string(dir.join(".judge/dupes.json")).unwrap();
+        assert!(
+            default_json_text.starts_with("{\n  \"header\": "),
+            "artifact context must be the first root field"
+        );
+        assert!(default_json["findings"].is_array());
+        assert_eq!(default_json["header"]["schema_version"], 1);
+        assert_eq!(default_json["header"]["command"], "dupes");
+        assert!(default_json["header"]["working_directory"].is_string());
+        assert!(
+            default_json["header"]["generated_at_utc"]
+                .as_str()
+                .is_some_and(|timestamp| timestamp.ends_with('Z'))
+        );
+        assert!(default_json["header"]["generated_at_unix_seconds"].is_u64());
+        assert_eq!(
+            default_json["header"]["assessment"]["kind"],
+            "informational"
+        );
+
+        let custom_path = dir.join("reports/custom.json");
+        let mut custom_cli = dupes_cli(OutputFormat::Json, false, None);
+        custom_cli.output = Some(custom_path.clone());
+        let mut custom_out = Vec::new();
+        run_json_in_dir(&dir, custom_cli, &mut custom_out)
+            .expect("explicit JSON artifact must be written");
+        assert!(custom_path.is_file());
+
+        let mut invalid_cli = dupes_cli(OutputFormat::Tty, false, None);
+        invalid_cli.output = Some(PathBuf::from("report.json"));
+        let error = run_with_json_output(invalid_cli, &mut Vec::new())
+            .expect_err("--output without JSON must be rejected");
+        assert!(matches!(error, CliError::Config(message) if message.contains("--format json")));
+    }
+
+    #[test]
+    fn root_help_states_the_codebase_intelligence_purpose() {
+        use clap::CommandFactory;
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("Codebase intelligence for Rust workspaces"));
+        assert!(help.contains("--progress <PATH>"));
+    }
+
+    #[test]
+    fn map_and_impact_json_keep_refactoring_facts_machine_readable() {
+        let dir = TempDir::new("refactoring-command-contracts");
+        write_fixture_crate(&dir);
+
+        let mut map_out = Vec::new();
+        let map = cli_with(Command::Map(MapOptions {
+            format: OutputFormat::Json,
+            include_tests: false,
+        }));
+        let outcome = run_in_dir(&dir, map, &mut map_out).expect("map must run");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let map: serde_json::Value = serde_json::from_slice(&map_out).expect("map JSON");
+        assert_eq!(map["schema_version"], judge::refactor_map::SCHEMA_VERSION);
+        assert_eq!(map["includes_tests"], false);
+        assert_eq!(map["crates"][0]["name"], "fixture");
+        assert_eq!(map["files"][0]["production"]["functions"], 1);
+        assert_eq!(map["duplication"]["schema_version"], 1);
+        assert_eq!(map["duplication"]["clone_families"], 0);
+
+        let mut impact_out = Vec::new();
+        let impact = cli_with(Command::Impact(ImpactOptions {
+            target: PathBuf::from("src/lib.rs"),
+            format: OutputFormat::Json,
+        }));
+        let outcome = run_in_dir(&dir, impact, &mut impact_out).expect("impact must run");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let impact: serde_json::Value = serde_json::from_slice(&impact_out).expect("impact JSON");
+        assert_eq!(impact["schema_version"], judge::impact::SCHEMA_VERSION);
+        assert_eq!(impact["target"], "src/lib.rs");
+        assert_eq!(impact["crate_name"], "fixture");
+        assert!(impact["direct_analysis"].as_array().is_some_and(|effects| {
+            effects
+                .iter()
+                .any(|effect| effect["command"] == "cargo judge map")
+        }));
+    }
+
+    #[test]
+    fn map_include_tests_changes_ranking_scope_without_merging_metrics() {
+        let dir = TempDir::new("map-include-tests-contract");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn production() {}\n\n#[cfg(test)]\nmod tests { fn helper(value: bool) { if value {} } }\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        let cli = cli_with(Command::Map(MapOptions {
+            format: OutputFormat::Json,
+            include_tests: true,
+        }));
+        run_in_dir(&dir, cli, &mut out).expect("map with tests must run");
+        let map: serde_json::Value = serde_json::from_slice(&out).expect("map JSON");
+        assert_eq!(map["includes_tests"], true);
+        let file = map["files"]
+            .as_array()
+            .and_then(|files| files.iter().find(|file| file["file"] == "src/lib.rs"))
+            .expect("lib.rs must appear in the map");
+        assert_eq!(file["production"]["functions"], 1);
+        assert_eq!(file["tests"]["functions"], 1);
+        assert_eq!(file["complexity_rank"], 1);
+    }
+
+    #[test]
+    fn combined_progress_is_separate_versioned_jsonl_and_subcommands_reject_it() {
+        let dir = TempDir::new("combined-progress-contract");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let mut out = Vec::new();
+        let mut cli = all_cli(false, None);
+        cli.progress = Some(PathBuf::from("judge-progress.jsonl"));
+        run_in_dir(&dir, cli, &mut out).expect("combined run with progress must succeed");
+
+        let progress = std::fs::read_to_string(dir.join("judge-progress.jsonl"))
+            .expect("progress file must be written");
+        let records: Vec<serde_json::Value> = progress
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON record per line"))
+            .collect();
+        assert!(!records.is_empty());
+        assert_eq!(records[0]["schema_version"], 1);
+        assert_eq!(records[0]["event"], "phase_started");
+        assert!(records.iter().all(|record| record["phase"].is_string()));
+
+        let error = run(
+            Cli {
+                command: Some(Command::Init),
+                baseline_args: baseline_args(OutputFormat::Tty, false, None),
+                progress: Some(PathBuf::from("not-allowed.jsonl")),
+                output: None,
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("subcommands must not share the combined progress channel");
+        let CliError::Config(message) = error else {
+            panic!("progress misuse must be a configuration error");
+        };
+        assert!(message.contains("bare `cargo judge` combined run"));
     }
 
     #[test]

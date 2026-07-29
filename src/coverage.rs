@@ -676,6 +676,7 @@ end_of_record
             qualified_name: "hot_fn".to_string(),
             file,
             line,
+            is_test_context: false,
             cyclomatic,
             cognitive: 0,
             lines_of_code,

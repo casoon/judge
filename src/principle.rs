@@ -274,6 +274,52 @@ pub struct PrincipleHeuristic {
     pub related_findings: Vec<FindingId>,
 }
 
+fn item_context(krate: &CrateInfo, file: &Path, item_path: &str) -> (CodeScope, EvidenceLocation) {
+    (
+        CodeScope {
+            krate: krate.name.clone(),
+            modules: vec![item_path.to_string()],
+        },
+        EvidenceLocation {
+            file: file.to_path_buf(),
+            item_path: Some(item_path.to_string()),
+        },
+    )
+}
+
+// The detectors differ in evidence and recommendation, but not in how those
+// parts become a stable, externally visible heuristic.
+macro_rules! principle_heuristic {
+    (
+        principle: $principle:expr,
+        $scope:expr,
+        $evidence_identities:expr,
+        {
+            evidence: $evidence:expr,
+            interpretation: $interpretation:expr,
+            contraindications: $contraindications:expr,
+            missing_evidence: $missing_evidence:expr,
+            alternatives: $alternatives:expr,
+            related_findings: $related_findings:expr $(,)?
+        }
+    ) => {{
+        let principle = $principle;
+        let scope = $scope;
+        let evidence_identities = $evidence_identities;
+        PrincipleHeuristic {
+            id: PrincipleHeuristicId::compute(principle, &scope, &evidence_identities),
+            principle,
+            scope,
+            evidence: $evidence,
+            interpretation: $interpretation,
+            contraindications: $contraindications,
+            missing_evidence: $missing_evidence,
+            alternatives: $alternatives,
+            related_findings: $related_findings,
+        }
+    }};
+}
+
 /// Runs every implemented principle-heuristic detector over `workspace`,
 /// using `complexity` (the already-computed `judge::complexity::analyze_workspace`
 /// result) as one of the independent evidence sources for
@@ -458,14 +504,7 @@ fn build_functional_core_imperative_shell_heuristic(
     cyclomatic: u32,
     io_hits: &[String],
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![item_path.to_string()],
-    };
-    let location = EvidenceLocation {
-        file: file.to_path_buf(),
-        item_path: Some(item_path.to_string()),
-    };
+    let (scope, location) = item_context(krate, file, item_path);
 
     let structural = Evidence {
         description: format!(
@@ -485,16 +524,11 @@ fn build_functional_core_imperative_shell_heuristic(
     };
 
     let evidence_identities = vec![item_path.to_string()];
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::FunctionalCoreImperativeShell,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::FunctionalCoreImperativeShell,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, measured],
         interpretation: "This function combines I/O/environment/process operations with \
             non-trivial branching complexity in one place. Separating the deterministic \
@@ -528,7 +562,8 @@ fn build_functional_core_imperative_shell_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -723,16 +758,11 @@ fn build_interface_segregation_heuristic(
         first.self_type.clone(),
         second.self_type.clone(),
     ];
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::InterfaceSegregation,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::InterfaceSegregation,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, usage],
         interpretation: format!(
             "This trait has {} methods, and its implementors in this crate split into \
@@ -769,7 +799,8 @@ fn build_interface_segregation_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -1084,16 +1115,11 @@ fn build_dependency_inversion_heuristic(
     let mut evidence_identities = vec![rule.name.clone()];
     evidence_identities.extend(leaks.iter().map(|leak| leak.item_path.clone()));
     evidence_identities.extend(related_findings.iter().map(|f| f.id.as_str().to_string()));
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::DependencyInversion,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::DependencyInversion,
         scope,
+        evidence_identities,
+        {
         evidence: vec![call_level, signature_leak],
         interpretation: "This module boundary is both crossed at the call level and has \
             infrastructure types leaking into public signatures of the domain-tagged module. \
@@ -1130,7 +1156,8 @@ fn build_dependency_inversion_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: related_findings.iter().map(|f| f.id.clone()).collect(),
+            related_findings: related_findings.iter().map(|f| f.id.clone()).collect(),
+        }
     }
 }
 
@@ -1447,12 +1474,11 @@ fn build_cohesion_heuristic(
     };
 
     let evidence_identities: Vec<String> = items.iter().map(|item| item.name.clone()).collect();
-    let id = PrincipleHeuristicId::compute(DesignPrinciple::Cohesion, &scope, &evidence_identities);
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::Cohesion,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, category_evidence],
         interpretation: "This file defines several public items, and at least two of them \
             exhibit different effect categories (I/O, terminal output, complex computation) \
@@ -1489,7 +1515,8 @@ fn build_cohesion_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -1699,14 +1726,7 @@ fn build_law_of_demeter_heuristic(
     item_path: &str,
     hit: &ChainHit,
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![item_path.to_string()],
-    };
-    let location = EvidenceLocation {
-        file: file.to_path_buf(),
-        item_path: Some(item_path.to_string()),
-    };
+    let (scope, location) = item_context(krate, file, item_path);
 
     let structural = Evidence {
         description: format!(
@@ -1734,13 +1754,11 @@ fn build_law_of_demeter_heuristic(
     };
 
     let evidence_identities = vec![item_path.to_string(), hit.rendered.clone()];
-    let id =
-        PrincipleHeuristicId::compute(DesignPrinciple::LawOfDemeter, &scope, &evidence_identities);
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::LawOfDemeter,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, corroborating],
         interpretation: format!(
             "In the examined function, this expression reaches through {} chained method calls \
@@ -1781,7 +1799,8 @@ fn build_law_of_demeter_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -1912,14 +1931,7 @@ fn build_bounded_resources_loop_heuristic(
     item_path: &str,
     hit: &LoopHit,
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![item_path.to_string()],
-    };
-    let location = EvidenceLocation {
-        file: file.to_path_buf(),
-        item_path: Some(item_path.to_string()),
-    };
+    let (scope, location) = item_context(krate, file, item_path);
 
     let structural = Evidence {
         description: format!(
@@ -1938,16 +1950,11 @@ fn build_bounded_resources_loop_heuristic(
     };
 
     let evidence_identities = vec![item_path.to_string(), hit.line.to_string()];
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::BoundedResources,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::BoundedResources,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, corroborating],
         interpretation: "In the examined function, this `loop` has no visible exit — no \
             `break`, `return`, `?`, `panic!`, or `std::process::exit` — anywhere in its own \
@@ -1989,7 +1996,8 @@ fn build_bounded_resources_loop_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -2206,14 +2214,7 @@ fn build_bounded_resources_recursion_heuristic(
     item_path: &str,
     hit: &RecursionHit,
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![item_path.to_string()],
-    };
-    let location = EvidenceLocation {
-        file: file.to_path_buf(),
-        item_path: Some(item_path.to_string()),
-    };
+    let (scope, location) = item_context(krate, file, item_path);
 
     let structural = Evidence {
         description: format!(
@@ -2243,16 +2244,11 @@ fn build_bounded_resources_recursion_heuristic(
     };
 
     let evidence_identities = vec![item_path.to_string()];
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::BoundedResources,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::BoundedResources,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, corroborating],
         interpretation: "In the examined function, direct self-recursion occurs with no \
             parameter-referencing `if`/`match` visible before the recursive call. That may \
@@ -2293,7 +2289,8 @@ fn build_bounded_resources_recursion_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -2729,14 +2726,7 @@ fn build_parse_dont_validate_heuristic(
     hit: &ParamGuardHit,
     siblings: &[String],
 ) -> PrincipleHeuristic {
-    let scope = CodeScope {
-        krate: krate.name.clone(),
-        modules: vec![item_path.to_string()],
-    };
-    let location = EvidenceLocation {
-        file: file.to_path_buf(),
-        item_path: Some(item_path.to_string()),
-    };
+    let (scope, location) = item_context(krate, file, item_path);
 
     let structural = Evidence {
         description: format!(
@@ -2761,16 +2751,11 @@ fn build_parse_dont_validate_heuristic(
     };
 
     let evidence_identities = vec![item_path.to_string(), hit.param_name.clone()];
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::ParseDontValidate,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::ParseDontValidate,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, corroborating],
         interpretation: format!(
             "In the examined function, parameter `{}` is checked at the boundary but the \
@@ -2817,7 +2802,8 @@ fn build_parse_dont_validate_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -3062,16 +3048,11 @@ fn build_api_evolvability_heuristic(
         site.location.file.display().to_string(),
         site.line.to_string(),
     ];
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::ApiEvolvability,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::ApiEvolvability,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, usage],
         interpretation: format!(
             "`{}` exposes every field as `pub` with no `#[non_exhaustive]` attribute, and at \
@@ -3113,7 +3094,8 @@ fn build_api_evolvability_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -3375,16 +3357,11 @@ fn build_unsafe_containment_heuristic(
         wrapper.qualified_name.clone(),
         wrapper.line.to_string(),
     ];
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::UnsafeContainment,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::UnsafeContainment,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, contrast],
         interpretation: format!(
             "`{}` is `pub unsafe fn` with no `# Safety` section in its own doc comment, so \
@@ -3429,7 +3406,8 @@ fn build_unsafe_containment_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -3730,16 +3708,11 @@ fn build_misu_heuristic(
 
     let mut evidence_identities = vec![candidate.name.clone()];
     evidence_identities.extend(site_refs.iter().cloned());
-    let id = PrincipleHeuristicId::compute(
-        DesignPrinciple::MakeIllegalStatesUnrepresentable,
-        &scope,
-        &evidence_identities,
-    );
-
-    PrincipleHeuristic {
-        id,
+    principle_heuristic! {
         principle: DesignPrinciple::MakeIllegalStatesUnrepresentable,
         scope,
+        evidence_identities,
+        {
         evidence: vec![structural, usage],
         interpretation: format!(
             "`{}` declares {} `Option<T>` fields ({}), and every construction site in the crate \
@@ -3785,7 +3758,8 @@ fn build_misu_heuristic(
                     .to_string(),
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 

@@ -170,18 +170,18 @@ fn missed_mutant_finding(mutant: &MissedMutant) -> Finding {
         .function_name
         .clone()
         .unwrap_or_else(|| format!("{}:{}", mutant.file, mutant.line));
-    Finding {
-        id: format!("{MUTATION_SURVIVOR_RULE}:{}", mutant.name).into(),
-        rule: MUTATION_SURVIVOR_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{MUTATION_SURVIVOR_RULE}:{}", mutant.name),
+        MUTATION_SURVIVOR_RULE,
+        Severity::Warn,
+        Location {
             file: PathBuf::from(&mutant.file),
             line: OneBasedLine::new(mutant.line).unwrap_or(OneBasedLine::FIRST),
             item_path,
         },
-        evidence_class: EvidenceClass::ExternalMeasurement,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::ExternalMeasurement,
+        Origin::Code,
+        Some(serde_json::json!({
             "file": mutant.file,
             "function": mutant.function_name,
             "line": mutant.line,
@@ -189,10 +189,7 @@ fn missed_mutant_finding(mutant: &MissedMutant) -> Finding {
             "replacement": mutant.replacement,
             "name": mutant.name,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 #[cfg(test)]

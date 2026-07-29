@@ -108,6 +108,7 @@ pub enum ModuleGraphError {
 }
 
 impl std::fmt::Display for ModuleGraphError {
+    // judge-dupe-ignore: explicit per-domain error rendering; variants and messages are intentionally distinct
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
@@ -475,27 +476,24 @@ fn unlinked_file_finding(krate: &CrateInfo, file: &SourceFile, tree: &CrateModul
     let mut roots_searched = tree.root_labels.clone();
     roots_searched.sort();
     roots_searched.dedup();
-    Finding {
-        id: format!("{UNLINKED_FILE_RULE}:{}", file.path.display()).into(),
-        rule: UNLINKED_FILE_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{UNLINKED_FILE_RULE}:{}", file.path.display()),
+        UNLINKED_FILE_RULE,
+        Severity::Warn,
+        Location {
             file: file.path.clone(),
             line: OneBasedLine::FIRST,
             item_path: format!("{}: {}", krate.name, file.path.display()),
         },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::BoundedSemantic,
+        Origin::Code,
+        Some(serde_json::json!({
             "crate": krate.name,
             "roots_searched": roots_searched,
             "reason": "not reached by resolving `mod` declarations (including #[path] \
                 overrides) from any of this crate's own Cargo target roots",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// One resolved reference found anywhere in the workspace, from
@@ -740,18 +738,18 @@ fn orphan_module_findings(
 }
 
 fn orphan_module_finding(krate: &CrateInfo, node: &ModuleNode, files_scanned: usize) -> Finding {
-    Finding {
-        id: format!("{ORPHAN_MODULE_RULE}:{}:{}", krate.name, node.module_path).into(),
-        rule: ORPHAN_MODULE_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{ORPHAN_MODULE_RULE}:{}:{}", krate.name, node.module_path),
+        ORPHAN_MODULE_RULE,
+        Severity::Warn,
+        Location {
             file: node.declared_at_file.clone(),
             line: OneBasedLine::new(node.declared_at_line).unwrap_or(OneBasedLine::FIRST),
             item_path: format!("{}::{}", krate.name, node.module_path),
         },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::BoundedSemantic,
+        Origin::Code,
+        Some(serde_json::json!({
             "crate": krate.name,
             "module_path": node.module_path,
             "searched_files": files_scanned,
@@ -759,10 +757,7 @@ fn orphan_module_finding(krate: &CrateInfo, node: &ModuleNode, files_scanned: us
                 `crate::<module_path>` or `<crate-name>::<module_path>` from outside the \
                 module's own files",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 #[cfg(test)]

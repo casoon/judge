@@ -74,6 +74,7 @@ use syn::{
 };
 
 use crate::finding::{Finding, Location, Origin, Severity};
+use crate::functions::{read_and_parse_source, type_name};
 use crate::ingest::SourceFile;
 
 /// Rule id for a discarded fallible result: `let _ = fallible();` or a bare
@@ -184,6 +185,7 @@ pub enum SlopError {
 }
 
 impl std::fmt::Display for SlopError {
+    // judge-dupe-ignore: explicit per-domain error rendering; variants and messages are intentionally distinct
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
@@ -211,9 +213,11 @@ pub fn analyze_file(
     path: &Path,
     allow_anyhow_at_boundary: bool,
 ) -> Result<Vec<Finding>, SlopError> {
-    let source =
-        std::fs::read_to_string(path).map_err(|err| SlopError::Io(path.to_path_buf(), err))?;
-    let ast = syn::parse_file(&source).map_err(|err| SlopError::Parse(path.to_path_buf(), err))?;
+    let (source, ast) = read_and_parse_source(
+        path,
+        |err| SlopError::Io(path.to_path_buf(), err),
+        |err| SlopError::Parse(path.to_path_buf(), err),
+    )?;
 
     let mut visitor = SlopVisitor {
         file: path,
@@ -902,20 +906,6 @@ fn path_to_string(path: &SynPath) -> String {
         .map(|segment| segment.ident.to_string())
         .collect::<Vec<_>>()
         .join("::")
-}
-
-/// The last path segment's name, or `"?"` for a type this doesn't recognize
-/// (mirrors `crate::functions::type_name`, kept local so this module doesn't
-/// need to reach into the private helper of an unrelated detector).
-fn type_name(ty: &Type) -> String {
-    match ty {
-        Type::Path(type_path) => type_path
-            .path
-            .segments
-            .last()
-            .map_or_else(|| "?".to_string(), |segment| segment.ident.to_string()),
-        _ => "?".to_string(),
-    }
 }
 
 /// Whether `pat` is `Err(_)` or `Err(..)`.

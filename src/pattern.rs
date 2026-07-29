@@ -264,6 +264,37 @@ pub struct PatternCandidate {
     pub related_findings: Vec<FindingId>,
 }
 
+// Keeps the candidate builders focused on their domain-specific evidence and
+// migration advice while preserving the stable id construction in one place.
+macro_rules! pattern_candidate {
+    (
+        pattern: $pattern:expr,
+        $scope:expr,
+        $evidence_identities:expr,
+        {
+            evidence: $evidence:expr,
+            preconditions: $preconditions:expr,
+            contraindications: $contraindications:expr,
+            migration: $migration:expr,
+            related_findings: $related_findings:expr $(,)?
+        }
+    ) => {{
+        let pattern = $pattern;
+        let scope = $scope;
+        let evidence_identities = $evidence_identities;
+        PatternCandidate {
+            id: PatternCandidateId::compute(pattern, &scope, &evidence_identities),
+            pattern,
+            scope,
+            evidence: $evidence,
+            preconditions: $preconditions,
+            contraindications: $contraindications,
+            migration: $migration,
+            related_findings: $related_findings,
+        }
+    }};
+}
+
 /// Runs every implemented pattern-aggregation rule over `workspace` and
 /// `findings` (the combined output of `judge::slop::analyze_workspace`, or
 /// any superset of it): `stringly-error-boundary`, `primitive-domain-value`,
@@ -408,12 +439,11 @@ fn build_candidate(
         .map(|id| id.as_str().to_string())
         .collect();
 
-    let id = PatternCandidateId::compute(RustPattern::DomainError, &scope, &evidence_identities);
-
-    PatternCandidate {
-        id,
+    pattern_candidate! {
         pattern: RustPattern::DomainError,
         scope,
+        evidence_identities,
+        {
         evidence: CorroboratedEvidence {
             primary,
             independent,
@@ -464,7 +494,8 @@ fn build_candidate(
                 affected_paths,
             },
         ],
-        related_findings,
+            related_findings: related_findings,
+        }
     }
 }
 
@@ -733,17 +764,15 @@ fn build_primitive_domain_value_candidate(
             )
         })
         .collect();
-    let id =
-        PatternCandidateId::compute(RustPattern::ValidatedNewtype, &scope, &evidence_identities);
-
     let mut affected_paths: Vec<PathBuf> = group.iter().map(|fact| fact.file.clone()).collect();
     affected_paths.sort();
     affected_paths.dedup();
 
-    PatternCandidate {
-        id,
+    pattern_candidate! {
         pattern: RustPattern::ValidatedNewtype,
         scope,
+        evidence_identities,
+        {
         evidence: CorroboratedEvidence {
             primary,
             independent,
@@ -793,7 +822,8 @@ fn build_primitive_domain_value_candidate(
                 affected_paths,
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -843,6 +873,21 @@ struct PrimitiveDomainValueVisitor<'a> {
     facts: Vec<SignatureParamFact>,
 }
 
+/// Reuses the shared `self_type` stack discipline across pattern visitors
+/// that need qualified inherent-method names.
+macro_rules! visit_item_impl_with_self_type {
+    () => {
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            use quote::ToTokens;
+            let previous = self
+                .self_type
+                .replace(node.self_ty.to_token_stream().to_string());
+            syn::visit::visit_item_impl(self, node);
+            self.self_type = previous;
+        }
+    };
+}
+
 impl PrimitiveDomainValueVisitor<'_> {
     fn record_fn(&mut self, name: &str, sig: &syn::Signature, block: &syn::Block) {
         let item_path = match &self.self_type {
@@ -880,14 +925,7 @@ impl<'ast> Visit<'ast> for PrimitiveDomainValueVisitor<'_> {
         syn::visit::visit_item_fn(self, node);
     }
 
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        use quote::ToTokens;
-        let previous = self
-            .self_type
-            .replace(node.self_ty.to_token_stream().to_string());
-        syn::visit::visit_item_impl(self, node);
-        self.self_type = previous;
-    }
+    visit_item_impl_with_self_type!();
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if matches!(node.vis, syn::Visibility::Public(_)) {
@@ -1156,12 +1194,11 @@ fn build_boolean_state_cluster_candidate(
         .chain(fact.bool_params.iter().cloned())
         .chain(fact.combo_hits.iter().cloned())
         .collect();
-    let id = PatternCandidateId::compute(RustPattern::OptionsStruct, &scope, &evidence_identities);
-
-    PatternCandidate {
-        id,
+    pattern_candidate! {
         pattern: RustPattern::OptionsStruct,
         scope,
+        evidence_identities,
+        {
         evidence: CorroboratedEvidence {
             primary,
             independent,
@@ -1211,7 +1248,8 @@ fn build_boolean_state_cluster_candidate(
                 affected_paths: vec![fact.file.clone()],
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -1293,14 +1331,7 @@ impl<'ast> Visit<'ast> for BooleanStateClusterVisitor<'_> {
         syn::visit::visit_item_fn(self, node);
     }
 
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        use quote::ToTokens;
-        let previous = self
-            .self_type
-            .replace(node.self_ty.to_token_stream().to_string());
-        syn::visit::visit_item_impl(self, node);
-        self.self_type = previous;
-    }
+    visit_item_impl_with_self_type!();
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         self.record_fn(
@@ -1571,14 +1602,7 @@ impl<'ast> Visit<'ast> for ConstructorVisitor<'_> {
         syn::visit::visit_item_fn(self, node);
     }
 
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        use quote::ToTokens;
-        let previous = self
-            .self_type
-            .replace(node.self_ty.to_token_stream().to_string());
-        syn::visit::visit_item_impl(self, node);
-        self.self_type = previous;
-    }
+    visit_item_impl_with_self_type!();
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if matches!(node.vis, syn::Visibility::Public(_)) {
@@ -1737,19 +1761,17 @@ fn build_public_invariant_bypass_candidate(
         .chain(fact.fields.iter().cloned())
         .chain(ctor_facts.iter().map(|ctor| ctor.item_path.clone()))
         .collect();
-    let id =
-        PatternCandidateId::compute(RustPattern::SmartConstructor, &scope, &evidence_identities);
-
     let mut affected_paths: Vec<PathBuf> = std::iter::once(fact.file.clone())
         .chain(ctor_facts.iter().map(|ctor| ctor.file.clone()))
         .collect();
     affected_paths.sort();
     affected_paths.dedup();
 
-    PatternCandidate {
-        id,
+    pattern_candidate! {
         pattern: RustPattern::SmartConstructor,
         scope,
+        evidence_identities,
+        {
         evidence: CorroboratedEvidence {
             primary,
             independent,
@@ -1801,7 +1823,8 @@ fn build_public_invariant_bypass_candidate(
                 affected_paths,
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 
@@ -1980,14 +2003,7 @@ impl<'ast> Visit<'ast> for ResourceLifecycleVisitor<'_> {
         syn::visit::visit_item_fn(self, node);
     }
 
-    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        use quote::ToTokens;
-        let previous = self
-            .self_type
-            .replace(node.self_ty.to_token_stream().to_string());
-        syn::visit::visit_item_impl(self, node);
-        self.self_type = previous;
-    }
+    visit_item_impl_with_self_type!();
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         self.record_fn(&node.sig.ident.to_string(), &node.block);
@@ -2044,16 +2060,15 @@ fn build_manual_resource_lifecycle_candidate(
             )
         })
         .collect();
-    let id = PatternCandidateId::compute(RustPattern::RaiiGuard, &scope, &evidence_identities);
-
     let mut affected_paths: Vec<PathBuf> = hits.iter().map(|hit| hit.file.clone()).collect();
     affected_paths.sort();
     affected_paths.dedup();
 
-    PatternCandidate {
-        id,
+    pattern_candidate! {
         pattern: RustPattern::RaiiGuard,
         scope,
+        evidence_identities,
+        {
         evidence: CorroboratedEvidence {
             primary,
             independent,
@@ -2110,7 +2125,8 @@ fn build_manual_resource_lifecycle_candidate(
                 affected_paths,
             },
         ],
-        related_findings: Vec::new(),
+            related_findings: Vec::new(),
+        }
     }
 }
 

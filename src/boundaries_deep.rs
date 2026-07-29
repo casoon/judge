@@ -216,31 +216,27 @@ fn module_boundary_violation_deep_finding(
     line: usize,
     witness_file: &Path,
 ) -> Finding {
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{MODULE_BOUNDARY_VIOLATION_DEEP_RULE}:{}:{qualified_name}",
             file.display()
-        )
-        .into(),
-        rule: MODULE_BOUNDARY_VIOLATION_DEEP_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        MODULE_BOUNDARY_VIOLATION_DEEP_RULE,
+        Severity::Warn,
+        Location {
             file: file.to_path_buf(),
             line: OneBasedLine::new(line).expect("proc-macro2 span lines are 1-based"),
             item_path: qualified_name.to_string(),
         },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::BoundedSemantic,
+        Origin::Code,
+        Some(serde_json::json!({
             "rule": rule.name,
             "from": rule.from,
             "witness_file": witness_file.display().to_string(),
             "basis": "deep_symbol_reference",
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ mod functions;
 pub mod gate;
 pub mod git;
 pub mod health_score;
+pub mod impact;
 pub mod ingest;
 pub mod markdown;
 pub mod module_graph;
@@ -38,6 +39,7 @@ pub mod principle;
 pub mod provenance;
 #[cfg(feature = "deep")]
 pub mod reachability;
+pub mod refactor_map;
 pub mod rule_registry;
 pub mod sarif;
 pub mod security;

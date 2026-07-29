@@ -220,6 +220,10 @@ pub struct WorkspaceOwnership {
     pub files: Vec<FileOwnership>,
     /// The `low-bus-factor` and `ownership-fragmentation` findings.
     pub findings: Vec<Finding>,
+    /// Workspace source files that are present in the working tree but not
+    /// in `HEAD`, so Git cannot provide ownership history for them. They are
+    /// skipped rather than treated as analysis failures.
+    pub history_unavailable: Vec<PathBuf>,
     pub errors: Vec<OwnershipError>,
 }
 
@@ -233,9 +237,10 @@ pub struct WorkspaceOwnership {
 /// repo-wide author count is computed once via `active_authors_since`, not
 /// per file. A repository with no commits yet (unborn `HEAD`) yields an
 /// empty result rather than an error, matching [`crate::git::hotspots`]'s
-/// tolerance for "no git history at all". A failure to blame a single file
-/// (e.g. it isn't tracked) is recorded in `errors` and that file is skipped,
-/// not treated as a fatal error for the whole run.
+/// tolerance for "no git history at all". A source file absent from `HEAD`
+/// (for example, a newly created uncommitted module) is recorded in
+/// [`WorkspaceOwnership::history_unavailable`] and skipped. A real failure
+/// while blaming a tracked file remains an error.
 pub fn analyze_workspace(
     workspace: &Workspace,
     window_days: i64,
@@ -245,6 +250,14 @@ pub fn analyze_workspace(
     let Ok(head_id) = repo.head_id() else {
         return Ok(WorkspaceOwnership::default());
     };
+
+    let head_id = head_id.detach();
+    let head_tree = repo
+        .find_object(head_id)
+        .map_err(|err| GitError::Walk(Box::new(err)))?
+        .into_commit()
+        .tree()
+        .map_err(|err| GitError::Walk(Box::new(err)))?;
 
     let active_authors = crate::git::active_authors_since(&workspace.root, window_days)?;
     let repo_has_enough_authors_for_bus_factor =
@@ -260,9 +273,18 @@ pub fn analyze_workspace(
             let relative_str = relative.to_string_lossy();
             let file_path: &BStr = BStr::new(relative_str.as_bytes());
 
+            if head_tree
+                .lookup_entry_by_path(relative)
+                .map_err(|err| GitError::Walk(Box::new(err)))?
+                .is_none()
+            {
+                result.history_unavailable.push(relative.to_path_buf());
+                continue;
+            }
+
             let outcome = repo.blame_file(
                 file_path,
-                head_id.detach(),
+                head_id,
                 gix::repository::blame_file::Options {
                     // Without this, gix does not follow a `git mv` rename at
                     // all (see `gix_blame`'s `tree_diff_without_rewrites_at_file_path`):
@@ -450,6 +472,30 @@ mod tests {
         let ownership = &report.files[0];
         assert_eq!(ownership.bus_factor, 1);
         assert_eq!(ownership.primary_author_share, 1.0);
+    }
+
+    #[test]
+    fn uncommitted_source_is_marked_history_unavailable_not_an_error() {
+        let dir = TempDir::new("ownership-uncommitted-source");
+        git(&dir, &["init", "-q", "-b", "main"]);
+
+        let tracked = dir.join("tracked.rs");
+        std::fs::write(&tracked, "fn tracked() {}\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let uncommitted = dir.join("uncommitted.rs");
+        std::fs::write(&uncommitted, "fn uncommitted() {}\n").unwrap();
+
+        let workspace = workspace_of_files(dir.to_path_buf(), vec![tracked, uncommitted]);
+        let report = analyze_workspace(&workspace, crate::git::DEFAULT_WINDOW_DAYS).unwrap();
+
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(
+            report.history_unavailable,
+            [PathBuf::from("uncommitted.rs")]
+        );
     }
 
     #[test]

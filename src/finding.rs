@@ -610,6 +610,12 @@ pub struct Report {
     /// pattern of an omitted-when-absent field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_surface_size: Option<HashMap<String, usize>>,
+    /// Source files that exist in the working tree but not in the committed
+    /// revision used for historical analysis. They have no history facts;
+    /// this is not an analyzer error. Additive in schema v2 and omitted when
+    /// every source file is available in `HEAD`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub history_unavailable: Vec<PathBuf>,
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -634,6 +640,7 @@ impl Report {
             errors,
             suppressed_inline: 0,
             api_surface_size: None,
+            history_unavailable: Vec::new(),
         }
     }
 
@@ -660,6 +667,13 @@ impl Report {
     /// api-surface` opts in.
     pub fn with_api_surface_size(mut self, size: HashMap<String, usize>) -> Self {
         self.api_surface_size = Some(size);
+        self
+    }
+
+    /// Marks working-tree files for which no committed history was available,
+    /// without turning that ordinary in-progress state into a report error.
+    pub fn with_history_unavailable(mut self, files: Vec<PathBuf>) -> Self {
+        self.history_unavailable = files;
         self
     }
 }
@@ -1118,6 +1132,19 @@ mod tests {
         assert_eq!(json["counts"]["gating"], 0);
         assert_eq!(json["counts"]["advisory"], 1);
         assert_eq!(json["errors"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn report_marks_uncommitted_files_without_promoting_them_to_errors() {
+        let report = Report::new(Vec::new())
+            .with_history_unavailable(vec![PathBuf::from("src/new_module.rs")]);
+        let json = serde_json::to_value(&report).unwrap();
+
+        assert_eq!(json["errors"], serde_json::json!([]));
+        assert_eq!(
+            json["history_unavailable"],
+            serde_json::json!(["src/new_module.rs"])
+        );
     }
 
     /// Full-shape drift guard for the top-level JSON envelope (todo.md

@@ -1409,25 +1409,22 @@ fn feature_graph_cycle_finding(
     package_name: &str,
 ) -> Finding {
     let path_str = cycle.join(" -> ");
-    Finding {
-        id: format!("{FEATURE_GRAPH_CYCLE_RULE}:{package_name}:{path_str}").into(),
-        rule: FEATURE_GRAPH_CYCLE_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{FEATURE_GRAPH_CYCLE_RULE}:{package_name}:{path_str}"),
+        FEATURE_GRAPH_CYCLE_RULE,
+        Severity::Warn,
+        Location {
             file: manifest_path.to_path_buf(),
             line: OneBasedLine::FIRST,
             item_path: format!("{package_name}: {path_str}"),
         },
-        evidence_class: EvidenceClass::DerivedFact,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::DerivedFact,
+        Origin::Code,
+        Some(serde_json::json!({
             "package": package_name,
             "cycle": cycle,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Runs `change-coupling-signal` over `workspace`'s git history within
@@ -1540,18 +1537,18 @@ fn change_coupling_signal_finding(
 ) -> Finding {
     let layer_a = layers.assign.get(crate_a).cloned().unwrap_or_default();
     let layer_b = layers.assign.get(crate_b).cloned().unwrap_or_default();
-    Finding {
-        id: format!("{CHANGE_COUPLING_SIGNAL_RULE}:{crate_a}:{crate_b}").into(),
-        rule: CHANGE_COUPLING_SIGNAL_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+    Finding::new(
+        format!("{CHANGE_COUPLING_SIGNAL_RULE}:{crate_a}:{crate_b}"),
+        CHANGE_COUPLING_SIGNAL_RULE,
+        Severity::Warn,
+        Location {
             file: cargo_toml.to_path_buf(),
             line: OneBasedLine::FIRST,
             item_path: format!("{crate_a} ({layer_a}) <-> {crate_b} ({layer_b})"),
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(serde_json::json!({
             "crate_a": crate_a,
             "crate_b": crate_b,
             "layer_a": layer_a,
@@ -1559,10 +1556,7 @@ fn change_coupling_signal_finding(
             "co_change_commits": co_change_count,
             "ratio": ratio,
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 #[cfg(test)]
