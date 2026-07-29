@@ -255,29 +255,27 @@ fn connectivity_drop_findings(records: &[FunctionFanIn]) -> Vec<Finding> {
     records
         .iter()
         .filter(|record| record.cross_file_references == 0)
-        .map(|record| Finding {
-            id: format!(
-                "{CONNECTIVITY_DROP_RULE}:{}:{}",
-                record.file.display(),
-                record.qualified_name
+        .map(|record| {
+            Finding::new(
+                format!(
+                    "{CONNECTIVITY_DROP_RULE}:{}:{}",
+                    record.file.display(),
+                    record.qualified_name
+                ),
+                CONNECTIVITY_DROP_RULE,
+                Severity::Info,
+                Location {
+                    file: record.file.clone(),
+                    line: OneBasedLine::new(record.line).expect("proc-macro2 span lines are 1-based"),
+                    item_path: record.qualified_name.clone(),
+                },
+                EvidenceClass::Heuristic,
+                Origin::Code,
+                Some(json!({
+                    "tier": "deep",
+                    "cross_file_references": 0,
+                })),
             )
-            .into(),
-            rule: CONNECTIVITY_DROP_RULE.into(),
-            severity: Severity::Info,
-            location: Location {
-                file: record.file.clone(),
-                line: OneBasedLine::new(record.line).expect("proc-macro2 span lines are 1-based"),
-                item_path: record.qualified_name.clone(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
-                "tier": "deep",
-                "cross_file_references": 0,
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
         })
         .collect()
 }
@@ -435,24 +433,23 @@ fn monomorphization_load_findings(
                 return None;
             }
 
-            Some(Finding {
-                id: format!(
+            Some(Finding::new(
+                format!(
                     "{MONOMORPHIZATION_LOAD_RULE}:{}:{}",
                     record.file.display(),
                     record.qualified_name
-                )
-                .into(),
-                rule: MONOMORPHIZATION_LOAD_RULE.into(),
-                severity: Severity::Info,
-                location: Location {
+                ),
+                MONOMORPHIZATION_LOAD_RULE,
+                Severity::Info,
+                Location {
                     file: record.file.clone(),
                     line: OneBasedLine::new(record.line)
                         .expect("proc-macro2 span lines are 1-based"),
                     item_path: record.qualified_name.clone(),
                 },
-                evidence_class: EvidenceClass::Heuristic,
-                origin: Origin::Code,
-                evidence: Some(json!({
+                EvidenceClass::Heuristic,
+                Origin::Code,
+                Some(json!({
                     "tier": "deep",
                     "file": record.file.display().to_string(),
                     "function": record.qualified_name,
@@ -461,10 +458,7 @@ fn monomorphization_load_findings(
                     "cross_file_call_sites": cross_file_call_sites,
                     "monomorphization_load_score": monomorphization_load_score,
                 })),
-                limitations: None,
-                caused_by: Vec::new(),
-                causes: Vec::new(),
-            })
+            ))
         })
         .collect()
 }

@@ -113,7 +113,7 @@ pub fn analyze(workspace: &Workspace, target: &Path) -> Result<ImpactMap, Impact
         schema_version: SCHEMA_VERSION,
         target: relative_target,
         crate_name: krate.name.clone(),
-        source_kind: source_kind_label(source_file.kind),
+        source_kind: source_file.kind.label(),
         source_domain,
         crate_targets,
         direct_analysis: direct_analysis(source_file.kind),
@@ -171,14 +171,6 @@ fn direct_analysis(source_kind: SourceKind) -> Vec<AnalysisEffect> {
 
 fn relative_path(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_path_buf()
-}
-
-fn source_kind_label(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Authored => "authored",
-        SourceKind::Generated => "generated",
-        SourceKind::BuildOutput => "build_output",
-    }
 }
 
 fn usage_domain_label(domain: UsageDomain) -> &'static str {

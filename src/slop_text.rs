@@ -175,23 +175,20 @@ fn build_finding(
 ) -> Finding {
     let rule = crate::finding::RuleId::from(rule);
     let evidence_class = crate::finding::evidence_class_for_rule(&rule);
-    Finding {
-        id: format!("{rule}:{}:{line}:1", file.display()).into(),
+    Finding::new(
+        format!("{rule}:{}:{line}:1", file.display()),
         rule,
         severity,
-        location: Location {
+        Location {
             file: file.to_path_buf(),
             line: crate::finding::OneBasedLine::new(line)
                 .expect("text-scan line numbers are 1-based"),
             item_path: nearest_item_path(item_spans, line, file),
         },
         evidence_class,
-        origin: Origin::Code,
+        Origin::Code,
         evidence,
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 /// Lowercases `text` and splits it on non-alphanumeric boundaries (naturally

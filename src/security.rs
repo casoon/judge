@@ -184,7 +184,7 @@ use syn::{
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::{read_and_parse_source, type_name, walk_functions};
+use crate::functions::{has_test_attr, read_and_parse_source, type_name, walk_functions};
 use crate::ingest::SourceFile;
 use crate::slop_text::{CommentSpan, extract_comments};
 
@@ -325,6 +325,7 @@ impl std::fmt::Display for SecurityError {
 }
 
 impl std::error::Error for SecurityError {
+    // judge-dupe-ignore: explicit per-domain error rendering; variants and messages are intentionally distinct
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(_, err) => Some(err),
@@ -408,8 +409,7 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
 /// own visibility must be exactly `pub` (`None` — a trait default method —
 /// is never in scope), and it must not itself be `#[test]`-attributed.
 fn is_public_and_not_test(vis: Option<&Visibility>, attrs: &[Attribute]) -> bool {
-    matches!(vis, Some(Visibility::Public(_)))
-        && !attrs.iter().any(|attr| attr.path().is_ident("test"))
+    matches!(vis, Some(Visibility::Public(_))) && !has_test_attr(attrs)
 }
 
 /// Runs [`analyze_file`] over every file in `source_files` and aggregates the
@@ -507,23 +507,13 @@ fn classify_index_kind(index: &Expr) -> &'static str {
 /// comment adjacent to it in the examined source text — are read directly
 /// from the parsed file, not interpreted.
 fn unsafe_surface_finding(file: &Path, span: proc_macro2::Span, item_path: &str) -> Finding {
-    let start = span.start();
-    Finding::new(
-        format!(
-            "{UNSAFE_SURFACE_RULE}:{}:{}:{}",
-            file.display(),
-            start.line,
-            start.column
-        ),
+    Finding::at_span(
         UNSAFE_SURFACE_RULE,
+        file,
+        span,
+        item_path,
         Severity::Warn,
-        Location {
-            file: file.to_path_buf(),
-            line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
-            item_path: item_path.to_string(),
-        },
         EvidenceClass::DerivedFact,
-        Origin::Code,
         Some(serde_json::json!({
             "reason": "no `SAFETY:` comment found adjacent to this unsafe block",
         })),
@@ -542,23 +532,13 @@ fn integer_cast_risk_finding(
     item_path: &str,
     target_type: &str,
 ) -> Finding {
-    let start = span.start();
-    Finding::new(
-        format!(
-            "{INTEGER_CAST_RISK_RULE}:{}:{}:{}",
-            file.display(),
-            start.line,
-            start.column
-        ),
+    Finding::at_span(
         INTEGER_CAST_RISK_RULE,
+        file,
+        span,
+        item_path,
         Severity::Warn,
-        Location {
-            file: file.to_path_buf(),
-            line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
-            item_path: item_path.to_string(),
-        },
         EvidenceClass::Heuristic,
-        Origin::Code,
         Some(serde_json::json!({
             "target_type": target_type,
             "reason": "a possible truncation candidate based on the cast's target type; the \
@@ -580,23 +560,13 @@ fn panic_in_lib_finding(
     item_path: &str,
     kind: &str,
 ) -> Finding {
-    let start = span.start();
-    Finding::new(
-        format!(
-            "{PANIC_IN_LIB_RULE}:{}:{}:{}",
-            file.display(),
-            start.line,
-            start.column
-        ),
+    Finding::at_span(
         PANIC_IN_LIB_RULE,
+        file,
+        span,
+        item_path,
         Severity::Warn,
-        Location {
-            file: file.to_path_buf(),
-            line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
-            item_path: item_path.to_string(),
-        },
         EvidenceClass::DerivedFact,
-        Origin::Code,
         Some(serde_json::json!({
             "kind": kind,
             "reason": "a panicking construct reachable from a `pub` path; not a claim that it \
@@ -751,6 +721,16 @@ struct PanicVisitor<'a> {
     findings: Vec<Finding>,
 }
 
+impl PanicVisitor<'_> {
+    /// Records a `panic-in-lib` finding at `span` — shared by every
+    /// `visit_expr_*` method below, which differ only in how they classify
+    /// `kind` and which expression they attach the finding to.
+    fn push_panic_finding(&mut self, span: proc_macro2::Span, kind: &str) {
+        self.findings
+            .push(panic_in_lib_finding(self.file, span, self.item_path, kind));
+    }
+}
+
 impl<'ast> Visit<'ast> for PanicVisitor<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let kind = match node.method.to_string().as_str() {
@@ -759,35 +739,20 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
             _ => None,
         };
         if let Some(kind) = kind {
-            self.findings.push(panic_in_lib_finding(
-                self.file,
-                node.span(),
-                self.item_path,
-                kind,
-            ));
+            self.push_panic_finding(node.span(), kind);
         }
         visit::visit_expr_method_call(self, node);
     }
 
     fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
         if node.mac.path.is_ident("panic") {
-            self.findings.push(panic_in_lib_finding(
-                self.file,
-                node.span(),
-                self.item_path,
-                "panic_macro",
-            ));
+            self.push_panic_finding(node.span(), "panic_macro");
         }
         visit::visit_expr_macro(self, node);
     }
 
     fn visit_expr_index(&mut self, node: &'ast ExprIndex) {
-        self.findings.push(panic_in_lib_finding(
-            self.file,
-            node.span(),
-            self.item_path,
-            classify_index_kind(&node.index),
-        ));
+        self.push_panic_finding(node.span(), classify_index_kind(&node.index));
         visit::visit_expr_index(self, node);
     }
 
@@ -925,9 +890,7 @@ fn attrs_have_cfg_test(attrs: &[Attribute]) -> bool {
 /// `hardcoded-secret` (see module doc): itself `#[cfg(test)]`-gated,
 /// nested under one (`cfg_test_depth > 0`), or itself `#[test]`-attributed.
 fn is_test_scoped(cfg_test_depth: usize, attrs: &[Attribute]) -> bool {
-    cfg_test_depth > 0
-        || attrs_have_cfg_test(attrs)
-        || attrs.iter().any(|attr| attr.path().is_ident("test"))
+    cfg_test_depth > 0 || attrs_have_cfg_test(attrs) || has_test_attr(attrs)
 }
 
 /// Builds a `hardcoded-secret` finding. Its evidence class is `heuristic`
@@ -944,7 +907,6 @@ fn hardcoded_secret_finding(
     pattern: Option<&str>,
     length: usize,
 ) -> Finding {
-    let start = span.start();
     let mut evidence = serde_json::json!({
         "kind": kind,
         "length": length,
@@ -952,28 +914,15 @@ fn hardcoded_secret_finding(
     if let Some(pattern) = pattern {
         evidence["pattern"] = serde_json::Value::String(pattern.to_string());
     }
-    Finding {
-        id: format!(
-            "{HARDCODED_SECRET_RULE}:{}:{}:{}",
-            file.display(),
-            start.line,
-            start.column
-        )
-        .into(),
-        rule: HARDCODED_SECRET_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
-            file: file.to_path_buf(),
-            line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
-            item_path: item_path.to_string(),
-        },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(evidence),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    Finding::at_span(
+        HARDCODED_SECRET_RULE,
+        file,
+        span,
+        item_path,
+        Severity::Warn,
+        EvidenceClass::Heuristic,
+        Some(evidence),
+    )
 }
 
 /// Whole-file `hardcoded-secret` visitor (see module doc "`hardcoded-secret`
@@ -1012,6 +961,36 @@ impl<'a> SecretVisitor<'a> {
             Some(name) => format!("{}::{name}", self.path.join("::")),
             None => self.current_path(),
         }
+    }
+
+    /// Skips test-scoped functions (see [`is_test_scoped`]), otherwise pushes
+    /// `ident` onto `path` for the duration of `visit` — shared by every
+    /// function-like `Visit` method (`fn`, impl method, trait default method).
+    fn visit_fn_scoped(&mut self, attrs: &[Attribute], ident: &syn::Ident, visit: impl FnOnce(&mut Self)) {
+        if is_test_scoped(self.cfg_test_depth, attrs) {
+            return;
+        }
+        self.path.push(ident.to_string());
+        visit(self);
+        self.path.pop();
+    }
+
+    /// Skips test-scoped bindings (see [`is_test_scoped`]), otherwise records
+    /// `ident` as the current `binding_name` for the duration of `visit` —
+    /// shared by `visit_item_const` and `visit_item_static`.
+    fn visit_binding_scoped(
+        &mut self,
+        attrs: &[Attribute],
+        ident: &syn::Ident,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        if is_test_scoped(self.cfg_test_depth, attrs) {
+            return;
+        }
+        let previous = self.binding_name.take();
+        self.binding_name = Some(ident.to_string());
+        visit(self);
+        self.binding_name = previous;
     }
 }
 
@@ -1063,50 +1042,27 @@ impl<'ast> Visit<'ast> for SecretVisitor<'_> {
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        if is_test_scoped(self.cfg_test_depth, &node.attrs) {
-            return;
-        }
-        self.path.push(node.sig.ident.to_string());
-        visit::visit_item_fn(self, node);
-        self.path.pop();
+        self.visit_fn_scoped(&node.attrs, &node.sig.ident, |w| visit::visit_item_fn(w, node));
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        if is_test_scoped(self.cfg_test_depth, &node.attrs) {
-            return;
-        }
-        self.path.push(node.sig.ident.to_string());
-        visit::visit_impl_item_fn(self, node);
-        self.path.pop();
+        self.visit_fn_scoped(&node.attrs, &node.sig.ident, |w| {
+            visit::visit_impl_item_fn(w, node)
+        });
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast TraitItemFn) {
-        if is_test_scoped(self.cfg_test_depth, &node.attrs) {
-            return;
-        }
-        self.path.push(node.sig.ident.to_string());
-        visit::visit_trait_item_fn(self, node);
-        self.path.pop();
+        self.visit_fn_scoped(&node.attrs, &node.sig.ident, |w| {
+            visit::visit_trait_item_fn(w, node)
+        });
     }
 
     fn visit_item_const(&mut self, node: &'ast ItemConst) {
-        if is_test_scoped(self.cfg_test_depth, &node.attrs) {
-            return;
-        }
-        let previous = self.binding_name.take();
-        self.binding_name = Some(node.ident.to_string());
-        visit::visit_item_const(self, node);
-        self.binding_name = previous;
+        self.visit_binding_scoped(&node.attrs, &node.ident, |w| visit::visit_item_const(w, node));
     }
 
     fn visit_item_static(&mut self, node: &'ast ItemStatic) {
-        if is_test_scoped(self.cfg_test_depth, &node.attrs) {
-            return;
-        }
-        let previous = self.binding_name.take();
-        self.binding_name = Some(node.ident.to_string());
-        visit::visit_item_static(self, node);
-        self.binding_name = previous;
+        self.visit_binding_scoped(&node.attrs, &node.ident, |w| visit::visit_item_static(w, node));
     }
 
     fn visit_local(&mut self, node: &'ast Local) {

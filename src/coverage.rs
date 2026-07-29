@@ -323,33 +323,29 @@ pub fn untested_hotspots(
                 return None;
             }
 
-            Some(Finding {
-                id: format!(
+            Some(Finding::new(
+                format!(
                     "{UNTESTED_HOTSPOT_RULE}:{}:{}",
                     function.file.display(),
                     function.qualified_name
-                )
-                .into(),
-                rule: UNTESTED_HOTSPOT_RULE.into(),
-                severity: Severity::Warn,
-                location: Location {
+                ),
+                UNTESTED_HOTSPOT_RULE,
+                Severity::Warn,
+                Location {
                     file: function.file.clone(),
                     line: OneBasedLine::new(function.line)
                         .expect("proc-macro2 span lines are 1-based"),
                     item_path: function.qualified_name.clone(),
                 },
-                evidence_class: EvidenceClass::ExternalMeasurement,
-                origin: Origin::Code,
-                evidence: Some(json!({
+                EvidenceClass::ExternalMeasurement,
+                Origin::Code,
+                Some(json!({
                     "cyclomatic_complexity": function.cyclomatic,
                     "file_churn": file_churn,
                     "lines_covered_pct": file_coverage.covered_pct(),
                     "uncovered_line_count": uncovered_in_function,
                 })),
-                limitations: None,
-                caused_by: Vec::new(),
-                causes: Vec::new(),
-            })
+            ))
         })
         .collect();
     findings.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));

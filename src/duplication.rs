@@ -833,12 +833,7 @@ fn suppressed_ranges(path: &Path, source: &str) -> Result<Vec<(usize, usize)>, D
     for (index, line) in source.lines().enumerate() {
         let line_number = index + 1;
         if let Some(at) = line.find(OFF) {
-            if line[at + OFF.len()..].trim().is_empty() {
-                return Err(DuplicationError::MissingSuppressionReason(
-                    path.to_path_buf(),
-                    line_number,
-                ));
-            }
+            require_suppression_reason(path, line, at + OFF.len(), line_number)?;
             open.get_or_insert(line_number);
         } else if line.contains(ON)
             && let Some(start) = open.take()
@@ -850,6 +845,25 @@ fn suppressed_ranges(path: &Path, source: &str) -> Result<Vec<(usize, usize)>, D
         ranges.push((start, usize::MAX));
     }
     Ok(ranges)
+}
+
+/// Validates that a `judge-dupe-off`/`judge-dupe-ignore` directive on `line`
+/// carries a non-empty reason after its marker (ending at `marker_end`) —
+/// both raw-text scanners below require one so a bare suppression can't
+/// silently swallow future duplicates.
+fn require_suppression_reason(
+    path: &Path,
+    line: &str,
+    marker_end: usize,
+    line_number: usize,
+) -> Result<(), DuplicationError> {
+    if line[marker_end..].trim().is_empty() {
+        return Err(DuplicationError::MissingSuppressionReason(
+            path.to_path_buf(),
+            line_number,
+        ));
+    }
+    Ok(())
 }
 
 /// Returns the function-start line targeted by every narrowly scoped
@@ -872,12 +886,7 @@ fn item_suppression_lines(
         let Some(at) = line.find(&ignore) else {
             continue;
         };
-        if line[at + ignore.len()..].trim().is_empty() {
-            return Err(DuplicationError::MissingSuppressionReason(
-                path.to_path_buf(),
-                line_number,
-            ));
-        }
+        require_suppression_reason(path, line, at + ignore.len(), line_number)?;
         targets.insert(line_number + 1, line_number);
     }
     Ok(targets)

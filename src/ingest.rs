@@ -87,6 +87,17 @@ impl SourceKind {
     pub const fn is_locally_reportable(self) -> bool {
         matches!(self, Self::Authored)
     }
+
+    /// The stable, lowercase label used in JSON output — shared by
+    /// [`crate::impact`] and [`crate::refactor_map`], which both surface a
+    /// source file's kind in their reports.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::Generated => "generated",
+            Self::BuildOutput => "build_output",
+        }
+    }
 }
 
 /// Header markers that flag a file as generated, checked against the first

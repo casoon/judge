@@ -13,7 +13,7 @@ use syn::{
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::walk_functions;
+use crate::functions::{read_and_parse_source, walk_functions};
 use crate::ingest::SourceFile;
 
 /// Cyclomatic complexity and size of a single function or method.
@@ -92,6 +92,7 @@ impl std::fmt::Display for ComplexityError {
 }
 
 impl std::error::Error for ComplexityError {
+    // judge-dupe-ignore: explicit per-domain error rendering; variants and messages are intentionally distinct
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(_, err) => Some(err),
@@ -103,10 +104,11 @@ impl std::error::Error for ComplexityError {
 /// Parses a single Rust source file and returns the complexity of every
 /// function, method, and default trait-method body it contains.
 pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|err| ComplexityError::Io(path.to_path_buf(), err))?;
-    let ast =
-        syn::parse_file(&source).map_err(|err| ComplexityError::Parse(path.to_path_buf(), err))?;
+    let (_, ast) = read_and_parse_source(
+        path,
+        |err| ComplexityError::Io(path.to_path_buf(), err),
+        |err| ComplexityError::Parse(path.to_path_buf(), err),
+    )?;
 
     let mut functions = Vec::new();
     walk_functions(&ast, |site| {
@@ -548,34 +550,33 @@ pub fn signature_complexity(functions: &[FunctionInfo]) -> Vec<Finding> {
                 || function.generic_param_count > MAX_GENERIC_PARAM_COUNT
                 || function.trait_bound_count > MAX_TRAIT_BOUND_COUNT
         })
-        .map(|function| Finding {
-            id: format!(
-                "{SIGNATURE_COMPLEXITY_RULE}:{}:{}",
-                function.file.display(),
-                function.qualified_name
+        .map(|function| {
+            Finding::new(
+                format!(
+                    "{SIGNATURE_COMPLEXITY_RULE}:{}:{}",
+                    function.file.display(),
+                    function.qualified_name
+                ),
+                SIGNATURE_COMPLEXITY_RULE,
+                Severity::Warn,
+                Location {
+                    file: function.file.clone(),
+                    line: OneBasedLine::new(function.line)
+                        .expect("proc-macro2 span lines are 1-based"),
+                    item_path: function.qualified_name.clone(),
+                },
+                EvidenceClass::Heuristic,
+                Origin::Code,
+                Some(json!({
+                    "file": function.file.display().to_string(),
+                    "function": function.qualified_name,
+                    "line": function.line,
+                    "return_type_depth": function.return_type_depth,
+                    "generic_param_count": function.generic_param_count,
+                    "lifetime_param_count": function.lifetime_param_count,
+                    "trait_bound_count": function.trait_bound_count,
+                })),
             )
-            .into(),
-            rule: SIGNATURE_COMPLEXITY_RULE.into(),
-            severity: Severity::Warn,
-            location: Location {
-                file: function.file.clone(),
-                line: OneBasedLine::new(function.line).expect("proc-macro2 span lines are 1-based"),
-                item_path: function.qualified_name.clone(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
-                "file": function.file.display().to_string(),
-                "function": function.qualified_name,
-                "line": function.line,
-                "return_type_depth": function.return_type_depth,
-                "generic_param_count": function.generic_param_count,
-                "lifetime_param_count": function.lifetime_param_count,
-                "trait_bound_count": function.trait_bound_count,
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
         })
         .collect()
 }
@@ -802,10 +803,11 @@ struct FileHalstead {
 /// (which only walks individual function bodies), since Halstead Volume is a
 /// file-level metric with no natural per-function decomposition.
 fn analyze_file_halstead(path: &Path) -> Result<FileHalstead, ComplexityError> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|err| ComplexityError::Io(path.to_path_buf(), err))?;
-    let ast =
-        syn::parse_file(&source).map_err(|err| ComplexityError::Parse(path.to_path_buf(), err))?;
+    let (_, ast) = read_and_parse_source(
+        path,
+        |err| ComplexityError::Io(path.to_path_buf(), err),
+        |err| ComplexityError::Parse(path.to_path_buf(), err),
+    )?;
 
     let mut visitor = HalsteadVisitor::default();
     visitor.visit_file(&ast);
@@ -904,18 +906,18 @@ pub fn maintainability_index(functions: &[FunctionInfo]) -> Vec<Finding> {
             continue;
         }
 
-        findings.push(Finding {
-            id: format!("{MAINTAINABILITY_INDEX_RULE}:{}", file.display()).into(),
-            rule: MAINTAINABILITY_INDEX_RULE.into(),
-            severity: Severity::Warn,
-            location: Location {
+        findings.push(Finding::new(
+            format!("{MAINTAINABILITY_INDEX_RULE}:{}", file.display()),
+            MAINTAINABILITY_INDEX_RULE,
+            Severity::Warn,
+            Location {
                 file: file.to_path_buf(),
                 line: OneBasedLine::FIRST,
                 item_path: file.display().to_string(),
             },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
+            EvidenceClass::Heuristic,
+            Origin::Code,
+            Some(json!({
                 "file": file.display().to_string(),
                 "maintainability_index": mi,
                 "halstead_volume": volume,
@@ -926,10 +928,7 @@ pub fn maintainability_index(functions: &[FunctionInfo]) -> Vec<Finding> {
                 "cyclomatic_complexity_sum": file_totals.cyclomatic,
                 "lines_of_code_sum": file_totals.lines_of_code,
             })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
+        ));
     }
     findings
 }

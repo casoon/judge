@@ -37,7 +37,7 @@ use syn::{
 
 use crate::complexity::FunctionInfo;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::{type_name, walk_functions};
+use crate::functions::{path_last_segment_name, type_name, walk_functions};
 use crate::ingest::{SourceFile, SourceKind};
 
 /// Rule id for a file reworked often within a short window (see todo.md
@@ -93,24 +93,23 @@ pub fn churn_hotspots(churn: &HashMap<PathBuf, u32>) -> Vec<Finding> {
     let mut findings: Vec<Finding> = churn
         .iter()
         .filter(|&(_, &count)| count >= CHURN_HOTSPOT_THRESHOLD)
-        .map(|(file, &count)| Finding {
-            id: format!("{CHURN_HOTSPOT_RULE}:{}", file.display()).into(),
-            rule: CHURN_HOTSPOT_RULE.into(),
-            severity: Severity::Warn,
-            location: Location {
-                file: file.clone(),
-                line: OneBasedLine::FIRST,
-                item_path: file.display().to_string(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
-                "commits_in_window": count,
-                "window_days": CHURN_HOTSPOT_WINDOW_DAYS,
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
+        .map(|(file, &count)| {
+            Finding::new(
+                format!("{CHURN_HOTSPOT_RULE}:{}", file.display()),
+                CHURN_HOTSPOT_RULE,
+                Severity::Warn,
+                Location {
+                    file: file.clone(),
+                    line: OneBasedLine::FIRST,
+                    item_path: file.display().to_string(),
+                },
+                EvidenceClass::Heuristic,
+                Origin::Code,
+                Some(json!({
+                    "commits_in_window": count,
+                    "window_days": CHURN_HOTSPOT_WINDOW_DAYS,
+                })),
+            )
         })
         .collect();
     // `churn` is a `HashMap`, so its iteration order isn't stable — sort for
@@ -169,32 +168,31 @@ pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
                     || function.async_nesting_depth > MAX_ASYNC_NESTING_FOR_INFLATION
                     || function.max_expression_width > MAX_EXPRESSION_WIDTH_FOR_INFLATION)
         })
-        .map(|function| Finding {
-            id: format!(
-                "{COMPLEXITY_INFLATION_RULE}:{}:{}",
-                function.file.display(),
-                function.qualified_name
+        .map(|function| {
+            Finding::new(
+                format!(
+                    "{COMPLEXITY_INFLATION_RULE}:{}:{}",
+                    function.file.display(),
+                    function.qualified_name
+                ),
+                COMPLEXITY_INFLATION_RULE,
+                Severity::Warn,
+                Location {
+                    file: function.file.clone(),
+                    line: OneBasedLine::new(function.line)
+                        .expect("proc-macro2 span lines are 1-based"),
+                    item_path: function.qualified_name.clone(),
+                },
+                EvidenceClass::Heuristic,
+                Origin::Code,
+                Some(json!({
+                    "lines_of_code": function.lines_of_code,
+                    "cyclomatic": function.cyclomatic,
+                    "cognitive": function.cognitive,
+                    "async_nesting_depth": function.async_nesting_depth,
+                    "max_expression_width": function.max_expression_width,
+                })),
             )
-            .into(),
-            rule: COMPLEXITY_INFLATION_RULE.into(),
-            severity: Severity::Warn,
-            location: Location {
-                file: function.file.clone(),
-                line: OneBasedLine::new(function.line).expect("proc-macro2 span lines are 1-based"),
-                item_path: function.qualified_name.clone(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
-                "lines_of_code": function.lines_of_code,
-                "cyclomatic": function.cyclomatic,
-                "cognitive": function.cognitive,
-                "async_nesting_depth": function.async_nesting_depth,
-                "max_expression_width": function.max_expression_width,
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
         })
         .collect()
 }
@@ -306,10 +304,7 @@ impl<'ast> Visit<'ast> for FileCollector<'ast> {
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
         let self_type = type_name(&node.self_ty);
         if let Some((_, path, _)) = &node.trait_ {
-            let trait_name = path
-                .segments
-                .last()
-                .map_or_else(|| "?".to_string(), |segment| segment.ident.to_string());
+            let trait_name = path_last_segment_name(path);
             self.trait_impls
                 .push((trait_name, self_type, node.span().start().line));
         } else {
@@ -409,26 +404,22 @@ fn abstraction_finding(
     item_path: String,
     evidence: serde_json::Value,
 ) -> Finding {
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{ABSTRACTION_INFLATION_RULE}:{}:{line}:{item_path}",
             file.display()
-        )
-        .into(),
-        rule: ABSTRACTION_INFLATION_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        ABSTRACTION_INFLATION_RULE,
+        Severity::Warn,
+        Location {
             file: file.to_path_buf(),
             line: OneBasedLine::new(line).expect("proc-macro2 span lines are 1-based"),
             item_path,
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(evidence),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(evidence),
+    )
 }
 
 /// Three structural sub-patterns from todo.md §3.G `abstraction-inflation`
@@ -456,15 +447,16 @@ fn abstraction_finding(
 /// struct-shape half of sub-check 3 are workspace-wide, since that's
 /// exactly the correlation they need (an impl can live in a different file
 /// than its trait; a builder's target struct is often defined elsewhere).
-pub fn analyze_workspace_structural<'a>(
+/// Parses every [`SourceKind::Authored`] file in `source_files`, calling
+/// `visit` with each file and its parsed AST — silently skipping files that
+/// fail to read or parse (see the Generated-Code-Policy, todo.md §3.A).
+/// Shared by every structural pass below, which only cares about what it
+/// *can* see, not about surfacing read/parse failures as findings of their
+/// own (unlike, say, [`crate::complexity::analyze_file`]).
+fn for_each_authored_file<'a>(
     source_files: impl IntoIterator<Item = &'a SourceFile>,
-) -> Vec<Finding> {
-    let mut findings = Vec::new();
-    let mut trait_impls: HashMap<String, Vec<(PathBuf, String, usize)>> = HashMap::new();
-    let mut struct_field_counts: HashMap<String, usize> = HashMap::new();
-    let mut builder_matches: Vec<(String, String, PathBuf, usize)> = Vec::new();
-    let mut declared_traits: HashSet<String> = HashSet::new();
-
+    mut visit: impl FnMut(&'a SourceFile, syn::File),
+) {
     for file in source_files {
         if file.kind != SourceKind::Authored {
             continue;
@@ -475,7 +467,29 @@ pub fn analyze_workspace_structural<'a>(
         let Ok(ast) = syn::parse_file(&source) else {
             continue;
         };
+        visit(file, ast);
+    }
+}
 
+/// Sorts `findings` deterministically by `(file, line, id)` — every
+/// structural pass in this module pushes findings while iterating
+/// `HashMap`s or per-file parse order, neither of which is stable.
+fn sort_by_location(findings: &mut [Finding]) {
+    findings.sort_by(|a, b| {
+        (&a.location.file, a.location.line, &a.id).cmp(&(&b.location.file, b.location.line, &b.id))
+    });
+}
+
+pub fn analyze_workspace_structural<'a>(
+    source_files: impl IntoIterator<Item = &'a SourceFile>,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut trait_impls: HashMap<String, Vec<(PathBuf, String, usize)>> = HashMap::new();
+    let mut struct_field_counts: HashMap<String, usize> = HashMap::new();
+    let mut builder_matches: Vec<(String, String, PathBuf, usize)> = Vec::new();
+    let mut declared_traits: HashSet<String> = HashSet::new();
+
+    for_each_authored_file(source_files, |file, ast| {
         let mut collector = FileCollector::default();
         collector.visit_file(&ast);
 
@@ -547,7 +561,7 @@ pub fn analyze_workspace_structural<'a>(
                 ));
             }
         }
-    }
+    });
 
     // Sub-check 1: trait with exactly one impl.
     for (trait_name, impls) in &trait_impls {
@@ -596,9 +610,7 @@ pub fn analyze_workspace_structural<'a>(
 
     // Deterministic output: `trait_impls`/`struct_field_counts` are
     // `HashMap`s, so the order findings were pushed above isn't stable.
-    findings.sort_by(|a, b| {
-        (&a.location.file, a.location.line, &a.id).cmp(&(&b.location.file, b.location.line, &b.id))
-    });
+    sort_by_location(&mut findings);
     findings
 }
 
@@ -781,17 +793,7 @@ pub fn fragile_substring_classification<'a>(
     source_files: impl IntoIterator<Item = &'a SourceFile>,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
-    for file in source_files {
-        if file.kind != SourceKind::Authored {
-            continue;
-        }
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
-            continue;
-        };
-        let Ok(ast) = syn::parse_file(&source) else {
-            continue;
-        };
-
+    for_each_authored_file(source_files, |file, ast| {
         walk_functions(&ast, |site| {
             let mut visitor = FragileSubstringVisitor::default();
             visitor.visit_block(site.block);
@@ -803,12 +805,10 @@ pub fn fragile_substring_classification<'a>(
                 ));
             }
         });
-    }
+    });
     // Deterministic output, matching `analyze_workspace_structural`'s own
     // sort convention.
-    findings.sort_by(|a, b| {
-        (&a.location.file, a.location.line, &a.id).cmp(&(&b.location.file, b.location.line, &b.id))
-    });
+    sort_by_location(&mut findings);
     findings
 }
 

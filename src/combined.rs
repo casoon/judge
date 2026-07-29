@@ -141,10 +141,7 @@ pub(super) fn run(
             )?;
         }
         OutputFormat::Markdown => {
-            let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = collected
-                .findings
-                .iter()
-                .partition(|finding| finding.is_gating());
+            let (gating, advisory) = judge::baseline::partition_gating(&collected.findings);
             let markdown = build_report(
                 &gating,
                 &advisory,
@@ -158,10 +155,7 @@ pub(super) fn run(
             write!(out, "{markdown}")?;
         }
         OutputFormat::Tty => {
-            let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = collected
-                .findings
-                .iter()
-                .partition(|finding| finding.is_gating());
+            let (gating, advisory) = judge::baseline::partition_gating(&collected.findings);
             build_report(
                 &gating,
                 &advisory,

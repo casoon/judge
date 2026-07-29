@@ -398,6 +398,36 @@ impl Finding {
         }
     }
 
+    /// Constructs a finding anchored to a `syn`/`proc_macro2` span — the
+    /// shape shared by every syntax-derived finding that reports a precise
+    /// token location: an id of `{rule}:{file}:{line}:{col}`, and a
+    /// `Location` at the span's start line. Callers only supply what makes
+    /// their rule's claim distinct: severity, evidence class, and evidence.
+    pub fn at_span(
+        rule: &str,
+        file: &Path,
+        span: proc_macro2::Span,
+        item_path: &str,
+        severity: Severity,
+        evidence_class: EvidenceClass,
+        evidence: Option<serde_json::Value>,
+    ) -> Self {
+        let start = span.start();
+        Self::new(
+            format!("{rule}:{}:{}:{}", file.display(), start.line, start.column),
+            rule,
+            severity,
+            Location {
+                file: file.to_path_buf(),
+                line: OneBasedLine::new(start.line).expect("proc-macro2 span lines are 1-based"),
+                item_path: item_path.to_string(),
+            },
+            evidence_class,
+            Origin::Code,
+            evidence,
+        )
+    }
+
     /// See [`EvidenceClass::is_gating`] — `false` means this finding is
     /// advisory: shown, but with no effect on verdicts or the health score.
     pub fn is_gating(&self) -> bool {
@@ -904,7 +934,7 @@ impl FindingGraph {
     /// Findings that `id` caused (the cascade direction), derived from the
     /// stored edges. Unknown ids yield an empty list.
     pub fn causes_of(&self, id: &FindingId) -> Vec<&Finding> {
-        let Some(&index) = self.index_by_id.get(id) else {
+        let Some(index) = self.index_of(id) else {
             return Vec::new();
         };
         self.edges
@@ -916,7 +946,7 @@ impl FindingGraph {
     /// Findings that caused `id` (the root-cause direction), derived from
     /// the stored edges. Unknown ids yield an empty list.
     pub fn caused_by_of(&self, id: &FindingId) -> Vec<&Finding> {
-        let Some(&index) = self.index_by_id.get(id) else {
+        let Some(index) = self.index_of(id) else {
             return Vec::new();
         };
         self.edges
@@ -924,6 +954,14 @@ impl FindingGraph {
             .filter(|&&(_, effect)| effect == index)
             .map(|&(cause, _)| &self.findings[cause])
             .collect()
+    }
+
+    /// Resolves `id` to its internal node index, or `None` for an unknown
+    /// id — the shared fallback [`causes_of`](Self::causes_of) and
+    /// [`caused_by_of`](Self::caused_by_of) both bail out to an empty list
+    /// on.
+    fn index_of(&self, id: &FindingId) -> Option<usize> {
+        self.index_by_id.get(id).copied()
     }
 
     /// Consumes the graph and returns the findings in insertion order with

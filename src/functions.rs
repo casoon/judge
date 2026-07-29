@@ -126,7 +126,10 @@ fn has_test_cfg(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
+/// Whether an item is itself `#[test]`-attributed. Shared with
+/// [`crate::security`], which folds this same check into its own
+/// visibility/test-scope predicates.
+pub(crate) fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("test"))
 }
 
@@ -166,12 +169,81 @@ where
 
 pub(crate) fn type_name(ty: &Type) -> String {
     match ty {
-        Type::Path(type_path) => type_path
-            .path
-            .segments
-            .last()
-            .map_or_else(|| "?".to_string(), |segment| segment.ident.to_string()),
+        Type::Path(type_path) => path_last_segment_name(&type_path.path),
         _ => "?".to_string(),
+    }
+}
+
+/// A path's final segment name (e.g. `Foo` from `some::module::Foo`), or
+/// `"?"` for a path with no segments (never happens for a valid `syn::Path`,
+/// but avoids a panic on the off chance). Shared by [`type_name`] above and
+/// [`crate::slop_structural`]'s trait-impl collector, which extracts the
+/// same name from a bare `syn::Path` (a trait reference) rather than a
+/// `syn::Type`.
+pub(crate) fn path_last_segment_name(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map_or_else(|| "?".to_string(), |segment| segment.ident.to_string())
+}
+
+impl<'ast, F> Walker<F>
+where
+    F: FnMut(FunctionSite<'ast>),
+{
+    /// Pushes `name` and the inherited test-context flag for the duration of
+    /// `visit` — shared by `mod` and `trait`, the two scopes that only track a
+    /// path segment and test context (an `impl` block additionally tracks
+    /// `in_trait_impl`, so it keeps its own visitor body).
+    fn visit_scoped(&mut self, name: String, attrs: &[syn::Attribute], visit: impl FnOnce(&mut Self)) {
+        let is_test_context = self.current_test_context() || has_test_cfg(attrs);
+        self.path.push(name);
+        self.visit_fn_scoped(is_test_context, visit);
+        self.path.pop();
+    }
+
+    /// Whether a function-like item is test-only: its enclosing scope is, or
+    /// it's `#[cfg(test)]`, or it's `#[test]` itself.
+    fn compute_is_test_context(&self, attrs: &[syn::Attribute]) -> bool {
+        self.current_test_context() || has_test_cfg(attrs) || has_test_attr(attrs)
+    }
+
+    /// Runs `visit` with `is_test_context` pushed onto the test-context stack
+    /// for its duration — shared by every function-like `Visit` method so
+    /// nested items inherit the right test scope.
+    fn visit_fn_scoped(&mut self, is_test_context: bool, visit: impl FnOnce(&mut Self)) {
+        self.test_context.push(is_test_context);
+        visit(self);
+        self.test_context.pop();
+    }
+
+    /// Emits a free function or an inherent/trait-impl method: `ItemFn` and
+    /// `ImplItemFn` share the same `sig`/`block`/`vis`/`attrs` shape, so this
+    /// one helper drives both `visit_item_fn` and `visit_impl_item_fn`.
+    /// Returns the computed `is_test_context` so the caller can scope its
+    /// nested `visit::visit_*` call with it.
+    fn emit_fn(
+        &mut self,
+        spanned: &impl Spanned,
+        sig: &'ast syn::Signature,
+        block: &'ast Block,
+        vis: &'ast syn::Visibility,
+        attrs: &'ast [syn::Attribute],
+        in_trait_impl: bool,
+    ) -> bool {
+        let is_test_context = self.compute_is_test_context(attrs);
+        self.emit(
+            &sig.ident.to_string(),
+            spanned,
+            block,
+            sig.inputs.len(),
+            sig.ident.span(),
+            Some(vis),
+            attrs,
+            in_trait_impl,
+            is_test_context,
+            sig,
+        );
+        is_test_context
     }
 }
 
@@ -181,12 +253,9 @@ where
 {
     fn visit_item_mod(&mut self, node: &'ast ItemMod) {
         if node.content.is_some() {
-            let is_test_context = self.current_test_context() || has_test_cfg(&node.attrs);
-            self.path.push(node.ident.to_string());
-            self.test_context.push(is_test_context);
-            visit::visit_item_mod(self, node);
-            self.test_context.pop();
-            self.path.pop();
+            self.visit_scoped(node.ident.to_string(), &node.attrs, |w| {
+                visit::visit_item_mod(w, node)
+            });
         } else {
             visit::visit_item_mod(self, node);
         }
@@ -204,58 +273,25 @@ where
     }
 
     fn visit_item_trait(&mut self, node: &'ast ItemTrait) {
-        let is_test_context = self.current_test_context() || has_test_cfg(&node.attrs);
-        self.path.push(node.ident.to_string());
-        self.test_context.push(is_test_context);
-        visit::visit_item_trait(self, node);
-        self.test_context.pop();
-        self.path.pop();
+        self.visit_scoped(node.ident.to_string(), &node.attrs, |w| {
+            visit::visit_item_trait(w, node)
+        });
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        let is_test_context =
-            self.current_test_context() || has_test_cfg(&node.attrs) || has_test_attr(&node.attrs);
-        self.emit(
-            &node.sig.ident.to_string(),
-            node,
-            &node.block,
-            node.sig.inputs.len(),
-            node.sig.ident.span(),
-            Some(&node.vis),
-            &node.attrs,
-            false,
-            is_test_context,
-            &node.sig,
-        );
-        self.test_context.push(is_test_context);
-        visit::visit_item_fn(self, node);
-        self.test_context.pop();
+        let is_test_context = self.emit_fn(node, &node.sig, &node.block, &node.vis, &node.attrs, false);
+        self.visit_fn_scoped(is_test_context, |w| visit::visit_item_fn(w, node));
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         let in_trait_impl = self.current_in_trait_impl();
         let is_test_context =
-            self.current_test_context() || has_test_cfg(&node.attrs) || has_test_attr(&node.attrs);
-        self.emit(
-            &node.sig.ident.to_string(),
-            node,
-            &node.block,
-            node.sig.inputs.len(),
-            node.sig.ident.span(),
-            Some(&node.vis),
-            &node.attrs,
-            in_trait_impl,
-            is_test_context,
-            &node.sig,
-        );
-        self.test_context.push(is_test_context);
-        visit::visit_impl_item_fn(self, node);
-        self.test_context.pop();
+            self.emit_fn(node, &node.sig, &node.block, &node.vis, &node.attrs, in_trait_impl);
+        self.visit_fn_scoped(is_test_context, |w| visit::visit_impl_item_fn(w, node));
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast TraitItemFn) {
-        let is_test_context =
-            self.current_test_context() || has_test_cfg(&node.attrs) || has_test_attr(&node.attrs);
+        let is_test_context = self.compute_is_test_context(&node.attrs);
         if let Some(block) = &node.default {
             self.emit(
                 &node.sig.ident.to_string(),
@@ -270,9 +306,7 @@ where
                 &node.sig,
             );
         }
-        self.test_context.push(is_test_context);
-        visit::visit_trait_item_fn(self, node);
-        self.test_context.pop();
+        self.visit_fn_scoped(is_test_context, |w| visit::visit_trait_item_fn(w, node));
     }
 }
 

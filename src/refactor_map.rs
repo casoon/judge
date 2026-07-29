@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::complexity;
-use crate::ingest::{CrateInfo, EntryPointKind, SourceKind, Workspace};
+use crate::ingest::{CrateInfo, EntryPointKind, Workspace};
 
 /// Schema version for [`RefactorMap`]'s independent JSON contract.
 pub const SCHEMA_VERSION: u32 = 3;
@@ -158,7 +158,7 @@ pub fn analyze(workspace: &Workspace, include_tests: bool) -> RefactorMap {
             files.push(FileSummary {
                 crate_name: krate.name.clone(),
                 file: relative_path(&workspace.root, &source_file.path),
-                source_kind: source_kind_label(source_file.kind),
+                source_kind: source_file.kind.label(),
                 production: metrics.production,
                 tests: metrics.tests,
                 complexity_rank: None,
@@ -216,18 +216,10 @@ fn relative_path(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
 
-fn source_kind_label(kind: SourceKind) -> &'static str {
-    match kind {
-        SourceKind::Authored => "authored",
-        SourceKind::Generated => "generated",
-        SourceKind::BuildOutput => "build_output",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingest::{CrateInfo, SourceFile};
+    use crate::ingest::{CrateInfo, SourceFile, SourceKind};
 
     fn workspace(root: &Path) -> Workspace {
         Workspace {

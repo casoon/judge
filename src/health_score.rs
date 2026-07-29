@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::baseline::Baseline;
 use crate::boundaries::CrateProfile;
 use crate::finding::{Finding, Severity};
-use crate::ingest::{CrateInfo, Workspace};
+use crate::ingest::{CrateInfo, SourceFile, Workspace};
 
 /// Fixed per-severity deduction weight (see module docs, point 2 — not
 /// configurable per rule).
@@ -235,11 +235,7 @@ impl std::error::Error for LocError {
 /// [`total_authored_loc_checked`] instead, so a read failure can never
 /// masquerade as a smaller codebase.
 pub fn total_authored_loc(workspace: &Workspace) -> usize {
-    workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter())
-        .filter(|file| file.kind.is_locally_reportable())
+    authored_source_files(workspace)
         .filter_map(|file| std::fs::read_to_string(&file.path).ok())
         .map(|content| content.lines().count())
         .sum()
@@ -248,11 +244,7 @@ pub fn total_authored_loc(workspace: &Workspace) -> usize {
 /// Like [`total_authored_loc`], but a read failure is a [`LocError`] instead
 /// of a silently skipped file (see todo.md §15.1).
 pub fn total_authored_loc_checked(workspace: &Workspace) -> Result<usize, LocError> {
-    workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter())
-        .filter(|file| file.kind.is_locally_reportable())
+    authored_source_files(workspace)
         .map(|file| {
             std::fs::read_to_string(&file.path)
                 .map(|content| content.lines().count())
@@ -269,11 +261,7 @@ pub fn total_authored_loc_checked(workspace: &Workspace) -> Result<usize, LocErr
 /// denominator for a ratio gate judged against only what changed (see
 /// `audit --since`, todo.md §6), not the whole workspace total.
 pub fn authored_loc_in(workspace: &Workspace, files: &HashSet<PathBuf>) -> usize {
-    workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter())
-        .filter(|file| file.kind.is_locally_reportable())
+    authored_source_files(workspace)
         .filter(|file| {
             file.path
                 .strip_prefix(&workspace.root)
@@ -282,6 +270,18 @@ pub fn authored_loc_in(workspace: &Workspace, files: &HashSet<PathBuf>) -> usize
         .filter_map(|file| std::fs::read_to_string(&file.path).ok())
         .map(|content| content.lines().count())
         .sum()
+}
+
+/// Every authored (non-generated) source file across `workspace` — the
+/// shared starting point for [`total_authored_loc`], [`total_authored_loc_checked`],
+/// and [`authored_loc_in`], which otherwise only differ in how they turn
+/// file contents into a count.
+fn authored_source_files(workspace: &Workspace) -> impl Iterator<Item = &SourceFile> {
+    workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter())
+        .filter(|file| file.kind.is_locally_reportable())
 }
 
 /// Finds the workspace crate that owns `file` — the one whose `root` is the
@@ -343,16 +343,8 @@ pub fn compute(
         if !finding.is_gating() {
             continue;
         }
-        let weight = match finding.severity {
-            Severity::Fail => {
-                fail_count += 1;
-                FAIL_WEIGHT
-            }
-            Severity::Warn => {
-                warn_count += 1;
-                WARN_WEIGHT
-            }
-            Severity::Info => continue,
+        let Some(weight) = score_severity(finding.severity, &mut fail_count, &mut warn_count) else {
+            continue;
         };
 
         let multiplier = multiplier_for(workspace, &finding.location.file, crate_profiles);
@@ -360,6 +352,24 @@ pub fn compute(
     }
 
     ScoreOutcome::Available(score_from(fail_count, warn_count, deduction, total_loc))
+}
+
+/// Scores one gating finding's `severity` as a fail/warn deduction weight,
+/// bumping the matching counter — the part of the scoring formula [`compute`]
+/// and [`trend`] share exactly; they differ only in what a "finding" is and
+/// how its file path is resolved. `None` for `Info`, which is never scored.
+fn score_severity(severity: Severity, fail_count: &mut usize, warn_count: &mut usize) -> Option<f64> {
+    match severity {
+        Severity::Fail => {
+            *fail_count += 1;
+            Some(FAIL_WEIGHT)
+        }
+        Severity::Warn => {
+            *warn_count += 1;
+            Some(WARN_WEIGHT)
+        }
+        Severity::Info => None,
+    }
 }
 
 /// The score-formula conditions a baseline's findings were saved under:
@@ -527,16 +537,8 @@ pub fn trend(
         if !finding.evidence_class.is_gating() {
             continue;
         }
-        let weight = match finding.severity {
-            Severity::Fail => {
-                fail_count += 1;
-                FAIL_WEIGHT
-            }
-            Severity::Warn => {
-                warn_count += 1;
-                WARN_WEIGHT
-            }
-            Severity::Info => continue,
+        let Some(weight) = score_severity(finding.severity, &mut fail_count, &mut warn_count) else {
+            continue;
         };
 
         // Stored paths are workspace-relative (`join` is a no-op for older
