@@ -56,6 +56,19 @@ impl PartialEq<&str> for FindingId {
     }
 }
 
+/// Deterministic, version-independent 64-bit FNV-1a hash, hex-encoded.
+/// Used to compute stable, deterministic identifiers for candidates and heuristics.
+pub(crate) fn fnv1a_hex(input: &str) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    for byte in input.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:016x}")
+}
+
 /// Stable identifier of a rule (e.g. `duplicate-code`). A newtype around the
 /// rule-id string each detector exposes as a `&'static str` constant — the
 /// ids themselves are unchanged, and `#[serde(transparent)]` keeps the JSON

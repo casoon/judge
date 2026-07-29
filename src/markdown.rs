@@ -7,59 +7,8 @@
 
 use std::fmt::Write;
 
-use crate::baseline::{Delta, TriVerdict, Verdict};
+use crate::baseline::{Delta, Verdict};
 use crate::finding::{Finding, Severity};
-use crate::gate::{GateVerdict, RatioGate};
-
-/// One named gate slot of the audit output: the evaluated gate, or `None`
-/// plus the threshold flag that would enable it — a skipped gate stays
-/// visible (todo.md §6), never a silent pass.
-pub struct GateSlot<'a> {
-    pub name: &'a str,
-    pub threshold_flag: &'a str,
-    pub gate: Option<&'a RatioGate>,
-}
-
-/// Legacy audit rendering: verdict, every gate (including
-/// not-evaluated ones), then the delta table.
-pub fn render_audit(delta: &Delta, verdict: TriVerdict, gates: &[GateSlot<'_>]) -> String {
-    let verdict_label = match verdict {
-        TriVerdict::Pass => "pass",
-        TriVerdict::Warn => "warn",
-        TriVerdict::Fail => "fail",
-    };
-    let mut out = format!("**verdict: {verdict_label}**\n\n");
-    for slot in gates {
-        match slot.gate {
-            Some(gate) => {
-                let gate_verdict = match gate.verdict {
-                    GateVerdict::Pass => "pass",
-                    GateVerdict::Fail => "fail",
-                    GateVerdict::NotEvaluatedSmallSample => "not_evaluated_small_sample",
-                };
-                writeln!(
-                    out,
-                    "- gate `{}`: {gate_verdict} — {}/{} (min sample {}, max ratio {})",
-                    gate.name,
-                    gate.numerator,
-                    gate.sample_size,
-                    gate.minimum_sample,
-                    gate.max_ratio
-                )
-                .unwrap();
-            }
-            None => writeln!(
-                out,
-                "- gate `{}`: not evaluated (pass --audit-min-sample and {} to enable)",
-                slot.name, slot.threshold_flag
-            )
-            .unwrap(),
-        }
-    }
-    out.push('\n');
-    push_delta_body(&mut out, delta);
-    out
-}
 
 /// An artifact baseline comparison as a compact Markdown delta.
 pub fn render_delta(delta: &Delta, verdict: Verdict) -> String {
@@ -171,74 +120,6 @@ mod tests {
             Origin::Code,
             None,
         )
-    }
-
-    #[test]
-    fn render_audit_golden() {
-        let delta = Delta {
-            introduced: vec![
-                finding(
-                    "duplicate-code",
-                    Severity::Warn,
-                    EvidenceClass::DerivedFact,
-                    "src/a.rs",
-                    3,
-                    "foo",
-                ),
-                finding(
-                    "hotspot",
-                    Severity::Info,
-                    EvidenceClass::Heuristic,
-                    "src/b.rs",
-                    1,
-                    "src/b.rs",
-                ),
-            ],
-            code_introduced: Vec::new(),
-            rule_introduced: Vec::new(),
-            resolved: Vec::new(),
-            severity_changed: Vec::new(),
-            unchanged_count: 4,
-        };
-        let evaluated = crate::gate::ratio_gate("duplication-ratio", 3, 100, 1, 0.0);
-        let gates = [
-            GateSlot {
-                name: "duplication-ratio",
-                threshold_flag: "--max-duplication-ratio",
-                gate: Some(&evaluated),
-            },
-            GateSlot {
-                name: "suppression-debt-ratio",
-                threshold_flag: "--max-suppression-ratio",
-                gate: None,
-            },
-        ];
-
-        let text = render_audit(&delta, TriVerdict::Warn, &gates);
-
-        assert_eq!(
-            text,
-            "\
-**verdict: warn**
-
-- gate `duplication-ratio`: fail — 3/100 (min sample 1, max ratio 0)
-- gate `suppression-debt-ratio`: not evaluated (pass --audit-min-sample and --max-suppression-ratio to enable)
-
-unchanged: 4 — resolved: 0 — severity changed: 0
-
-### introduced: 1
-
-| rule | severity | location | item |
-|---|---|---|---|
-| duplicate-code | warn | src/a.rs:3 | foo |
-
-### introduced advisory (heuristic — no verdict effect): 1
-
-| rule | severity | location | item |
-|---|---|---|---|
-| hotspot | info | src/b.rs:1 | src/b.rs |
-"
-        );
     }
 
     #[test]

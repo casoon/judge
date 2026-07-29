@@ -34,20 +34,21 @@
 //! Every rule but `name-collision-risk` needs real network access
 //! (crates.io), which judge only ever performs when explicitly requested —
 //! see `--check-crates-io` on `cargo judge deps` in `src/main.rs`. Bare
-//! `cargo judge`/`audit` never call out to the network; only
+//! Bare `cargo judge` never calls out to the network; only
 //! `name-collision-risk` runs there.
 //!
-//! `dep-added-by-agent` (the fifth rule from todo.md's G5 table) is
-//! deliberately not implemented — see the "Bewusst noch nicht umgesetzt"
-//! section of `todo.md`.
 
+#[cfg(feature = "network")]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "network")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cargo_metadata::MetadataCommand;
 use semver::{Version, VersionReq};
+#[cfg(feature = "network")]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -310,12 +311,14 @@ pub trait CratesIoOwners {
 /// "Cache" for the general blake3-based pattern this deliberately deviates
 /// from — there's no local file content to hash here, so the crate name
 /// string itself is the cache key). TTL is [`CACHE_TTL_SECS`].
+#[cfg(feature = "network")]
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheRecord<T> {
     fetched_at: u64,
     data: T,
 }
 
+#[cfg(feature = "network")]
 const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
 fn now_unix_secs() -> u64 {
@@ -331,10 +334,12 @@ fn now_unix_secs() -> u64 {
 /// directory later if needed). `category` separates the sparse-index cache
 /// from the REST-metadata cache so the two don't collide on the same crate
 /// name.
+#[cfg(feature = "network")]
 fn cache_path(cache_root: &Path, category: &str, crate_name: &str) -> PathBuf {
     cache_root.join(category).join(format!("{crate_name}.json"))
 }
 
+#[cfg(feature = "network")]
 fn read_cache<T: DeserializeOwned>(path: &Path) -> Option<T> {
     let text = std::fs::read_to_string(path).ok()?;
     let record: CacheRecord<T> = serde_json::from_str(&text).ok()?;
@@ -345,6 +350,7 @@ fn read_cache<T: DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 /// Best-effort: a cache write failure doesn't fail the lookup it's caching.
+#[cfg(feature = "network")]
 fn write_cache<T: Serialize>(path: &Path, data: &T) {
     let record = CacheRecord {
         fetched_at: now_unix_secs(),
@@ -358,6 +364,7 @@ fn write_cache<T: Serialize>(path: &Path, data: &T) {
     }
 }
 
+#[cfg(feature = "network")]
 /// Classifies a `ureq` error as connection-level (DNS failure, connect
 /// timeout, TLS handshake failure, request timeout — the network itself
 /// isn't reachable) vs. anything else (bad status, protocol error, etc.).
@@ -371,6 +378,7 @@ fn is_connection_error(err: &ureq::Error) -> bool {
     )
 }
 
+#[cfg(feature = "network")]
 fn build_agent(user_agent: &str) -> ureq::Agent {
     let config = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(3)))
@@ -382,6 +390,7 @@ fn build_agent(user_agent: &str) -> ureq::Agent {
 
 /// User-Agent sent on every request, per crates.io's crawler policy (a
 /// descriptive UA identifying the tool and a way to reach its maintainers).
+#[cfg(feature = "network")]
 const JUDGE_USER_AGENT: &str = "cargo-judge (https://github.com/casoon/judge)";
 
 /// Builds the crates.io sparse-index path for `crate_name`, per crates.io's
@@ -389,6 +398,7 @@ const JUDGE_USER_AGENT: &str = "cargo-judge (https://github.com/casoon/judge)";
 /// `2/<name>`, 3-char in `3/<first-char>/<name>`, 4+ chars in
 /// `<first-two>/<next-two>/<name>`. Crate names are lowercased for the path,
 /// matching cargo's own sparse-index client behavior.
+#[cfg(feature = "network")]
 fn sparse_index_path(crate_name: &str) -> String {
     let lower = crate_name.to_lowercase();
     match lower.len() {
@@ -403,6 +413,7 @@ fn sparse_index_path(crate_name: &str) -> String {
 /// One line of the sparse index's JSON-lines response body — only the
 /// fields judge needs are captured; extra fields (`deps`, `cksum`,
 /// `features`, ...) are ignored by `serde_json` automatically.
+#[cfg(feature = "network")]
 #[derive(Debug, Deserialize)]
 struct RawIndexLine {
     vers: String,
@@ -421,12 +432,14 @@ struct RawIndexLine {
 /// evidence there's no network available at all for the rest of this run;
 /// retrying per-dependency would just flood the output with the same
 /// failure N times for no benefit.
+#[cfg(feature = "network")]
 pub struct SparseIndexClient {
     agent: ureq::Agent,
     cache_root: PathBuf,
     circuit_open: Cell<bool>,
 }
 
+#[cfg(feature = "network")]
 impl SparseIndexClient {
     pub fn new(cache_root: PathBuf) -> Self {
         Self {
@@ -437,6 +450,7 @@ impl SparseIndexClient {
     }
 }
 
+#[cfg(feature = "network")]
 impl CratesIoIndex for SparseIndexClient {
     fn lookup(&self, crate_name: &str) -> Result<Option<IndexEntry>, SlopsquatError> {
         let path = cache_path(&self.cache_root, "index", crate_name);
@@ -484,8 +498,28 @@ impl CratesIoIndex for SparseIndexClient {
     }
 }
 
+#[cfg(not(feature = "network"))]
+pub struct SparseIndexClient {}
+
+#[cfg(not(feature = "network"))]
+impl SparseIndexClient {
+    pub fn new(_cache_root: PathBuf) -> Self {
+        Self {}
+    }
+}
+
+#[cfg(not(feature = "network"))]
+impl CratesIoIndex for SparseIndexClient {
+    fn lookup(&self, _crate_name: &str) -> Result<Option<IndexEntry>, SlopsquatError> {
+        Err(SlopsquatError::Connection(Box::new(std::io::Error::other(
+            "cargo-judge was compiled without the 'network' feature",
+        ))))
+    }
+}
+
 /// The crates.io REST API's `{"crate": {...}}` envelope — only the fields
 /// [`CrateMetadata`] needs are captured.
+#[cfg(feature = "network")]
 #[derive(Debug, Deserialize)]
 struct RestCrateResponse {
     #[serde(rename = "crate")]
@@ -498,12 +532,14 @@ struct RestCrateResponse {
 /// [`SparseIndexClient`] — see its docs — but tracked independently, since
 /// this is a separate network call path (a different host/API) that can
 /// fail on its own.
+#[cfg(feature = "network")]
 pub struct RestMetadataClient {
     agent: ureq::Agent,
     cache_root: PathBuf,
     circuit_open: Cell<bool>,
 }
 
+#[cfg(feature = "network")]
 impl RestMetadataClient {
     pub fn new(cache_root: PathBuf) -> Self {
         Self {
@@ -514,6 +550,7 @@ impl RestMetadataClient {
     }
 }
 
+#[cfg(feature = "network")]
 impl CratesIoMetadata for RestMetadataClient {
     fn metadata(&self, crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError> {
         let path = cache_path(&self.cache_root, "meta", crate_name);
@@ -550,7 +587,27 @@ impl CratesIoMetadata for RestMetadataClient {
     }
 }
 
+#[cfg(not(feature = "network"))]
+pub struct RestMetadataClient {}
+
+#[cfg(not(feature = "network"))]
+impl RestMetadataClient {
+    pub fn new(_cache_root: PathBuf) -> Self {
+        Self {}
+    }
+}
+
+#[cfg(not(feature = "network"))]
+impl CratesIoMetadata for RestMetadataClient {
+    fn metadata(&self, _crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError> {
+        Err(SlopsquatError::Connection(Box::new(std::io::Error::other(
+            "cargo-judge was compiled without the 'network' feature",
+        ))))
+    }
+}
+
 /// The crates.io owners endpoint's `{"users": [...]}` envelope.
+#[cfg(feature = "network")]
 #[derive(Debug, Deserialize)]
 struct RestOwnersResponse {
     users: Vec<CrateOwner>,
@@ -562,12 +619,14 @@ struct RestOwnersResponse {
 /// [`SparseIndexClient`]/[`RestMetadataClient`] — see their docs — but
 /// tracked independently, since this hits yet another endpoint that can
 /// fail on its own.
+#[cfg(feature = "network")]
 pub struct RestOwnersClient {
     agent: ureq::Agent,
     cache_root: PathBuf,
     circuit_open: Cell<bool>,
 }
 
+#[cfg(feature = "network")]
 impl RestOwnersClient {
     pub fn new(cache_root: PathBuf) -> Self {
         Self {
@@ -578,6 +637,7 @@ impl RestOwnersClient {
     }
 }
 
+#[cfg(feature = "network")]
 impl CratesIoOwners for RestOwnersClient {
     fn owners(&self, crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError> {
         let path = cache_path(&self.cache_root, "owners", crate_name);
@@ -611,6 +671,25 @@ impl CratesIoOwners for RestOwnersClient {
 
         write_cache(&path, &Some(parsed.users.clone()));
         Ok(Some(parsed.users))
+    }
+}
+
+#[cfg(not(feature = "network"))]
+pub struct RestOwnersClient {}
+
+#[cfg(not(feature = "network"))]
+impl RestOwnersClient {
+    pub fn new(_cache_root: PathBuf) -> Self {
+        Self {}
+    }
+}
+
+#[cfg(not(feature = "network"))]
+impl CratesIoOwners for RestOwnersClient {
+    fn owners(&self, _crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError> {
+        Err(SlopsquatError::Connection(Box::new(std::io::Error::other(
+            "cargo-judge was compiled without the 'network' feature",
+        ))))
     }
 }
 

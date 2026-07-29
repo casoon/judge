@@ -66,7 +66,8 @@ pub(super) fn run_patterns(
         match format {
             OutputFormat::Json => {
                 let json = serde_json::json!({ "delta": delta });
-                writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+                let json_str = serde_json::to_string_pretty(&json)?;
+                writeln!(out, "{}", json_str)?;
             }
             OutputFormat::Sarif | OutputFormat::Markdown => {
                 unreachable!("rejected above before loading the workspace")
@@ -79,7 +80,8 @@ pub(super) fn run_patterns(
     match format {
         OutputFormat::Json => {
             let json = serde_json::json!({ "candidates": candidates });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+            let json_str = serde_json::to_string_pretty(&json)?;
+            writeln!(out, "{}", json_str)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
             unreachable!("rejected above before loading the workspace")
@@ -147,7 +149,8 @@ pub(super) fn run_principles(
     match format {
         OutputFormat::Json => {
             let json = serde_json::json!({ "heuristics": heuristics });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+            let json_str = serde_json::to_string_pretty(&json)?;
+            writeln!(out, "{}", json_str)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
             unreachable!("rejected above before loading the workspace")
@@ -278,7 +281,8 @@ pub(super) fn run_explain_pattern(
 
     match format {
         OutputFormat::Json => {
-            writeln!(out, "{}", serde_json::to_string_pretty(&candidate).unwrap())?;
+            let json_str = serde_json::to_string_pretty(&candidate)?;
+            writeln!(out, "{}", json_str)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
             unreachable!("rejected above before loading the workspace")
@@ -350,7 +354,8 @@ pub(super) fn run_explain_principle(
 
     match format {
         OutputFormat::Json => {
-            writeln!(out, "{}", serde_json::to_string_pretty(&heuristic).unwrap())?;
+            let json_str = serde_json::to_string_pretty(&heuristic)?;
+            writeln!(out, "{}", json_str)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
             unreachable!("rejected above before loading the workspace")
@@ -384,7 +389,8 @@ pub(super) fn run_fix_preview(
                 "patch": serde_json::Value::Null,
                 "note": "migration plan only — no patch is generated (see todo.md §16.5)",
             });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+            let json_str = serde_json::to_string_pretty(&json)?;
+            writeln!(out, "{}", json_str)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
             unreachable!("rejected above before loading the workspace")
@@ -449,13 +455,14 @@ pub(super) fn run_explain_rule(
                 "allowed_wording": entry.allowed_wording,
                 "example": example,
             });
-            writeln!(out, "{}", serde_json::to_string_pretty(&json).unwrap())?;
+            let json_str = serde_json::to_string_pretty(&json)?;
+            writeln!(out, "{}", json_str)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
             unreachable!("rejected above before looking up the rule")
         }
         OutputFormat::Tty => {
-            let evidence_class = serde_json::to_value(entry.evidence_class).unwrap();
+            let evidence_class = serde_json::to_value(entry.evidence_class)?;
             writeln!(out, "rule: {}", entry.id)?;
             writeln!(
                 out,

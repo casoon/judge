@@ -33,29 +33,12 @@ pub(super) enum Command {
     /// (see todo.md §3.H, §14.2 P1/P2). Opt-in: does nothing if no config is
     /// found.
     Boundaries(BoundariesOptions),
-    /// Show ownership/bus-factor findings (see todo.md §3.E, §8).
-    Distribution(DistributionOptions),
-    /// Show heuristic author-class breakdowns (churn, duplication rate,
-    /// suppression debt) from commit trailers/markers and optional
-    /// configured labels (see todo.md §3.G G6). A distribution trend, never
-    /// a per-commit or per-person judgement — see the printed caveat.
-    /// Subcommand-only: not part of bare `cargo judge`.
-    Provenance(ProvenanceOptions),
     /// Find `pub` items no other workspace crate references (see todo.md
     /// §3.A, §14.2 P1). Needs the Deep Tier — build with `--features deep`.
     DeadCode(DeadCodeOptions),
     /// Explains a specific item (see todo.md §7). Currently only
     /// `--why-live` is implemented.
     Explain(ExplainOptions),
-    /// Combined pass/warn/fail PR verdict reflecting only findings
-    /// introduced since `<ref>` (see todo.md §5 "audit --since"). Reuses the
-    /// already-saved `.judge/baseline.json` (or `--baseline`) the same way
-    /// `--baseline` works today — `<ref>` is only the boundary for "what
-    /// changed since then", not a second analysis target. This is
-    /// verdict-incremental, not analysis-incremental: cross-file analyzers
-    /// like duplication still run over the full corpus, only the delta
-    /// classification is scoped to touched files.
-    Audit(AuditOptions),
     /// Compare the current project state with a recorded baseline artifact.
     /// This command never reads Git history.
     Compare(CompareOptions),
@@ -114,8 +97,7 @@ pub(super) enum Command {
     ExplainRule(ExplainRuleOptions),
     /// Shows public-API-surface findings (`undocumented-public-item` and
     /// `semver-hazard` — see todo.md §I). Subcommand-only: not part of bare
-    /// `cargo judge`, `audit`, or `health`, matching
-    /// `Distribution`/`Provenance`/`DeadCode`'s own opt-in precedent. A
+    /// `cargo judge` or `health`. A
     /// build compiled with `--features deep` additionally checks
     /// `semver-hazard`'s `leaked_dependency_type` sub-case.
     ApiSurface(ApiSurfaceOptions),
@@ -123,8 +105,7 @@ pub(super) enum Command {
     Api(ApiSurfaceOptions),
     /// Shows `unlinked-file`/`orphan-module` findings from resolving each
     /// crate's real `mod` tree (see `judge::module_graph`). Subcommand-only:
-    /// not part of bare `cargo judge`, `audit`, or `health`, matching
-    /// `Distribution`/`Provenance`/`ApiSurface`'s own opt-in precedent.
+    /// not part of bare `cargo judge` or `health`.
     ModuleGraph(ModuleGraphOptions),
 }
 
@@ -137,14 +118,9 @@ impl Command {
             Self::Dupes(options) => Some((options.baseline_args.format, "dupes")),
             Self::Health(options) => Some((options.baseline_args.format, "health")),
             Self::Deps(options) => Some((options.baseline_args.format, "deps")),
-            Self::Boundaries(options) if options.graph.is_none() => {
-                Some((options.baseline_args.format, "boundaries"))
-            }
-            Self::Distribution(options) => Some((options.baseline_args.format, "distribution")),
-            Self::Provenance(options) => Some((options.baseline_args.format, "provenance")),
+            Self::Boundaries(options) => Some((options.baseline_args.format, "boundaries")),
             Self::DeadCode(options) => Some((options.baseline_args.format, "dead-code")),
             Self::Explain(options) => Some((options.format, "explain")),
-            Self::Audit(options) => Some((options.format, "audit")),
             Self::Compare(options) => Some((options.format, "compare")),
             Self::Coverage(options) => Some((options.baseline_args.format, "coverage")),
             Self::Patterns(options) => Some((options.format, "patterns")),
@@ -165,7 +141,7 @@ impl Command {
             Self::Errors(options) => Some((options.format, "errors")),
             Self::Tests(options) => Some((options.format, "tests")),
             Self::Slop(options) => Some((options.format, "slop")),
-            Self::Init | Self::Inspect | Self::Boundaries(_) => None,
+            Self::Init | Self::Inspect => None,
         }
     }
 
@@ -176,11 +152,8 @@ impl Command {
             Self::Health(options) => run_health(options, out),
             Self::Deps(options) => run_deps(options, out),
             Self::Boundaries(options) => run_boundaries(options, out),
-            Self::Distribution(options) => run_distribution(options, out),
-            Self::Provenance(options) => run_provenance(options, out),
             Self::DeadCode(options) => run_dead_code(options, out),
             Self::Explain(options) => run_explain(options, out),
-            Self::Audit(options) => run_audit(options, out),
             Self::Compare(options) => combined::run(
                 options.format,
                 false,

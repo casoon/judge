@@ -47,7 +47,7 @@
 //! costs more trust than the false negatives it avoids are worth (todo.md
 //! §3.A).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
@@ -58,10 +58,7 @@ use crate::duplication::WorkspaceDuplication;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::walk_functions;
 use crate::ingest::Workspace;
-use crate::reachability::{
-    ReachabilityError, entry_point_positions, has_attr_ending_in, is_reachable_from_entry,
-    position_key,
-};
+use crate::reachability::{ReachabilityError, has_attr_ending_in};
 
 pub const DUPLICATIVE_REINVENTION_RULE: &str = "duplicative-reinvention";
 /// Bump when the duplicative-reinvention rule's logic changes (see todo.md
@@ -70,14 +67,6 @@ pub const DUPLICATIVE_REINVENTION_RULE_REVISION: u32 = 1;
 
 pub const CONNECTIVITY_DROP_RULE: &str = "connectivity-drop";
 pub const CONNECTIVITY_DROP_RULE_REVISION: u32 = 1;
-
-/// Rule id for a function judge's Deep Tier finds no fan-in for, no test
-/// path to, and whose file's dominant blame author is no longer active in
-/// the repo — see [`orphaned_code_findings`] (todo.md §3.E "orphaned-code").
-pub const ORPHANED_CODE_RULE: &str = "orphaned-code";
-/// Bump when the orphaned-code rule's logic changes (see todo.md §5
-/// "Regelversions-Schutz").
-pub const ORPHANED_CODE_RULE_REVISION: u32 = 1;
 
 /// Rule id for `monomorphization-load` (todo.md §3.C "Rust-spezifisch:
 /// Monomorphisierungs-Last (Proxy für `cargo-llvm-lines`)") — see
@@ -117,14 +106,6 @@ impl std::fmt::Display for SlopStructuralDeepError {
 
 impl std::error::Error for SlopStructuralDeepError {}
 
-/// Maps a [`ReachabilityError`] into this module's own error type, the same
-/// conversion [`crate::dead_code::reachability_error`] already does for
-/// `DeadCodeError` — [`orphaned_code_findings`]'s only source of
-/// `ReachabilityError`.
-fn reachability_error(err: ReachabilityError) -> SlopStructuralDeepError {
-    SlopStructuralDeepError::Reachability(err)
-}
-
 #[derive(Debug, Default)]
 pub struct DeepStructuralReport {
     pub findings: Vec<Finding>,
@@ -145,13 +126,6 @@ struct FunctionFanIn {
     /// genuine reference to this function (see
     /// [`cross_file_reference_count`]).
     cross_file_references: usize,
-    /// Byte offset of the function's identifier within `file`, kept around
-    /// so [`orphaned_code_findings`] can re-derive the same `FilePosition`
-    /// this record was originally resolved at, for its own reachability
-    /// check — without this, it would need to re-parse `file` and re-walk
-    /// its functions just to get back to the position `collect_function_fan_in`
-    /// already had.
-    offset: u32,
 }
 
 /// Counts the files — other than `file_id`, the item's own defining file —
@@ -254,7 +228,6 @@ fn collect_function_fan_in(
                         file: file.path.clone(),
                         line: site.ident_span.start().line,
                         cross_file_references,
-                        offset,
                     }),
                     Err(err) => errors.push(SlopStructuralDeepError::Deep(err)),
                 }
@@ -400,149 +373,6 @@ fn duplicative_reinvention_findings(
     findings
 }
 
-/// `orphaned-code` (todo.md §3.E: "braucht Deep-Tier-Fan-in (kein Commit des
-/// Blame-Hauptautors, kein Testpfad, kein Fan-in)"): a function is flagged
-/// only when all three independent signals hold at once —
-///
-/// 1. **No fan-in**: zero cross-file references, reusing `records`'
-///    existing `cross_file_references` count (same candidate set and same
-///    exclusions as `connectivity-drop` — see [`is_reliably_checkable_for_fan_in`]
-///    and the module docs; a `#[test]`/`#[bench]` function or trait-impl
-///    method is never a candidate).
-/// 2. **No test path**: not reachable from a test-only entry point.
-///    `entries_all` (`include_tests: true`) minus `entries_production`
-///    (`include_tests: false`) is exactly the set of entries that only
-///    exist *because* tests are counted — `fn main`/FFI/wasm-bindgen
-///    exports are entries either way, so they cancel out of the
-///    difference, leaving only `#[test]`/`#[bench]` functions. Checking
-///    [`is_reachable_from_entry`] against that difference (with
-///    `include_tests: true`, so the BFS itself is allowed to traverse
-///    test-authored call edges) answers "does any test path reach this
-///    function at all" — a different question from `connectivity-drop`'s
-///    plain fan-in, since a test in the *same* file as its target has
-///    cross-file fan-in of zero but very much has a test path.
-/// 3. **Dominant blame author inactive**: `dominant_author_by_file` maps a
-///    file to its *file-level* dominant blame author
-///    (`FileOwnership.authors[0]`, from [`crate::ownership`]), checked
-///    against `active_authors`. This is a **file-level proxy for the
-///    item's author**, a deliberate, documented approximation — true
-///    per-function blame isn't threaded through here — reasonable because a
-///    small file's dominant author is usually representative of any single
-///    item within it. A file this rule has no ownership data for at all
-///    (e.g. blame failed, or it's untracked) is skipped, not assumed
-///    inactive.
-///
-/// `Severity::Info`, `EvidenceClass::Heuristic`: even though the fan-in and
-/// reachability legs are exact Deep Tier facts, "the file-level dominant
-/// author is inactive" is inherently interpretive (the same classification
-/// `low-bus-factor` already uses for that judgment), and this rule compounds
-/// several heterogeneous signal types into one claim — never "totter
-/// Code"/"sicher löschbar", only that these three conditions co-occurred in
-/// the examined view.
-fn orphaned_code_findings(
-    workspace: &Workspace,
-    ctx: &DeepContext,
-    analysis: &ra_ap_ide::Analysis,
-    records: &[FunctionFanIn],
-    dominant_author_by_file: &HashMap<PathBuf, String>,
-    active_authors: &HashSet<String>,
-) -> (Vec<Finding>, Vec<SlopStructuralDeepError>) {
-    let mut findings = Vec::new();
-    let mut errors = Vec::new();
-
-    let candidates: Vec<&FunctionFanIn> = records
-        .iter()
-        .filter(|record| record.cross_file_references == 0)
-        .collect();
-    if candidates.is_empty() {
-        return (findings, errors);
-    }
-
-    let entries_production = match entry_point_positions(workspace, ctx, false) {
-        Ok(entries) => entries,
-        Err(err) => {
-            errors.push(reachability_error(err));
-            return (findings, errors);
-        }
-    };
-    let entries_all = match entry_point_positions(workspace, ctx, true) {
-        Ok(entries) => entries,
-        Err(err) => {
-            errors.push(reachability_error(err));
-            return (findings, errors);
-        }
-    };
-    let production_keys: HashSet<(FileId, u32)> = entries_production
-        .iter()
-        .map(|(_, position)| position_key(*position))
-        .collect();
-    let test_only_keys: HashSet<(FileId, u32)> = entries_all
-        .iter()
-        .map(|(_, position)| position_key(*position))
-        .filter(|key| !production_keys.contains(key))
-        .collect();
-
-    for record in candidates {
-        let Some(dominant_author) = dominant_author_by_file.get(&record.file) else {
-            continue;
-        };
-        if active_authors.contains(dominant_author) {
-            continue;
-        }
-        let file_id = match ctx.file_id(&record.file) {
-            Ok(Some(file_id)) => file_id,
-            Ok(None) => continue,
-            Err(err) => {
-                errors.push(SlopStructuralDeepError::Deep(err));
-                continue;
-            }
-        };
-        let position = ra_ap_ide::FilePosition {
-            file_id,
-            offset: record.offset.into(),
-        };
-        match is_reachable_from_entry(analysis, &test_only_keys, position, true) {
-            Ok(true) => continue,
-            Ok(false) => {}
-            Err(err) => {
-                errors.push(reachability_error(err));
-                continue;
-            }
-        }
-
-        findings.push(Finding {
-            id: format!(
-                "{ORPHANED_CODE_RULE}:{}:{}",
-                record.file.display(),
-                record.qualified_name
-            )
-            .into(),
-            rule: ORPHANED_CODE_RULE.into(),
-            severity: Severity::Info,
-            location: Location {
-                file: record.file.clone(),
-                line: OneBasedLine::new(record.line).expect("proc-macro2 span lines are 1-based"),
-                item_path: record.qualified_name.clone(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
-                "tier": "deep",
-                "file": record.file.display().to_string(),
-                "function": record.qualified_name,
-                "line": record.line,
-                "dominant_author": dominant_author,
-                "active_authors_count": active_authors.len(),
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
-    }
-
-    (findings, errors)
-}
-
 /// `monomorphization-load` (todo.md §3.C "Rust-spezifisch:
 /// Monomorphisierungs-Last (Proxy für `cargo-llvm-lines`)"): a Fast-signal
 /// PROXY for `cargo-llvm-lines`-style monomorphization bloat — judge never
@@ -573,9 +403,7 @@ fn orphaned_code_findings(
 /// load of 0. `production_records` must already be a
 /// [`collect_function_fan_in`] pass run with `include_tests: false` — a
 /// test-only call site never produces production binary bloat, so it must
-/// not count toward this score (mirrors [`orphaned_code_findings`]'s own
-/// dedicated production-only `entry_point_positions(.., false)` pass for the
-/// same reason). `Severity::Info`/`EvidenceClass::Heuristic`, the same
+/// not count toward this score. `Severity::Info`/`EvidenceClass::Heuristic`, the same
 /// current-state-only framing this module's other two rules use (see module
 /// docs) — trend-against-baseline is handled by the existing baseline/delta
 /// system.
@@ -641,28 +469,10 @@ fn monomorphization_load_findings(
         .collect()
 }
 
-/// Runs `connectivity-drop`, `duplicative-reinvention`, `orphaned-code`, and
-/// `monomorphization-load` over `workspace`, sharing one Deep Tier workspace
-/// load and one function-fan-in pass across the first three. `duplication`
-/// is the caller's already-computed [`WorkspaceDuplication`] (Fast Tier,
-/// cheap) — this function only adds the Deep Tier fan-in check on top of it,
-/// it doesn't re-run duplicate detection itself. `dominant_author_by_file`
-/// and `active_authors` are the caller's already-computed
-/// [`crate::ownership`]/`active_authors_since` data (Fast Tier, git-blame
-/// based) — see [`orphaned_code_findings`] for how they're used.
-/// `complexity_functions` is the caller's already-computed
-/// [`crate::complexity::WorkspaceComplexity::functions`] (Fast Tier), reused
-/// as-is for its `generic_param_count` — see [`monomorphization_load_findings`].
-/// `orphaned-code` is skipped entirely (same as `low-bus-factor`, see
-/// [`crate::ownership::LOW_BUS_FACTOR_MIN_REPO_AUTHORS`]) if the repository
-/// doesn't have enough distinct active authors for "inactive" to be a
-/// meaningful comparison.
 pub fn analyze_workspace(
     workspace: &Workspace,
     duplication: &WorkspaceDuplication,
     include_tests: bool,
-    dominant_author_by_file: &HashMap<PathBuf, String>,
-    active_authors: &HashSet<String>,
     complexity_functions: &[FunctionInfo],
 ) -> Result<DeepStructuralReport, SlopStructuralDeepError> {
     let ctx = DeepContext::load(&workspace.root).map_err(SlopStructuralDeepError::Deep)?;
@@ -693,19 +503,6 @@ pub fn analyze_workspace(
             &records,
             complexity_functions,
         ));
-    }
-
-    if active_authors.len() >= crate::ownership::LOW_BUS_FACTOR_MIN_REPO_AUTHORS {
-        let (orphaned_code, orphaned_code_errors) = orphaned_code_findings(
-            workspace,
-            &ctx,
-            &analysis,
-            &records,
-            dominant_author_by_file,
-            active_authors,
-        );
-        findings.extend(orphaned_code);
-        errors.extend(orphaned_code_errors);
     }
 
     Ok(DeepStructuralReport {
@@ -779,15 +576,7 @@ fn isolated_helper() -> i32 {
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let duplication = WorkspaceDuplication::default();
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
 
         let names: HashSet<&str> = report
             .findings
@@ -836,15 +625,7 @@ fn some_test() {
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let duplication = WorkspaceDuplication::default();
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
 
         let names: HashSet<&str> = report
             .findings
@@ -886,15 +667,7 @@ resolver = "2"
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let duplication = WorkspaceDuplication::default();
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
 
         let names: HashSet<&str> = report
             .findings
@@ -925,15 +698,7 @@ resolver = "2"
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let duplication = WorkspaceDuplication::default();
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
 
         let finding = report
             .findings
@@ -1002,15 +767,7 @@ resolver = "2"
             excluded_generated: 0,
         };
 
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
         let hit = report
             .findings
             .iter()
@@ -1084,15 +841,7 @@ fn clone_two() -> i32 {
             excluded_generated: 0,
         };
 
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
         assert!(
             !report
                 .findings
@@ -1164,15 +913,7 @@ resolver = "2"
             excluded_generated: 0,
         };
 
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
         assert!(
             !report
                 .findings
@@ -1216,15 +957,7 @@ fn calls_it() {
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let duplication = WorkspaceDuplication::default();
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
 
         let names: HashSet<&str> = report
             .findings
@@ -1277,15 +1010,7 @@ fn calls_it() {
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let duplication = WorkspaceDuplication::default();
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            false,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, false, &Vec::new()).unwrap();
 
         let names: HashSet<&str> = report
             .findings
@@ -1362,15 +1087,7 @@ fn calls_it() {
             duplication.families
         );
 
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
         assert!(
             !report
                 .findings
@@ -1482,15 +1199,7 @@ macros = { path = "../macros" }
             duplication.families
         );
 
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
         assert!(
             report
                 .findings
@@ -1521,15 +1230,7 @@ macros = { path = "../macros" }
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let duplication = WorkspaceDuplication::default();
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
 
         assert_eq!(
             report
@@ -1597,15 +1298,7 @@ macros = { path = "../macros" }
             excluded_generated: 0,
         };
 
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &Vec::new(),
-        )
-        .unwrap();
+        let report = analyze_workspace(&workspace, &duplication, true, &Vec::new()).unwrap();
 
         assert_eq!(
             report
@@ -1615,191 +1308,6 @@ macros = { path = "../macros" }
                 .count(),
             1,
             "{:?}",
-            report.findings
-        );
-    }
-
-    #[test]
-    fn orphaned_code_fires_when_no_fan_in_no_test_path_and_dominant_author_inactive() {
-        let dir = TempDir::new("orphaned-code-fires");
-        write_crate(
-            &dir,
-            "core",
-            &[],
-            r#"fn orphaned_helper() -> i32 {
-    1
-}
-"#,
-        );
-        write_workspace_manifest(&dir, &["core"]);
-
-        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
-        let duplication = WorkspaceDuplication::default();
-        let core_lib = dir.join("core/src/lib.rs");
-
-        let dominant_author_by_file = HashMap::from([(core_lib, "gone@example.com".to_string())]);
-        let active_authors = HashSet::from([
-            "recent-a@example.com".to_string(),
-            "recent-b@example.com".to_string(),
-        ]);
-
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &dominant_author_by_file,
-            &active_authors,
-            &Vec::new(),
-        )
-        .unwrap();
-
-        let finding = report
-            .findings
-            .iter()
-            .find(|f| f.rule == ORPHANED_CODE_RULE && f.location.item_path == "orphaned_helper");
-        assert!(finding.is_some(), "{:?}", report.findings);
-        let finding = finding.unwrap();
-        assert_eq!(finding.severity, Severity::Info);
-        assert_eq!(finding.evidence_class, EvidenceClass::Heuristic);
-        let evidence = finding.evidence.as_ref().expect("evidence must be set");
-        assert_eq!(evidence["dominant_author"], "gone@example.com");
-        assert_eq!(evidence["active_authors_count"], 2);
-    }
-
-    #[test]
-    fn orphaned_code_does_not_fire_when_a_test_calls_it() {
-        let dir = TempDir::new("orphaned-code-test-path");
-        write_crate(
-            &dir,
-            "core",
-            &[],
-            r#"fn orphaned_helper() -> i32 {
-    1
-}
-
-#[test]
-fn calls_orphaned_helper() {
-    assert_eq!(orphaned_helper(), 1);
-}
-"#,
-        );
-        write_workspace_manifest(&dir, &["core"]);
-
-        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
-        let duplication = WorkspaceDuplication::default();
-        let core_lib = dir.join("core/src/lib.rs");
-
-        let dominant_author_by_file = HashMap::from([(core_lib, "gone@example.com".to_string())]);
-        let active_authors = HashSet::from([
-            "recent-a@example.com".to_string(),
-            "recent-b@example.com".to_string(),
-        ]);
-
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &dominant_author_by_file,
-            &active_authors,
-            &Vec::new(),
-        )
-        .unwrap();
-
-        assert!(
-            !report.findings.iter().any(|f| f.rule == ORPHANED_CODE_RULE),
-            "a test in the same file reaches it via a test-only entry point — must not fire: {:?}",
-            report.findings
-        );
-    }
-
-    #[test]
-    fn orphaned_code_does_not_fire_when_a_non_test_caller_exists() {
-        let dir = TempDir::new("orphaned-code-fan-in");
-        write_crate(
-            &dir,
-            "core",
-            &[],
-            r#"pub fn orphaned_helper() -> i32 {
-    1
-}
-"#,
-        );
-        write_crate(
-            &dir,
-            "consumer",
-            &[("core", "../core")],
-            r#"pub fn run() -> i32 {
-    core::orphaned_helper()
-}
-"#,
-        );
-        write_workspace_manifest(&dir, &["core", "consumer"]);
-
-        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
-        let duplication = WorkspaceDuplication::default();
-        let core_lib = dir.join("core/src/lib.rs");
-
-        let dominant_author_by_file = HashMap::from([(core_lib, "gone@example.com".to_string())]);
-        let active_authors = HashSet::from([
-            "recent-a@example.com".to_string(),
-            "recent-b@example.com".to_string(),
-        ]);
-
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &dominant_author_by_file,
-            &active_authors,
-            &Vec::new(),
-        )
-        .unwrap();
-
-        assert!(
-            !report.findings.iter().any(|f| f.rule == ORPHANED_CODE_RULE),
-            "called from another crate — has fan-in, must not fire: {:?}",
-            report.findings
-        );
-    }
-
-    #[test]
-    fn orphaned_code_does_not_fire_when_dominant_author_is_active() {
-        let dir = TempDir::new("orphaned-code-author-active");
-        write_crate(
-            &dir,
-            "core",
-            &[],
-            r#"fn orphaned_helper() -> i32 {
-    1
-}
-"#,
-        );
-        write_workspace_manifest(&dir, &["core"]);
-
-        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
-        let duplication = WorkspaceDuplication::default();
-        let core_lib = dir.join("core/src/lib.rs");
-
-        let dominant_author_by_file =
-            HashMap::from([(core_lib, "still-here@example.com".to_string())]);
-        let active_authors = HashSet::from([
-            "still-here@example.com".to_string(),
-            "recent-b@example.com".to_string(),
-        ]);
-
-        let report = analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &dominant_author_by_file,
-            &active_authors,
-            &Vec::new(),
-        )
-        .unwrap();
-
-        assert!(
-            !report.findings.iter().any(|f| f.rule == ORPHANED_CODE_RULE),
-            "the file's dominant author is still active — must not fire: {:?}",
             report.findings
         );
     }
@@ -1850,15 +1358,7 @@ fn calls_orphaned_helper() {
             .flat_map(|krate| krate.source_files.iter());
         let complexity = crate::complexity::analyze_workspace(source_files, false);
 
-        analyze_workspace(
-            &workspace,
-            &duplication,
-            true,
-            &HashMap::new(),
-            &HashSet::new(),
-            &complexity.functions,
-        )
-        .unwrap()
+        analyze_workspace(&workspace, &duplication, true, &complexity.functions).unwrap()
     }
 
     #[test]

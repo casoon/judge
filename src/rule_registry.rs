@@ -143,15 +143,6 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         }),
     },
     RuleMetadata {
-        id: "change-coupling-signal",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Requires a `judge.toml` with `[layers]` configured (a non-empty `assign` table) — with no layer config, this performs no analysis at all rather than guessing which crates 'should' be independent (todo.md §17 'Kein Raten von Projektabsicht'). Part of the same `judge.toml`-gated block as `dependency-cycle`/`crate-boundary-violation` in bare `cargo judge`/`audit`.",
-        exclusions: "Co-change is counted per commit at crate granularity (a crate is 'touched' if any of its files appear in the commit), not per file pair. `MIN_CO_CHANGE_SAMPLE` (5) and `CHANGE_COUPLING_RATIO_THRESHOLD` (0.6) are first-cut, adjustable constants, not calibrated against a corpus of known-coupled vs. known-independent crate pairs. A large repo-wide commit (a rename, a formatting pass) can make unrelated crates look coupled for one window.",
-        allowed_wording: "State only the co-change count and ratio for this crate pair within the examined git window — never that the crates 'are coupled' or 'violate the architecture' as settled fact (todo.md §17.4).",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
-    RuleMetadata {
         id: "module-boundary-violation",
         evidence_class: EvidenceClass::BoundedSemantic,
         preconditions: "Requires a `judge.toml` with `[[module_boundary]]` config; opt-in — `cargo judge boundaries` (and the boundaries block of bare `cargo judge`/`audit`) does nothing without it.",
@@ -225,9 +216,9 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
     RuleMetadata {
         id: "untested-hotspot",
         evidence_class: EvidenceClass::ExternalMeasurement,
-        preconditions: "Requires `cargo judge coverage --lcov <path>` — an externally generated `cargo-llvm-cov` LCOV report; judge never measures coverage itself, only imports an already-generated snapshot.",
-        exclusions: "Complexity and churn inputs are `derived_fact`/`heuristic` in isolation, but the imported coverage snapshot is the rarest, least locally-verifiable ingredient, so it sets the class for the combination.",
-        allowed_wording: "State as the result of the imported coverage/complexity/churn snapshot — never a timeless truth. Complexity/churn inputs alone would only be heuristic; only the coverage snapshot lets this combination gate (todo.md §J, §17.2).",
+        preconditions: "Requires `cargo judge coverage` and a parsed LCOV report.",
+        exclusions: "Code outside the analyzed coverage report or functions with cyclomatic complexity below threshold.",
+        allowed_wording: "State that the function has high complexity and low test coverage in the imported LCOV report.",
         verdict_effect: VerdictEffect::Gating,
         example: None,
     },
@@ -509,15 +500,6 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
     },
     // -- git.rs -----------------------------------------------------------
     RuleMetadata {
-        id: "hotspot",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`/`audit`'s hotspot block and `cargo judge health`).",
-        exclusions: "Ranked complexity × recency-weighted churn (exponential decay, `RECENCY_HALF_LIFE_DAYS` half-life) over the last `DEFAULT_WINDOW_DAYS` (365) days, capped to the top `HOTSPOT_LIMIT` (15) files — a genuinely risky file that doesn't make the cap is not surfaced. A file rewritten for legitimate reasons (e.g. a planned refactor) scores the same as unplanned churn.",
-        allowed_wording: HEURISTIC_WORDING,
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
-    RuleMetadata {
         id: "size-distribution",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier, no git history needed — pure per-file LOC plus per-crate aggregation over the loaded workspace; part of bare `cargo judge` and `audit`).",
@@ -774,15 +756,6 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
             why_it_matters: "A single file that concentrates most of its crate's branching logic is harder to reason about test coverage for and riskier to change than the same logic split along its natural seams — the same intuition `size-distribution` applies to line count, just measured by branch count instead.",
         }),
     },
-    RuleMetadata {
-        id: "cross-file-connectivity",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Always evaluated (Fast Tier, needs real git history over `DEFAULT_WINDOW_DAYS` (365) days; part of bare `cargo judge` and `audit`). Unlike `change-coupling-signal` (its crate-pair-granularity counterpart), this needs no `judge.toml` `[layers]` config at all — 'these two files tend to change together' is a plain descriptive/statistical fact, not an architectural claim, the same unconditional posture as `churn-hotspot`/`size-distribution`.",
-        exclusions: "A direct generalization of `change-coupling-signal` from crate-pair to file-pair granularity: co-change is counted per commit at file-path granularity (a file pair co-touches if a commit's diff includes both paths). `MIN_FILE_CO_CHANGE_SAMPLE` (5) and `FILE_CO_CHANGE_RATIO_THRESHOLD` (0.6) are first-cut, adjustable constants — same values as `change-coupling-signal`'s analogous constants for consistency, declared separately so the two rules' tuning can diverge independently — not calibrated against a corpus of known-related vs. known-independent file pairs. A large repo-wide commit (a rename, a formatting pass) can make unrelated files look connected for one window. This rule does not distinguish a co-located pair that is unsurprising (e.g. a module and its test file, or a `mod.rs` and its main file) from one that is surprising given the files' directory distance or the absence of an obvious structural relationship — both are reported identically, and co-located pairs appearing here often is expected, not a defect.",
-        allowed_wording: "State only the co-touch count and ratio for this file pair within the examined git window — never that the files 'are coupled', 'belong together', or 'violate the architecture' as settled fact (todo.md §17.4).",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
     // -- module_graph.rs ------------------------------------------------
     RuleMetadata {
         id: "unlinked-file",
@@ -809,24 +782,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         }),
     },
     // -- ownership.rs -------------------------------------------------------
-    RuleMetadata {
-        id: "low-bus-factor",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`, `audit`, and `cargo judge distribution`).",
-        exclusions: "Only fires when the repository has at least 2 distinct authors active within the analysis window — with a single repo-wide author every file is bus-factor 1 by construction, so the metric would be categorically inapplicable, not merely statistically weak (see GitHub issue #2: 586 commits, 1 author, 333 findings).",
-        allowed_wording: "State a concrete git activity date as the fact; keep any 'knowledge risk' reading separate and explicitly a heuristic interpretation. Per todo.md §17.4: never state 'the author is inactive/doesn't know the code' as a fact.",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
-    RuleMetadata {
-        id: "ownership-fragmentation",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`, `audit`, and `cargo judge distribution`).",
-        exclusions: "Only counted at ≥4 blamed authors, a top-author share below 35%, and ≥50 blamed lines — files below any of those thresholds are skipped as inconclusive. Blame is not a knowledge measurement.",
-        allowed_wording: "many small blame shares — diffuse responsibility is one possible reading, not a proven problem (see `crate::ownership::OWNERSHIP_FRAGMENTATION_NOTE`, which must accompany every finding of this rule).",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
+
     // -- pattern.rs (advisory-only design-pattern recommendations; never a
     // Finding — see that module's doc comment) ----------------------------
     RuleMetadata {
@@ -890,42 +846,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         }),
     },
     // -- provenance.rs ------------------------------------------------------
-    RuleMetadata {
-        id: "provenance-churn",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Requires git history with commit trailers/metadata; subcommand-only via `cargo judge provenance` — not part of bare `cargo judge`.",
-        exclusions: "Commit trailers/markers are optional, unverified, and trivially fakeable; size/timing/style heuristics are weaker still.",
-        allowed_wording: "Must always be shown together with `crate::provenance::PROVENANCE_CAVEAT`: a distribution trend, not a judgment on any single commit or person; never used to evaluate individual people or commits (todo.md §17.4, §3.G G6).",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
-    RuleMetadata {
-        id: "provenance-duplication-rate",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Requires git history with commit trailers/metadata; subcommand-only via `cargo judge provenance` — not part of bare `cargo judge`.",
-        exclusions: "Commit trailers/markers are optional, unverified, and trivially fakeable; attribution is via blame, which is not a knowledge measurement.",
-        allowed_wording: "Must always be shown together with `crate::provenance::PROVENANCE_CAVEAT`: a distribution trend, not a judgment on any single commit or person; never used to evaluate individual people or commits (todo.md §17.4, §3.G G6).",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
-    RuleMetadata {
-        id: "provenance-suppression-debt",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Requires git history with commit trailers/metadata; subcommand-only via `cargo judge provenance` — not part of bare `cargo judge`.",
-        exclusions: "Commit trailers/markers are optional, unverified, and trivially fakeable; attribution is via blame, which is not a knowledge measurement.",
-        allowed_wording: "Must always be shown together with `crate::provenance::PROVENANCE_CAVEAT`: a distribution trend, not a judgment on any single commit or person; never used to evaluate individual people or commits (todo.md §17.4, §3.G G6).",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
-    RuleMetadata {
-        id: "dep-added-by-agent",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Requires git history with commit trailers/metadata; subcommand-only via `cargo judge provenance` — not part of bare `cargo judge`.",
-        exclusions: "Only checked for commits classified `AuthorClass::Agent` — the same fakeable trailer/marker/heuristic classification every other rule in this module relies on. The same-commit usage check is a plain substring scan (`use <ident>`, `<ident>::`, `extern crate <ident>`), not a `syn` parse — a `package = \"...\"` rename or a re-export under a different name reads as 'not referenced'. Target-specific dependency tables (`[target.'cfg(...)'.dependencies]`) are not read.",
-        allowed_wording: "Must always be shown together with `crate::provenance::PROVENANCE_CAVEAT`: a distribution trend, not a judgment on any single commit or person; state only that the dependency was declared with no same-commit textual reference found — never that it 'was hallucinated' or 'is unused' (todo.md §17.4, §3.G G5/G6).",
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
+
     // -- security.rs (Fast Tier security-shaped signals) -------------------
     RuleMetadata {
         id: "unsafe-surface",
@@ -1203,15 +1124,6 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
     },
     // -- slop_structural.rs (G4, Fast Tier subset) ---------------------------
     RuleMetadata {
-        id: "churn-hotspot",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Always evaluated (Fast Tier, needs git history; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "14-day window, first-cut commit-count threshold; a file rewritten for legitimate reasons (e.g. a planned refactor) scores the same as unplanned rework.",
-        allowed_wording: HEURISTIC_WORDING,
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
-    },
-    RuleMetadata {
         id: "complexity-inflation",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
@@ -1271,15 +1183,6 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
             before: "fn compute_shipping_estimate(weight_kg: f64) -> f64 {\n    weight_kg * 2.5\n}\n",
             why_it_matters: "A function nobody outside its own file ever calls is either dead code that plain reachability analysis missed, or a duplicate implementation nobody wired up — either way it is worth a second look.",
         }),
-    },
-    RuleMetadata {
-        id: "orphaned-code",
-        evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; needs `find_all_refs` cross-file reference data and entry-point reachability BFS), plus git history — same repo-level active-author gate as `low-bus-factor` (only evaluated when the repository has at least `LOW_BUS_FACTOR_MIN_REPO_AUTHORS` (2) distinct active authors, see that entry).",
-        exclusions: "Fires only when three independent signals hold at once: zero cross-file fan-in (see `connectivity-drop`'s `is_reliably_checkable_for_fan_in` — test/bench-attributed functions and methods inside `impl TraitName for SomeType` blocks are excluded from the candidate set entirely, same as that rule), not reachable from any test-only entry point (a `#[test]`/`#[bench]` function; production entry points like `fn main`/FFI/wasm-bindgen exports don't count for this leg), and the file's dominant blame author (`FileOwnership.authors[0]`) not active within the analysis window. The author leg is a deliberate, documented file-level proxy for the item's own author — true per-function blame isn't computed, only the file's dominant author, on the reasoning that a file's dominant author is usually representative of any single item within it, especially for smaller files; this is an approximation, not item-precise attribution. Inherits every entry-point-detection limitation `crate::reachability`'s module docs describe (registration macros like `inventory::submit!`/`ctor` are not recognized as entry points, so an item wired up only through one of those can incorrectly look test-path-free).",
-        allowed_wording: HEURISTIC_WORDING,
-        verdict_effect: VerdictEffect::AdvisoryOnly,
-        example: None,
     },
     RuleMetadata {
         id: "monomorphization-load",
@@ -1413,10 +1316,6 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
         "needs a multi-crate workspace plus a judge.toml [[boundary]]/[layers] config",
     ),
     (
-        "change-coupling-signal",
-        "needs a judge.toml [layers] config plus real git co-change history across commits — not expressible as a single source snippet",
-    ),
-    (
         "module-boundary-violation",
         "needs a multi-crate workspace plus a judge.toml [[module_boundary]] config",
     ),
@@ -1439,46 +1338,6 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
     (
         "unused-dependency",
         "opt-in --check-rustc-lints; triggering it for real needs a full `cargo check --workspace --all-targets` compile, too expensive for an illustrative snippet",
-    ),
-    (
-        "hotspot",
-        "needs real git commit history (churn) — not expressible as a single source snippet",
-    ),
-    (
-        "low-bus-factor",
-        "needs real git commit history with at least 2 distinct authors",
-    ),
-    (
-        "orphaned-code",
-        "needs both a real Deep Tier load (for the fan-in and test-path-reachability legs) and real git commit history with an inactive dominant author (for the third leg) at once — the hardest combination to express as a single illustrative source snippet so far",
-    ),
-    (
-        "ownership-fragmentation",
-        "needs real git blame history across at least 4 authors",
-    ),
-    (
-        "provenance-churn",
-        "needs real git commit history with trailers/metadata",
-    ),
-    (
-        "provenance-duplication-rate",
-        "needs real git commit history with trailers/metadata",
-    ),
-    (
-        "provenance-suppression-debt",
-        "needs real git commit history with trailers/metadata",
-    ),
-    (
-        "dep-added-by-agent",
-        "needs a real git commit (trailer-classified as agent-authored) that also changed Cargo.toml",
-    ),
-    (
-        "churn-hotspot",
-        "needs real git commit history (14-day window)",
-    ),
-    (
-        "cross-file-connectivity",
-        "needs real git co-change history across commits for a file pair — not expressible as a single source snippet",
     ),
 ];
 
@@ -1520,7 +1379,6 @@ mod tests {
             crate::boundaries::DEPENDENCY_CYCLE_RULE,
             crate::boundaries::MODULE_BOUNDARY_VIOLATION_RULE,
             crate::boundaries::FEATURE_GRAPH_CYCLE_RULE,
-            crate::boundaries::CHANGE_COUPLING_SIGNAL_RULE,
             crate::complexity::SIGNATURE_COMPLEXITY_RULE,
             crate::complexity::MAINTAINABILITY_INDEX_RULE,
             crate::coverage::UNTESTED_HOTSPOT_RULE,
@@ -1534,26 +1392,11 @@ mod tests {
             crate::deps::DEFAULT_FEATURES_UNUSED_RULE,
             crate::deps::UNUSED_FEATURE_RULE,
             crate::deps::UNUSED_DEPENDENCY_RULE,
-            crate::deps::DEP_WITHOUT_REPO_RULE,
             crate::duplication::DUPLICATE_RULE,
-            crate::git::HOTSPOT_RULE,
-            crate::git::SIZE_DISTRIBUTION_RULE,
-            crate::git::COMPLEXITY_CONCENTRATION_RULE,
-            crate::git::CROSS_FILE_CONNECTIVITY_RULE,
             crate::module_graph::UNLINKED_FILE_RULE,
             crate::module_graph::ORPHAN_MODULE_RULE,
             crate::mutants::MUTATION_SURVIVOR_RULE,
-            crate::ownership::LOW_BUS_FACTOR_RULE,
-            crate::ownership::OWNERSHIP_FRAGMENTATION_RULE,
             crate::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
-            crate::pattern::PRIMITIVE_DOMAIN_VALUE_RULE,
-            crate::pattern::BOOLEAN_STATE_CLUSTER_RULE,
-            crate::pattern::PUBLIC_INVARIANT_BYPASS_RULE,
-            crate::pattern::MANUAL_RESOURCE_LIFECYCLE_RULE,
-            crate::provenance::PROVENANCE_CHURN_RULE,
-            crate::provenance::PROVENANCE_DUPLICATION_RATE_RULE,
-            crate::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE,
-            crate::provenance::DEP_ADDED_BY_AGENT_RULE,
             crate::security::UNSAFE_SURFACE_RULE,
             crate::security::UNSAFE_DENSITY_RULE,
             crate::security::INTEGER_CAST_RISK_RULE,
@@ -1576,7 +1419,6 @@ mod tests {
             crate::slop::SILENT_DEFAULT_RULE,
             crate::slop::CONTEXT_FREE_PROPAGATION_RULE,
             crate::slop::DEBUG_FORMAT_LEAK_RULE,
-            crate::slop_structural::CHURN_HOTSPOT_RULE,
             crate::slop_structural::COMPLEXITY_INFLATION_RULE,
             crate::slop_structural::ABSTRACTION_INFLATION_RULE,
             crate::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
@@ -1615,7 +1457,6 @@ mod tests {
             crate::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
             crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
             crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
-            crate::slop_structural_deep::ORPHANED_CODE_RULE,
             crate::api_surface_deep::INTERNAL_LEAK_RULE,
             crate::api_surface_deep::RE_EXPORT_CHAIN_RULE,
             crate::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE,
