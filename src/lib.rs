@@ -40,6 +40,7 @@ pub mod provenance;
 #[cfg(feature = "deep")]
 pub mod reachability;
 pub mod refactor_map;
+pub mod report;
 pub mod rule_registry;
 pub mod sarif;
 pub mod security;

@@ -45,15 +45,17 @@ pub(super) fn run_dupes(
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
     if let Some(result) = baseline_request.handle(
-        &workspace.root,
-        &findings,
-        &analysis_errors,
-        std::collections::HashMap::from([(
-            judge::duplication::DUPLICATE_RULE.to_string(),
-            judge::duplication::DUPLICATE_RULE_REVISION,
-        )]),
-        Path::new(DEFAULT_BASELINE_DUPES),
-        judge::health_score::total_authored_loc(&workspace),
+        BaselineInput {
+            workspace_root: &workspace.root,
+            findings: &findings,
+            analysis_errors: &analysis_errors,
+            rule_revisions: std::collections::HashMap::from([(
+                judge::duplication::DUPLICATE_RULE.to_string(),
+                judge::duplication::DUPLICATE_RULE_REVISION,
+            )]),
+            default_save_path: Path::new(DEFAULT_BASELINE_DUPES),
+            total_loc: judge::health_score::total_authored_loc(&workspace),
+        },
         out,
     ) {
         return result;
@@ -324,12 +326,14 @@ pub(super) fn run_deps(
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
     if let Some(result) = baseline_request.handle(
-        &workspace.root,
-        &findings,
-        &analysis_errors,
-        rule_revisions,
-        Path::new(DEFAULT_BASELINE_DEPS),
-        judge::health_score::total_authored_loc(&workspace),
+        BaselineInput {
+            workspace_root: &workspace.root,
+            findings: &findings,
+            analysis_errors: &analysis_errors,
+            rule_revisions,
+            default_save_path: Path::new(DEFAULT_BASELINE_DEPS),
+            total_loc: judge::health_score::total_authored_loc(&workspace),
+        },
         out,
     ) {
         return result;
@@ -486,12 +490,14 @@ pub(super) fn run_coverage(
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
     if let Some(result) = baseline_request.handle(
-        &workspace.root,
-        &findings,
-        &analysis_errors,
-        rule_revisions,
-        Path::new(DEFAULT_BASELINE_COVERAGE),
-        judge::health_score::total_authored_loc(&workspace),
+        BaselineInput {
+            workspace_root: &workspace.root,
+            findings: &findings,
+            analysis_errors: &analysis_errors,
+            rule_revisions,
+            default_save_path: Path::new(DEFAULT_BASELINE_COVERAGE),
+            total_loc: judge::health_score::total_authored_loc(&workspace),
+        },
         out,
     ) {
         return result;
@@ -687,12 +693,14 @@ pub(super) fn run_boundaries(
         }
         return baseline_request
             .handle(
-                &workspace.root,
-                &findings,
-                &analysis_errors,
-                rule_revisions,
-                Path::new(DEFAULT_BASELINE_BOUNDARIES),
-                judge::health_score::total_authored_loc(&workspace),
+                BaselineInput {
+                    workspace_root: &workspace.root,
+                    findings: &findings,
+                    analysis_errors: &analysis_errors,
+                    rule_revisions,
+                    default_save_path: Path::new(DEFAULT_BASELINE_BOUNDARIES),
+                    total_loc: judge::health_score::total_authored_loc(&workspace),
+                },
                 out,
             )
             .expect("baseline request was checked above");
@@ -781,12 +789,14 @@ pub(super) fn run_distribution(
         ]);
         return baseline_request
             .handle(
-                &workspace.root,
-                &findings,
-                &analysis_errors,
-                rule_revisions,
-                Path::new(DEFAULT_BASELINE_DISTRIBUTION),
-                judge::health_score::total_authored_loc(&workspace),
+                BaselineInput {
+                    workspace_root: &workspace.root,
+                    findings: &findings,
+                    analysis_errors: &analysis_errors,
+                    rule_revisions,
+                    default_save_path: Path::new(DEFAULT_BASELINE_DISTRIBUTION),
+                    total_loc: judge::health_score::total_authored_loc(&workspace),
+                },
                 out,
             )
             .expect("baseline request was checked above");
@@ -915,12 +925,14 @@ pub(super) fn run_module_graph(
         ]);
         return baseline_request
             .handle(
-                &workspace.root,
-                &findings,
-                &analysis_errors,
-                rule_revisions,
-                Path::new(DEFAULT_BASELINE_MODULE_GRAPH),
-                judge::health_score::total_authored_loc(&workspace),
+                BaselineInput {
+                    workspace_root: &workspace.root,
+                    findings: &findings,
+                    analysis_errors: &analysis_errors,
+                    rule_revisions,
+                    default_save_path: Path::new(DEFAULT_BASELINE_MODULE_GRAPH),
+                    total_loc: judge::health_score::total_authored_loc(&workspace),
+                },
                 out,
             )
             .expect("baseline request was checked above");
@@ -984,6 +996,177 @@ pub(super) fn run_module_graph(
                     finding.location.item_path
                 )?;
             }
+        }
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// Focused unsafe-code review. The result is a projection of concrete syntax
+/// findings, not a claim that a particular author introduced unsafe code.
+pub(super) fn run_unsafe(
+    options: FocusedAnalysisOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    let source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let report = judge::security::analyze_workspace(source_files, options.include_generated);
+    let findings = report
+        .findings
+        .into_iter()
+        .filter(|finding| {
+            matches!(
+                finding.rule.as_str(),
+                judge::security::UNSAFE_SURFACE_RULE | judge::security::UNSAFE_DENSITY_RULE
+            )
+        })
+        .collect();
+    render_focused(
+        "unsafe",
+        options.format,
+        &workspace,
+        findings,
+        analysis_errors(&report.errors),
+        out,
+    )
+}
+
+/// Focused error-handling review built from existing evidence-backed syntax
+/// rules. Type-dependent conclusions remain a Deep-Tier follow-up.
+pub(super) fn run_errors(
+    options: FocusedAnalysisOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    let source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let config = load_judge_toml(&workspace.root)?.rules;
+    let report = judge::slop::analyze_workspace(
+        source_files,
+        options.include_generated,
+        config.catch_all_error.allow_anyhow_at_boundary,
+    );
+    let findings = report
+        .findings
+        .into_iter()
+        .filter(|finding| {
+            matches!(
+                finding.rule.as_str(),
+                judge::slop::SWALLOWED_RESULT_RULE
+                    | judge::slop::EMPTY_ERROR_ARM_RULE
+                    | judge::slop::CATCH_ALL_ERROR_RULE
+                    | judge::slop::CONTEXT_FREE_PROPAGATION_RULE
+                    | judge::slop::SILENT_DEFAULT_RULE
+            )
+        })
+        .collect();
+    render_focused(
+        "errors",
+        options.format,
+        &workspace,
+        findings,
+        analysis_errors(&report.errors),
+        out,
+    )
+}
+
+/// Test-structure review. It reports relationships judge can actually see and
+/// never turns an absent syntactic relation into a coverage claim.
+pub(super) fn run_tests(
+    options: FocusedAnalysisOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    let source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let report = judge::slop::analyze_workspace(source_files, options.include_generated, false);
+    let findings = report
+        .findings
+        .into_iter()
+        .filter(|finding| {
+            matches!(
+                finding.rule.as_str(),
+                judge::slop::ASSERTION_FREE_TEST_RULE
+                    | judge::slop::TAUTOLOGICAL_TEST_RULE
+                    | judge::slop::IGNORED_TEST_ACCUMULATION_RULE
+            )
+        })
+        .collect();
+    render_focused(
+        "tests",
+        options.format,
+        &workspace,
+        findings,
+        analysis_errors(&report.errors),
+        out,
+    )
+}
+
+/// Current-state mechanical code smells. The report deliberately contains no
+/// author, model, or provenance classification.
+pub(super) fn run_slop(
+    options: FocusedAnalysisOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    let source_files = workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter());
+    let config = load_judge_toml(&workspace.root)?.rules;
+    let report = judge::slop::analyze_workspace(
+        source_files,
+        options.include_generated,
+        config.catch_all_error.allow_anyhow_at_boundary,
+    );
+    render_focused(
+        "slop",
+        options.format,
+        &workspace,
+        report.findings,
+        analysis_errors(&report.errors),
+        out,
+    )
+}
+
+fn render_focused(
+    label: &str,
+    format: OutputFormat,
+    workspace: &judge::ingest::Workspace,
+    mut findings: Vec<Finding>,
+    errors: Vec<String>,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    judge::finding::sort_by_severity_desc(&mut findings);
+    match format {
+        OutputFormat::Json => write_json(
+            out,
+            &serde_json::json!({
+                "schema_version": judge::finding::SCHEMA_VERSION,
+                "analysis": label,
+                "scope": {
+                    "tier": "fast",
+                    "claim": "Findings are current-state syntax and workspace facts. Absence of a finding is not proof of absence in unanalysed generated or semantic code."
+                },
+                "report": Report::with_errors(findings, errors),
+            }),
+        )?,
+        OutputFormat::Sarif => write_sarif(out, &workspace.root, findings, errors, None)?,
+        OutputFormat::Tty => judge::report::write_findings_tty(
+            out,
+            &workspace.root,
+            format!("Judge {label}"),
+            &findings,
+            &errors,
+        )?,
+        OutputFormat::Markdown => {
+            return Err(unsupported_format(label, format, "tty, json, sarif"));
         }
     }
     Ok(CommandOutcome::Clean)
@@ -1275,12 +1458,14 @@ pub(super) fn run_provenance(
         ]);
         return baseline_request
             .handle(
-                &workspace.root,
-                &breakdown.findings,
-                &analysis_errors,
-                rule_revisions,
-                Path::new(DEFAULT_BASELINE_PROVENANCE),
-                judge::health_score::total_authored_loc(&workspace),
+                BaselineInput {
+                    workspace_root: &workspace.root,
+                    findings: &breakdown.findings,
+                    analysis_errors: &analysis_errors,
+                    rule_revisions,
+                    default_save_path: Path::new(DEFAULT_BASELINE_PROVENANCE),
+                    total_loc: judge::health_score::total_authored_loc(&workspace),
+                },
                 out,
             )
             .expect("baseline request was checked above");

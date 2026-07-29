@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -27,20 +27,22 @@ use advisory_commands::{
 };
 use analysis_commands::{
     run_api_surface, run_boundaries, run_coverage, run_deps, run_distribution, run_dupes,
-    run_module_graph, run_provenance,
+    run_errors, run_module_graph, run_provenance, run_slop, run_tests, run_unsafe,
 };
 #[cfg(test)]
 use audit_command::combine_verdict;
 use audit_command::run as run_audit;
 use baseline_output::{
-    BaselineOptions, BaselineRequest, analysis_errors, append_analysis_errors,
+    BaselineInput, BaselineOptions, BaselineRequest, analysis_errors, append_analysis_errors,
     handle_baseline_with_trend, print_pattern_delta_tty, write_json,
 };
 use combined_analysis::{collect_findings, collect_findings_with_progress};
 use commands::{BaselineArgs, Command};
 use deep_commands::{run_dead_code, run_explain};
 use health_command::run as run_health;
-use workspace_commands::{run_impact, run_inspect, run_map};
+use workspace_commands::{
+    run_complexity, run_impact, run_inspect, run_map, run_refactor, run_structure,
+};
 
 const DEFAULT_BASELINE_HEALTH: &str = ".judge/baseline-health.json";
 const DEFAULT_BASELINE_DUPES: &str = ".judge/baseline-dupes.json";
@@ -55,16 +57,6 @@ const DEFAULT_BASELINE_MODULE_GRAPH: &str = ".judge/baseline-module-graph.json";
 const DEFAULT_PATTERN_BASELINE: &str = ".judge/baseline-patterns.json";
 #[cfg(feature = "deep")]
 const DEFAULT_BASELINE_DEAD_CODE: &str = ".judge/baseline-dead-code.json";
-
-/// Top-N cap on git hotspot findings — shared by the dedicated `health`
-/// hotspot print path and every combined findings list `git::hotspots`
-/// feeds into. `git::hotspots` already sorts by score (complexity ×
-/// recency-weighted changes) descending, so `.take(HOTSPOT_LIMIT)` keeps
-/// the highest-score files, not an arbitrary prefix. Without this cap a
-/// repo where every file crosses
-/// both complexity and churn thresholds floods the findings list with one
-/// hotspot per file instead of surfacing genuine outliers.
-const HOTSPOT_LIMIT: usize = 15;
 
 /// `cargo judge dupes`'s TTY view prints at most this many clone families
 /// (GitHub issue #7: on a large workspace the unindicated truncation reads
@@ -81,8 +73,8 @@ const DUPE_FAMILY_TTY_LIMIT: usize = 15;
 #[command(
     name = "cargo judge",
     version,
-    about = "Codebase intelligence for Rust workspaces",
-    long_about = "Codebase intelligence for Rust workspaces"
+    about = "Deterministic post-refactoring analysis for Rust workspaces",
+    long_about = "Deterministic post-refactoring analysis for Rust workspaces. Analyses the current source tree, workspace structure, public APIs, and dependency graph without Git history or code provenance."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -96,8 +88,18 @@ struct Cli {
     /// after every phase event so agents can observe long-running analysis.
     #[arg(long, value_name = "PATH")]
     progress: Option<PathBuf>,
-    /// Write JSON output to this path. With `--format json`, the default is
-    /// `.judge/<command>.json`; this option selects a different artifact.
+    /// Show every finding in the bare combined TTY report instead of the
+    /// default rule-grouped decision summary.
+    #[arg(long)]
+    details: bool,
+    /// Terminal color policy for the bare combined report. `auto` uses color
+    /// only on a terminal and honours `NO_COLOR`; use `always` to force it.
+    #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
+    /// Write the artifact to this path. With `--format json`, the default is
+    /// `.judge/<command>.json`; with the bare `cargo judge --format
+    /// markdown`, the default is `.judge/judge.md`. This option selects a
+    /// different artifact path.
     #[arg(long, global = true, value_name = "PATH")]
     output: Option<PathBuf>,
 }
@@ -286,6 +288,15 @@ struct AuditOptions {
 }
 
 #[derive(Debug, Args)]
+struct CompareOptions {
+    /// Baseline artifact produced by `cargo judge --save-baseline`.
+    baseline: PathBuf,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
 struct PatternsOptions {
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
@@ -398,11 +409,48 @@ struct ImpactOptions {
     format: OutputFormat,
 }
 
+#[derive(Debug, Args)]
+struct StructureOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct ComplexityOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+    /// Include test-only functions in the ranking while keeping their metrics separate.
+    #[arg(long)]
+    include_tests: bool,
+}
+
+#[derive(Debug, Args)]
+struct RefactorOptions {
+    /// Optional workspace-relative source file to focus the queue on.
+    target: Option<PathBuf>,
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct FocusedAnalysisOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+    /// Include generated source files in the analysis.
+    #[arg(long)]
+    include_generated: bool,
+}
+
 /// Output format shared by commands that emit findings (see todo.md §7).
 /// Not every command supports every format: SARIF exists for the
-/// report-producing commands, Markdown only for the audit/baseline delta
-/// (the PR-comment use case) — anything else is rejected as a config error
-/// instead of producing half-baked output.
+/// report-producing commands; Markdown exists for the audit/baseline delta
+/// and the bare `cargo judge` review report (the PR-comment use cases) —
+/// anything else is rejected as a config error instead of producing
+/// half-baked output.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OutputFormat {
     /// Human-readable, reduced to root findings by default.
@@ -411,9 +459,28 @@ enum OutputFormat {
     Json,
     /// SARIF 2.1.0 (report-producing commands only — see `judge::sarif`).
     Sarif,
-    /// Markdown delta table (`audit --since` and `--baseline` comparison
-    /// only — see `judge::markdown`).
+    /// Markdown: a delta table for `audit --since`/`--baseline` comparisons
+    /// (see `judge::markdown`), or the shared-model review report for the
+    /// bare `cargo judge` combined run (see `judge::report`).
     Markdown,
+}
+
+/// Color policy for the bare human-readable combined report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ColorChoice {
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorChoice {
+    fn is_enabled(self) -> bool {
+        match self {
+            Self::Auto => std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            Self::Always => true,
+            Self::Never => false,
+        }
+    }
 }
 
 impl OutputFormat {
@@ -646,7 +713,7 @@ fn main() -> ExitCode {
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let result = run_with_json_output(cli, &mut out).and_then(|outcome| {
+    let result = run_with_artifact_output(cli, &mut out).and_then(|outcome| {
         out.flush()?;
         Ok(outcome)
     });
@@ -666,6 +733,8 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
             cli.baseline_args.save_baseline,
             cli.baseline_args.baseline,
             cli.progress.as_deref(),
+            cli.details,
+            cli.color.is_enabled(),
             out,
         ),
         Some(command) => {
@@ -675,52 +744,92 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
                         .to_string(),
                 ));
             }
+            if cli.details {
+                return Err(CliError::Config(
+                    "--details is available only for the bare `cargo judge` combined run"
+                        .to_string(),
+                ));
+            }
+            if cli.color != ColorChoice::Auto {
+                return Err(CliError::Config(
+                    "--color is available only for the bare `cargo judge` combined run".to_string(),
+                ));
+            }
             command.run(out)
         }
     }
 }
 
-/// Runs a JSON-formatted command into its artifact file while keeping the
-/// internal command handlers stream-oriented. Non-JSON formats keep their
-/// existing stdout behavior; `--output` is deliberately rejected for them so
-/// a file extension never silently changes a rendering contract.
-fn run_with_json_output(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let Some((path, command)) = cli.json_output_artifact()? else {
+/// Runs a JSON-formatted command, or the bare `cargo judge --format
+/// markdown` review report (issue #14), into its artifact file while
+/// keeping the internal command handlers stream-oriented. Every other
+/// format/command combination keeps its existing stdout behavior;
+/// `--output` is deliberately rejected for them so a file extension never
+/// silently changes a rendering contract.
+fn run_with_artifact_output(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
+    let Some((path, command, format)) = cli.output_artifact()? else {
         return run(cli, out);
     };
 
     let mut rendered = Vec::new();
     let result = run(cli, &mut rendered);
     if !rendered.is_empty() {
-        let artifact = add_json_header(&rendered, &path, command, &result)?;
-        write_json_artifact(&path, &artifact)?;
-        writeln!(out, "JSON written to {}", path.display())?;
+        match format {
+            OutputFormat::Json => {
+                let artifact = add_json_header(&rendered, &path, command, &result)?;
+                write_artifact_file(&path, &artifact)?;
+                writeln!(out, "JSON written to {}", path.display())?;
+            }
+            OutputFormat::Markdown => {
+                write_artifact_file(&path, &rendered)?;
+                writeln!(out, "Markdown written to {}", path.display())?;
+            }
+            OutputFormat::Tty | OutputFormat::Sarif => {
+                unreachable!("output_artifact only returns Json or Markdown")
+            }
+        }
     }
     result
 }
 
 impl Cli {
-    fn json_output_artifact(&self) -> Result<Option<(PathBuf, &'static str)>, CliError> {
+    /// The command's default output-artifact naming for `--format json`, or
+    /// (bare command only) `--format markdown` — the two formats that
+    /// support `--output` and a default `.judge/` artifact path.
+    fn output_artifact(&self) -> Result<Option<(PathBuf, &'static str, OutputFormat)>, CliError> {
         let format_and_name = match &self.command {
             Some(command) => command.json_artifact(),
             None => Some((self.baseline_args.format, "judge")),
         };
-        let is_json = matches!(format_and_name, Some((OutputFormat::Json, _)));
-        if !is_json {
+        let supports_artifact = matches!(
+            (&self.command, format_and_name),
+            (_, Some((OutputFormat::Json, _))) | (None, Some((OutputFormat::Markdown, _)))
+        );
+        if !supports_artifact {
             return self.output.is_none().then_some(None).ok_or_else(|| {
-                CliError::Config("--output requires a command using `--format json`".to_string())
+                CliError::Config(
+                    "--output requires a command using `--format json`, or the bare `cargo judge --format markdown` run"
+                        .to_string(),
+                )
             });
         }
-        let (_, name) = format_and_name.expect("JSON format has an artifact name");
+        let (format, name) = format_and_name.expect("checked by supports_artifact above");
+        let extension = match format {
+            OutputFormat::Json => "json",
+            OutputFormat::Markdown => "md",
+            OutputFormat::Tty | OutputFormat::Sarif => {
+                unreachable!("checked by supports_artifact above")
+            }
+        };
         let path = self
             .output
             .clone()
-            .unwrap_or_else(|| PathBuf::from(".judge").join(format!("{name}.json")));
-        Ok(Some((path, name)))
+            .unwrap_or_else(|| PathBuf::from(".judge").join(format!("{name}.{extension}")));
+        Ok(Some((path, name, format)))
     }
 }
 
-fn write_json_artifact(path: &Path, contents: &[u8]) -> Result<(), CliError> {
+fn write_artifact_file(path: &Path, contents: &[u8]) -> Result<(), CliError> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -796,6 +905,10 @@ fn add_json_header(
         .map_err(|err| CliError::Analyzer(format!("system clock is before Unix epoch: {err}")))?
         .as_secs();
     let generated_at_utc = format_utc_timestamp(generated_at_unix_seconds)?;
+    let analysis_universe = root
+        .get("analysis_universe")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let header = serde_json::json!({
         "schema_version": 1,
@@ -806,6 +919,15 @@ fn add_json_header(
         "command": command,
         "description": json_artifact_description(command),
         "contains": "The command's normal versioned JSON payload plus this artifact header.",
+        "context": {
+            "analysis_universe": analysis_universe,
+            "evidence_contract": {
+                "finding_identity": "id, rule, severity, location, and origin are stable references within this artifact.",
+                "evidence": "A finding's evidence and limitations state the observed facts and the boundary of the claim.",
+                "recommendations": "Next actions are review order only; they are not automatic refactoring instructions.",
+            },
+            "next_actions": json_next_actions(command, findings, errors),
+        },
         "assessment": {
             "kind": assessment,
             "action_required": action_required,
@@ -821,6 +943,38 @@ fn add_json_header(
         payload: root,
     })
     .map_err(|err| CliError::Analyzer(err.to_string()))
+}
+
+/// Small, stable navigation hints for humans and agents. These are derived
+/// solely from the selected report and never claim a code change is required.
+fn json_next_actions(command: &str, findings: usize, errors: usize) -> Vec<serde_json::Value> {
+    if errors > 0 {
+        return vec![serde_json::json!({
+            "id": "resolve-analysis-errors",
+            "reason": "The report is incomplete; inspect the errors array before acting on findings."
+        })];
+    }
+    if findings == 0 {
+        return Vec::new();
+    }
+    let mut actions = vec![serde_json::json!({
+        "id": "inspect-findings",
+        "reason": "Start with each finding's location, evidence, limitations, and causal links."
+    })];
+    match command {
+        "judge" | "compare" => actions.push(serde_json::json!({
+            "id": "refactoring-context",
+            "command": "cargo judge dupes --format json",
+            "reason": "Inspect duplicate families before deciding whether a shared extraction is justified."
+        })),
+        "deps" => actions.push(serde_json::json!({
+            "id": "dependency-context",
+            "command": "cargo judge deps --format json",
+            "reason": "Use the dependency findings and their source locations to verify actual usage."
+        })),
+        _ => {}
+    }
+    actions
 }
 
 /// Serializes an artifact's context before its established command payload.
@@ -999,59 +1153,6 @@ fn trend_json(trend: &judge::health_score::Trend) -> serde_json::Value {
             "message": reason.to_string(),
         }),
     }
-}
-
-/// Hotspot = complexity × recency-weighted change frequency (see todo.md
-/// §3.E). Files with no recorded churn (or no git history at all) are left
-/// out rather than shown as zero-risk. Reduced to root findings unless
-/// `show_cascades` is set (see todo.md §14.2 P0#2) — currently a no-op,
-/// since nothing yet populates `caused_by` for hotspot findings, but the
-/// mechanism is exercised here so future detectors that do can rely on it.
-fn print_hotspots(
-    out: &mut dyn Write,
-    hotspots: &[judge::git::Hotspot],
-    findings: &[judge::finding::Finding],
-    show_cascades: bool,
-) -> std::io::Result<()> {
-    if hotspots.is_empty() {
-        writeln!(
-            out,
-            "hotspots: none in the last {} days (no git history, or no file crosses both complexity and churn)",
-            judge::git::DEFAULT_WINDOW_DAYS
-        )?;
-        return Ok(());
-    }
-
-    let shown_ids: std::collections::HashSet<&str> = if show_cascades {
-        findings.iter().map(|f| f.id.as_str()).collect()
-    } else {
-        judge::finding::root_findings(findings)
-            .into_iter()
-            .map(|f| f.id.as_str())
-            .collect()
-    };
-
-    writeln!(
-        out,
-        "hotspots (complexity × recency-weighted changes in the last {} days — advisory, no verdict effect):",
-        judge::git::DEFAULT_WINDOW_DAYS
-    )?;
-    for hotspot in hotspots.iter().take(HOTSPOT_LIMIT) {
-        let id = format!("{}:{}", judge::git::HOTSPOT_RULE, hotspot.file.display());
-        if !shown_ids.contains(id.as_str()) {
-            continue;
-        }
-        writeln!(
-            out,
-            "  {:>6}  {} × {:.1} weighted ({} raw) changes  {}",
-            hotspot.score(),
-            hotspot.complexity,
-            hotspot.recency_weight,
-            hotspot.changes,
-            hotspot.file.display()
-        )?;
-    }
-    Ok(())
 }
 
 /// AI-slop signals (see todo.md §G "AI-Slop-Signale", §12 "Entscheidungen":
@@ -1594,7 +1695,7 @@ fn dup_two(x: i32) -> i32 {
         let _guard = lock_cwd();
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
-        let result = run_with_json_output(cli, out);
+        let result = run_with_artifact_output(cli, out);
         std::env::set_current_dir(original).unwrap();
         result
     }
@@ -1604,6 +1705,8 @@ fn dup_two(x: i32) -> i32 {
             command: Some(command),
             baseline_args: baseline_args(OutputFormat::Tty, false, None),
             progress: None,
+            details: false,
+            color: ColorChoice::Auto,
             output: None,
         }
     }
@@ -1647,8 +1750,74 @@ fn dup_two(x: i32) -> i32 {
             command: None,
             baseline_args: baseline_args(OutputFormat::Tty, save_baseline, baseline),
             progress: None,
+            details: false,
+            color: ColorChoice::Auto,
             output: None,
         }
+    }
+
+    fn all_cli_markdown() -> Cli {
+        Cli {
+            baseline_args: baseline_args(OutputFormat::Markdown, false, None),
+            ..all_cli(false, None)
+        }
+    }
+
+    #[test]
+    fn compare_works_from_an_artifact_in_a_workspace_without_git() {
+        let dir = TempDir::new("compare-without-git");
+        write_fixture_crate(&dir);
+
+        let mut save_out = Vec::new();
+        run_in_dir(&dir, all_cli(true, None), &mut save_out)
+            .expect("saving a baseline must not require Git");
+        let baseline_path = dir.join(DEFAULT_BASELINE_ALL);
+        let baseline: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&baseline_path).unwrap()).unwrap();
+        assert!(baseline.get("commit").is_none(), "baseline: {baseline}");
+
+        let mut compare_out = Vec::new();
+        let outcome = run_in_dir(
+            &dir,
+            cli_with(Command::Compare(CompareOptions {
+                baseline: baseline_path,
+                format: OutputFormat::Json,
+            })),
+            &mut compare_out,
+        )
+        .expect("comparison must not require Git");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let compare: serde_json::Value = serde_json::from_slice(&compare_out).unwrap();
+        assert_eq!(compare["delta"]["introduced"], serde_json::json!([]));
+        assert_eq!(compare["delta"]["resolved"], serde_json::json!([]));
+
+        let mut structure_out = Vec::new();
+        run_in_dir(
+            &dir,
+            cli_with(Command::Structure(StructureOptions {
+                format: OutputFormat::Json,
+            })),
+            &mut structure_out,
+        )
+        .expect("structure must not require Git");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&structure_out).unwrap()["crates"]
+                .is_array()
+        );
+
+        let mut refactor_out = Vec::new();
+        run_in_dir(
+            &dir,
+            cli_with(Command::Refactor(RefactorOptions {
+                target: None,
+                format: OutputFormat::Json,
+            })),
+            &mut refactor_out,
+        )
+        .expect("refactor must not require Git");
+        let refactor: serde_json::Value = serde_json::from_slice(&refactor_out).unwrap();
+        assert!(refactor["candidates"].is_array());
+        assert!(refactor["findings"].is_array());
     }
 
     #[test]
@@ -1675,6 +1844,55 @@ fn dup_two(x: i32) -> i32 {
         assert_eq!(
             options.baseline_args.baseline,
             Some(PathBuf::from("saved.json"))
+        );
+
+        let root_details =
+            Cli::try_parse_from(["judge", "--details"]).expect("combined details flag must parse");
+        assert!(root_details.details);
+    }
+
+    #[test]
+    fn combined_tty_defaults_to_a_grouped_summary_and_keeps_details_available() {
+        let dir = TempDir::new("combined-tty-summary");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        std::fs::write(dir.join("src/lib.rs"), DUPE_FILE_CONTENT).unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let mut summary_out = Vec::new();
+        run_in_dir(&dir, all_cli(false, None), &mut summary_out)
+            .expect("combined summary must run");
+        let summary = String::from_utf8(summary_out).unwrap();
+        assert!(
+            summary.starts_with("[WARN] Judge summary\n"),
+            "unexpected output: {summary}"
+        );
+        assert!(
+            summary.contains("duplicate-code"),
+            "unexpected output: {summary}"
+        );
+        assert!(
+            summary.contains("Next steps"),
+            "unexpected output: {summary}"
+        );
+        assert!(
+            !summary.contains("[warn] duplicate-code"),
+            "the default must not print every clone member: {summary}"
+        );
+
+        let mut detailed_cli = all_cli(false, None);
+        detailed_cli.details = true;
+        let mut details_out = Vec::new();
+        run_in_dir(&dir, detailed_cli, &mut details_out).expect("detailed report must run");
+        let details = String::from_utf8(details_out).unwrap();
+        assert!(
+            details.contains("duplicate-code in dup_one"),
+            "details must retain the exhaustive list: {details}"
+        );
+        assert!(
+            details.contains("src/lib.rs:2"),
+            "details must use workspace-relative paths: {details}"
         );
     }
 
@@ -2595,7 +2813,7 @@ fn dup_two(x: i32) -> i32 {
             "unexpected output: {text}"
         );
         assert!(
-            text.contains("### code-introduced: 3"),
+            text.contains("### introduced: 3"),
             "unexpected output: {text}"
         );
         assert!(
@@ -2768,15 +2986,10 @@ fn dup_two(x: i32) -> i32 {
         );
     }
 
-    /// An untouched file's finding that only appears because a rule
-    /// revision changed must classify as `rule_introduced`, not
-    /// `code_introduced` — and must not fail the verdict (see todo.md §5
-    /// "Regelversions-Schutz"). `judge::baseline::diff` itself already has
-    /// dedicated coverage for this; this test only confirms `run_audit`'s
-    /// own verdict combination (`tri_verdict` + `combine_verdict`) respects
-    /// it once wired together.
+    /// Artifact comparisons retain an identical finding even when the rule
+    /// revision changed; Git history is irrelevant to the comparison.
     #[test]
-    fn audit_wiring_does_not_fail_on_a_rule_introduced_finding() {
+    fn artifact_comparison_keeps_an_identical_finding_unchanged() {
         let dir = TempDir::new("audit-rule-introduced");
         git(&dir, &["init", "-q", "-b", "main"]);
         write_fixture_crate(&dir);
@@ -2820,8 +3033,9 @@ fn dup_two(x: i32) -> i32 {
 
         let delta = judge::baseline::diff(&[pre_existing], &baseline, &touched, &bumped_revisions);
 
-        assert!(delta.code_introduced.is_empty());
-        assert_eq!(delta.rule_introduced.len(), 1);
+        assert_eq!(delta.unchanged_count, 1);
+        assert!(delta.introduced.is_empty());
+        assert!(delta.rule_introduced.is_empty());
         assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
         assert_eq!(combine_verdict(delta.tri_verdict(), None), TriVerdict::Pass);
     }
@@ -3039,13 +3253,19 @@ pub fn quiet_three() -> u32 {
         assert!(collected.analysis_errors.is_empty());
         judge::finding::relativize_paths(&mut collected.findings, &workspace.root);
 
-        assert!(
-            collected
-                .findings
-                .iter()
-                .any(|finding| finding.rule == judge::slop_structural::CHURN_HOTSPOT_RULE),
-            "fixture should provoke a churn-hotspot finding"
-        );
+        collected.findings.push(judge::finding::Finding::new(
+            "synthetic-advisory:src/lib.rs".to_string(),
+            "synthetic-advisory".to_string(),
+            judge::finding::Severity::Info,
+            judge::finding::Location {
+                file: PathBuf::from("src/lib.rs"),
+                line: judge::finding::OneBasedLine::FIRST,
+                item_path: "hello".to_string(),
+            },
+            judge::finding::EvidenceClass::Heuristic,
+            judge::finding::Origin::Code,
+            None,
+        ));
         let gating_rules: Vec<&judge::finding::RuleId> = collected
             .findings
             .iter()
@@ -3090,15 +3310,10 @@ pub fn quiet_three() -> u32 {
         assert!(report.counts.advisory > 0);
     }
 
-    /// A repo where every file crosses both the complexity and churn
-    /// thresholds must not flood the combined findings list with one
-    /// `hotspot` finding per file (see `HOTSPOT_LIMIT`'s doc comment: 317/317
-    /// files flagged in a real repo, no "outlier" signal left). `collect_findings`
-    /// caps at `HOTSPOT_LIMIT`, and — since `git::hotspots` already sorts by
-    /// score (complexity × recency-weighted changes) descending — keeps the
-    /// *highest*-score files, not an arbitrary prefix.
+    /// The default current-state pass does not derive historical hotspots,
+    /// even when its workspace happens to be a Git repository.
     #[test]
-    fn collect_findings_caps_hotspots_at_the_shared_limit_keeping_the_highest_scores() {
+    fn collect_findings_omits_historical_hotspots() {
         let _guard = lock_cwd();
         let dir = TempDir::new("hotspot-limit");
         git(&dir, &["init", "-q", "-b", "main"]);
@@ -3135,30 +3350,7 @@ pub fn quiet_three() -> u32 {
             .filter(|finding| finding.rule == judge::git::HOTSPOT_RULE)
             .map(|finding| finding.location.file.as_path())
             .collect();
-        assert_eq!(
-            hotspot_files.len(),
-            HOTSPOT_LIMIT,
-            "expected exactly {HOTSPOT_LIMIT} hotspot findings out of 21 candidates, got {}",
-            hotspot_files.len()
-        );
-
-        // Bottom 6 by score (`src/lib.rs` at complexity 1, then branches
-        // 1..=5) must be dropped; top 15 (branches 6..=20) must survive.
-        assert!(!hotspot_files.contains(Path::new("src/lib.rs")));
-        for branches in 1..=5 {
-            let file = PathBuf::from(format!("src/hotspot_{branches:02}.rs"));
-            assert!(
-                !hotspot_files.contains(file.as_path()),
-                "expected the lower-complexity {file:?} to be dropped by the cap"
-            );
-        }
-        for branches in 6..=FILE_COUNT {
-            let file = PathBuf::from(format!("src/hotspot_{branches:02}.rs"));
-            assert!(
-                hotspot_files.contains(file.as_path()),
-                "expected the higher-complexity {file:?} to survive the cap"
-            );
-        }
+        assert!(hotspot_files.is_empty());
     }
 
     #[test]
@@ -3178,6 +3370,24 @@ pub fn quiet_three() -> u32 {
         };
         assert_eq!(options.target, PathBuf::from("src/lib.rs"));
         assert!(matches!(options.format, OutputFormat::Json));
+
+        let structure = Cli::try_parse_from(["judge", "structure", "--format", "json"])
+            .expect("structure arguments must parse");
+        assert!(matches!(structure.command, Some(Command::Structure(_))));
+
+        let complexity = Cli::try_parse_from(["judge", "complexity", "--include-tests"])
+            .expect("complexity arguments must parse");
+        let Some(Command::Complexity(options)) = complexity.command else {
+            panic!("expected complexity command");
+        };
+        assert!(options.include_tests);
+
+        let refactor = Cli::try_parse_from(["judge", "refactor", "src/lib.rs", "--format", "json"])
+            .expect("refactor arguments must parse");
+        let Some(Command::Refactor(options)) = refactor.command else {
+            panic!("expected refactor command");
+        };
+        assert_eq!(options.target, Some(PathBuf::from("src/lib.rs")));
 
         let combined = Cli::try_parse_from(["judge", "--progress", "progress.jsonl"])
             .expect("combined progress arguments must parse");
@@ -3223,6 +3433,9 @@ pub fn quiet_three() -> u32 {
         assert!(default_json["findings"].is_array());
         assert_eq!(default_json["header"]["schema_version"], 1);
         assert_eq!(default_json["header"]["command"], "dupes");
+        assert!(default_json["header"]["context"]["analysis_universe"].is_null());
+        assert!(default_json["header"]["context"]["evidence_contract"].is_object());
+        assert!(default_json["header"]["context"]["next_actions"].is_array());
         assert!(default_json["header"]["working_directory"].is_string());
         assert!(
             default_json["header"]["generated_at_utc"]
@@ -3245,17 +3458,63 @@ pub fn quiet_three() -> u32 {
 
         let mut invalid_cli = dupes_cli(OutputFormat::Tty, false, None);
         invalid_cli.output = Some(PathBuf::from("report.json"));
-        let error = run_with_json_output(invalid_cli, &mut Vec::new())
+        let error = run_with_artifact_output(invalid_cli, &mut Vec::new())
             .expect_err("--output without JSON must be rejected");
         assert!(matches!(error, CliError::Config(message) if message.contains("--format json")));
     }
 
     #[test]
-    fn root_help_states_the_codebase_intelligence_purpose() {
+    fn markdown_review_reports_use_a_default_or_explicit_judge_artifact_path() {
+        let dir = TempDir::new("markdown-artifacts");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        write_fixture_crate(&dir);
+        std::fs::write(dir.join("src/lib.rs"), DUPE_FILE_CONTENT).unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-q", "-m", "initial"]);
+
+        let mut default_out = Vec::new();
+        let outcome = run_json_in_dir(&dir, all_cli_markdown(), &mut default_out)
+            .expect("default Markdown artifact must be written");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        assert_eq!(
+            String::from_utf8(default_out).unwrap(),
+            "Markdown written to .judge/judge.md\n"
+        );
+        let default_markdown = std::fs::read_to_string(dir.join(".judge/judge.md")).unwrap();
+        assert!(
+            default_markdown.starts_with("# Judge summary\n"),
+            "unexpected artifact: {default_markdown}"
+        );
+        assert!(
+            default_markdown.contains("## Evidence-backed findings"),
+            "unexpected artifact: {default_markdown}"
+        );
+        assert!(
+            default_markdown.contains("## Next steps"),
+            "unexpected artifact: {default_markdown}"
+        );
+
+        let custom_path = dir.join("reports/review.md");
+        let mut custom_cli = all_cli_markdown();
+        custom_cli.output = Some(custom_path.clone());
+        let mut custom_out = Vec::new();
+        run_json_in_dir(&dir, custom_cli, &mut custom_out)
+            .expect("explicit Markdown artifact must be written");
+        assert!(custom_path.is_file());
+
+        let mut invalid_cli = all_cli(false, None);
+        invalid_cli.output = Some(PathBuf::from("report.md"));
+        let error = run_with_artifact_output(invalid_cli, &mut Vec::new())
+            .expect_err("--output on the bare tty run must be rejected");
+        assert!(matches!(error, CliError::Config(message) if message.contains("--format json")));
+    }
+
+    #[test]
+    fn root_help_states_the_post_refactoring_purpose() {
         use clap::CommandFactory;
 
         let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("Codebase intelligence for Rust workspaces"));
+        assert!(help.contains("Deterministic post-refactoring analysis for Rust workspaces"));
         assert!(help.contains("--progress <PATH>"));
     }
 
@@ -3358,6 +3617,8 @@ pub fn quiet_three() -> u32 {
                 command: Some(Command::Init),
                 baseline_args: baseline_args(OutputFormat::Tty, false, None),
                 progress: Some(PathBuf::from("not-allowed.jsonl")),
+                details: false,
+                color: ColorChoice::Auto,
                 output: None,
             },
             &mut Vec::new(),

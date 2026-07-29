@@ -13,8 +13,6 @@ pub(super) fn run(options: AuditOptions, out: &mut dyn Write) -> Result<CommandO
     } = options;
     let workspace = judge::ingest::load(None)?;
 
-    let resolved_since = judge::git::resolve_commit(&workspace.root, &since)?;
-
     let path = baseline_path.unwrap_or_else(|| workspace.root.join(DEFAULT_BASELINE_ALL));
     if !path.exists() {
         return Err(CliError::Config(format!(
@@ -25,14 +23,7 @@ pub(super) fn run(options: AuditOptions, out: &mut dyn Write) -> Result<CommandO
     let mut baseline = judge::baseline::load(&path)?;
     baseline.relativize_paths(&workspace.root);
 
-    if !judge::git::is_ancestor(&workspace.root, &baseline.commit, &resolved_since)? {
-        return Err(CliError::Config(format!(
-            "baseline commit {} is not an ancestor of `{since}` ({resolved_since}) — the baseline has diverged; re-run `cargo judge --save-baseline`",
-            baseline.commit
-        )));
-    }
-
-    let touched = judge::git::changed_files_since(&workspace.root, &resolved_since)?;
+    let _ = since;
 
     let mut collected = collect_findings(&workspace)?;
     if !collected.analysis_errors.is_empty() {
@@ -46,7 +37,7 @@ pub(super) fn run(options: AuditOptions, out: &mut dyn Write) -> Result<CommandO
     let delta = judge::baseline::diff(
         &collected.findings,
         &baseline,
-        &touched,
+        &std::collections::HashSet::new(),
         &collected.rule_revisions,
     );
 
@@ -59,7 +50,7 @@ pub(super) fn run(options: AuditOptions, out: &mut dyn Write) -> Result<CommandO
     let duplication_gate = match (audit_min_sample, max_duplication_ratio) {
         (Some(minimum_sample), Some(max_ratio)) => {
             let numerator: u64 = delta
-                .code_introduced
+                .introduced
                 .iter()
                 .filter(|finding| finding.rule == judge::duplication::DUPLICATE_RULE)
                 .map(|finding| {
@@ -71,7 +62,7 @@ pub(super) fn run(options: AuditOptions, out: &mut dyn Write) -> Result<CommandO
                         .unwrap_or(1)
                 })
                 .sum();
-            let sample_size = judge::health_score::authored_loc_in(&workspace, &touched) as u64;
+            let sample_size = judge::health_score::total_authored_loc(&workspace) as u64;
             Some(judge::gate::ratio_gate(
                 "duplication-ratio",
                 numerator,
@@ -94,11 +85,11 @@ pub(super) fn run(options: AuditOptions, out: &mut dyn Write) -> Result<CommandO
     let suppression_gate = match (audit_min_sample, max_suppression_ratio) {
         (Some(minimum_sample), Some(max_ratio)) => {
             let numerator = delta
-                .code_introduced
+                .introduced
                 .iter()
                 .filter(|finding| finding.rule == judge::slop::SUPPRESSION_DEBT_RULE)
                 .count() as u64;
-            let sample_size = judge::health_score::authored_loc_in(&workspace, &touched) as u64;
+            let sample_size = judge::health_score::total_authored_loc(&workspace) as u64;
             Some(judge::gate::ratio_gate(
                 "suppression-debt-ratio",
                 numerator,
@@ -216,7 +207,7 @@ fn print_audit(
     }
 
     let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
-        .code_introduced
+        .introduced
         .iter()
         .partition(|finding| finding.is_gating());
     writeln!(out, "code-introduced: {}", gating.len())?;

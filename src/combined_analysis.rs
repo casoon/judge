@@ -15,9 +15,6 @@ pub(super) struct CollectedFindings {
     /// How many findings an inline `// judge-ignore: <rule> — <reason>`
     /// comment dropped (see [`judge::suppression::apply_inline_suppressions`]).
     pub(super) suppressed_inline: usize,
-    /// Working-tree files without a corresponding `HEAD` blob. Historical
-    /// detectors skip them; code-only analysis remains complete.
-    pub(super) history_unavailable: Vec<PathBuf>,
 }
 
 /// Runs every detector that doesn't need extra opt-in config (complexity +
@@ -46,9 +43,9 @@ pub(super) fn collect_findings_with_progress(
     let mut analysis_errors = Vec::new();
     let mut rule_revisions = default_rule_revisions();
 
-    progress(combined::ProgressEvent::started("complexity_and_history"))?;
+    progress(combined::ProgressEvent::started("complexity"))?;
     collect_complexity_and_history(workspace, &mut findings, &mut analysis_errors);
-    progress(combined::ProgressEvent::completed("complexity_and_history"))?;
+    progress(combined::ProgressEvent::completed("complexity"))?;
 
     progress(combined::ProgressEvent::started("slop"))?;
     collect_slop(workspace, &mut findings, &mut analysis_errors)?;
@@ -70,10 +67,6 @@ pub(super) fn collect_findings_with_progress(
     collect_dependencies(workspace, &mut findings, &mut analysis_errors);
     progress(combined::ProgressEvent::completed("dependencies"))?;
 
-    progress(combined::ProgressEvent::started("ownership"))?;
-    let history_unavailable = collect_ownership(workspace, &mut findings, &mut analysis_errors)?;
-    progress(combined::ProgressEvent::completed("ownership"))?;
-
     progress(combined::ProgressEvent::started("boundaries"))?;
     let (boundaries_config_path, boundary_rules_checked) = collect_boundaries(
         workspace,
@@ -94,28 +87,11 @@ pub(super) fn collect_findings_with_progress(
         boundary_rules_checked,
         boundaries_config_path,
         suppressed_inline,
-        history_unavailable,
     })
 }
 
 fn default_rule_revisions() -> std::collections::HashMap<String, u32> {
     std::collections::HashMap::from([
-        (
-            judge::git::HOTSPOT_RULE.to_string(),
-            judge::git::HOTSPOT_RULE_REVISION,
-        ),
-        (
-            judge::git::SIZE_DISTRIBUTION_RULE.to_string(),
-            judge::git::SIZE_DISTRIBUTION_RULE_REVISION,
-        ),
-        (
-            judge::git::COMPLEXITY_CONCENTRATION_RULE.to_string(),
-            judge::git::COMPLEXITY_CONCENTRATION_RULE_REVISION,
-        ),
-        (
-            judge::git::CROSS_FILE_CONNECTIVITY_RULE.to_string(),
-            judge::git::CROSS_FILE_CONNECTIVITY_RULE_REVISION,
-        ),
         (
             judge::duplication::DUPLICATE_RULE.to_string(),
             judge::duplication::DUPLICATE_RULE_REVISION,
@@ -217,16 +193,8 @@ fn default_rule_revisions() -> std::collections::HashMap<String, u32> {
             judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
         ),
         (
-            judge::ownership::LOW_BUS_FACTOR_RULE.to_string(),
-            judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
-        ),
-        (
             judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
             judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
-        ),
-        (
-            judge::slop_structural::CHURN_HOTSPOT_RULE.to_string(),
-            judge::slop_structural::CHURN_HOTSPOT_RULE_REVISION,
         ),
         (
             judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
@@ -282,37 +250,6 @@ fn collect_complexity_and_history(
         .flat_map(|krate| krate.source_files.iter());
     let complexity = judge::complexity::analyze_workspace(complexity_source_files, false);
     analysis_errors.extend(complexity.errors.iter().map(ToString::to_string));
-    match judge::git::hotspots(
-        &workspace.root,
-        &complexity.functions,
-        judge::git::DEFAULT_WINDOW_DAYS,
-    ) {
-        Ok(hotspots) => findings.extend(
-            hotspots
-                .iter()
-                .take(HOTSPOT_LIMIT)
-                .map(judge::git::Hotspot::to_finding),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
-    findings.extend(
-        judge::git::size_distribution(workspace)
-            .iter()
-            .map(judge::git::SizeDistributionOutlier::to_finding),
-    );
-    findings.extend(
-        judge::git::complexity_concentration(workspace, &complexity.functions)
-            .iter()
-            .map(judge::git::ComplexityConcentrationOutlier::to_finding),
-    );
-    match judge::git::cross_file_connectivity(&workspace.root, judge::git::DEFAULT_WINDOW_DAYS) {
-        Ok(outliers) => findings.extend(
-            outliers
-                .iter()
-                .map(|outlier| outlier.to_finding(&workspace.root)),
-        ),
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
     findings.extend(judge::slop_structural::complexity_inflation(
         &complexity.functions,
     ));
@@ -322,16 +259,6 @@ fn collect_complexity_and_history(
     findings.extend(judge::complexity::maintainability_index(
         &complexity.functions,
     ));
-
-    // G4 structural slop: `churn-hotspot` needs its own [`judge::git::churn`]
-    // call at a different window (2 weeks) than [`judge::git::hotspots`]'s
-    // internal one above.
-    match judge::git::churn(&workspace.root, 14) {
-        Ok(two_week_churn) => {
-            findings.extend(judge::slop_structural::churn_hotspots(&two_week_churn));
-        }
-        Err(err) => analysis_errors.push(err.to_string()),
-    }
 }
 
 fn collect_slop(
@@ -427,18 +354,6 @@ fn collect_dependencies(
     findings.extend(judge::slopsquat::analyze_name_collision(workspace));
 }
 
-fn collect_ownership(
-    workspace: &judge::ingest::Workspace,
-    findings: &mut Vec<Finding>,
-    analysis_errors: &mut Vec<String>,
-) -> Result<Vec<PathBuf>, CliError> {
-    let ownership =
-        judge::ownership::analyze_workspace(workspace, judge::git::DEFAULT_WINDOW_DAYS)?;
-    analysis_errors.extend(ownership.errors.iter().map(ToString::to_string));
-    findings.extend(ownership.findings);
-    Ok(ownership.history_unavailable)
-}
-
 fn collect_boundaries(
     workspace: &judge::ingest::Workspace,
     findings: &mut Vec<Finding>,
@@ -469,21 +384,6 @@ fn collect_boundaries(
             judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
             judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
         );
-
-        match judge::boundaries::change_coupling_signals(
-            workspace,
-            &config,
-            judge::git::DEFAULT_WINDOW_DAYS,
-        ) {
-            Ok(coupling_findings) => {
-                findings.extend(coupling_findings);
-                rule_revisions.insert(
-                    judge::boundaries::CHANGE_COUPLING_SIGNAL_RULE.to_string(),
-                    judge::boundaries::CHANGE_COUPLING_SIGNAL_RULE_REVISION,
-                );
-            }
-            Err(err) => analysis_errors.push(err.to_string()),
-        }
     }
 
     // `feature-graph-cycle` is always-on, unlike the `judge.toml`-gated

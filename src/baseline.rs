@@ -1,11 +1,9 @@
 //! Baseline snapshots and delta verdicts (see todo.md §5, §14.2 P0#5).
 //!
-//! A baseline freezes which findings were already known at a given commit,
-//! plus the judge version and rule revisions active then. Comparing a fresh
-//! run against it separates truly new findings (`code-introduced`) from
-//! findings that only appear because a rule changed on otherwise-untouched
-//! code (`rule-introduced`, protected by "Regelversions-Schutz") — only the
-//! former may fail a delta verdict.
+//! A baseline freezes a previously analysed project state. Comparing a fresh
+//! run against it reports findings that were introduced, resolved, or changed
+//! in severity. The comparison is deliberately artifact-based: it neither
+//! requires nor inspects a Git repository.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,13 +15,12 @@ use crate::finding::{
 };
 use crate::health_score::ScoreContext;
 
-/// v2: findings carry `evidence_class` instead of the removed numeric
-/// `confidence` (todo.md §17.5) — see [`migrate`] for the v1→v2 step.
-pub const SCHEMA_VERSION: u32 = 2;
+/// v3 removes commit identity and the Git-derived code/rule introduction
+/// split. v2 introduced `evidence_class` in place of numeric `confidence`.
+pub const SCHEMA_VERSION: u32 = 3;
 
-/// The minimal record kept per finding in a baseline file — enough to tell
-/// whether a current finding was already known, and where to look when
-/// deciding whether its file was touched since.
+/// The minimal record kept per finding in a baseline file — enough to match
+/// it against a later project state and point a reviewer at its prior scope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineFinding {
     pub id: FindingId,
@@ -39,9 +36,6 @@ pub struct Baseline {
     pub schema_version: u32,
     /// judge version active when this baseline was saved.
     pub judge_version: String,
-    /// The commit this baseline was saved from (`first_seen_commit` for
-    /// every finding it contains).
-    pub commit: String,
     /// Revision of every rule active when this baseline was saved.
     pub rule_revisions: HashMap<String, u32>,
     /// Authored lines of code analyzed when this baseline was saved (see
@@ -72,7 +66,7 @@ pub struct Baseline {
 impl Baseline {
     pub fn new(
         findings: &[Finding],
-        commit: String,
+        _legacy_commit: String,
         rule_revisions: HashMap<String, u32>,
         total_loc: usize,
         score_context: ScoreContext,
@@ -80,7 +74,6 @@ impl Baseline {
         Self {
             schema_version: SCHEMA_VERSION,
             judge_version: env!("CARGO_PKG_VERSION").to_string(),
-            commit,
             rule_revisions,
             total_loc,
             score_context: Some(score_context),
@@ -212,7 +205,7 @@ fn migrate(path: &Path, mut value: serde_json::Value) -> Result<Baseline, Baseli
         .get("schema_version")
         .and_then(serde_json::Value::as_u64);
     match found {
-        Some(1) => {
+        Some(1) | Some(2) => {
             if let Some(findings) = value
                 .get_mut("findings")
                 .and_then(serde_json::Value::as_array_mut)
@@ -221,19 +214,25 @@ fn migrate(path: &Path, mut value: serde_json::Value) -> Result<Baseline, Baseli
                     let Some(finding) = finding.as_object_mut() else {
                         continue;
                     };
-                    finding.remove("confidence");
-                    let class = finding
-                        .get("rule")
-                        .and_then(serde_json::Value::as_str)
-                        .map_or(EvidenceClass::Heuristic, |rule| {
-                            evidence_class_for_rule(&RuleId::from(rule))
-                        });
-                    finding.insert(
-                        "evidence_class".to_string(),
-                        serde_json::to_value(class).map_err(BaselineError::Serialize)?,
-                    );
+                    if finding.get("evidence_class").is_none() {
+                        finding.remove("confidence");
+                        let class = finding
+                            .get("rule")
+                            .and_then(serde_json::Value::as_str)
+                            .map_or(EvidenceClass::Heuristic, |rule| {
+                                evidence_class_for_rule(&RuleId::from(rule))
+                            });
+                        finding.insert(
+                            "evidence_class".to_string(),
+                            serde_json::to_value(class).map_err(BaselineError::Serialize)?,
+                        );
+                    }
                 }
             }
+            value
+                .as_object_mut()
+                .expect("baseline must be an object")
+                .remove("commit");
             value["schema_version"] = serde_json::json!(SCHEMA_VERSION);
             serde_json::from_value(value)
                 .map_err(|err| BaselineError::Deserialize(path.to_path_buf(), err))
@@ -250,44 +249,57 @@ fn migrate(path: &Path, mut value: serde_json::Value) -> Result<Baseline, Baseli
 /// The result of comparing a fresh set of findings against a [`Baseline`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Delta {
-    /// New findings whose file changed since the baseline commit — a real
-    /// regression introduced by this code change.
-    pub code_introduced: Vec<Finding>,
-    /// New findings whose file did *not* change since the baseline commit —
-    /// they can only have appeared because a rule (or judge itself) changed
-    /// on code that was already there (see todo.md §5 "Regelversions-Schutz").
-    pub rule_introduced: Vec<Finding>,
+    /// Findings absent from the recorded project state.
+    pub introduced: Vec<Finding>,
     /// Baseline findings that no longer appear in the current run.
     pub resolved: Vec<BaselineFinding>,
+    /// Findings with the same stable identity but a different severity.
+    pub severity_changed: Vec<SeverityChange>,
     /// Findings present in both the baseline and the current run.
     pub unchanged_count: usize,
+    /// Backwards-compatible in-memory aliases for callers that have not yet
+    /// moved from commit terminology. They are intentionally absent from the
+    /// artifact schema and contain no Git-derived classification.
+    #[serde(skip)]
+    pub code_introduced: Vec<Finding>,
+    #[serde(skip)]
+    pub rule_introduced: Vec<Finding>,
 }
 
-/// Compares `current` findings against `baseline`, classifying every finding
-/// not already in the baseline as `code_introduced` or `rule_introduced`
-/// depending on whether `touched_files` (paths changed since the baseline
-/// commit — see [`crate::git::changed_files_since`]) contains its file.
+/// One stable finding whose severity changed between two analysed states.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeverityChange {
+    pub before: BaselineFinding,
+    pub after: Finding,
+}
+
+/// Compares `current` findings against a recorded project state. The legacy
+/// arguments are retained temporarily for source compatibility but are
+/// deliberately ignored: comparison is wholly artifact-based.
 pub fn diff(
     current: &[Finding],
     baseline: &Baseline,
-    touched_files: &HashSet<PathBuf>,
-    current_rule_revisions: &HashMap<String, u32>,
+    _touched_files: &HashSet<PathBuf>,
+    _current_rule_revisions: &HashMap<String, u32>,
 ) -> Delta {
-    let known_ids: HashSet<&str> = baseline.findings.iter().map(|f| f.id.as_str()).collect();
+    let known = baseline
+        .findings
+        .iter()
+        .map(|finding| (finding.id.as_str(), finding))
+        .collect::<HashMap<_, _>>();
 
-    let mut code_introduced = Vec::new();
-    let mut rule_introduced = Vec::new();
+    let mut introduced = Vec::new();
+    let mut severity_changed = Vec::new();
     let mut unchanged_count = 0;
 
     for finding in current {
-        let rule_changed = baseline.rule_revisions.get(finding.rule.as_str())
-            != current_rule_revisions.get(finding.rule.as_str());
-        if known_ids.contains(finding.id.as_str()) && !rule_changed {
-            unchanged_count += 1;
-        } else if rule_changed && !touched_files.contains(&finding.location.file) {
-            rule_introduced.push(finding.clone());
-        } else {
-            code_introduced.push(finding.clone());
+        match known.get(finding.id.as_str()) {
+            Some(previous) if previous.severity == finding.severity => unchanged_count += 1,
+            Some(previous) => severity_changed.push(SeverityChange {
+                before: (*previous).clone(),
+                after: finding.clone(),
+            }),
+            None => introduced.push(finding.clone()),
         }
     }
 
@@ -300,9 +312,11 @@ pub fn diff(
         .collect();
 
     Delta {
-        code_introduced,
-        rule_introduced,
+        code_introduced: introduced.clone(),
+        rule_introduced: Vec::new(),
+        introduced,
         resolved,
+        severity_changed,
         unchanged_count,
     }
 }
@@ -327,14 +341,14 @@ pub enum TriVerdict {
 }
 
 impl Delta {
-    /// Only actionable (`Warn`/`Fail`) *gating* code-introduced findings can
+    /// Only actionable (`Warn`/`Fail`) *gating* introduced findings can
     /// fail the verdict. `Info` findings remain visible in the delta but are
     /// explicitly descriptive, not pass/fail judgements — and advisory
     /// (heuristic) findings never gate regardless of severity (see
     /// [`crate::finding::EvidenceClass::is_gating`], todo.md §17.2).
     pub fn verdict(&self) -> Verdict {
         if self
-            .code_introduced
+            .introduced
             .iter()
             .filter(|finding| finding.is_gating())
             .all(|finding| finding.severity == crate::finding::Severity::Info)
@@ -350,7 +364,7 @@ impl Delta {
     /// advisory carve-out: heuristic findings never force `Warn`/`Fail`.
     pub fn tri_verdict(&self) -> TriVerdict {
         let mut has_warn = false;
-        for finding in self.code_introduced.iter().filter(|f| f.is_gating()) {
+        for finding in self.introduced.iter().filter(|f| f.is_gating()) {
             match finding.severity {
                 crate::finding::Severity::Fail => return TriVerdict::Fail,
                 crate::finding::Severity::Warn => has_warn = true,
@@ -412,7 +426,6 @@ mod tests {
         save(&path, &baseline).unwrap();
         let loaded = load(&path).unwrap();
 
-        assert_eq!(loaded.commit, baseline.commit);
         assert_eq!(loaded.findings.len(), 1);
         assert_eq!(loaded.findings[0].id, "a");
         assert_eq!(loaded.score_context, baseline.score_context);
@@ -445,7 +458,6 @@ mod tests {
         let baseline = load(&path).unwrap();
 
         assert!(baseline.score_context.is_none());
-        assert_eq!(baseline.commit, "abc123");
     }
 
     #[test]
@@ -469,7 +481,6 @@ mod tests {
         let baseline = load(&path).unwrap();
 
         assert!(baseline.api_surface_size.is_none());
-        assert_eq!(baseline.commit, "abc123");
     }
 
     #[test]
@@ -556,7 +567,7 @@ mod tests {
         let (_dir, path) = write_baseline_json(
             "baseline-future-schema",
             r#"{
-                "schema_version": 3,
+                "schema_version": 4,
                 "judge_version": "9.9.9",
                 "commit": "abc123",
                 "rule_revisions": {},
@@ -569,11 +580,11 @@ mod tests {
 
         assert!(matches!(
             err,
-            BaselineError::UnsupportedSchemaVersion { found: Some(3), .. }
+            BaselineError::UnsupportedSchemaVersion { found: Some(4), .. }
         ));
         let message = err.to_string();
-        assert!(message.contains("schema_version 3"), "{message}");
-        assert!(message.contains("supports version 2"), "{message}");
+        assert!(message.contains("schema_version 4"), "{message}");
+        assert!(message.contains("supports version 3"), "{message}");
     }
 
     #[test]
@@ -625,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn new_finding_in_an_untouched_file_is_rule_introduced_and_does_not_fail() {
+    fn new_finding_is_introduced_even_when_a_rule_revision_changed() {
         let baseline = baseline_with(&[]);
         let current = [finding("new", "src/a.rs")];
 
@@ -633,9 +644,9 @@ mod tests {
         revised.insert("duplicate-code".to_string(), 2);
         let delta = diff(&current, &baseline, &HashSet::new(), &revised);
 
-        assert!(delta.code_introduced.is_empty());
-        assert_eq!(delta.rule_introduced.len(), 1);
-        assert_eq!(delta.verdict(), Verdict::Pass);
+        assert_eq!(delta.introduced.len(), 1);
+        assert!(delta.rule_introduced.is_empty());
+        assert_eq!(delta.verdict(), Verdict::Fail);
     }
 
     #[test]
@@ -661,15 +672,15 @@ mod tests {
     }
 
     #[test]
-    fn changed_rule_rechecks_an_existing_finding() {
+    fn changed_rule_keeps_an_identical_finding_unchanged() {
         let baseline = baseline_with(&[finding("known", "src/a.rs")]);
         let current = [finding("known", "src/a.rs")];
         let revised = HashMap::from([("duplicate-code".to_string(), 2)]);
 
         let delta = diff(&current, &baseline, &HashSet::new(), &revised);
 
-        assert_eq!(delta.unchanged_count, 0);
-        assert_eq!(delta.rule_introduced.len(), 1);
+        assert_eq!(delta.unchanged_count, 1);
+        assert!(delta.rule_introduced.is_empty());
     }
 
     #[test]

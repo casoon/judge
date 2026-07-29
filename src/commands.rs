@@ -56,14 +56,32 @@ pub(super) enum Command {
     /// like duplication still run over the full corpus, only the delta
     /// classification is scoped to touched files.
     Audit(AuditOptions),
+    /// Compare the current project state with a recorded baseline artifact.
+    /// This command never reads Git history.
+    Compare(CompareOptions),
     /// Initialize judge configuration in a workspace.
     Init,
     /// Show detected entry points, tiers, and cache status.
     Inspect,
     /// Show a compact, deterministic map of refactoring-relevant workspace facts.
     Map(MapOptions),
+    /// Diagnose the current workspace structure: crates, targets, dependency edges,
+    /// modules, complexity concentration, and duplicate-code context.
+    Structure(StructureOptions),
+    /// Show current-state complexity facts without historical hotspot signals.
+    Complexity(ComplexityOptions),
     /// Show the analysis and Cargo-target context of one workspace source file.
     Impact(ImpactOptions),
+    /// Build a deterministic, evidence-backed queue of refactoring candidates.
+    Refactor(RefactorOptions),
+    /// Review unsafe-code structure and safety documentation.
+    Unsafe(FocusedAnalysisOptions),
+    /// Review current error-handling patterns and architecture signals.
+    Errors(FocusedAnalysisOptions),
+    /// Review test-structure signals without making coverage claims.
+    Tests(FocusedAnalysisOptions),
+    /// Review mechanical code smells without inferring authorship.
+    Slop(FocusedAnalysisOptions),
     /// Imports an externally generated `cargo-llvm-cov` LCOV report and
     /// flags `untested-hotspot` functions: high complexity, high churn, and
     /// mostly uncovered lines (see todo.md §J). judge never measures
@@ -101,6 +119,8 @@ pub(super) enum Command {
     /// build compiled with `--features deep` additionally checks
     /// `semver-hazard`'s `leaked_dependency_type` sub-case.
     ApiSurface(ApiSurfaceOptions),
+    /// Focused public API analysis.
+    Api(ApiSurfaceOptions),
     /// Shows `unlinked-file`/`orphan-module` findings from resolving each
     /// crate's real `mod` tree (see `judge::module_graph`). Subcommand-only:
     /// not part of bare `cargo judge`, `audit`, or `health`, matching
@@ -125,6 +145,7 @@ impl Command {
             Self::DeadCode(options) => Some((options.baseline_args.format, "dead-code")),
             Self::Explain(options) => Some((options.format, "explain")),
             Self::Audit(options) => Some((options.format, "audit")),
+            Self::Compare(options) => Some((options.format, "compare")),
             Self::Coverage(options) => Some((options.baseline_args.format, "coverage")),
             Self::Patterns(options) => Some((options.format, "patterns")),
             Self::Principles(options) => Some((options.format, "principles")),
@@ -133,9 +154,17 @@ impl Command {
             Self::FixPreview(options) => Some((options.format, "fix-preview")),
             Self::ExplainRule(options) => Some((options.format, "explain-rule")),
             Self::ApiSurface(options) => Some((options.baseline_args.format, "api-surface")),
+            Self::Api(options) => Some((options.baseline_args.format, "api")),
             Self::ModuleGraph(options) => Some((options.baseline_args.format, "module-graph")),
             Self::Map(options) => Some((options.format, "map")),
+            Self::Structure(options) => Some((options.format, "structure")),
+            Self::Complexity(options) => Some((options.format, "complexity")),
             Self::Impact(options) => Some((options.format, "impact")),
+            Self::Refactor(options) => Some((options.format, "refactor")),
+            Self::Unsafe(options) => Some((options.format, "unsafe")),
+            Self::Errors(options) => Some((options.format, "errors")),
+            Self::Tests(options) => Some((options.format, "tests")),
+            Self::Slop(options) => Some((options.format, "slop")),
             Self::Init | Self::Inspect | Self::Boundaries(_) => None,
         }
     }
@@ -152,13 +181,29 @@ impl Command {
             Self::DeadCode(options) => run_dead_code(options, out),
             Self::Explain(options) => run_explain(options, out),
             Self::Audit(options) => run_audit(options, out),
+            Self::Compare(options) => combined::run(
+                options.format,
+                false,
+                Some(options.baseline),
+                None,
+                false,
+                false,
+                out,
+            ),
             Self::Init => {
                 writeln!(out, "judge init is not implemented yet")?;
                 Ok(CommandOutcome::Clean)
             }
             Self::Inspect => run_inspect(out),
             Self::Map(options) => run_map(options, out),
+            Self::Structure(options) => run_structure(options, out),
+            Self::Complexity(options) => run_complexity(options, out),
             Self::Impact(options) => run_impact(options, out),
+            Self::Refactor(options) => run_refactor(options, out),
+            Self::Unsafe(options) => run_unsafe(options, out),
+            Self::Errors(options) => run_errors(options, out),
+            Self::Tests(options) => run_tests(options, out),
+            Self::Slop(options) => run_slop(options, out),
             Self::Coverage(options) => run_coverage(options, out),
             Self::Patterns(options) => run_patterns(options, out),
             Self::Principles(options) => run_principles(options, out),
@@ -167,6 +212,7 @@ impl Command {
             Self::FixPreview(options) => run_fix_preview(options, out),
             Self::ExplainRule(options) => run_explain_rule(options, out),
             Self::ApiSurface(options) => run_api_surface(options, out),
+            Self::Api(options) => run_api_surface(options, out),
             Self::ModuleGraph(options) => run_module_graph(options, out),
         }
     }

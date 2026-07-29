@@ -1,4 +1,4 @@
-//! Markdown rendering of baseline/audit deltas (todo.md §7) — the
+//! Markdown rendering of baseline comparison deltas (todo.md §7) — the
 //! PR-comment use case: a compact verdict + gates + per-finding table that
 //! reads well pasted into a GitHub comment. Pure functions over the
 //! already-computed [`Delta`]; the CLI only writes the returned string.
@@ -20,7 +20,7 @@ pub struct GateSlot<'a> {
     pub gate: Option<&'a RatioGate>,
 }
 
-/// `audit --since` as Markdown: verdict, every gate (including
+/// Legacy audit rendering: verdict, every gate (including
 /// not-evaluated ones), then the delta table.
 pub fn render_audit(delta: &Delta, verdict: TriVerdict, gates: &[GateSlot<'_>]) -> String {
     let verdict_label = match verdict {
@@ -61,8 +61,7 @@ pub fn render_audit(delta: &Delta, verdict: TriVerdict, gates: &[GateSlot<'_>]) 
     out
 }
 
-/// A baseline comparison (`--baseline`) as the same compact Markdown delta,
-/// with the two-state verdict every non-audit command uses.
+/// An artifact baseline comparison as a compact Markdown delta.
 pub fn render_delta(delta: &Delta, verdict: Verdict) -> String {
     let verdict_label = match verdict {
         Verdict::Pass => "pass",
@@ -76,27 +75,44 @@ pub fn render_delta(delta: &Delta, verdict: Verdict) -> String {
 fn push_delta_body(out: &mut String, delta: &Delta) {
     writeln!(
         out,
-        "unchanged: {} — resolved: {}",
+        "unchanged: {} — resolved: {} — severity changed: {}",
         delta.unchanged_count,
-        delta.resolved.len()
+        delta.resolved.len(),
+        delta.severity_changed.len(),
     )
     .unwrap();
     let (gating, advisory): (Vec<&Finding>, Vec<&Finding>) = delta
-        .code_introduced
+        .introduced
         .iter()
         .partition(|finding| finding.is_gating());
-    push_section(out, "code-introduced", &gating);
+    push_section(out, "introduced", &gating);
     push_section(
         out,
-        "code-introduced advisory (heuristic — no verdict effect)",
+        "introduced advisory (heuristic — no verdict effect)",
         &advisory,
     );
-    let rule_introduced: Vec<&Finding> = delta.rule_introduced.iter().collect();
-    push_section(
-        out,
-        "rule-introduced (protected, does not fail)",
-        &rule_introduced,
-    );
+    if !delta.severity_changed.is_empty() {
+        writeln!(
+            out,
+            "\n### severity changed: {}",
+            delta.severity_changed.len()
+        )
+        .unwrap();
+        out.push_str("\n| rule | previous | current | location | item |\n|---|---|---|---|---|\n");
+        for change in &delta.severity_changed {
+            writeln!(
+                out,
+                "| {} | {} | {} | {}:{} | {} |",
+                change.after.rule,
+                severity_label(change.before.severity),
+                severity_label(change.after.severity),
+                crate::sarif::artifact_uri(&change.after.location.file),
+                change.after.location.line,
+                change.after.location.item_path
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn push_section(out: &mut String, title: &str, findings: &[&Finding]) {
@@ -160,7 +176,7 @@ mod tests {
     #[test]
     fn render_audit_golden() {
         let delta = Delta {
-            code_introduced: vec![
+            introduced: vec![
                 finding(
                     "duplicate-code",
                     Severity::Warn,
@@ -178,15 +194,10 @@ mod tests {
                     "src/b.rs",
                 ),
             ],
-            rule_introduced: vec![finding(
-                "generic-naming",
-                Severity::Warn,
-                EvidenceClass::DerivedFact,
-                "src/c.rs",
-                7,
-                "handle_data",
-            )],
+            code_introduced: Vec::new(),
+            rule_introduced: Vec::new(),
             resolved: Vec::new(),
+            severity_changed: Vec::new(),
             unchanged_count: 4,
         };
         let evaluated = crate::gate::ratio_gate("duplication-ratio", 3, 100, 1, 0.0);
@@ -213,25 +224,19 @@ mod tests {
 - gate `duplication-ratio`: fail — 3/100 (min sample 1, max ratio 0)
 - gate `suppression-debt-ratio`: not evaluated (pass --audit-min-sample and --max-suppression-ratio to enable)
 
-unchanged: 4 — resolved: 0
+unchanged: 4 — resolved: 0 — severity changed: 0
 
-### code-introduced: 1
+### introduced: 1
 
 | rule | severity | location | item |
 |---|---|---|---|
 | duplicate-code | warn | src/a.rs:3 | foo |
 
-### code-introduced advisory (heuristic — no verdict effect): 1
+### introduced advisory (heuristic — no verdict effect): 1
 
 | rule | severity | location | item |
 |---|---|---|---|
 | hotspot | info | src/b.rs:1 | src/b.rs |
-
-### rule-introduced (protected, does not fail): 1
-
-| rule | severity | location | item |
-|---|---|---|---|
-| generic-naming | warn | src/c.rs:7 | handle_data |
 "
         );
     }
@@ -239,9 +244,11 @@ unchanged: 4 — resolved: 0
     #[test]
     fn render_delta_uses_the_two_state_verdict_and_skips_empty_tables() {
         let delta = Delta {
+            introduced: Vec::new(),
             code_introduced: Vec::new(),
             rule_introduced: Vec::new(),
             resolved: Vec::new(),
+            severity_changed: Vec::new(),
             unchanged_count: 2,
         };
 
@@ -252,13 +259,11 @@ unchanged: 4 — resolved: 0
             "\
 **verdict: pass**
 
-unchanged: 2 — resolved: 0
+unchanged: 2 — resolved: 0 — severity changed: 0
 
-### code-introduced: 0
+### introduced: 0
 
-### code-introduced advisory (heuristic — no verdict effect): 0
-
-### rule-introduced (protected, does not fail): 0
+### introduced advisory (heuristic — no verdict effect): 0
 "
         );
     }
@@ -266,7 +271,7 @@ unchanged: 2 — resolved: 0
     #[test]
     fn table_locations_use_forward_slashes_for_windows_style_paths() {
         let delta = Delta {
-            code_introduced: vec![finding(
+            introduced: vec![finding(
                 "duplicate-code",
                 Severity::Warn,
                 EvidenceClass::DerivedFact,
@@ -274,8 +279,10 @@ unchanged: 2 — resolved: 0
                 3,
                 "foo",
             )],
+            code_introduced: Vec::new(),
             rule_introduced: Vec::new(),
             resolved: Vec::new(),
+            severity_changed: Vec::new(),
             unchanged_count: 0,
         };
 
