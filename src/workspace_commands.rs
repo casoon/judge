@@ -3,6 +3,43 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Loads the workspace and runs the shared complexity/duplication pass,
+/// respecting `--include-tests`. Shared by `complexity` and `map`, whose
+/// data-loading preamble is otherwise byte-identical; neither command needs
+/// the `Workspace` itself afterwards, only the derived `RefactorMap`.
+fn load_complexity_map(include_tests: bool) -> Result<judge::refactor_map::RefactorMap, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    Ok(judge::refactor_map::analyze(&workspace, include_tests))
+}
+
+/// Renders up to `limit` files ranked by measured complexity. Shared by
+/// `complexity` (top 20) and `map` (top 15) — the limit is the only
+/// difference between the two callers.
+fn print_top_complexity_files_tty(
+    out: &mut dyn Write,
+    map: &judge::refactor_map::RefactorMap,
+    limit: usize,
+) -> std::io::Result<()> {
+    for file in map
+        .files
+        .iter()
+        .filter(|file| file.complexity_rank.is_some())
+        .take(limit)
+    {
+        let metrics = file.complexity_in_scope(map.includes_tests);
+        writeln!(
+            out,
+            "  #{:<2} {:>4} total, {:>3} max, {:>3} functions  {}",
+            file.complexity_rank.unwrap(),
+            metrics.total_cyclomatic,
+            metrics.max_cyclomatic,
+            metrics.functions,
+            file.file.display()
+        )?;
+    }
+    Ok(())
+}
+
 /// Current-state workspace architecture, deliberately independent of Git.
 pub(super) fn run_structure(
     options: StructureOptions,
@@ -105,8 +142,7 @@ pub(super) fn run_complexity(
     options: ComplexityOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
-    let map = judge::refactor_map::analyze(&workspace, options.include_tests);
+    let map = load_complexity_map(options.include_tests)?;
     match options.format {
         OutputFormat::Json => write_json(
             out,
@@ -128,23 +164,7 @@ pub(super) fn run_complexity(
                     "production"
                 }
             )?;
-            for file in map
-                .files
-                .iter()
-                .filter(|file| file.complexity_rank.is_some())
-                .take(20)
-            {
-                let metrics = file.complexity_in_scope(map.includes_tests);
-                writeln!(
-                    out,
-                    "  #{:<2} {:>4} total, {:>3} max, {:>3} functions  {}",
-                    file.complexity_rank.unwrap(),
-                    metrics.total_cyclomatic,
-                    metrics.max_cyclomatic,
-                    metrics.functions,
-                    file.file.display()
-                )?;
-            }
+            print_top_complexity_files_tty(out, &map, 20)?;
             if !map.analysis_errors.is_empty() {
                 writeln!(out, "analysis errors: {}", map.analysis_errors.len())?;
             }
@@ -340,13 +360,10 @@ pub(super) fn run_map(
     options: MapOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
-    let map = judge::refactor_map::analyze(&workspace, options.include_tests);
+    let map = load_complexity_map(options.include_tests)?;
 
     match options.format {
-        OutputFormat::Json => {
-            writeln!(out, "{}", serde_json::to_string_pretty(&map).unwrap())?;
-        }
+        OutputFormat::Json => write_json(out, &map)?,
         OutputFormat::Tty => {
             let authored_files = map
                 .files
@@ -374,23 +391,7 @@ pub(super) fn run_map(
                     "production code"
                 }
             )?;
-            for file in map
-                .files
-                .iter()
-                .filter(|file| file.complexity_rank.is_some())
-                .take(15)
-            {
-                let metrics = file.complexity_in_scope(map.includes_tests);
-                writeln!(
-                    out,
-                    "  #{:<2} {:>4} total, {:>3} max, {:>3} functions  {}",
-                    file.complexity_rank.unwrap(),
-                    metrics.total_cyclomatic,
-                    metrics.max_cyclomatic,
-                    metrics.functions,
-                    file.file.display()
-                )?;
-            }
+            print_top_complexity_files_tty(out, &map, 15)?;
             writeln!(out)?;
             writeln!(
                 out,
@@ -430,9 +431,7 @@ pub(super) fn run_impact(
         .map_err(|err| CliError::Config(err.to_string()))?;
 
     match options.format {
-        OutputFormat::Json => {
-            writeln!(out, "{}", serde_json::to_string_pretty(&impact).unwrap())?;
-        }
+        OutputFormat::Json => write_json(out, &impact)?,
         OutputFormat::Tty => {
             writeln!(out, "impact: {}", impact.target.display())?;
             writeln!(out, "crate: {}", impact.crate_name)?;

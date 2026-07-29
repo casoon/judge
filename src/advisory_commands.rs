@@ -2,6 +2,57 @@
 
 use super::*;
 
+/// Rejects `sarif`/`markdown` up front; every advisory command in this
+/// module only supports `tty`/`json`. Shared so the supported-format list is
+/// stated once instead of duplicated per command.
+fn reject_unsupported_advisory_format(
+    format: OutputFormat,
+    command_name: &str,
+) -> Result<(), CliError> {
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format(command_name, format, "tty, json"));
+    }
+    Ok(())
+}
+
+/// Pretty-prints `value` as the `json` closure every [`render_advisory`]
+/// caller passes — factored out so the call sites don't each repeat the same
+/// `Ok(serde_json::to_string_pretty(..)?)` wrapper.
+fn to_json_string<T: Serialize + ?Sized>(value: &T) -> Result<String, CliError> {
+    Ok(serde_json::to_string_pretty(value)?)
+}
+
+/// Converts a TTY renderer's `std::io::Result` into this module's
+/// `CliError`, as the `tty` closure every [`render_advisory`] caller passes
+/// — factored out so the call sites don't each repeat the same
+/// `Ok(print_..(..)?)` wrapper.
+fn to_cli_result(result: std::io::Result<()>) -> Result<(), CliError> {
+    Ok(result?)
+}
+
+/// Dispatches an advisory command's final `tty`/`json` rendering. Every
+/// advisory command in this module rejects `sarif`/`markdown` up front (via
+/// [`reject_unsupported_advisory_format`]) before reaching here, so the
+/// `sarif`/`markdown` arm is unreachable by construction. `json` is a
+/// closure (not an already-built value) so the json serialization work is
+/// only ever paid for `--format json`, matching the original per-command
+/// match arms this replaces.
+fn render_advisory(
+    out: &mut dyn Write,
+    format: OutputFormat,
+    json: impl FnOnce() -> Result<String, CliError>,
+    tty: impl FnOnce(&mut dyn Write) -> Result<(), CliError>,
+) -> Result<CommandOutcome, CliError> {
+    match format {
+        OutputFormat::Json => writeln!(out, "{}", json()?)?,
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            unreachable!("rejected above before dispatch")
+        }
+        OutputFormat::Tty => tty(out)?,
+    }
+    Ok(CommandOutcome::Clean)
+}
+
 /// Runs the shared slop and optional Clippy evidence pass for the pattern
 /// commands. Keeping it local prevents standalone commands from duplicating
 /// their analysis inputs.
@@ -41,9 +92,7 @@ pub(super) fn run_patterns(
         save_pattern_baseline,
         pattern_baseline,
     } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`patterns`", format, "tty, json"));
-    }
+    reject_unsupported_advisory_format(format, "`patterns`")?;
     let workspace = judge::ingest::load(None)?;
     let candidates = collect_pattern_candidates(&workspace, clippy_json.as_deref())?;
 
@@ -63,30 +112,19 @@ pub(super) fn run_patterns(
     if let Some(path) = &pattern_baseline {
         let baseline = judge::pattern_baseline::load(path)?;
         let delta = judge::pattern_baseline::diff_patterns(&candidates, &baseline);
-        match format {
-            OutputFormat::Json => {
-                let json = serde_json::json!({ "delta": delta });
-                let json_str = serde_json::to_string_pretty(&json)?;
-                writeln!(out, "{}", json_str)?;
-            }
-            OutputFormat::Sarif | OutputFormat::Markdown => {
-                unreachable!("rejected above before loading the workspace")
-            }
-            OutputFormat::Tty => print_pattern_delta_tty(out, &delta)?,
-        }
-        return Ok(CommandOutcome::Clean);
+        return render_advisory(
+            out,
+            format,
+            || to_json_string(&serde_json::json!({ "delta": delta })),
+            |out| to_cli_result(print_pattern_delta_tty(out, &delta)),
+        );
     }
 
-    match format {
-        OutputFormat::Json => {
-            let json = serde_json::json!({ "candidates": candidates });
-            let json_str = serde_json::to_string_pretty(&json)?;
-            writeln!(out, "{}", json_str)?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => {
+    render_advisory(
+        out,
+        format,
+        || to_json_string(&serde_json::json!({ "candidates": candidates })),
+        |out| {
             writeln!(
                 out,
                 "heuristic pattern suggestions — advisory, no verdict effect: {}",
@@ -99,9 +137,9 @@ pub(super) fn run_patterns(
                     candidate.id, candidate.pattern, candidate.scope.krate
                 )?;
             }
-        }
-    }
-    Ok(CommandOutcome::Clean)
+            Ok(())
+        },
+    )
 }
 
 /// Loads the workspace's complexity metrics (same complexity pass
@@ -140,22 +178,15 @@ pub(super) fn run_principles(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let PrinciplesOptions { format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`principles`", format, "tty, json"));
-    }
+    reject_unsupported_advisory_format(format, "`principles`")?;
     let workspace = judge::ingest::load(None)?;
     let heuristics = collect_principle_heuristics(&workspace)?;
 
-    match format {
-        OutputFormat::Json => {
-            let json = serde_json::json!({ "heuristics": heuristics });
-            let json_str = serde_json::to_string_pretty(&json)?;
-            writeln!(out, "{}", json_str)?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => {
+    render_advisory(
+        out,
+        format,
+        || to_json_string(&serde_json::json!({ "heuristics": heuristics })),
+        |out| {
             writeln!(
                 out,
                 "design principle heuristics — advisory, no verdict effect, always a judgment \
@@ -172,9 +203,9 @@ pub(super) fn run_principles(
                     writeln!(out, "    - {module}")?;
                 }
             }
-        }
-    }
-    Ok(CommandOutcome::Clean)
+            Ok(())
+        },
+    )
 }
 
 /// Finds the pattern candidate `id` refers to, re-running the same analysis
@@ -273,23 +304,16 @@ pub(super) fn run_explain_pattern(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let ExplainPatternOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`explain-pattern`", format, "tty, json"));
-    }
+    reject_unsupported_advisory_format(format, "`explain-pattern`")?;
     let workspace = judge::ingest::load(None)?;
     let candidate = find_pattern_candidate(&workspace, &id)?;
 
-    match format {
-        OutputFormat::Json => {
-            let json_str = serde_json::to_string_pretty(&candidate)?;
-            writeln!(out, "{}", json_str)?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => print_pattern_candidate_tty(out, &candidate)?,
-    }
-    Ok(CommandOutcome::Clean)
+    render_advisory(
+        out,
+        format,
+        || to_json_string(&candidate),
+        |out| to_cli_result(print_pattern_candidate_tty(out, &candidate)),
+    )
 }
 
 /// Full TTY rendering of one principle heuristic: scope, evidence,
@@ -342,27 +366,16 @@ pub(super) fn run_explain_principle(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let ExplainPrincipleOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format(
-            "`explain-principle`",
-            format,
-            "tty, json",
-        ));
-    }
+    reject_unsupported_advisory_format(format, "`explain-principle`")?;
     let workspace = judge::ingest::load(None)?;
     let heuristic = find_principle_heuristic(&workspace, &id)?;
 
-    match format {
-        OutputFormat::Json => {
-            let json_str = serde_json::to_string_pretty(&heuristic)?;
-            writeln!(out, "{}", json_str)?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => print_principle_heuristic_tty(out, &heuristic)?,
-    }
-    Ok(CommandOutcome::Clean)
+    render_advisory(
+        out,
+        format,
+        || to_json_string(&heuristic),
+        |out| to_cli_result(print_principle_heuristic_tty(out, &heuristic)),
+    )
 }
 
 /// `cargo judge fix-preview <id>` (todo.md §16.5): only the migration plan
@@ -373,14 +386,14 @@ pub(super) fn run_fix_preview(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let FixPreviewOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`fix-preview`", format, "tty, json"));
-    }
+    reject_unsupported_advisory_format(format, "`fix-preview`")?;
     let workspace = judge::ingest::load(None)?;
     let candidate = find_pattern_candidate(&workspace, &id)?;
 
-    match format {
-        OutputFormat::Json => {
+    render_advisory(
+        out,
+        format,
+        || {
             let json = serde_json::json!({
                 "id": candidate.id,
                 "pattern": candidate.pattern,
@@ -389,13 +402,9 @@ pub(super) fn run_fix_preview(
                 "patch": serde_json::Value::Null,
                 "note": "migration plan only — no patch is generated (see todo.md §16.5)",
             });
-            let json_str = serde_json::to_string_pretty(&json)?;
-            writeln!(out, "{}", json_str)?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before loading the workspace")
-        }
-        OutputFormat::Tty => {
+            to_json_string(&json)
+        },
+        |out| {
             writeln!(
                 out,
                 "fix preview for {} ({}) — no patch is generated, migration plan only:",
@@ -416,9 +425,9 @@ pub(super) fn run_fix_preview(
             for finding_id in &candidate.related_findings {
                 writeln!(out, "  {finding_id}")?;
             }
-        }
-    }
-    Ok(CommandOutcome::Clean)
+            Ok(())
+        },
+    )
 }
 
 /// `cargo judge explain-rule <id>` (todo.md §17.5): a rule's fixed
@@ -432,14 +441,14 @@ pub(super) fn run_explain_rule(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let ExplainRuleOptions { id, format } = options;
-    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
-        return Err(unsupported_format("`explain-rule`", format, "tty, json"));
-    }
+    reject_unsupported_advisory_format(format, "`explain-rule`")?;
     let entry = judge::rule_registry::lookup(&id)
         .ok_or_else(|| CliError::Analyzer(format!("unknown rule id: {id}")))?;
 
-    match format {
-        OutputFormat::Json => {
+    render_advisory(
+        out,
+        format,
+        || {
             let example = entry.example.map(|example| {
                 serde_json::json!({
                     "before": example.before,
@@ -455,13 +464,9 @@ pub(super) fn run_explain_rule(
                 "allowed_wording": entry.allowed_wording,
                 "example": example,
             });
-            let json_str = serde_json::to_string_pretty(&json)?;
-            writeln!(out, "{}", json_str)?;
-        }
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            unreachable!("rejected above before looking up the rule")
-        }
-        OutputFormat::Tty => {
+            to_json_string(&json)
+        },
+        |out| {
             let evidence_class = serde_json::to_value(entry.evidence_class)?;
             writeln!(out, "rule: {}", entry.id)?;
             writeln!(
@@ -480,7 +485,7 @@ pub(super) fn run_explain_rule(
                 }
                 writeln!(out, "  why it matters: {}", example.why_it_matters)?;
             }
-        }
-    }
-    Ok(CommandOutcome::Clean)
+            Ok(())
+        },
+    )
 }
