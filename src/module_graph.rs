@@ -82,7 +82,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use syn::visit::{self, Visit};
-use syn::{Item, ItemUse, UseTree};
+use syn::{Item, ItemUse};
 
 use crate::finding::{
     EvidenceClass, Finding, FindingGraph, FindingId, Location, OneBasedLine, Origin, Severity,
@@ -247,8 +247,7 @@ fn visit_items(
             continue;
         }
 
-        let Some(child_file) = resolve_mod_file(file, &item_mod.attrs, &item_mod.ident.to_string())
-        else {
+        let Some(child_file) = resolve_mod_item_file(file, item_mod) else {
             continue; // unresolved mod target — undiscoverable, not an error
         };
         if tree.file_module_path.contains_key(&child_file) {
@@ -292,6 +291,13 @@ fn resolve_mod_file(
         return Some(as_mod_dir);
     }
     None
+}
+
+/// [`resolve_mod_file`] for an out-of-line `mod` item directly — shared by
+/// [`visit_items`] (building the tree) and [`unlinked_file_findings`]'s own
+/// second, causal-edge-only re-walk of an unreached file's `mod` items.
+fn resolve_mod_item_file(declaring_file: &Path, item_mod: &syn::ItemMod) -> Option<PathBuf> {
+    resolve_mod_file(declaring_file, &item_mod.attrs, &item_mod.ident.to_string())
 }
 
 /// Reads a `#[path = "..."]` attribute's string value, if present. Unlike
@@ -396,6 +402,34 @@ pub fn analyze_workspace(workspace: &Workspace, include_generated: bool) -> Work
     }
 }
 
+/// Each workspace crate paired with its own resolved [`CrateModuleTree`] —
+/// shared by [`unlinked_file_findings`] and [`orphan_module_findings`], the
+/// two traversals that both need a crate's tree looked up by name out of
+/// `trees`.
+fn crates_with_trees<'a>(
+    workspace: &'a Workspace,
+    trees: &'a HashMap<&str, CrateModuleTree>,
+) -> impl Iterator<Item = (&'a CrateInfo, &'a CrateModuleTree)> {
+    workspace
+        .crates
+        .iter()
+        .map(move |krate| (krate, &trees[krate.name.as_str()]))
+}
+
+/// Whether a file/module of `kind` should be skipped under the default
+/// (non-`include_generated`) mode, counting it into `excluded_generated` —
+/// shared by [`unlinked_file_findings`] and [`orphan_module_findings`], which
+/// both report a single combined `excluded_generated` total (see
+/// [`WorkspaceModuleGraph::excluded_generated`]).
+fn skip_generated(kind: SourceKind, include_generated: bool, excluded_generated: &mut usize) -> bool {
+    if kind == SourceKind::Generated && !include_generated {
+        *excluded_generated += 1;
+        true
+    } else {
+        false
+    }
+}
+
 /// `unlinked-file`: every crate source file never reached by
 /// [`build_crate_module_tree`]'s traversal. Causally groups a missing root's
 /// own cascade of unreached children under it (see module docs' "Kausale
@@ -412,15 +446,13 @@ fn unlinked_file_findings(
     errors: &mut Vec<ModuleGraphError>,
 ) -> Vec<Finding> {
     let mut unreached_by_crate: HashMap<&str, Vec<&SourceFile>> = HashMap::new();
-    for krate in &workspace.crates {
-        let tree = &trees[krate.name.as_str()];
+    for (krate, tree) in crates_with_trees(workspace, trees) {
         let mut unreached = Vec::new();
         for file in &krate.source_files {
             if tree.file_module_path.contains_key(&file.path) {
                 continue;
             }
-            if file.kind == SourceKind::Generated && !include_generated {
-                *excluded_generated += 1;
+            if skip_generated(file.kind, include_generated, excluded_generated) {
                 continue;
             }
             unreached.push(file);
@@ -430,8 +462,7 @@ fn unlinked_file_findings(
 
     let mut graph = FindingGraph::new();
     let mut id_by_path: HashMap<&Path, FindingId> = HashMap::new();
-    for krate in &workspace.crates {
-        let tree = &trees[krate.name.as_str()];
+    for (krate, tree) in crates_with_trees(workspace, trees) {
         for file in &unreached_by_crate[krate.name.as_str()] {
             let finding = unlinked_file_finding(krate, file, tree);
             let id = finding.id.clone();
@@ -458,9 +489,7 @@ fn unlinked_file_findings(
                 if item_mod.content.is_some() {
                     continue;
                 }
-                let Some(child_file) =
-                    resolve_mod_file(&file.path, &item_mod.attrs, &item_mod.ident.to_string())
-                else {
+                let Some(child_file) = resolve_mod_item_file(&file.path, item_mod) else {
                     continue;
                 };
                 if let Some(effect_id) = id_by_path.get(child_file.as_path())
@@ -509,11 +538,12 @@ struct ReferenceHit {
 
 /// Collects every `crate::…`/`super::…`/`<crate-name>::…`-qualified
 /// reference (plus the narrow bare-reference exception — see module docs) in
-/// one parsed file, resolved to `(owning crate, module path)` pairs.
-/// Duplicates `boundaries.rs`'s `resolve_leading_segments`/
-/// `use_tree_leaf_segments` shape — that module's helpers are private, the
-/// same trade-off `principle.rs` already documents for its own duplication
-/// of them.
+/// one parsed file, resolved to `(owning crate, module path)` pairs. Shares
+/// `boundaries.rs`'s `use_tree_leaf_segments`/`pop_leading_supers` helpers —
+/// `resolve` itself stays separate from `boundaries.rs`'s
+/// `resolve_leading_segments`: this resolver also needs the cross-crate
+/// `crate_by_identifier` lookup and the bare-reference exception, neither of
+/// which that module's narrower, single-crate resolution has any use for.
 struct ReferenceCollector<'a> {
     own_crate: &'a str,
     /// `None` when the current file's own module path is unknown (the file
@@ -544,10 +574,7 @@ impl ReferenceCollector<'_> {
         if head == "super" {
             let mut parts = module_path_segments(self.current_module?);
             parts.pop()?;
-            while segments.first().map(String::as_str) == Some("super") {
-                segments.remove(0);
-                parts.pop()?;
-            }
+            crate::boundaries::pop_leading_supers(&mut parts, &mut segments)?;
             parts.extend(segments);
             return Some((self.own_crate.to_string(), parts.join("::")));
         }
@@ -561,39 +588,10 @@ impl ReferenceCollector<'_> {
     }
 }
 
-/// Collects every leaf path of a `use` tree as a flat segment chain,
-/// including its leading identifier — duplicates
-/// `boundaries.rs::use_tree_leaf_segments` (private there).
-fn use_tree_leaf_segments(tree: &UseTree, acc: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
-    match tree {
-        UseTree::Path(use_path) => {
-            acc.push(use_path.ident.to_string());
-            use_tree_leaf_segments(&use_path.tree, acc, out);
-            acc.pop();
-        }
-        UseTree::Name(use_name) => {
-            let mut leaf = acc.clone();
-            leaf.push(use_name.ident.to_string());
-            out.push(leaf);
-        }
-        UseTree::Rename(use_rename) => {
-            let mut leaf = acc.clone();
-            leaf.push(use_rename.ident.to_string());
-            out.push(leaf);
-        }
-        UseTree::Glob(_) => out.push(acc.clone()),
-        UseTree::Group(group) => {
-            for item in &group.items {
-                use_tree_leaf_segments(item, acc, out);
-            }
-        }
-    }
-}
-
 impl<'ast> Visit<'ast> for ReferenceCollector<'_> {
     fn visit_item_use(&mut self, node: &'ast ItemUse) {
         let mut leaves = Vec::new();
-        use_tree_leaf_segments(&node.tree, &mut Vec::new(), &mut leaves);
+        crate::boundaries::use_tree_leaf_segments(&node.tree, &mut Vec::new(), &mut leaves);
         for leaf in leaves {
             if let Some(hit) = self.resolve(leaf) {
                 self.hits.push(hit);
@@ -671,8 +669,7 @@ fn orphan_module_findings(
 
     let mut hits: Vec<ReferenceHit> = Vec::new();
     let mut files_scanned = 0usize;
-    for krate in &workspace.crates {
-        let tree = &trees[krate.name.as_str()];
+    for (krate, tree) in crates_with_trees(workspace, trees) {
         for file in &krate.source_files {
             let Ok(source) = std::fs::read_to_string(&file.path) else {
                 continue;
@@ -709,16 +706,14 @@ fn orphan_module_findings(
     }
 
     let mut findings = Vec::new();
-    for krate in &workspace.crates {
-        let tree = &trees[krate.name.as_str()];
+    for (krate, tree) in crates_with_trees(workspace, trees) {
         for node in &tree.nodes {
             let node_kind = krate
                 .source_files
                 .iter()
                 .find(|file| file.path == node.file)
                 .map_or(SourceKind::Authored, |file| file.kind);
-            if node_kind == SourceKind::Generated && !include_generated {
-                *excluded_generated += 1;
+            if skip_generated(node_kind, include_generated, excluded_generated) {
                 continue;
             }
 

@@ -369,6 +369,21 @@ pub struct CrateGraph {
     pub edges: HashMap<String, Vec<String>>,
 }
 
+/// Runs a lightweight `cargo metadata --no-deps` call scoped to
+/// `manifest_path` (or the current directory's workspace, if `None`) —
+/// shared by [`build_crate_graph`] and [`feature_graph_cycles`], the two
+/// callers needing raw `cargo_metadata::Metadata` rather than the derived
+/// [`CrateGraph`].
+fn workspace_metadata(
+    manifest_path: Option<&Path>,
+) -> Result<cargo_metadata::Metadata, BoundaryConfigError> {
+    let mut cmd = MetadataCommand::new();
+    if let Some(path) = manifest_path {
+        cmd.manifest_path(path);
+    }
+    cmd.no_deps().exec().map_err(BoundaryConfigError::Metadata)
+}
+
 /// Builds a [`CrateGraph`] by running a lightweight `cargo metadata
 /// --no-deps` call scoped to `manifest_path` (or the current directory's
 /// workspace, if `None`). An edge `crate_a -> crate_b` exists whenever
@@ -376,16 +391,9 @@ pub struct CrateGraph {
 /// `crate_b` is itself a workspace member. Edges are sorted, so graph
 /// traversal is deterministic.
 pub fn build_crate_graph(manifest_path: Option<&Path>) -> Result<CrateGraph, BoundaryConfigError> {
-    let mut cmd = MetadataCommand::new();
-    if let Some(path) = manifest_path {
-        cmd.manifest_path(path);
-    }
-    let metadata = cmd
-        .no_deps()
-        .exec()
-        .map_err(BoundaryConfigError::Metadata)?;
+    let metadata = workspace_metadata(manifest_path)?;
 
-    let workspace_crate_names: HashSet<String> = metadata
+    let known_crate_names: HashSet<String> = metadata
         .packages
         .iter()
         .map(|package| package.name.to_string())
@@ -397,7 +405,7 @@ pub fn build_crate_graph(manifest_path: Option<&Path>) -> Result<CrateGraph, Bou
             .dependencies
             .iter()
             .map(|dep| dep.name.clone())
-            .filter(|name| workspace_crate_names.contains(name))
+            .filter(|name| known_crate_names.contains(name))
             .collect();
         deps.sort();
         deps.dedup();
@@ -420,6 +428,38 @@ fn mermaid_node_id(name: &str) -> String {
 }
 
 impl CrateGraph {
+    /// Crate names in this graph, sorted — the deterministic node order both
+    /// [`Self::to_dot`] and [`Self::to_mermaid`] enumerate nodes and edges
+    /// in.
+    fn sorted_names(&self) -> Vec<&String> {
+        let mut names: Vec<&String> = self.edges.keys().collect();
+        names.sort();
+        names
+    }
+
+    /// Renders one node line per crate (via `node_line`) followed by one
+    /// edge line per workspace-internal dependency (via `edge_line`), in
+    /// [`Self::sorted_names`] order — the shared traversal
+    /// [`Self::to_dot`]/[`Self::to_mermaid`] both need; only the two
+    /// renderers' distinct line formatting differs.
+    fn render_lines(
+        &self,
+        mut node_line: impl FnMut(&str) -> String,
+        mut edge_line: impl FnMut(&str, &str) -> String,
+    ) -> String {
+        let names = self.sorted_names();
+        let mut out = String::new();
+        for name in &names {
+            out.push_str(&node_line(name));
+        }
+        for name in &names {
+            for dep in &self.edges[*name] {
+                out.push_str(&edge_line(name, dep));
+            }
+        }
+        out
+    }
+
     /// Renders this graph as Graphviz DOT source (todo.md §H) — a pure
     /// projection of `edges`, one node per crate plus one directed edge per
     /// workspace-internal dependency. No new graph is computed; this only
@@ -427,18 +467,11 @@ impl CrateGraph {
     /// Crates and their dependency lists are printed in sorted order, so the
     /// output is deterministic run to run.
     pub fn to_dot(&self) -> String {
-        let mut names: Vec<&String> = self.edges.keys().collect();
-        names.sort();
-
         let mut out = String::from("digraph crates {\n");
-        for name in &names {
-            out.push_str(&format!("  \"{name}\";\n"));
-        }
-        for name in &names {
-            for dep in &self.edges[*name] {
-                out.push_str(&format!("  \"{name}\" -> \"{dep}\";\n"));
-            }
-        }
+        out.push_str(&self.render_lines(
+            |name| format!("  \"{name}\";\n"),
+            |name, dep| format!("  \"{name}\" -> \"{dep}\";\n"),
+        ));
         out.push_str("}\n");
         out
     }
@@ -448,22 +481,11 @@ impl CrateGraph {
     /// are sanitized (see [`mermaid_node_id`]); each node's original crate
     /// name is preserved as its display label.
     pub fn to_mermaid(&self) -> String {
-        let mut names: Vec<&String> = self.edges.keys().collect();
-        names.sort();
-
         let mut out = String::from("flowchart TD\n");
-        for name in &names {
-            out.push_str(&format!("  {}[\"{name}\"]\n", mermaid_node_id(name)));
-        }
-        for name in &names {
-            for dep in &self.edges[*name] {
-                out.push_str(&format!(
-                    "  {} --> {}\n",
-                    mermaid_node_id(name),
-                    mermaid_node_id(dep)
-                ));
-            }
-        }
+        out.push_str(&self.render_lines(
+            |name| format!("  {}[\"{name}\"]\n", mermaid_node_id(name)),
+            |name, dep| format!("  {} --> {}\n", mermaid_node_id(name), mermaid_node_id(dep)),
+        ));
         out
     }
 }
@@ -473,6 +495,36 @@ impl CrateGraph {
 #[derive(Debug, Default)]
 pub struct WorkspaceBoundaries {
     pub findings: Vec<Finding>,
+}
+
+/// Returns [`BoundaryConfigError::UnknownCrate`] unless `crate_name` is a
+/// known workspace crate — the single check every `[[boundary]]`,
+/// `[[module_boundary]]`, `internal_crates`, and `layers.assign` validator
+/// reduces to (see todo.md §14.2 P1/P2 bullet 2).
+fn require_known_crate(
+    crate_names: &HashSet<&str>,
+    rule_name: &str,
+    crate_name: &str,
+) -> Result<(), BoundaryConfigError> {
+    if crate_names.contains(crate_name) {
+        Ok(())
+    } else {
+        Err(BoundaryConfigError::UnknownCrate {
+            rule: rule_name.to_string(),
+            crate_name: crate_name.to_string(),
+        })
+    }
+}
+
+/// Every workspace crate's own name, as a lookup set — shared by
+/// [`validate_internal_crates`] and [`evaluate`], the two callers that need
+/// a full crate-name set rather than [`CrateGraph`]'s dependency edges.
+fn workspace_crate_names(workspace: &Workspace) -> HashSet<&str> {
+    workspace
+        .crates
+        .iter()
+        .map(|krate| krate.name.as_str())
+        .collect()
 }
 
 /// Validates that every crate name a rule references actually exists in the
@@ -492,12 +544,7 @@ fn validate_config(
             .chain(rule.forbidden.iter())
             .chain(rule.required.iter())
         {
-            if !crate_names.contains(name.as_str()) {
-                return Err(BoundaryConfigError::UnknownCrate {
-                    rule: rule.name.clone(),
-                    crate_name: name.clone(),
-                });
-            }
+            require_known_crate(crate_names, &rule.name, name)?;
         }
     }
     Ok(())
@@ -514,12 +561,7 @@ fn validate_internal_crates_config(
     crate_names: &HashSet<&str>,
 ) -> Result<(), BoundaryConfigError> {
     for name in &config.internal_crates {
-        if !crate_names.contains(name.as_str()) {
-            return Err(BoundaryConfigError::UnknownCrate {
-                rule: "internal_crates".to_string(),
-                crate_name: name.clone(),
-            });
-        }
+        require_known_crate(crate_names, "internal_crates", name)?;
     }
     Ok(())
 }
@@ -533,12 +575,7 @@ pub fn validate_internal_crates(
     workspace: &Workspace,
     config: &BoundaryConfig,
 ) -> Result<(), BoundaryConfigError> {
-    let crate_names: HashSet<&str> = workspace
-        .crates
-        .iter()
-        .map(|krate| krate.name.as_str())
-        .collect();
-    validate_internal_crates_config(config, &crate_names)
+    validate_internal_crates_config(config, &workspace_crate_names(workspace))
 }
 
 /// Validates every `[[module_boundary]]` rule: its `crate` must name a
@@ -550,12 +587,7 @@ fn validate_module_boundary_config(
     crate_names: &HashSet<&str>,
 ) -> Result<(), BoundaryConfigError> {
     for rule in &config.module_boundaries {
-        if !crate_names.contains(rule.krate.as_str()) {
-            return Err(BoundaryConfigError::UnknownCrate {
-                rule: rule.name.clone(),
-                crate_name: rule.krate.clone(),
-            });
-        }
+        require_known_crate(crate_names, &rule.name, &rule.krate)?;
         if rule.forbidden.is_empty() {
             return Err(BoundaryConfigError::InvalidModuleBoundary(format!(
                 "module boundary rule `{}` has no forbidden targets — a rule with no forbidden targets is vacuous",
@@ -584,6 +616,22 @@ fn group_crates(assigned: &[(&str, &str)], group_name: &str) -> Vec<String> {
 }
 
 const HEXAGONAL_ROLES: [&str; 3] = ["core", "ports", "adapters"];
+
+/// Builds a preset-generated [`BoundaryRule`]: transitive reach, no
+/// `required`, `allow_empty` off — the shape both [`generate_layered_rules`]
+/// and [`generate_feature_sliced_rules`] need for each of their pairwise
+/// from/forbidden splits ([`generate_hexagonal_rules`] differs enough —
+/// direct reach, a real `required` list — to stay separate).
+fn transitive_preset_rule(name: String, from: Vec<String>, forbidden: Vec<String>) -> BoundaryRule {
+    BoundaryRule {
+        name,
+        from,
+        forbidden,
+        required: Vec::new(),
+        reach: Reach::Transitive,
+        allow_empty: false,
+    }
+}
 
 /// `layered`: for each layer, forbids that layer's crates from reaching
 /// (directly or transitively) any crate assigned to a layer later in
@@ -620,14 +668,11 @@ fn generate_layered_rules(
         if forbidden.is_empty() {
             continue;
         }
-        rules.push(BoundaryRule {
-            name: format!("preset:layered:{inner}"),
+        rules.push(transitive_preset_rule(
+            format!("preset:layered:{inner}"),
             from,
             forbidden,
-            required: Vec::new(),
-            reach: Reach::Transitive,
-            allow_empty: false,
-        });
+        ));
     }
     Ok(rules)
 }
@@ -718,14 +763,11 @@ fn generate_feature_sliced_rules(
             .filter(|&&group| group != from_group)
             .flat_map(|group| group_crates(assigned, group))
             .collect();
-        rules.push(BoundaryRule {
-            name: format!("preset:feature-sliced:{from_group}"),
+        rules.push(transitive_preset_rule(
+            format!("preset:feature-sliced:{from_group}"),
             from,
             forbidden,
-            required: Vec::new(),
-            reach: Reach::Transitive,
-            allow_empty: false,
-        });
+        ));
     }
     Ok(rules)
 }
@@ -747,12 +789,7 @@ fn generate_layer_rules(
     assigned.sort();
 
     for (krate, _) in &assigned {
-        if !crate_names.contains(krate) {
-            return Err(BoundaryConfigError::UnknownCrate {
-                rule: "layers".to_string(),
-                crate_name: (*krate).to_string(),
-            });
-        }
+        require_known_crate(crate_names, "layers", krate)?;
     }
 
     match layers.preset {
@@ -770,11 +807,7 @@ pub fn evaluate(
     workspace: &Workspace,
     config: &BoundaryConfig,
 ) -> Result<WorkspaceBoundaries, BoundaryConfigError> {
-    let crate_names: HashSet<&str> = workspace
-        .crates
-        .iter()
-        .map(|krate| krate.name.as_str())
-        .collect();
+    let crate_names = workspace_crate_names(workspace);
     validate_config(config, &crate_names)?;
     validate_module_boundary_config(config, &crate_names)?;
     validate_internal_crates_config(config, &crate_names)?;
@@ -909,34 +942,30 @@ fn evaluate_rule(rule: &BoundaryRule, graph: &CrateGraph, cargo_toml: &Path) -> 
 
 fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) -> Finding {
     let path_str = path.join(" -> ");
-    Finding {
-        id: format!("{BOUNDARY_VIOLATION_RULE}:{}:{path_str}", rule.name).into(),
-        rule: BOUNDARY_VIOLATION_RULE.into(),
-        severity: Severity::Fail,
-        location: Location {
+    Finding::new(
+        format!("{BOUNDARY_VIOLATION_RULE}:{}:{path_str}", rule.name),
+        BOUNDARY_VIOLATION_RULE,
+        Severity::Fail,
+        Location {
             file: cargo_toml.to_path_buf(),
             line: OneBasedLine::FIRST,
             item_path: format!("{} [{}]: {path_str}", rule.name, rule.reach.label()),
         },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: None,
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+        EvidenceClass::BoundedSemantic,
+        Origin::Code,
+        None,
+    )
 }
 
 fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) -> Finding {
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{BOUNDARY_VIOLATION_RULE}:{}:missing-required:{from}",
             rule.name
-        )
-        .into(),
-        rule: BOUNDARY_VIOLATION_RULE.into(),
-        severity: Severity::Fail,
-        location: Location {
+        ),
+        BOUNDARY_VIOLATION_RULE,
+        Severity::Fail,
+        Location {
             file: cargo_toml.to_path_buf(),
             line: OneBasedLine::FIRST,
             item_path: format!(
@@ -946,13 +975,10 @@ fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) 
                 rule.required.join(", ")
             ),
         },
-        evidence_class: EvidenceClass::BoundedSemantic,
-        origin: Origin::Code,
-        evidence: None,
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+        EvidenceClass::BoundedSemantic,
+        Origin::Code,
+        None,
+    )
 }
 
 fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
@@ -1070,12 +1096,23 @@ fn resolve_leading_segments(
         }
         _ => return None,
     };
-    while segments.first().map(String::as_str) == Some("super") {
-        segments.remove(0);
-        resolved.pop()?;
-    }
+    pop_leading_supers(&mut resolved, &mut segments)?;
     resolved.extend(segments);
     Some(resolved)
+}
+
+/// Pops one level off `parts` for each additional leading `super` segment
+/// still at the front of `segments` (removing each as it's consumed) — the
+/// "more than one `super`" continuation both [`resolve_leading_segments`]
+/// and `module_graph::ReferenceCollector::resolve` need, once each has
+/// already popped its own first, already-matched `super`. `None` if walking
+/// up runs past the top of `parts`.
+pub(crate) fn pop_leading_supers(parts: &mut Vec<String>, segments: &mut Vec<String>) -> Option<()> {
+    while segments.first().map(String::as_str) == Some("super") {
+        segments.remove(0);
+        parts.pop()?;
+    }
+    Some(())
 }
 
 fn current_module_segments(current_module: &str) -> Vec<String> {
@@ -1092,7 +1129,13 @@ fn current_module_segments(current_module: &str) -> Vec<String> {
 /// level shallower (it records the whole chain, not just one segment past a
 /// target). A `use a::{b, c::d}` yields `[["a", "b"], ["a", "c", "d"]]`; a
 /// glob `use a::*` yields `[["a"]]` (no synthetic wildcard segment).
-fn use_tree_leaf_segments(tree: &UseTree, acc: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+/// `pub(crate)`: also used by `module_graph::ReferenceCollector`, which
+/// needs the same leaf-segment walk over a `use` tree.
+pub(crate) fn use_tree_leaf_segments(
+    tree: &UseTree,
+    acc: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
+) {
     match tree {
         UseTree::Path(use_path) => {
             acc.push(use_path.ident.to_string());
@@ -1314,14 +1357,7 @@ fn feature_implication_graph(package: &cargo_metadata::Package) -> CrateGraph {
 pub fn feature_graph_cycles(
     manifest_path: Option<&Path>,
 ) -> Result<Vec<Finding>, BoundaryConfigError> {
-    let mut cmd = MetadataCommand::new();
-    if let Some(path) = manifest_path {
-        cmd.manifest_path(path);
-    }
-    let metadata = cmd
-        .no_deps()
-        .exec()
-        .map_err(BoundaryConfigError::Metadata)?;
+    let metadata = workspace_metadata(manifest_path)?;
 
     let mut findings = Vec::new();
     for package in &metadata.packages {
