@@ -3,6 +3,20 @@
 
 use super::*;
 
+/// Every Fast-Tier analyzer takes a fresh iterator over the workspace's
+/// source files (each one is consumed once), so this one-liner is
+/// reconstructed at every call site rather than reused — shared here instead
+/// of repeating `workspace.crates.iter().flat_map(...)` in every command and
+/// collector.
+pub(super) fn workspace_source_files(
+    workspace: &judge::ingest::Workspace,
+) -> impl Iterator<Item = &judge::ingest::SourceFile> {
+    workspace
+        .crates
+        .iter()
+        .flat_map(|krate| krate.source_files.iter())
+}
+
 /// matching the GitHub Action's default report-only mode).
 pub(super) fn run_dupes(
     options: DupesOptions,
@@ -18,10 +32,7 @@ pub(super) fn run_dupes(
     let format = baseline_args.format;
     let workspace = judge::ingest::load(None)?;
 
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let source_files = workspace_source_files(&workspace);
     let report = judge::duplication::analyze_workspace_with_options(
         source_files,
         mode.into(),
@@ -186,52 +197,7 @@ pub(super) fn run_deps(
     let mut findings = report.findings;
 
     #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut rule_revisions = std::collections::HashMap::from([
-        (
-            judge::deps::MISPLACED_DEPENDENCY_KIND_RULE.to_string(),
-            judge::deps::MISPLACED_DEPENDENCY_KIND_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_DEV_DEPENDENCY_RULE.to_string(),
-            judge::deps::UNUSED_DEV_DEPENDENCY_RULE_REVISION,
-        ),
-        (
-            judge::deps::HEAVY_DEPENDENCY_RULE.to_string(),
-            judge::deps::HEAVY_DEPENDENCY_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_FEATURE_FLAG_RULE.to_string(),
-            judge::deps::UNUSED_FEATURE_FLAG_RULE_REVISION,
-        ),
-        (
-            judge::deps::DEFAULT_FEATURES_UNUSED_RULE.to_string(),
-            judge::deps::DEFAULT_FEATURES_UNUSED_RULE_REVISION,
-        ),
-        (
-            judge::deps::UNUSED_FEATURE_RULE.to_string(),
-            judge::deps::UNUSED_FEATURE_RULE_REVISION,
-        ),
-        (
-            judge::deps::DEP_WITHOUT_REPO_RULE.to_string(),
-            judge::deps::DEP_WITHOUT_REPO_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE.to_string(),
-            judge::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::MSRV_DRIFT_RULE.to_string(),
-            judge::dep_graph::MSRV_DRIFT_RULE_REVISION,
-        ),
-        (
-            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE.to_string(),
-            judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE_REVISION,
-        ),
-        (
-            judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
-            judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
-        ),
-    ]);
+    let mut rule_revisions = super::combined_analysis::deps_rule_revisions();
     findings.extend(judge::slopsquat::analyze_name_collision(&workspace));
 
     let dep_graph_report = judge::dep_graph::analyze_workspace(&workspace);
@@ -412,10 +378,7 @@ pub(super) fn run_coverage(
 
     let coverage = judge::coverage::read_lcov(&lcov, &workspace.root)?;
 
-    let complexity_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let complexity_source_files = workspace_source_files(&workspace);
     let complexity_report = judge::complexity::analyze_workspace(complexity_source_files, false);
     let mut analysis_errors = analysis_errors(&complexity_report.errors);
     for missing in &coverage.missing_files {
@@ -447,10 +410,7 @@ pub(super) fn run_coverage(
         );
     }
 
-    let no_coverage_data_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let no_coverage_data_source_files = workspace_source_files(&workspace);
     let no_coverage_data = coverage.files_without_coverage_data(
         &workspace.root,
         no_coverage_data_source_files.map(|file| file.path.as_path()),
@@ -813,10 +773,7 @@ pub(super) fn run_unsafe(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let workspace = judge::ingest::load(None)?;
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let source_files = workspace_source_files(&workspace);
     let report = judge::security::analyze_workspace(source_files, options.include_generated);
     let findings = report
         .findings
@@ -845,10 +802,7 @@ pub(super) fn run_errors(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let workspace = judge::ingest::load(None)?;
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let source_files = workspace_source_files(&workspace);
     let config = load_judge_toml(&workspace.root)?.rules;
     let report = judge::slop::analyze_workspace(
         source_files,
@@ -886,10 +840,7 @@ pub(super) fn run_tests(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let workspace = judge::ingest::load(None)?;
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let source_files = workspace_source_files(&workspace);
     let report = judge::slop::analyze_workspace(source_files, options.include_generated, false);
     let findings = report
         .findings
@@ -920,10 +871,7 @@ pub(super) fn run_slop(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let workspace = judge::ingest::load(None)?;
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let source_files = workspace_source_files(&workspace);
     let config = load_judge_toml(&workspace.root)?.rules;
     let report = judge::slop::analyze_workspace(
         source_files,

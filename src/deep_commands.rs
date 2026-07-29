@@ -57,10 +57,7 @@ fn run_dead_code_deep(
 
     // `duplicative-reinvention` needs clone-family membership — cheap,
     // Fast Tier, same defaults `cargo judge health`/`dupes` already use.
-    let dupes_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let dupes_source_files = super::analysis_commands::workspace_source_files(&workspace);
     let dupes = judge::duplication::analyze_workspace(
         dupes_source_files,
         DupeMode::Mild,
@@ -71,10 +68,7 @@ fn run_dead_code_deep(
     // `monomorphization-load` needs each function's `generic_param_count` —
     // cheap, Fast Tier, the same `Vec<FunctionInfo>` `signature-complexity`
     // already computes.
-    let monomorphization_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let monomorphization_source_files = super::analysis_commands::workspace_source_files(&workspace);
     let complexity = judge::complexity::analyze_workspace(monomorphization_source_files, false);
 
     let structural_report = judge::slop_structural_deep::analyze_workspace(

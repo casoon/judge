@@ -60,7 +60,7 @@ pub(super) fn collect_findings_with_progress(
     progress(combined::ProgressEvent::completed("structural"))?;
 
     progress(combined::ProgressEvent::started("security"))?;
-    collect_security(workspace, &mut findings, &mut analysis_errors);
+    collect_security(workspace, &mut findings, &mut analysis_errors, false);
     progress(combined::ProgressEvent::completed("security"))?;
 
     progress(combined::ProgressEvent::started("dependencies"))?;
@@ -91,11 +91,28 @@ pub(super) fn collect_findings_with_progress(
 }
 
 fn default_rule_revisions() -> std::collections::HashMap<String, u32> {
+    let mut revisions = deps_rule_revisions();
+    revisions.insert(
+        judge::duplication::DUPLICATE_RULE.to_string(),
+        judge::duplication::DUPLICATE_RULE_REVISION,
+    );
+    revisions.extend(slop_structural_security_rule_revisions());
+    revisions.insert(
+        judge::complexity::MAINTAINABILITY_INDEX_RULE.to_string(),
+        judge::complexity::MAINTAINABILITY_INDEX_RULE_REVISION,
+    );
+    revisions
+}
+
+/// Dependency-hygiene and dependency-graph rule revisions, plus the one G5
+/// slopsquatting rule that's fully local and always on
+/// (`name-collision-risk`). Shared between this module's own default map and
+/// `run_deps`'s baseline map (see `analysis_commands::run_deps`) — both build
+/// this identical static core before `run_deps` layers its
+/// `--check-crates-io`/`--check-rustc-lints`/`--audit-json` opt-in extras on
+/// top.
+pub(super) fn deps_rule_revisions() -> std::collections::HashMap<String, u32> {
     std::collections::HashMap::from([
-        (
-            judge::duplication::DUPLICATE_RULE.to_string(),
-            judge::duplication::DUPLICATE_RULE_REVISION,
-        ),
         (
             judge::deps::MISPLACED_DEPENDENCY_KIND_RULE.to_string(),
             judge::deps::MISPLACED_DEPENDENCY_KIND_RULE_REVISION,
@@ -136,6 +153,19 @@ fn default_rule_revisions() -> std::collections::HashMap<String, u32> {
             judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE.to_string(),
             judge::dep_graph::WORKSPACE_DEP_DRIFT_RULE_REVISION,
         ),
+        (
+            judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
+            judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
+        ),
+    ])
+}
+
+/// AI-slop, G4 structural, and security rule revisions. Shared between this
+/// module's own default map and `cargo judge health`'s `--save-baseline`/
+/// `--baseline` map (see `health_command::run`) — both commands compute these
+/// findings identically over the whole workspace.
+pub(super) fn slop_structural_security_rule_revisions() -> std::collections::HashMap<String, u32> {
+    std::collections::HashMap::from([
         (
             judge::slop::SWALLOWED_RESULT_RULE.to_string(),
             judge::slop::SWALLOWED_RESULT_RULE_REVISION,
@@ -193,20 +223,12 @@ fn default_rule_revisions() -> std::collections::HashMap<String, u32> {
             judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
         ),
         (
-            judge::slopsquat::NAME_COLLISION_RISK_RULE.to_string(),
-            judge::slopsquat::NAME_COLLISION_RISK_RULE_REVISION,
-        ),
-        (
             judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
             judge::slop_structural::COMPLEXITY_INFLATION_RULE_REVISION,
         ),
         (
             judge::complexity::SIGNATURE_COMPLEXITY_RULE.to_string(),
             judge::complexity::SIGNATURE_COMPLEXITY_RULE_REVISION,
-        ),
-        (
-            judge::complexity::MAINTAINABILITY_INDEX_RULE.to_string(),
-            judge::complexity::MAINTAINABILITY_INDEX_RULE_REVISION,
         ),
         (
             judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
@@ -244,12 +266,9 @@ fn collect_complexity_and_history(
     findings: &mut Vec<Finding>,
     analysis_errors: &mut Vec<String>,
 ) {
-    let complexity_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let complexity_source_files = super::analysis_commands::workspace_source_files(workspace);
     let complexity = judge::complexity::analyze_workspace(complexity_source_files, false);
-    analysis_errors.extend(complexity.errors.iter().map(ToString::to_string));
+    append_analysis_errors(analysis_errors, &complexity.errors);
     findings.extend(judge::slop_structural::complexity_inflation(
         &complexity.functions,
     ));
@@ -266,17 +285,14 @@ fn collect_slop(
     findings: &mut Vec<Finding>,
     analysis_errors: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let slop_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let slop_source_files = super::analysis_commands::workspace_source_files(workspace);
     let rules_config = load_judge_toml(&workspace.root)?.rules;
     let slop = judge::slop::analyze_workspace(
         slop_source_files,
         false,
         rules_config.catch_all_error.allow_anyhow_at_boundary,
     );
-    analysis_errors.extend(slop.errors.iter().map(ToString::to_string));
+    append_analysis_errors(analysis_errors, &slop.errors);
     findings.extend(slop.findings);
     Ok(())
 }
@@ -286,10 +302,7 @@ fn collect_duplication(
     findings: &mut Vec<Finding>,
     analysis_errors: &mut Vec<String>,
 ) {
-    let dupes_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let dupes_source_files = super::analysis_commands::workspace_source_files(workspace);
     let dupes = judge::duplication::analyze_workspace_with_options(
         dupes_source_files,
         DupeMode::Mild,
@@ -297,40 +310,42 @@ fn collect_duplication(
         false,
         false,
     );
-    analysis_errors.extend(dupes.errors.iter().map(ToString::to_string));
+    append_analysis_errors(analysis_errors, &dupes.errors);
     findings.extend(dupes.to_findings());
 }
 
-fn collect_structural(workspace: &judge::ingest::Workspace, findings: &mut Vec<Finding>) {
-    let abstraction_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+/// G4 structural slop (see todo.md §3.G). Shared with `cargo judge health`
+/// (see `health_command::run`), which computes these same two findings sets
+/// over the same whole-workspace scope.
+pub(super) fn collect_structural(workspace: &judge::ingest::Workspace, findings: &mut Vec<Finding>) {
+    let abstraction_source_files = super::analysis_commands::workspace_source_files(workspace);
     findings.extend(judge::slop_structural::analyze_workspace_structural(
         abstraction_source_files,
     ));
 
-    let fragile_substring_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let fragile_substring_source_files = super::analysis_commands::workspace_source_files(workspace);
     findings.extend(judge::slop_structural::fragile_substring_classification(
         fragile_substring_source_files,
     ));
 }
 
-fn collect_security(
+/// Shared with `cargo judge health` (see `health_command::run`), which needs
+/// `include_generated` to be a parameter rather than always-off, and needs
+/// the excluded-generated count back to fold into its own total; the bare
+/// combined run ignores both (bare `cargo judge`/`audit` never expose
+/// `--include-generated`, so this collector's own call site below always
+/// passes `false` and drops the returned count).
+pub(super) fn collect_security(
     workspace: &judge::ingest::Workspace,
     findings: &mut Vec<Finding>,
     analysis_errors: &mut Vec<String>,
-) {
-    let security_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let security = judge::security::analyze_workspace(security_source_files, false);
-    analysis_errors.extend(security.errors.iter().map(ToString::to_string));
+    include_generated: bool,
+) -> usize {
+    let security_source_files = super::analysis_commands::workspace_source_files(workspace);
+    let security = judge::security::analyze_workspace(security_source_files, include_generated);
+    append_analysis_errors(analysis_errors, &security.errors);
     findings.extend(security.findings);
+    security.excluded_generated
 }
 
 fn collect_dependencies(
@@ -339,11 +354,11 @@ fn collect_dependencies(
     analysis_errors: &mut Vec<String>,
 ) {
     let deps = judge::deps::analyze_workspace(workspace);
-    analysis_errors.extend(deps.errors.iter().map(ToString::to_string));
+    append_analysis_errors(analysis_errors, &deps.errors);
     findings.extend(deps.findings);
 
     let dep_graph = judge::dep_graph::analyze_workspace(workspace);
-    analysis_errors.extend(dep_graph.errors.iter().map(ToString::to_string));
+    append_analysis_errors(analysis_errors, &dep_graph.errors);
     findings.extend(dep_graph.findings);
 
     // `name-collision-risk` is fully local (no network), so it runs in the

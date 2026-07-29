@@ -16,10 +16,7 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     } = options;
     let workspace = judge::ingest::load(None)?;
 
-    let source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let source_files = super::analysis_commands::workspace_source_files(&workspace);
     let report = judge::complexity::analyze_workspace(source_files, include_generated);
     let mut analysis_errors = analysis_errors(&report.errors);
     let mut functions = report.functions;
@@ -31,10 +28,7 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     // "Der Slop-Block ist Teil von `health`, kein eigener Sub-Command") — a
     // second, fresh iterator over the same source files, since the first one
     // was consumed by `complexity::analyze_workspace` above.
-    let slop_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
+    let slop_source_files = super::analysis_commands::workspace_source_files(&workspace);
     let rules_config = load_judge_toml(&workspace.root)?.rules;
     let slop = judge::slop::analyze_workspace(
         slop_source_files,
@@ -50,29 +44,14 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     findings.extend(judge::slop_structural::complexity_inflation(&functions));
     findings.extend(judge::complexity::signature_complexity(&functions));
     findings.extend(judge::complexity::maintainability_index(&functions));
-    let abstraction_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    findings.extend(judge::slop_structural::analyze_workspace_structural(
-        abstraction_source_files,
-    ));
+    super::combined_analysis::collect_structural(&workspace, &mut findings);
 
-    let fragile_substring_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    findings.extend(judge::slop_structural::fragile_substring_classification(
-        fragile_substring_source_files,
-    ));
-
-    let security_source_files = workspace
-        .crates
-        .iter()
-        .flat_map(|krate| krate.source_files.iter());
-    let security = judge::security::analyze_workspace(security_source_files, include_generated);
-    append_analysis_errors(&mut analysis_errors, &security.errors);
-    findings.extend(security.findings);
+    let security_excluded_generated = super::combined_analysis::collect_security(
+        &workspace,
+        &mut findings,
+        &mut analysis_errors,
+        include_generated,
+    );
 
     // Inline `judge-ignore` suppression (todo.md §5): applied after every
     // detector above has merged its findings in, so a suppressed finding
@@ -81,7 +60,7 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
 
     let excluded_generated =
-        report.excluded_generated + slop.excluded_generated + security.excluded_generated;
+        report.excluded_generated + slop.excluded_generated + security_excluded_generated;
 
     // The LOC denominator is only computed — and an unreadable file only
     // fatal — where a score or a saved baseline depends on it (see todo.md
@@ -113,100 +92,7 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     }
 
     if save_baseline || baseline.is_some() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::slop::SWALLOWED_RESULT_RULE.to_string(),
-                judge::slop::SWALLOWED_RESULT_RULE_REVISION,
-            ),
-            (
-                judge::slop::EMPTY_ERROR_ARM_RULE.to_string(),
-                judge::slop::EMPTY_ERROR_ARM_RULE_REVISION,
-            ),
-            (
-                judge::slop::CATCH_ALL_ERROR_RULE.to_string(),
-                judge::slop::CATCH_ALL_ERROR_RULE_REVISION,
-            ),
-            (
-                judge::slop::SUPPRESSION_DEBT_RULE.to_string(),
-                judge::slop::SUPPRESSION_DEBT_RULE_REVISION,
-            ),
-            (
-                judge::slop::MERGED_STUB_RULE.to_string(),
-                judge::slop::MERGED_STUB_RULE_REVISION,
-            ),
-            (
-                judge::slop::EMPTY_IMPL_RULE.to_string(),
-                judge::slop::EMPTY_IMPL_RULE_REVISION,
-            ),
-            (
-                judge::slop::ASSERTION_FREE_TEST_RULE.to_string(),
-                judge::slop::ASSERTION_FREE_TEST_RULE_REVISION,
-            ),
-            (
-                judge::slop::TAUTOLOGICAL_TEST_RULE.to_string(),
-                judge::slop::TAUTOLOGICAL_TEST_RULE_REVISION,
-            ),
-            (
-                judge::slop::IGNORED_TEST_ACCUMULATION_RULE.to_string(),
-                judge::slop::IGNORED_TEST_ACCUMULATION_RULE_REVISION,
-            ),
-            (
-                judge::slop::CONVERSATIONAL_ARTIFACT_RULE.to_string(),
-                judge::slop::CONVERSATIONAL_ARTIFACT_RULE_REVISION,
-            ),
-            (
-                judge::slop::RESTATING_COMMENT_RULE.to_string(),
-                judge::slop::RESTATING_COMMENT_RULE_REVISION,
-            ),
-            (
-                judge::slop::STEP_COMMENT_INFLATION_RULE.to_string(),
-                judge::slop::STEP_COMMENT_INFLATION_RULE_REVISION,
-            ),
-            (
-                judge::slop::GENERIC_NAMING_RULE.to_string(),
-                judge::slop::GENERIC_NAMING_RULE_REVISION,
-            ),
-            (
-                judge::slop::DOC_RESTATES_SIGNATURE_RULE.to_string(),
-                judge::slop::DOC_RESTATES_SIGNATURE_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::COMPLEXITY_INFLATION_RULE.to_string(),
-                judge::slop_structural::COMPLEXITY_INFLATION_RULE_REVISION,
-            ),
-            (
-                judge::complexity::SIGNATURE_COMPLEXITY_RULE.to_string(),
-                judge::complexity::SIGNATURE_COMPLEXITY_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::ABSTRACTION_INFLATION_RULE.to_string(),
-                judge::slop_structural::ABSTRACTION_INFLATION_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE.to_string(),
-                judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE_REVISION,
-            ),
-            (
-                judge::security::UNSAFE_SURFACE_RULE.to_string(),
-                judge::security::UNSAFE_SURFACE_RULE_REVISION,
-            ),
-            (
-                judge::security::UNSAFE_DENSITY_RULE.to_string(),
-                judge::security::UNSAFE_DENSITY_RULE_REVISION,
-            ),
-            (
-                judge::security::INTEGER_CAST_RISK_RULE.to_string(),
-                judge::security::INTEGER_CAST_RISK_RULE_REVISION,
-            ),
-            (
-                judge::security::PANIC_IN_LIB_RULE.to_string(),
-                judge::security::PANIC_IN_LIB_RULE_REVISION,
-            ),
-            (
-                judge::security::HARDCODED_SECRET_RULE.to_string(),
-                judge::security::HARDCODED_SECRET_RULE_REVISION,
-            ),
-        ]);
+        let rule_revisions = super::combined_analysis::slop_structural_security_rule_revisions();
         return handle_baseline_with_trend(
             &workspace.root,
             &findings,
