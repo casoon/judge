@@ -263,11 +263,36 @@ fn word_index_at(text: &str, pos: usize) -> usize {
     text[..pos].split_whitespace().count()
 }
 
+/// Whether a quote character (`"` or `` ` ``) sits within a couple of
+/// characters of the phrase boundary on the side `chars` walks toward,
+/// skipping over intervening non-alphanumeric punctuation (e.g. the `(` in
+/// `("as an AI")`) — used by [`phrase_at_word_boundary`] to recognize a
+/// trigger phrase that is itself the *subject* of a quoting comment (like
+/// this rule's own `exclusions` text in `rule_registry.rs`, which quotes
+/// `"as an AI"` to explain the rule rather than uttering it as a
+/// disclaimer) rather than a live disclaimer. Bails out as soon as it hits
+/// an alphanumeric character, since that means no quote mark is adjacent.
+fn quote_char_nearby(mut chars: impl Iterator<Item = char>) -> bool {
+    for _ in 0..3 {
+        match chars.next() {
+            Some(c) if c == '"' || c == '`' => return true,
+            Some(c) if c.is_alphanumeric() => return false,
+            Some(_) => continue,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// The byte offset of the first occurrence of `phrase` in `haystack` that is
 /// bounded by non-alphanumeric characters (or the string's own start/end) on
 /// both sides — a plain substring search would also match `"here is"`/
 /// `"here's"` inside the common words `"there is"`/`"there's"`/`"where is"`
-/// (see `conversational-artifact`, todo.md §3.G G3).
+/// (see `conversational-artifact`, todo.md §3.G G3) — and that is not
+/// quoted meta-discussion of the phrase itself (see [`quote_char_nearby`]):
+/// a comment that quotes `"as an AI"` to explain why the rule exists is not
+/// itself an AI disclaimer, so a match immediately enclosed by matching
+/// quote marks on both sides is skipped in favor of the next candidate.
 fn phrase_at_word_boundary(haystack: &str, phrase: &str) -> Option<usize> {
     let mut start = 0;
     while let Some(offset) = haystack[start..].find(phrase) {
@@ -281,7 +306,9 @@ fn phrase_at_word_boundary(haystack: &str, phrase: &str) -> Option<usize> {
             .chars()
             .next()
             .is_some_and(|c| c.is_alphanumeric());
-        if before_ok && after_ok {
+        let quoted = quote_char_nearby(haystack[..match_start].chars().rev())
+            && quote_char_nearby(haystack[match_end..].chars());
+        if before_ok && after_ok && !quoted {
             return Some(match_start);
         }
         start = match_start + 1;
@@ -297,9 +324,13 @@ fn phrase_at_word_boundary(haystack: &str, phrase: &str) -> Option<usize> {
 /// legitimate stub-limitation prose like "in a real implementation you would
 /// also handle X" is common and appropriate in a `///` doc comment
 /// explaining a stub, and excluding doc comments entirely sidesteps that
-/// false-positive class. For a multi-line run of consecutive `//` comments,
-/// each line is scanned independently — they are deliberately not joined
-/// into one logical block (v1 scope-narrowing).
+/// false-positive class. A phrase quoted in the comment (see
+/// [`quote_char_nearby`]) to meta-discuss the rule itself — rather than
+/// utter it as a disclaimer — is also excluded, which is why this rule does
+/// not self-trigger on its own `exclusions` text in `rule_registry.rs`. For
+/// a multi-line run of consecutive `//` comments, each line is scanned
+/// independently — they are deliberately not joined into one logical block
+/// (v1 scope-narrowing).
 fn conversational_artifact_findings(
     comments: &[CommentSpan],
     item_spans: &[ItemSpan],
@@ -647,5 +678,36 @@ mod tests {
             "slop-text-consecutive-line-comments",
         );
         assert!(rule_findings(&findings, crate::slop::CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    /// A comment that *quotes* a trigger phrase to meta-discuss the rule
+    /// itself — the exact shape of `rule_registry.rs`'s own
+    /// `conversational-artifact` `exclusions` doc comment, which quotes
+    /// `"as an AI"` while explaining why a string literal elsewhere doesn't
+    /// self-trigger — must not fire. Without the quote check this comment
+    /// used to produce a false-positive finding against judge's own
+    /// codebase.
+    #[test]
+    fn quoted_trigger_phrase_used_for_meta_discussion_does_not_fire() {
+        let findings = findings_for(
+            "// The trigger phrase (\"as an AI\") lives inside a Rust string literal\n// here, not a real comment, so this can't self-trigger the rule.\nfn f() {}\n",
+            "slop-text-quoted-trigger-phrase",
+        );
+        assert!(rule_findings(&findings, crate::slop::CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    /// Regression guard for the fix above: an unquoted, genuine disclaimer
+    /// must still fire — the quote exclusion must not weaken real
+    /// detection.
+    #[test]
+    fn unquoted_genuine_disclaimer_still_fires() {
+        let findings = findings_for(
+            "fn f() {\n    // As an AI, I can't verify this.\n    let _ = 1;\n}\n",
+            "slop-text-unquoted-disclaimer",
+        );
+        assert_eq!(
+            rule_findings(&findings, crate::slop::CONVERSATIONAL_ARTIFACT_RULE).len(),
+            1
+        );
     }
 }

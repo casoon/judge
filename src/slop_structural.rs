@@ -31,8 +31,8 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     BinOp, Expr, ExprBinary, ExprCall, ExprIf, ExprMethodCall, Fields, FnArg, GenericArgument,
-    ImplItem, ImplItemFn, ItemFn, ItemImpl, ItemStruct, Lit, Member, PathArguments, ReturnType,
-    Stmt, Type,
+    ImplItem, ImplItemFn, ItemFn, ItemImpl, ItemStruct, ItemTrait, Lit, Member, PathArguments,
+    ReturnType, Stmt, Type,
 };
 
 use crate::complexity::FunctionInfo;
@@ -271,6 +271,10 @@ struct FileCollector<'ast> {
     trait_impls: Vec<(String, String, usize)>,
     /// Inherent (non-trait) impl methods, keyed by the `Self` type name.
     inherent_methods: HashMap<String, Vec<&'ast ImplItemFn>>,
+    /// Names of traits declared (`trait Foo { .. }`) in this file — used to
+    /// tell workspace-local traits apart from foreign (std/external-crate)
+    /// ones for the `single-impl-trait` sub-check.
+    declared_traits: Vec<String>,
 }
 
 impl<'ast> Visit<'ast> for FileCollector<'ast> {
@@ -319,6 +323,11 @@ impl<'ast> Visit<'ast> for FileCollector<'ast> {
             }
         }
         visit::visit_item_impl(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast ItemTrait) {
+        self.declared_traits.push(node.ident.to_string());
+        visit::visit_item_trait(self, node);
     }
 }
 
@@ -431,6 +440,15 @@ fn abstraction_finding(
 /// Only [`SourceKind::Authored`] files are analyzed, matching the rest of
 /// the codebase's Generated-Code-Policy (todo.md §3.A).
 ///
+/// Sub-check 1 (single-impl trait) only fires for traits *declared* somewhere
+/// in the analyzed workspace (a `syn::ItemTrait` with that name, collected by
+/// [`FileCollector::visit_item_trait`]) — a trait with exactly one impl but
+/// no local declaration must be foreign (std or an external crate), and
+/// "implemented once" isn't a signal about an abstraction the crate authors
+/// actually chose to introduce. This complements, and doesn't replace,
+/// `KNOWN_DERIVABLE_TRAITS`, which solves a different problem (derive-macro
+/// undercounting).
+///
 /// Sub-check 2 (delegating wrapper) and the `build()`-method half of
 /// sub-check 3 (builder) only look at impl blocks in the *same file* as the
 /// struct they belong to — a cross-file impl block for the same struct is a
@@ -445,6 +463,7 @@ pub fn analyze_workspace_structural<'a>(
     let mut trait_impls: HashMap<String, Vec<(PathBuf, String, usize)>> = HashMap::new();
     let mut struct_field_counts: HashMap<String, usize> = HashMap::new();
     let mut builder_matches: Vec<(String, String, PathBuf, usize)> = Vec::new();
+    let mut declared_traits: HashSet<String> = HashSet::new();
 
     for file in source_files {
         if file.kind != SourceKind::Authored {
@@ -471,6 +490,7 @@ pub fn analyze_workspace_structural<'a>(
                 .entry(record.name.clone())
                 .or_insert(record.field_count);
         }
+        declared_traits.extend(collector.declared_traits);
 
         // Sub-check 2: delegating wrapper.
         for record in collector.structs.iter().filter(|r| r.field_count == 1) {
@@ -532,6 +552,9 @@ pub fn analyze_workspace_structural<'a>(
     // Sub-check 1: trait with exactly one impl.
     for (trait_name, impls) in &trait_impls {
         if KNOWN_DERIVABLE_TRAITS.contains(&trait_name.as_str()) {
+            continue;
+        }
+        if !declared_traits.contains(trait_name) {
             continue;
         }
         let [(file, self_type, line)] = impls.as_slice() else {
@@ -1150,6 +1173,74 @@ impl Serialize for A {
             .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "single-impl-trait")
             .collect();
         assert!(hits.is_empty());
+    }
+
+    /// A trait with exactly one impl but no matching `trait` declaration
+    /// anywhere in the analyzed sources must be foreign (std or an external
+    /// crate, e.g. `std::io::Write`) — implementing it once isn't a signal
+    /// about the crate's own abstraction choices, so it must not fire.
+    #[test]
+    fn single_impl_trait_excludes_traits_not_declared_in_workspace() {
+        let dir = TempDir::new("abstraction-single-impl-foreign");
+        let foreign_impl = dir.join("foreign_impl.rs");
+        std::fs::write(
+            &foreign_impl,
+            r#"
+struct BrokenPipeWriter;
+impl SomeForeignTrait for BrokenPipeWriter {
+    fn write(&mut self, _buf: &[u8]) -> usize {
+        0
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([foreign_impl]);
+        let findings = analyze_workspace_structural(files.iter());
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "single-impl-trait")
+            .collect();
+        assert!(hits.is_empty());
+    }
+
+    /// Regression guard: a trait the workspace *does* declare, implemented
+    /// exactly once elsewhere, must still fire — the local-declaration gate
+    /// added above must not swallow genuine single-impl-trait findings.
+    #[test]
+    fn single_impl_trait_still_fires_for_workspace_declared_trait() {
+        let dir = TempDir::new("abstraction-single-impl-local");
+        let trait_file = dir.join("my_trait.rs");
+        std::fs::write(
+            &trait_file,
+            r#"
+trait MyTrait {
+    fn go(&self);
+}
+"#,
+        )
+        .unwrap();
+        let impl_file = dir.join("my_trait_impl.rs");
+        std::fs::write(
+            &impl_file,
+            r#"
+struct A;
+impl MyTrait for A {
+    fn go(&self) {}
+}
+"#,
+        )
+        .unwrap();
+
+        let files = authored([trait_file, impl_file]);
+        let findings = analyze_workspace_structural(files.iter());
+        let hits: Vec<_> = findings
+            .iter()
+            .filter(|f| f.evidence.as_ref().unwrap()["kind"] == "single-impl-trait")
+            .collect();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].evidence.as_ref().unwrap()["trait"], "MyTrait");
     }
 
     #[test]

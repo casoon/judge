@@ -918,7 +918,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "swallowed-result",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Syntax-only: only `let _ = fallible();` and a bare `.ok();` statement are matched; other ways of discarding a `Result` are not.",
+        exclusions: "Syntax-only: only `let _ = fallible();` and a bare `.ok();` statement are matched; other ways of discarding a `Result` are not. Exempt inside `Drop::drop`'s own body (`impl Drop for _ { fn drop(&mut self) { .. } }`, matched by trait path's last segment): `drop` cannot return a `Result`, so `let _ = fallible();` is the only correct idiom there, not a discarded error.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -978,7 +978,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "empty-impl",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Only a function/method/trait-default with a doc comment and a literally empty body is matched; an empty body without a doc comment is not flagged.",
+        exclusions: "Only a function/method/trait-default with a doc comment and a literally empty body is matched; an empty body without a doc comment is not flagged. Exempt for methods overriding one of the standard `syn` AST-visitor traits (`Visit`/`VisitMut`/`Fold`, matched by trait path's last segment): an empty override of one of these traits' hooks is a deliberate 'skip descending into this AST node type' choice constrained by the trait's own contract, not a stub. Other trait-impl method overrides are not exempted.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -1026,7 +1026,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "conversational-artifact",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`, since `syn` discards non-doc comments entirely); `///`/`//!` doc comments are out of scope for this rule.",
+        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`, since `syn` discards non-doc comments entirely); `///`/`//!` doc comments are out of scope for this rule. A trigger phrase immediately enclosed by matching quote marks (`\"` or a backtick) is treated as quoted meta-discussion of the phrase, not a live disclaimer, and does not fire — which is why this very comment can quote \"as an AI\" below without self-triggering.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         // The trigger phrase ("as an AI") lives inside a Rust string literal
@@ -1139,7 +1139,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "abstraction-inflation",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Covers three sub-patterns (single-impl trait, delegating wrapper, builder for a small struct) via `evidence.kind`; a deliberate abstraction seam kept for testability/future extension looks structurally identical to an unnecessary one.",
+        exclusions: "Covers three sub-patterns (single-impl trait, delegating wrapper, builder for a small struct) via `evidence.kind`; a deliberate abstraction seam kept for testability/future extension looks structurally identical to an unnecessary one. `single-impl-trait` only fires for traits declared within the analyzed workspace, so implementing a foreign trait (std or an external crate, e.g. `Write`, `Drop`, `Iterator`, `From`) exactly once is never flagged, regardless of impl count.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
         example: Some(RuleExample {

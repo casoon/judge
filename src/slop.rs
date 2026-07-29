@@ -227,6 +227,9 @@ pub fn analyze_file(
         item_spans: Vec::new(),
         allow_anyhow_at_boundary,
         display_impl_type_stack: Vec::new(),
+        visitor_trait_impl_stack: Vec::new(),
+        drop_impl_stack: Vec::new(),
+        in_drop_drop_body: false,
     };
     visitor.visit_file(&ast);
     let mut findings = visitor.findings;
@@ -300,6 +303,26 @@ struct SlopVisitor<'a> {
     /// inside a `Display` impl block is inside its `fmt` method by
     /// construction; no separate "are we inside `fmt`" tracking is needed.
     display_impl_type_stack: Vec<String>,
+    /// Whether the innermost currently-entered `impl` block implements one of
+    /// the standard `syn` AST-visitor traits (`Visit`/`VisitMut`/`Fold`) —
+    /// pushed/popped once per `impl` block, unlike
+    /// [`Self::display_impl_type_stack`], so a nested non-matching `impl`
+    /// correctly shadows an outer matching one. `empty-impl` consults the
+    /// top of this stack from `visit_impl_item_fn` (see todo.md §G2
+    /// `empty-impl`, [`is_ast_visitor_trait_impl`]).
+    visitor_trait_impl_stack: Vec<bool>,
+    /// Whether the innermost currently-entered `impl` block is `impl Drop for
+    /// _` — same push/pop-per-`impl` shape as
+    /// [`Self::visitor_trait_impl_stack`]. `swallowed-result` consults this,
+    /// combined with the method name, from `visit_impl_item_fn` to detect
+    /// `Drop::drop`'s body (see [`is_drop_trait_impl`]).
+    drop_impl_stack: Vec<bool>,
+    /// Whether the body currently being walked is `Drop::drop`'s own — set
+    /// while visiting an `impl Drop for _ { fn drop(&mut self) { .. } }`
+    /// method body, consulted by `visit_local`/`visit_stmt` to exempt the
+    /// idiomatic `let _ = ...;` there (see todo.md §G1 `swallowed-result`:
+    /// `drop` cannot return a `Result`, so discarding is the only option).
+    in_drop_drop_body: bool,
 }
 
 impl SlopVisitor<'_> {
@@ -635,7 +658,12 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         if is_display_impl {
             self.display_impl_type_stack.push(type_ident);
         }
+        self.visitor_trait_impl_stack
+            .push(is_ast_visitor_trait_impl(node));
+        self.drop_impl_stack.push(is_drop_trait_impl(node));
         visit::visit_item_impl(self, node);
+        self.drop_impl_stack.pop();
+        self.visitor_trait_impl_stack.pop();
         if is_display_impl {
             self.display_impl_type_stack.pop();
         }
@@ -698,7 +726,14 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
             item_path: self.current_item_path(),
         });
         self.check_catch_all_error(&node.vis, &node.sig, &node.block, node.span());
-        self.check_empty_impl(&node.attrs, &node.block, node.span());
+        let is_visitor_trait_override = self
+            .visitor_trait_impl_stack
+            .last()
+            .copied()
+            .unwrap_or(false);
+        if !is_visitor_trait_override {
+            self.check_empty_impl(&node.attrs, &node.block, node.span());
+        }
         self.check_doc_restates_signature(&node.attrs, &node.sig, node.span());
         self.check_silent_default(&node.block);
         self.check_context_free_propagation(&node.sig, &node.block, node.span());
@@ -706,7 +741,12 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
         if gated {
             self.feature_gated_depth += 1;
         }
+        let is_drop_drop =
+            self.drop_impl_stack.last().copied().unwrap_or(false) && node.sig.ident == "drop";
+        let prev_in_drop_drop_body = self.in_drop_drop_body;
+        self.in_drop_drop_body = is_drop_drop;
         visit::visit_impl_item_fn(self, node);
+        self.in_drop_drop_body = prev_in_drop_drop_body;
         if gated {
             self.feature_gated_depth -= 1;
         }
@@ -724,8 +764,12 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
 
     /// `let _ = <call-expression>;` — a call whose result is explicitly bound
     /// to `_` rather than a real name (see todo.md §G1 `swallowed-result`).
+    /// Exempt inside `Drop::drop`'s own body (see [`Self::in_drop_drop_body`]):
+    /// `drop` cannot return a `Result`, so `let _ = fallible();` is the only
+    /// correct idiom there, not a discarded error.
     fn visit_local(&mut self, node: &'ast Local) {
-        if matches!(node.pat, Pat::Wild(_))
+        if !self.in_drop_drop_body
+            && matches!(node.pat, Pat::Wild(_))
             && let Some(init) = &node.init
             && matches!(init.expr.as_ref(), Expr::Call(_) | Expr::MethodCall(_))
         {
@@ -744,9 +788,11 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     /// A bare expression-statement ending in `.ok()` — converts a `Result` to
     /// an `Option` and immediately discards it (see todo.md §G1
     /// `swallowed-result`). Only statements with a trailing `;` count: a tail
-    /// expression's value isn't discarded.
+    /// expression's value isn't discarded. Exempt inside `Drop::drop`'s own
+    /// body, same rationale as [`Self::visit_local`] above.
     fn visit_stmt(&mut self, stmt: &'ast Stmt) {
-        if let Stmt::Expr(Expr::MethodCall(call), Some(_)) = stmt
+        if !self.in_drop_drop_body
+            && let Stmt::Expr(Expr::MethodCall(call), Some(_)) = stmt
             && call.method == "ok"
         {
             let item_path = self.current_item_path();
@@ -1272,6 +1318,40 @@ fn is_display_trait_impl(node: &ItemImpl) -> bool {
     })
 }
 
+/// Whether `node` implements one of the standard `syn` AST-visitor traits
+/// (`Visit`, `VisitMut`, `Fold`) — matched on the trait path's last segment
+/// only, like [`is_display_trait_impl`]. An empty, doc-commented override of
+/// one of these traits' methods (e.g. `fn visit_attribute(&mut self, _node:
+/// &Attribute) {}`) is a deliberate "skip descending into this AST node
+/// type" choice constrained by the trait's own contract, not a stub — see
+/// todo.md §G2 `empty-impl`'s registry `exclusions`.
+fn is_ast_visitor_trait_impl(node: &ItemImpl) -> bool {
+    node.trait_.as_ref().is_some_and(|(bang, path, _)| {
+        bang.is_none()
+            && path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.to_string().as_str(),
+                    "Visit" | "VisitMut" | "Fold"
+                )
+            })
+    })
+}
+
+/// Whether `node` is `impl Drop for _` — matched on the trait path's last
+/// segment only, like [`is_display_trait_impl`]. Consulted together with the
+/// method name (`drop`) to detect `Drop::drop`'s body, where `let _ =
+/// fallible();` is the only correct idiom since `drop` cannot return a
+/// `Result` (see todo.md §G1 `swallowed-result`'s registry `exclusions`).
+fn is_drop_trait_impl(node: &ItemImpl) -> bool {
+    node.trait_.as_ref().is_some_and(|(bang, path, _)| {
+        bang.is_none()
+            && path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "Drop")
+    })
+}
+
 /// Whether `mac`'s first string-literal argument (the format string, for
 /// both `write!(f, "..")` and `format!("..")`) contains a `{:?}`/`{:#?}`
 /// placeholder — a plain substring match, per todo.md §K2
@@ -1560,6 +1640,31 @@ mod tests {
             "slop-let-real-name",
         );
         assert!(rule_findings(&findings, SWALLOWED_RESULT_RULE).is_empty());
+    }
+
+    /// `let _ = fallible();` inside `Drop::drop` is the only correct idiom —
+    /// `drop` cannot return a `Result`, so discarding it here is not
+    /// evidence of a swallowed error. Must not fire.
+    #[test]
+    fn let_underscore_inside_drop_drop_is_not_flagged() {
+        let findings = findings_for(
+            "struct S(String);\nimpl Drop for S {\n    fn drop(&mut self) {\n        let _ = std::fs::remove_dir_all(&self.0);\n    }\n}\n",
+            "slop-swallowed-result-drop-drop",
+        );
+        assert!(rule_findings(&findings, SWALLOWED_RESULT_RULE).is_empty());
+    }
+
+    /// The same `let _ = ...;` pattern in a normal (non-`Drop::drop`)
+    /// function must still be flagged — the exclusion is scoped to
+    /// `Drop::drop` only.
+    #[test]
+    fn let_underscore_inside_normal_fn_still_flagged() {
+        let findings = findings_for(
+            "fn cleanup() {\n    let _ = std::fs::remove_dir_all(\"/tmp/x\");\n}\n",
+            "slop-swallowed-result-normal-fn",
+        );
+        let hits = rule_findings(&findings, SWALLOWED_RESULT_RULE);
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
@@ -1986,6 +2091,31 @@ fn f(r: Result<i32, ()>) {
         let findings = findings_for(
             "trait T {\n    /// Does nothing yet.\n    fn f(&self) {}\n}\n",
             "slop-empty-impl-trait-default",
+        );
+        let hits = rule_findings(&findings, EMPTY_IMPL_RULE);
+        assert_eq!(hits.len(), 1);
+    }
+
+    /// A doc-commented empty override of `syn::visit::Visit` (matched by the
+    /// trait path's last segment, `Visit`) is a deliberate "skip descending
+    /// into this AST node type" choice, not a stub — must not fire.
+    #[test]
+    fn doc_commented_empty_visit_trait_override_is_not_flagged() {
+        let findings = findings_for(
+            "struct V;\nimpl Visit for V {\n    /// Never descends into an attribute.\n    fn visit_attribute(&mut self, _node: &Attribute) {}\n}\n",
+            "slop-empty-impl-visit-override",
+        );
+        assert!(rule_findings(&findings, EMPTY_IMPL_RULE).is_empty());
+    }
+
+    /// A doc-commented empty override of a non-visitor trait must still be
+    /// flagged — the exclusion is narrowly scoped to `Visit`/`VisitMut`/
+    /// `Fold` only, not every trait-impl override.
+    #[test]
+    fn doc_commented_empty_non_visitor_trait_override_is_flagged() {
+        let findings = findings_for(
+            "trait Handler {\n    fn handle(&self);\n}\nstruct S;\nimpl Handler for S {\n    /// Does nothing yet.\n    fn handle(&self) {}\n}\n",
+            "slop-empty-impl-non-visitor-override",
         );
         let hits = rule_findings(&findings, EMPTY_IMPL_RULE);
         assert_eq!(hits.len(), 1);
