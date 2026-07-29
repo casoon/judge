@@ -29,7 +29,15 @@ pub(super) fn run_dupes(
         include_generated,
         include_tests,
     );
-    let refactoring_summary = report.refactoring_summary(&workspace.root, 5);
+    // TTY gets a compact top-5 ranked summary; JSON is the documented "full
+    // list" escape hatch for the TTY family trailer below, so it must not
+    // truncate — an agent or script consuming `--format json` needs every
+    // family's members, not just the highest-priority handful.
+    let refactoring_summary_limit = match format {
+        OutputFormat::Json => report.families.len(),
+        OutputFormat::Tty | OutputFormat::Sarif | OutputFormat::Markdown => 5,
+    };
+    let refactoring_summary = report.refactoring_summary(&workspace.root, refactoring_summary_limit);
     let analysis_errors = analysis_errors(&report.errors);
 
     let (findings, suppressed_inline) = match suppress_and_baseline(

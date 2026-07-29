@@ -1889,26 +1889,7 @@ fn dup_two(x: i32) -> i32 {
     #[test]
     fn run_dupes_tty_reports_a_trailer_when_families_exceed_the_cap() {
         let dir = TempDir::new("dupes-truncation-trailer");
-        std::fs::write(
-            dir.join("Cargo.toml"),
-            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(dir.join("src")).unwrap();
-        // 16 distinct clone families (one over the 15-family TTY cap) — each
-        // pair has unique literals so Mild mode doesn't merge them into one
-        // family, and each body is well over `DEFAULT_MIN_TOKENS` (20).
-        let mut source = String::new();
-        for i in 0..16 {
-            for suffix in ["a", "b"] {
-                source.push_str(&format!(
-                    "pub fn dup_{i}_{suffix}() -> i32 {{ let v0 = {i}; let v1 = {i}; \
-                     let v2 = {i}; let v3 = {i}; let v4 = {i}; let v5 = {i}; \
-                     let v6 = {i}; v0 + v1 + v2 + v3 + v4 + v5 + v6 }}\n"
-                ));
-            }
-        }
-        std::fs::write(dir.join("src/lib.rs"), source).unwrap();
+        write_n_duplicate_clone_families(&dir, 16);
 
         let mut out = Vec::new();
         let outcome = run_in_dir(&dir, dupes_cli(OutputFormat::Tty, false, None), &mut out)
@@ -1923,6 +1904,53 @@ fn dup_two(x: i32) -> i32 {
             text.contains("... and 1 more families (see --format json for the full list)"),
             "missing truncation trailer: {text}"
         );
+    }
+
+    /// The TTY trailer above promises "the full list" in `--format json` —
+    /// `refactoring_summary.top_families` must actually carry every family in
+    /// that format, not just the TTY's own top-5 ranked summary slice.
+    #[test]
+    fn dupes_json_refactoring_summary_is_not_truncated_to_the_tty_summary_cap() {
+        let dir = TempDir::new("dupes-json-full-family-list");
+        write_n_duplicate_clone_families(&dir, 16);
+
+        let mut out = Vec::new();
+        run_in_dir(&dir, dupes_cli(OutputFormat::Json, false, None), &mut out)
+            .expect("dupes must run");
+        let json: serde_json::Value = serde_json::from_slice(&out).expect("dupes JSON");
+
+        assert_eq!(json["refactoring_summary"]["clone_families"], 16);
+        assert_eq!(
+            json["refactoring_summary"]["top_families"]
+                .as_array()
+                .expect("top_families array")
+                .len(),
+            16,
+            "JSON top_families must list every family, not just the TTY's top 5"
+        );
+    }
+
+    /// `count` distinct clone families (each a duplicated pair) — every pair
+    /// has unique literals so Mild mode doesn't merge them into one family,
+    /// and each body is well over `DEFAULT_MIN_TOKENS` (20).
+    fn write_n_duplicate_clone_families(dir: &Path, count: usize) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let mut source = String::new();
+        for i in 0..count {
+            for suffix in ["a", "b"] {
+                source.push_str(&format!(
+                    "pub fn dup_{i}_{suffix}() -> i32 {{ let v0 = {i}; let v1 = {i}; \
+                     let v2 = {i}; let v3 = {i}; let v4 = {i}; let v5 = {i}; \
+                     let v6 = {i}; v0 + v1 + v2 + v3 + v4 + v5 + v6 }}\n"
+                ));
+            }
+        }
+        std::fs::write(dir.join("src/lib.rs"), source).unwrap();
     }
 
     /// Findings path: a failing baseline-compare verdict becomes
