@@ -115,6 +115,18 @@ fn compat_bucket(version: &Version) -> (u64, u64, u64) {
     }
 }
 
+/// Resolves `id` to its package name via `metadata.packages`, falling back
+/// to the raw [`PackageId`] representation if the id isn't present (should
+/// not happen for a well-formed resolve, but reading it out of `metadata`
+/// defensively costs nothing and avoids a panic either way).
+fn package_name(metadata: &Metadata, id: &PackageId) -> String {
+    metadata
+        .packages
+        .iter()
+        .find(|package| &package.id == id)
+        .map_or_else(|| id.repr.clone(), |package| package.name.clone())
+}
+
 /// Multi-source BFS from every workspace member over the resolved dependency
 /// graph ([`cargo_metadata::Resolve`]), returning the shortest path (as
 /// crate names, root-first) from the nearest workspace member to every
@@ -126,13 +138,6 @@ fn shortest_paths_from_workspace(metadata: &Metadata) -> HashMap<PackageId, Vec<
         return paths;
     };
 
-    let name_of = |id: &PackageId| -> String {
-        metadata
-            .packages
-            .iter()
-            .find(|package| &package.id == id)
-            .map_or_else(|| id.repr.clone(), |package| package.name.clone())
-    };
     let adjacency: HashMap<&PackageId, &Vec<PackageId>> = resolve
         .nodes
         .iter()
@@ -142,7 +147,7 @@ fn shortest_paths_from_workspace(metadata: &Metadata) -> HashMap<PackageId, Vec<
     let mut queue: VecDeque<PackageId> = VecDeque::new();
     for member_id in &metadata.workspace_members {
         if let std::collections::hash_map::Entry::Vacant(entry) = paths.entry(member_id.clone()) {
-            entry.insert(vec![name_of(member_id)]);
+            entry.insert(vec![package_name(metadata, member_id)]);
             queue.push_back(member_id.clone());
         }
     }
@@ -154,7 +159,7 @@ fn shortest_paths_from_workspace(metadata: &Metadata) -> HashMap<PackageId, Vec<
         for dep_id in deps.iter() {
             if let std::collections::hash_map::Entry::Vacant(entry) = paths.entry(dep_id.clone()) {
                 let mut next_path = current_path.clone();
-                next_path.push(name_of(dep_id));
+                next_path.push(package_name(metadata, dep_id));
                 entry.insert(next_path);
                 queue.push_back(dep_id.clone());
             }
@@ -176,13 +181,7 @@ fn direct_requirers(metadata: &Metadata, target: &PackageId) -> Vec<String> {
         .nodes
         .iter()
         .filter(|node| node.dependencies.contains(target))
-        .map(|node| {
-            metadata
-                .packages
-                .iter()
-                .find(|package| package.id == node.id)
-                .map_or_else(|| node.id.repr.clone(), |package| package.name.clone())
-        })
+        .map(|node| package_name(metadata, &node.id))
         .collect();
     requirers.sort();
     requirers.dedup();
@@ -239,26 +238,23 @@ fn duplicate_crate_versions(metadata: &Metadata, workspace_root: &Path) -> Vec<F
             .collect();
         copies.sort_by(|a, b| a["version"].as_str().cmp(&b["version"].as_str()));
 
-        findings.push(Finding {
-            id: format!("{DUPLICATE_CRATE_VERSIONS_RULE}:{name}").into(),
-            rule: DUPLICATE_CRATE_VERSIONS_RULE.into(),
-            severity: Severity::Warn,
-            location: Location {
+        findings.push(Finding::new(
+            format!("{DUPLICATE_CRATE_VERSIONS_RULE}:{name}"),
+            DUPLICATE_CRATE_VERSIONS_RULE,
+            Severity::Warn,
+            Location {
                 file: manifest_path.clone(),
                 line: OneBasedLine::FIRST,
                 item_path: name.to_string(),
             },
-            evidence_class: EvidenceClass::DerivedFact,
-            origin: Origin::Code,
-            evidence: Some(serde_json::json!({
+            EvidenceClass::DerivedFact,
+            Origin::Code,
+            Some(serde_json::json!({
                 "crate": name,
                 "versions": versions,
                 "copies": copies,
             })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
+        ));
     }
     findings
 }
@@ -335,26 +331,25 @@ fn msrv_drift(
         .filter(|package| !member_ids.contains(&package.id))
         .filter_map(|package| {
             let dep_msrv = package.rust_version.as_ref()?;
-            (*dep_msrv > workspace_msrv).then(|| Finding {
-                id: format!("{MSRV_DRIFT_RULE}:{}:{}", package.name, package.version).into(),
-                rule: MSRV_DRIFT_RULE.into(),
-                severity: Severity::Warn,
-                location: Location {
-                    file: manifest_path.clone(),
-                    line: OneBasedLine::FIRST,
-                    item_path: package.name.clone(),
-                },
-                evidence_class: EvidenceClass::DerivedFact,
-                origin: Origin::Code,
-                evidence: Some(serde_json::json!({
-                    "dependency": package.name,
-                    "dependency_version": package.version.to_string(),
-                    "dependency_msrv": dep_msrv.to_string(),
-                    "workspace_msrv": workspace_msrv.to_string(),
-                })),
-                limitations: None,
-                caused_by: Vec::new(),
-                causes: Vec::new(),
+            (*dep_msrv > workspace_msrv).then(|| {
+                Finding::new(
+                    format!("{MSRV_DRIFT_RULE}:{}:{}", package.name, package.version),
+                    MSRV_DRIFT_RULE,
+                    Severity::Warn,
+                    Location {
+                        file: manifest_path.clone(),
+                        line: OneBasedLine::FIRST,
+                        item_path: package.name.clone(),
+                    },
+                    EvidenceClass::DerivedFact,
+                    Origin::Code,
+                    Some(serde_json::json!({
+                        "dependency": package.name,
+                        "dependency_version": package.version.to_string(),
+                        "dependency_msrv": dep_msrv.to_string(),
+                        "workspace_msrv": workspace_msrv.to_string(),
+                    })),
+                )
             })
         })
         .collect();
@@ -406,25 +401,22 @@ fn workspace_dep_drift(metadata: &Metadata, workspace_root: &Path) -> Vec<Findin
             .map(|(member, req)| serde_json::json!({"member": member, "requirement": req}))
             .collect();
 
-        findings.push(Finding {
-            id: format!("{WORKSPACE_DEP_DRIFT_RULE}:{dep_name}").into(),
-            rule: WORKSPACE_DEP_DRIFT_RULE.into(),
-            severity: Severity::Info,
-            location: Location {
+        findings.push(Finding::new(
+            format!("{WORKSPACE_DEP_DRIFT_RULE}:{dep_name}"),
+            WORKSPACE_DEP_DRIFT_RULE,
+            Severity::Info,
+            Location {
                 file: manifest_path.clone(),
                 line: OneBasedLine::FIRST,
                 item_path: dep_name.clone(),
             },
-            evidence_class: EvidenceClass::DerivedFact,
-            origin: Origin::Code,
-            evidence: Some(serde_json::json!({
+            EvidenceClass::DerivedFact,
+            Origin::Code,
+            Some(serde_json::json!({
                 "dependency": dep_name,
                 "requirements": requirements,
             })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
+        ));
     }
     findings
 }

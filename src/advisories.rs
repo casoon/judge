@@ -316,32 +316,28 @@ fn known_vulnerability_finding(
         Reachability::Production => Severity::Fail,
         Reachability::DevOnly | Reachability::Unknown => Severity::Warn,
     };
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{KNOWN_VULNERABILITY_RULE}:{}:{}",
             vuln.package_name, vuln.advisory_id
-        )
-        .into(),
-        rule: KNOWN_VULNERABILITY_RULE.into(),
+        ),
+        KNOWN_VULNERABILITY_RULE,
         severity,
-        location: Location {
+        Location {
             file: manifest_path.to_path_buf(),
             line: OneBasedLine::FIRST,
             item_path: vuln.package_name.clone(),
         },
-        evidence_class: EvidenceClass::ExternalMeasurement,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+        EvidenceClass::ExternalMeasurement,
+        Origin::Code,
+        Some(serde_json::json!({
             "advisory_id": vuln.advisory_id,
             "package_version": vuln.package_version,
             "title": vuln.title,
             "url": vuln.url,
             "reachability": reachability.label(),
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 #[cfg(test)]

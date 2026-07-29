@@ -174,6 +174,20 @@ pub fn analyze_name_collision(workspace: &Workspace) -> Vec<Finding> {
     findings
 }
 
+/// Every rule in this module reports its finding at the crate's manifest
+/// (line 1) with the affected dependency/crate name as `item_path` — the
+/// "location" of a slopsquatting/supply-chain-hygiene concern is always
+/// `Cargo.toml`, never a source line. Shared by every `*_finding` renderer
+/// below rather than repeating the same three-field [`Location`] literal in
+/// each.
+fn dep_location(manifest_path: impl Into<PathBuf>, item_path: impl Into<String>) -> Location {
+    Location {
+        file: manifest_path.into(),
+        line: OneBasedLine::FIRST,
+        item_path: item_path.into(),
+    }
+}
+
 /// Renders a `name-collision-risk` finding. Its evidence class is
 /// `heuristic` — edit-distance proximity is prone to false positives
 /// (unrelated crates just happen to be a typo apart), not proof of
@@ -188,11 +202,7 @@ fn name_collision_finding(
         format!("{NAME_COLLISION_RISK_RULE}:{}:{}", krate.name, dep.name),
         NAME_COLLISION_RISK_RULE,
         Severity::Warn,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate.manifest_path.clone(), dep.name.clone()),
         EvidenceClass::Heuristic,
         Origin::Code,
         Some(serde_json::json!({
@@ -421,6 +431,80 @@ struct RawIndexLine {
     yanked: bool,
 }
 
+/// Shared state behind all three real crates.io HTTP clients
+/// ([`SparseIndexClient`], [`RestMetadataClient`], [`RestOwnersClient`]) —
+/// same fields, same constructor, and (via [`cached_get`]) the same
+/// request/cache/circuit-breaker mechanics for all three; only the endpoint
+/// URL, cache category, and response-body parsing differ per client (see
+/// each `CratesIo*` trait impl below).
+#[cfg(feature = "network")]
+struct HttpClientState {
+    agent: ureq::Agent,
+    cache_root: PathBuf,
+    circuit_open: Cell<bool>,
+}
+
+#[cfg(feature = "network")]
+impl HttpClientState {
+    fn new(cache_root: PathBuf) -> Self {
+        Self {
+            agent: build_agent(JUDGE_USER_AGENT),
+            cache_root,
+            circuit_open: Cell::new(false),
+        }
+    }
+}
+
+/// The shared GET-and-classify plumbing behind every real [`CratesIoIndex`]/
+/// [`CratesIoMetadata`]/[`CratesIoOwners`] implementation: consult the
+/// on-disk cache, respect an already-tripped circuit breaker, issue the
+/// request, classify a 404 as "not found" (and cache that), trip the
+/// breaker on a connection-level failure (see [`is_connection_error`]), and
+/// otherwise hand the response body to `parse_body` — the one piece that
+/// actually differs between the sparse-index, metadata, and owners
+/// endpoints (NDJSON-per-line vs. two differently-shaped JSON envelopes).
+#[cfg(feature = "network")]
+fn cached_get<T, F>(
+    state: &HttpClientState,
+    category: &str,
+    crate_name: &str,
+    url: &str,
+    parse_body: F,
+) -> Result<Option<T>, SlopsquatError>
+where
+    T: Clone + Serialize + DeserializeOwned,
+    F: FnOnce(&str) -> Result<T, SlopsquatError>,
+{
+    let path = cache_path(&state.cache_root, category, crate_name);
+    if let Some(cached) = read_cache::<Option<T>>(&path) {
+        return Ok(cached);
+    }
+    if state.circuit_open.get() {
+        return Err(SlopsquatError::CircuitOpen);
+    }
+
+    let mut response = match state.agent.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => {
+            write_cache(&path, &None::<T>);
+            return Ok(None);
+        }
+        Err(err) if is_connection_error(&err) => {
+            state.circuit_open.set(true);
+            return Err(SlopsquatError::Connection(err.into()));
+        }
+        Err(err) => return Err(SlopsquatError::Other(err.into())),
+    };
+
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|err| SlopsquatError::Other(err.into()))?;
+    let data = parse_body(&body)?;
+    write_cache(&path, &Some(data.clone()));
+    Ok(Some(data))
+}
+
 /// Real [`CratesIoIndex`] implementation: fetches
 /// `https://index.crates.io/<path>` via a short-timeout `ureq::Agent`.
 ///
@@ -434,18 +518,14 @@ struct RawIndexLine {
 /// failure N times for no benefit.
 #[cfg(feature = "network")]
 pub struct SparseIndexClient {
-    agent: ureq::Agent,
-    cache_root: PathBuf,
-    circuit_open: Cell<bool>,
+    state: HttpClientState,
 }
 
 #[cfg(feature = "network")]
 impl SparseIndexClient {
     pub fn new(cache_root: PathBuf) -> Self {
         Self {
-            agent: build_agent(JUDGE_USER_AGENT),
-            cache_root,
-            circuit_open: Cell::new(false),
+            state: HttpClientState::new(cache_root),
         }
     }
 }
@@ -453,48 +533,21 @@ impl SparseIndexClient {
 #[cfg(feature = "network")]
 impl CratesIoIndex for SparseIndexClient {
     fn lookup(&self, crate_name: &str) -> Result<Option<IndexEntry>, SlopsquatError> {
-        let path = cache_path(&self.cache_root, "index", crate_name);
-        if let Some(cached) = read_cache::<Option<IndexEntry>>(&path) {
-            return Ok(cached);
-        }
-        if self.circuit_open.get() {
-            return Err(SlopsquatError::CircuitOpen);
-        }
-
         let url = format!("https://index.crates.io/{}", sparse_index_path(crate_name));
-        let mut response = match self.agent.get(&url).call() {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(404)) => {
-                write_cache(&path, &None::<IndexEntry>);
-                return Ok(None);
-            }
-            Err(err) if is_connection_error(&err) => {
-                self.circuit_open.set(true);
-                return Err(SlopsquatError::Connection(err.into()));
-            }
-            Err(err) => return Err(SlopsquatError::Other(err.into())),
-        };
-
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|err| SlopsquatError::Other(err.into()))?;
-
-        // Each line is an independent JSON object; a malformed line is
-        // skipped rather than failing the whole fetch.
-        let versions: Vec<IndexVersion> = body
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| serde_json::from_str::<RawIndexLine>(line).ok())
-            .map(|raw| IndexVersion {
-                vers: raw.vers,
-                yanked: raw.yanked,
-            })
-            .collect();
-
-        let entry = IndexEntry { versions };
-        write_cache(&path, &Some(entry.clone()));
-        Ok(Some(entry))
+        cached_get(&self.state, "index", crate_name, &url, |body| {
+            // Each line is an independent JSON object; a malformed line is
+            // skipped rather than failing the whole fetch.
+            let versions: Vec<IndexVersion> = body
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .filter_map(|line| serde_json::from_str::<RawIndexLine>(line).ok())
+                .map(|raw| IndexVersion {
+                    vers: raw.vers,
+                    yanked: raw.yanked,
+                })
+                .collect();
+            Ok(IndexEntry { versions })
+        })
     }
 }
 
@@ -534,18 +587,14 @@ struct RestCrateResponse {
 /// fail on its own.
 #[cfg(feature = "network")]
 pub struct RestMetadataClient {
-    agent: ureq::Agent,
-    cache_root: PathBuf,
-    circuit_open: Cell<bool>,
+    state: HttpClientState,
 }
 
 #[cfg(feature = "network")]
 impl RestMetadataClient {
     pub fn new(cache_root: PathBuf) -> Self {
         Self {
-            agent: build_agent(JUDGE_USER_AGENT),
-            cache_root,
-            circuit_open: Cell::new(false),
+            state: HttpClientState::new(cache_root),
         }
     }
 }
@@ -553,37 +602,12 @@ impl RestMetadataClient {
 #[cfg(feature = "network")]
 impl CratesIoMetadata for RestMetadataClient {
     fn metadata(&self, crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError> {
-        let path = cache_path(&self.cache_root, "meta", crate_name);
-        if let Some(cached) = read_cache::<Option<CrateMetadata>>(&path) {
-            return Ok(cached);
-        }
-        if self.circuit_open.get() {
-            return Err(SlopsquatError::CircuitOpen);
-        }
-
         let url = format!("https://crates.io/api/v1/crates/{crate_name}");
-        let mut response = match self.agent.get(&url).call() {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(404)) => {
-                write_cache(&path, &None::<CrateMetadata>);
-                return Ok(None);
-            }
-            Err(err) if is_connection_error(&err) => {
-                self.circuit_open.set(true);
-                return Err(SlopsquatError::Connection(err.into()));
-            }
-            Err(err) => return Err(SlopsquatError::Other(err.into())),
-        };
-
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|err| SlopsquatError::Other(err.into()))?;
-        let parsed: RestCrateResponse =
-            serde_json::from_str(&body).map_err(|err| SlopsquatError::Other(err.into()))?;
-
-        write_cache(&path, &Some(parsed.krate.clone()));
-        Ok(Some(parsed.krate))
+        cached_get(&self.state, "meta", crate_name, &url, |body| {
+            let parsed: RestCrateResponse =
+                serde_json::from_str(body).map_err(|err| SlopsquatError::Other(err.into()))?;
+            Ok(parsed.krate)
+        })
     }
 }
 
@@ -621,18 +645,14 @@ struct RestOwnersResponse {
 /// fail on its own.
 #[cfg(feature = "network")]
 pub struct RestOwnersClient {
-    agent: ureq::Agent,
-    cache_root: PathBuf,
-    circuit_open: Cell<bool>,
+    state: HttpClientState,
 }
 
 #[cfg(feature = "network")]
 impl RestOwnersClient {
     pub fn new(cache_root: PathBuf) -> Self {
         Self {
-            agent: build_agent(JUDGE_USER_AGENT),
-            cache_root,
-            circuit_open: Cell::new(false),
+            state: HttpClientState::new(cache_root),
         }
     }
 }
@@ -640,37 +660,12 @@ impl RestOwnersClient {
 #[cfg(feature = "network")]
 impl CratesIoOwners for RestOwnersClient {
     fn owners(&self, crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError> {
-        let path = cache_path(&self.cache_root, "owners", crate_name);
-        if let Some(cached) = read_cache::<Option<Vec<CrateOwner>>>(&path) {
-            return Ok(cached);
-        }
-        if self.circuit_open.get() {
-            return Err(SlopsquatError::CircuitOpen);
-        }
-
         let url = format!("https://crates.io/api/v1/crates/{crate_name}/owners");
-        let mut response = match self.agent.get(&url).call() {
-            Ok(response) => response,
-            Err(ureq::Error::StatusCode(404)) => {
-                write_cache(&path, &None::<Vec<CrateOwner>>);
-                return Ok(None);
-            }
-            Err(err) if is_connection_error(&err) => {
-                self.circuit_open.set(true);
-                return Err(SlopsquatError::Connection(err.into()));
-            }
-            Err(err) => return Err(SlopsquatError::Other(err.into())),
-        };
-
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|err| SlopsquatError::Other(err.into()))?;
-        let parsed: RestOwnersResponse =
-            serde_json::from_str(&body).map_err(|err| SlopsquatError::Other(err.into()))?;
-
-        write_cache(&path, &Some(parsed.users.clone()));
-        Ok(Some(parsed.users))
+        cached_get(&self.state, "owners", crate_name, &url, |body| {
+            let parsed: RestOwnersResponse =
+                serde_json::from_str(body).map_err(|err| SlopsquatError::Other(err.into()))?;
+            Ok(parsed.users)
+        })
     }
 }
 
@@ -831,6 +826,38 @@ pub struct SlopsquatNetworkReport {
     pub errors: Vec<String>,
 }
 
+/// Records a [`SlopsquatError`] from one per-dependency crates.io lookup
+/// into `report.errors` — the same connection-outage handling every
+/// network-dependent analysis pass in this module needs: `CircuitOpen` is
+/// silent (the connection failure that tripped the breaker was already
+/// reported once, earlier in this same loop); a first `Connection` failure
+/// is reported once for the whole run (via `connection_error_reported`),
+/// worded with `unreachable_message`; any other, per-lookup `Other` failure
+/// is reported individually, tagged with `item_name` and `lookup_label`.
+fn record_lookup_error(
+    report: &mut SlopsquatNetworkReport,
+    connection_error_reported: &mut bool,
+    err: SlopsquatError,
+    item_name: &str,
+    unreachable_message: &str,
+    lookup_label: &str,
+) {
+    match err {
+        SlopsquatError::CircuitOpen => {}
+        SlopsquatError::Connection(msg) => {
+            if !*connection_error_reported {
+                report.errors.push(format!("{unreachable_message}: {msg}"));
+                *connection_error_reported = true;
+            }
+        }
+        SlopsquatError::Other(msg) => {
+            report
+                .errors
+                .push(format!("{item_name}: {lookup_label} lookup failed: {msg}"));
+        }
+    }
+}
+
 /// Runs `phantom-crate` and `phantom-version` over every declared
 /// dependency in `workspace`, via `index`. One sparse-index lookup covers
 /// both rules per dependency.
@@ -850,20 +877,15 @@ pub fn analyze_phantom_dependencies(
                         report.findings.push(finding);
                     }
                 }
-                Err(SlopsquatError::CircuitOpen) => {}
-                Err(SlopsquatError::Connection(msg)) => {
-                    if !connection_error_reported {
-                        report.errors.push(format!(
-                            "crates.io sparse index unreachable, skipping remaining phantom-crate/phantom-version checks: {msg}"
-                        ));
-                        connection_error_reported = true;
-                    }
-                }
-                Err(SlopsquatError::Other(msg)) => {
-                    report
-                        .errors
-                        .push(format!("{}: crates.io lookup failed: {msg}", dep.name));
-                }
+                Err(err) => record_lookup_error(
+                    &mut report,
+                    &mut connection_error_reported,
+                    err,
+                    &dep.name,
+                    "crates.io sparse index unreachable, skipping remaining \
+                     phantom-crate/phantom-version checks",
+                    "crates.io",
+                ),
             }
         }
     }
@@ -876,11 +898,7 @@ fn phantom_crate_finding(krate: &CrateInfo, dep: &DeclaredDependency) -> Finding
         format!("{PHANTOM_CRATE_RULE}:{}:{}", krate.name, dep.name),
         PHANTOM_CRATE_RULE,
         Severity::Fail,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate.manifest_path.clone(), dep.name.clone()),
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({
@@ -910,25 +928,18 @@ fn phantom_version_finding(
         return None;
     }
 
-    Some(Finding {
-        id: format!("{PHANTOM_VERSION_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: PHANTOM_VERSION_RULE.into(),
-        severity: Severity::Fail,
-        location: Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
-        evidence_class: EvidenceClass::ExternalMeasurement,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+    Some(Finding::new(
+        format!("{PHANTOM_VERSION_RULE}:{}:{}", krate.name, dep.name),
+        PHANTOM_VERSION_RULE,
+        Severity::Fail,
+        dep_location(krate.manifest_path.clone(), dep.name.clone()),
+        EvidenceClass::ExternalMeasurement,
+        Origin::Code,
+        Some(serde_json::json!({
             "requirement": dep.version_req,
             "nearest_published_versions": nearest_versions(&published, 3),
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    })
+    ))
 }
 
 /// Up to `limit` published version strings, highest-first by parsed semver
@@ -1010,21 +1021,14 @@ pub fn analyze_fresh_low_reputation(
                     }
                 }
                 Ok(None) => {}
-                Err(SlopsquatError::CircuitOpen) => {}
-                Err(SlopsquatError::Connection(msg)) => {
-                    if !connection_error_reported {
-                        report.errors.push(format!(
-                            "crates.io API unreachable, skipping remaining fresh-low-reputation-dep checks: {msg}"
-                        ));
-                        connection_error_reported = true;
-                    }
-                }
-                Err(SlopsquatError::Other(msg)) => {
-                    report.errors.push(format!(
-                        "{}: crates.io metadata lookup failed: {msg}",
-                        dep.name
-                    ));
-                }
+                Err(err) => record_lookup_error(
+                    &mut report,
+                    &mut connection_error_reported,
+                    err,
+                    &dep.name,
+                    "crates.io API unreachable, skipping remaining fresh-low-reputation-dep checks",
+                    "crates.io metadata",
+                ),
             }
         }
     }
@@ -1058,11 +1062,7 @@ fn fresh_low_reputation_finding(
         ),
         FRESH_LOW_REPUTATION_DEP_RULE,
         Severity::Warn,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate.manifest_path.clone(), dep.name.clone()),
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({
@@ -1171,20 +1171,14 @@ pub fn analyze_yanked_dependencies(
             // different (and, for a registry-resolved graph, essentially
             // impossible) condition — not this rule's concern.
             Ok(None) => {}
-            Err(SlopsquatError::CircuitOpen) => {}
-            Err(SlopsquatError::Connection(msg)) => {
-                if !connection_error_reported {
-                    report.errors.push(format!(
-                        "crates.io sparse index unreachable, skipping remaining yanked-dependency checks: {msg}"
-                    ));
-                    connection_error_reported = true;
-                }
-            }
-            Err(SlopsquatError::Other(msg)) => {
-                report
-                    .errors
-                    .push(format!("{}: crates.io lookup failed: {msg}", package.name));
-            }
+            Err(err) => record_lookup_error(
+                &mut report,
+                &mut connection_error_reported,
+                err,
+                &package.name,
+                "crates.io sparse index unreachable, skipping remaining yanked-dependency checks",
+                "crates.io",
+            ),
         }
     }
 
@@ -1207,11 +1201,7 @@ fn yanked_dependency_finding(
         format!("{YANKED_DEPENDENCY_RULE}:{crate_name}:{resolved_version}"),
         YANKED_DEPENDENCY_RULE,
         Severity::Warn,
-        Location {
-            file: manifest_path.to_path_buf(),
-            line: OneBasedLine::FIRST,
-            item_path: crate_name.to_string(),
-        },
+        dep_location(manifest_path.to_path_buf(), crate_name.to_string()),
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({
@@ -1249,21 +1239,15 @@ pub fn analyze_single_maintainer_dependencies(
                 // A crate crates.io doesn't know about at all is
                 // `phantom-crate`'s concern, not this rule's.
                 Ok(None) => {}
-                Err(SlopsquatError::CircuitOpen) => {}
-                Err(SlopsquatError::Connection(msg)) => {
-                    if !connection_error_reported {
-                        report.errors.push(format!(
-                            "crates.io owners endpoint unreachable, skipping remaining dep-single-maintainer checks: {msg}"
-                        ));
-                        connection_error_reported = true;
-                    }
-                }
-                Err(SlopsquatError::Other(msg)) => {
-                    report.errors.push(format!(
-                        "{}: crates.io owners lookup failed: {msg}",
-                        dep.name
-                    ));
-                }
+                Err(err) => record_lookup_error(
+                    &mut report,
+                    &mut connection_error_reported,
+                    err,
+                    &dep.name,
+                    "crates.io owners endpoint unreachable, skipping remaining \
+                     dep-single-maintainer checks",
+                    "crates.io owners",
+                ),
             }
         }
     }
@@ -1282,25 +1266,18 @@ fn single_maintainer_finding(
     dep: &DeclaredDependency,
     owners: &[CrateOwner],
 ) -> Finding {
-    Finding {
-        id: format!("{DEP_SINGLE_MAINTAINER_RULE}:{}:{}", krate.name, dep.name).into(),
-        rule: DEP_SINGLE_MAINTAINER_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
-        evidence_class: EvidenceClass::ExternalMeasurement,
-        origin: Origin::Code,
-        evidence: Some(serde_json::json!({
+    Finding::new(
+        format!("{DEP_SINGLE_MAINTAINER_RULE}:{}:{}", krate.name, dep.name),
+        DEP_SINGLE_MAINTAINER_RULE,
+        Severity::Warn,
+        dep_location(krate.manifest_path.clone(), dep.name.clone()),
+        EvidenceClass::ExternalMeasurement,
+        Origin::Code,
+        Some(serde_json::json!({
             "owner_count": owners.len(),
             "owners": owners.iter().map(|o| o.login.clone()).collect::<Vec<_>>(),
         })),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+    )
 }
 
 #[cfg(test)]

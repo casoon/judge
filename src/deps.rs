@@ -441,6 +441,20 @@ fn manifest_explicitly_enables_default_features(manifest: &toml::Value, dep_name
         })
 }
 
+/// Every finding in this module is reported at the crate's manifest (line 1)
+/// with the affected item name (a dependency name, or — for `unused-feature`
+/// — this crate's own feature name) as `item_path`: the "location" of a
+/// dependency-hygiene concern is `Cargo.toml`, not a source file. Shared by
+/// every `*_finding` renderer below rather than repeating the same
+/// three-field [`Location`] literal in each.
+fn dep_location(krate: &CrateInfo, item_path: impl Into<String>) -> Location {
+    Location {
+        file: krate.manifest_path.clone(),
+        line: OneBasedLine::FIRST,
+        item_path: item_path.into(),
+    }
+}
+
 /// Renders a misplaced-dependency-kind finding. Its evidence class is
 /// `heuristic` (todo.md §17.3: a wrong dependency kind is an
 /// interpretation): usage-domain classification is a directory-convention
@@ -449,26 +463,18 @@ fn manifest_explicitly_enables_default_features(manifest: &toml::Value, dep_name
 /// path — the "location" of a dependency-kind mismatch is `Cargo.toml`, not
 /// a source file — and `location.item_path` is the dependency name.
 fn misplaced_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDependency) -> Finding {
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{MISPLACED_DEPENDENCY_KIND_RULE}:{}:{}",
             krate.name, dep.name
-        )
-        .into(),
-        rule: MISPLACED_DEPENDENCY_KIND_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: None,
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+        ),
+        MISPLACED_DEPENDENCY_KIND_RULE,
+        Severity::Warn,
+        dep_location(krate, dep.name.clone()),
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        None,
+    )
 }
 
 /// Renders an `unused-dev-dependency` finding. Its evidence class is
@@ -487,11 +493,7 @@ fn unused_dev_dependency_finding(
         format!("{UNUSED_DEV_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name),
         UNUSED_DEV_DEPENDENCY_RULE,
         Severity::Warn,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate, dep.name.clone()),
         EvidenceClass::BoundedSemantic,
         Origin::Code,
         Some(serde_json::json!({
@@ -516,28 +518,22 @@ fn unused_feature_flag_findings(
 ) -> Vec<Finding> {
     dep.features
         .iter()
-        .map(|feature| Finding {
-            id: format!(
-                "{UNUSED_FEATURE_FLAG_RULE}:{}:{}:{feature}",
-                krate.name, dep.name
+        .map(|feature| {
+            Finding::new(
+                format!(
+                    "{UNUSED_FEATURE_FLAG_RULE}:{}:{}:{feature}",
+                    krate.name, dep.name
+                ),
+                UNUSED_FEATURE_FLAG_RULE,
+                Severity::Warn,
+                dep_location(krate, dep.name.clone()),
+                EvidenceClass::DerivedFact,
+                Origin::Code,
+                Some(serde_json::json!({
+                    "feature": feature,
+                    "reason": "no other usage of this dependency was found in the examined view",
+                })),
             )
-            .into(),
-            rule: UNUSED_FEATURE_FLAG_RULE.into(),
-            severity: Severity::Warn,
-            location: Location {
-                file: krate.manifest_path.clone(),
-                line: OneBasedLine::FIRST,
-                item_path: dep.name.clone(),
-            },
-            evidence_class: EvidenceClass::DerivedFact,
-            origin: Origin::Code,
-            evidence: Some(serde_json::json!({
-                "feature": feature,
-                "reason": "no other usage of this dependency was found in the examined view",
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
         })
         .collect()
 }
@@ -558,11 +554,7 @@ fn default_features_unused_finding(
         format!("{DEFAULT_FEATURES_UNUSED_RULE}:{}:{}", krate.name, dep.name),
         DEFAULT_FEATURES_UNUSED_RULE,
         Severity::Warn,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate, dep.name.clone()),
         EvidenceClass::DerivedFact,
         Origin::Code,
         Some(serde_json::json!({
@@ -621,11 +613,7 @@ fn unused_feature_finding(krate: &CrateInfo, feature_name: &str) -> Finding {
         format!("{UNUSED_FEATURE_RULE}:{}:{feature_name}", krate.name),
         UNUSED_FEATURE_RULE,
         Severity::Warn,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: feature_name.to_string(),
-        },
+        dep_location(krate, feature_name.to_string()),
         EvidenceClass::DerivedFact,
         Origin::Code,
         Some(serde_json::json!({
@@ -721,11 +709,7 @@ fn heavy_dependency_finding(
         format!("{HEAVY_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name),
         HEAVY_DEPENDENCY_RULE,
         Severity::Info,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate, dep.name.clone()),
         EvidenceClass::Heuristic,
         Origin::Code,
         Some(serde_json::json!({
@@ -745,11 +729,7 @@ fn dep_without_repo_finding(krate: &CrateInfo, dep: &crate::ingest::DeclaredDepe
         format!("{DEP_WITHOUT_REPO_RULE}:{}:{}", krate.name, dep.name),
         DEP_WITHOUT_REPO_RULE,
         Severity::Info,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate, dep.name.clone()),
         EvidenceClass::DerivedFact,
         Origin::Code,
         Some(serde_json::json!({
@@ -1064,11 +1044,7 @@ fn unused_dependency_finding(
         format!("{UNUSED_DEPENDENCY_RULE}:{}:{}", krate.name, dep.name),
         UNUSED_DEPENDENCY_RULE,
         Severity::Warn,
-        Location {
-            file: krate.manifest_path.clone(),
-            line: OneBasedLine::FIRST,
-            item_path: dep.name.clone(),
-        },
+        dep_location(krate, dep.name.clone()),
         EvidenceClass::BoundedSemantic,
         Origin::Code,
         Some(serde_json::json!({
