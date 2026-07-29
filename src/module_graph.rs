@@ -105,6 +105,7 @@ pub const ORPHAN_MODULE_RULE_REVISION: u32 = 1;
 pub enum ModuleGraphError {
     Io(PathBuf, std::io::Error),
     Parse(PathBuf, syn::Error),
+    Graph(crate::finding::GraphError),
 }
 
 impl std::fmt::Display for ModuleGraphError {
@@ -113,6 +114,7 @@ impl std::fmt::Display for ModuleGraphError {
         match self {
             Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
             Self::Parse(path, err) => write!(f, "{}: failed to parse: {err}", path.display()),
+            Self::Graph(err) => write!(f, "graph error: {err}"),
         }
     }
 }
@@ -122,6 +124,7 @@ impl std::error::Error for ModuleGraphError {
         match self {
             Self::Io(_, err) => Some(err),
             Self::Parse(_, err) => Some(err),
+            Self::Graph(err) => Some(err),
         }
     }
 }
@@ -377,6 +380,7 @@ pub fn analyze_workspace(workspace: &Workspace, include_generated: bool) -> Work
         &trees,
         include_generated,
         &mut excluded_generated,
+        &mut errors,
     );
     findings.extend(orphan_module_findings(
         workspace,
@@ -405,6 +409,7 @@ fn unlinked_file_findings(
     trees: &HashMap<&str, CrateModuleTree>,
     include_generated: bool,
     excluded_generated: &mut usize,
+    errors: &mut Vec<ModuleGraphError>,
 ) -> Vec<Finding> {
     let mut unreached_by_crate: HashMap<&str, Vec<&SourceFile>> = HashMap::new();
     for krate in &workspace.crates {
@@ -458,12 +463,10 @@ fn unlinked_file_findings(
                 else {
                     continue;
                 };
-                if let Some(effect_id) = id_by_path.get(child_file.as_path()) {
-                    // A duplicate/cyclic edge is impossible here (each file
-                    // is unreached at most once, and this only ever walks
-                    // downward from a parent's own `mod` items), but ignore
-                    // rather than panic if the graph ever disagrees.
-                    let _ = graph.add_edge(&cause_id, effect_id);
+                if let Some(effect_id) = id_by_path.get(child_file.as_path())
+                    && let Err(err) = graph.add_edge(&cause_id, effect_id)
+                {
+                    errors.push(ModuleGraphError::Graph(err));
                 }
             }
         }

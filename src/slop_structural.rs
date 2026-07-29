@@ -809,87 +809,8 @@ mod tests {
         );
     }
 
-    /// Runs `git` in `dir` with a fixed test identity, so these fixtures
-    /// don't depend on the host's global git config (mirrors `crate::git`'s
-    /// own test helper of the same name).
-    fn git(dir: &Path, args: &[&str]) {
-        run_git(dir, args, &[]);
-    }
-
-    fn run_git(dir: &Path, args: &[&str], extra_env: &[(&str, &str)]) {
-        let status = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=judge-test",
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .envs(extra_env.iter().copied())
-            .status()
-            .expect("failed to run git — required for these fixtures");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     /// `churn-hotspot` (todo.md §17.5 candidate 1) — unentscheidbar: a file
     /// renamed mid-window. [`crate::git::churn`] walks a plain tree diff
-    /// with no rewrite/rename tracking configured, so a `git mv` commit is
-    /// reported as a `Deletion` at the old path plus an `Addition` at the
-    /// new path — each counted as one commit "touching" its own path. A
-    /// file edited often enough to clear [`CHURN_HOTSPOT_THRESHOLD`] under
-    /// one continuous identity can therefore split into two paths that each
-    /// stay under threshold, and the hotspot goes unreported entirely.
-    /// Golden test of that honest, git-primitive-based limitation — not a
-    /// bug.
-    #[test]
-    fn churn_hotspot_history_splits_across_a_rename_and_stays_under_threshold() {
-        let dir = TempDir::new("churn-hotspot-rename");
-        git(&dir, &["init", "-q", "-b", "main"]);
-
-        std::fs::write(dir.join("old.rs"), "fn a() {}\n").unwrap();
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "create"]);
-
-        std::fs::write(dir.join("old.rs"), "fn a() { 1 }\n").unwrap();
-        git(&dir, &["commit", "-q", "-am", "edit 1"]);
-
-        std::fs::write(dir.join("old.rs"), "fn a() { 2 }\n").unwrap();
-        git(&dir, &["commit", "-q", "-am", "edit 2"]);
-
-        git(&dir, &["mv", "old.rs", "new.rs"]);
-        git(&dir, &["commit", "-q", "-m", "rename"]);
-
-        std::fs::write(dir.join("new.rs"), "fn a() { 3 }\n").unwrap();
-        git(&dir, &["commit", "-q", "-am", "edit 3"]);
-
-        std::fs::write(dir.join("new.rs"), "fn a() { 4 }\n").unwrap();
-        git(&dir, &["commit", "-q", "-am", "edit 4"]);
-
-        // 6 commits touched what is, by content lineage, a single file —
-        // at or above CHURN_HOTSPOT_THRESHOLD if the history were merged
-        // across the rename.
-        let churn = crate::git::churn(&dir, CHURN_HOTSPOT_WINDOW_DAYS).unwrap();
-        assert!(
-            churn.get(&PathBuf::from("old.rs")).copied().unwrap_or(0) < CHURN_HOTSPOT_THRESHOLD,
-            "old.rs count: {churn:?}"
-        );
-        assert!(
-            churn.get(&PathBuf::from("new.rs")).copied().unwrap_or(0) < CHURN_HOTSPOT_THRESHOLD,
-            "new.rs count: {churn:?}"
-        );
-
-        let findings = churn_hotspots(&churn);
-
-        assert!(
-            findings.is_empty(),
-            "expected the rename to split churn across two paths, neither reaching \
-             the threshold alone: {churn:?}"
-        );
-    }
-
     fn function_info(lines_of_code: usize, cyclomatic: u32) -> FunctionInfo {
         function_info_with_cognitive(lines_of_code, cyclomatic, 0)
     }

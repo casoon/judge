@@ -67,19 +67,9 @@
 //! layers were meant to express isn't holding in practice, even if no
 //! `[[boundary]]` rule is technically violated.
 //!
-//! Requires `[layers]` with a non-empty `assign` — with no layer
-//! configuration, this performs no analysis at all rather than guessing
-//! which crates "should" be independent (todo.md §17 "Kein Raten von
-//! Projektabsicht"). Reuses [`crate::git::walk_commits`]'s same window
-//! semantics as the rest of judge's git-derived signals.
-//!
-//! **Heuristic, not proof** (`EvidenceClass::Heuristic`, matching
-//! [`crate::git::Hotspot`]/`churn-hotspot`'s own class): a large repo-wide
-//! commit (a rename, a formatting pass) can make unrelated crates look
-//! coupled for one window, and the ratio threshold (see
-//! [`CHANGE_COUPLING_RATIO_THRESHOLD`]) is a first-cut constant, not
-//! calibrated against a corpus of known-coupled vs. known-independent crate
-//! pairs.
+//! Architecture boundaries are checked only against explicit workspace
+//! configuration. Without configured rules, judge reports no violations
+//! rather than inferring an intended architecture.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -91,30 +81,9 @@ use syn::visit::{self, Visit};
 use syn::{ItemUse, UseTree};
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::git::{self, GitError};
 use crate::health_score::DeductionMultiplier;
 use crate::ingest::{CrateInfo, Workspace};
 use crate::slopsquat::SlopsquatConfig;
-
-/// One user-configured `[[provenance_label]]` rule (see `crate::provenance`,
-/// todo.md §3.G G6): a trusted, explicitly-provided signal that wins outright
-/// over heuristic classification for any commit it matches.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProvenanceLabel {
-    pub name: String,
-    #[serde(default)]
-    pub trailer_contains: Vec<String>,
-    #[serde(default)]
-    pub author_email_contains: Vec<String>,
-}
-
-/// The `judge.toml` `[[provenance_label]]` table (see `crate::provenance`,
-/// todo.md §3.G G6).
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ProvenanceConfig {
-    #[serde(rename = "provenance_label", default)]
-    pub labels: Vec<ProvenanceLabel>,
-}
 
 /// Rule id used for both forbidden-edge and missing-required violations (see
 /// todo.md §14.2 P1/P2 bullet 1).
@@ -143,26 +112,6 @@ pub const MODULE_BOUNDARY_VIOLATION_RULE_REVISION: u32 = 1;
 pub const FEATURE_GRAPH_CYCLE_RULE: &str = "feature-graph-cycle";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const FEATURE_GRAPH_CYCLE_RULE_REVISION: u32 = 1;
-
-/// Rule id for two crates in different `[layers]` changing together, in the
-/// same commit, far more often than either changes alone (see module docs
-/// "`change-coupling-signal`", todo.md §H).
-pub const CHANGE_COUPLING_SIGNAL_RULE: &str = "change-coupling-signal";
-/// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
-pub const CHANGE_COUPLING_SIGNAL_RULE_REVISION: u32 = 1;
-
-/// Minimum number of same-commit co-changes between a crate pair before
-/// [`change_coupling_signals`] considers the sample large enough to mean
-/// anything — below this, a handful of shared commits (e.g. one repo-wide
-/// rename) could produce a misleadingly high ratio. First-cut, adjustable
-/// constant (see module docs).
-const MIN_CO_CHANGE_SAMPLE: u32 = 5;
-
-/// Minimum fraction of the less-changed crate's own commits that must be
-/// shared with the other crate before [`change_coupling_signals`] fires —
-/// see module docs. First-cut, adjustable threshold, not backed by a study
-/// of what ratio distinguishes genuine coupling from coincidence.
-const CHANGE_COUPLING_RATIO_THRESHOLD: f64 = 0.6;
 
 /// Whether a boundary is checked against direct neighbors only, or against
 /// anything reachable via any number of hops.
@@ -320,11 +269,6 @@ pub struct BoundaryConfig {
     pub internal_crates: Vec<String>,
     #[serde(default)]
     pub slopsquat: SlopsquatConfig,
-    /// Flattened so `[[provenance_label]]` sits at the top level of
-    /// `judge.toml`, alongside `[[boundary]]`/`[[crate_profile]]`, rather
-    /// than nested under a `[provenance]` table.
-    #[serde(flatten)]
-    pub provenance: ProvenanceConfig,
     #[serde(default)]
     pub rules: RulesConfig,
     #[serde(default)]
@@ -1426,138 +1370,6 @@ fn feature_graph_cycle_finding(
     )
 }
 
-/// Runs `change-coupling-signal` over `workspace`'s git history within
-/// `window_days`, using `config.layers`'s crate assignment (see module docs
-/// "`change-coupling-signal`"). `Ok(vec![])` with no analysis performed at
-/// all when `config.layers` is absent or its `assign` table is empty.
-pub fn change_coupling_signals(
-    workspace: &Workspace,
-    config: &BoundaryConfig,
-    window_days: i64,
-) -> Result<Vec<Finding>, GitError> {
-    let Some(layers) = &config.layers else {
-        return Ok(Vec::new());
-    };
-    if layers.assign.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let commits = git::walk_commits(&workspace.root, window_days)?;
-
-    // Longest-root-first, so a crate nested inside another workspace crate's
-    // directory tree (unusual, but not impossible) resolves to the more
-    // specific crate, not its parent.
-    let mut crate_roots: Vec<(&str, &Path)> = workspace
-        .crates
-        .iter()
-        .map(|krate| (krate.name.as_str(), krate.root.as_path()))
-        .collect();
-    crate_roots.sort_by_key(|(_, root)| std::cmp::Reverse(root.as_os_str().len()));
-
-    let mut total_touches: HashMap<&str, u32> = HashMap::new();
-    let mut co_touches: HashMap<(String, String), u32> = HashMap::new();
-
-    for commit in &commits {
-        let mut touched_crates: HashSet<&str> = HashSet::new();
-        for file in &commit.files_changed {
-            let absolute = workspace.root.join(file);
-            if let Some((name, _)) = crate_roots
-                .iter()
-                .find(|(_, root)| absolute.starts_with(root))
-            {
-                touched_crates.insert(name);
-            }
-        }
-
-        // Only crates assigned to a layer are this rule's concern.
-        let mut layered: Vec<&str> = touched_crates
-            .into_iter()
-            .filter(|name| layers.assign.contains_key(*name))
-            .collect();
-        layered.sort_unstable();
-
-        for name in &layered {
-            *total_touches.entry(*name).or_insert(0) += 1;
-        }
-        for i in 0..layered.len() {
-            for j in (i + 1)..layered.len() {
-                let (a, b) = (layered[i], layered[j]);
-                if layers.assign.get(a) == layers.assign.get(b) {
-                    continue; // same layer — not this rule's concern
-                }
-                co_touches
-                    .entry((a.to_string(), b.to_string()))
-                    .and_modify(|count| *count += 1)
-                    .or_insert(1);
-            }
-        }
-    }
-
-    let cargo_toml = workspace.root.join("Cargo.toml");
-    let mut findings = Vec::new();
-    for ((crate_a, crate_b), co_change_count) in &co_touches {
-        if *co_change_count < MIN_CO_CHANGE_SAMPLE {
-            continue;
-        }
-        let total_a = total_touches.get(crate_a.as_str()).copied().unwrap_or(0);
-        let total_b = total_touches.get(crate_b.as_str()).copied().unwrap_or(0);
-        let denominator = total_a.min(total_b);
-        if denominator == 0 {
-            continue;
-        }
-        let ratio = f64::from(*co_change_count) / f64::from(denominator);
-        if ratio >= CHANGE_COUPLING_RATIO_THRESHOLD {
-            findings.push(change_coupling_signal_finding(
-                &cargo_toml,
-                crate_a,
-                crate_b,
-                *co_change_count,
-                ratio,
-                layers,
-            ));
-        }
-    }
-    findings.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-    Ok(findings)
-}
-
-/// Builds a `change-coupling-signal` finding. Its evidence class is
-/// `heuristic` (see module docs "`change-coupling-signal`"): the co-change
-/// counts themselves are exact, but reading them as evidence of genuine
-/// coupling — rather than coincidence within one git window — is an
-/// interpretation, never proof.
-fn change_coupling_signal_finding(
-    cargo_toml: &Path,
-    crate_a: &str,
-    crate_b: &str,
-    co_change_count: u32,
-    ratio: f64,
-    layers: &LayersConfig,
-) -> Finding {
-    let layer_a = layers.assign.get(crate_a).cloned().unwrap_or_default();
-    let layer_b = layers.assign.get(crate_b).cloned().unwrap_or_default();
-    Finding::new(
-        format!("{CHANGE_COUPLING_SIGNAL_RULE}:{crate_a}:{crate_b}"),
-        CHANGE_COUPLING_SIGNAL_RULE,
-        Severity::Warn,
-        Location {
-            file: cargo_toml.to_path_buf(),
-            line: OneBasedLine::FIRST,
-            item_path: format!("{crate_a} ({layer_a}) <-> {crate_b} ({layer_b})"),
-        },
-        EvidenceClass::Heuristic,
-        Origin::Code,
-        Some(serde_json::json!({
-            "crate_a": crate_a,
-            "crate_b": crate_b,
-            "layer_a": layer_a,
-            "layer_b": layer_b,
-            "co_change_commits": co_change_count,
-            "ratio": ratio,
-        })),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2163,34 +1975,6 @@ crates = ["cli"]
     }
 
     #[test]
-    fn toml_from_str_round_trips_provenance_labels() {
-        let source = r#"
-[[provenance_label]]
-name = "contractor-x"
-trailer_contains = ["contractor-x@example.com"]
-author_email_contains = ["contractor-x@example.com"]
-
-[[provenance_label]]
-name = "internal-bot"
-trailer_contains = ["internal-ci-bot"]
-"#;
-        let config: BoundaryConfig = toml::from_str(source).unwrap();
-
-        assert_eq!(config.provenance.labels.len(), 2);
-        assert_eq!(config.provenance.labels[0].name, "contractor-x");
-        assert_eq!(
-            config.provenance.labels[0].trailer_contains,
-            vec!["contractor-x@example.com".to_string()]
-        );
-        assert_eq!(
-            config.provenance.labels[0].author_email_contains,
-            vec!["contractor-x@example.com".to_string()]
-        );
-        assert_eq!(config.provenance.labels[1].name, "internal-bot");
-        assert!(config.provenance.labels[1].author_email_contains.is_empty());
-    }
-
-    #[test]
     fn toml_from_str_round_trips_catch_all_error_rule_config() {
         let source = r#"
 [rules.catch-all-error]
@@ -2781,8 +2565,7 @@ order = ["domain", "application", "infrastructure"]
         // resolution — a file wired in via `#[path = "..."]` is misplaced.
         // Here `src/domain/mod.rs` pulls in a submodule whose *physical*
         // file lives under `src/shared/`, via `#[path = "../shared/..."]`.
-        // `module_path_for_file` derives the module path purely from the
-        // file's position on disk, so it resolves to `shared::domain_impl`
+        // `module_path_for_file` resolves to `shared::domain_impl`
         // — not `domain::domain_impl`, its logical position. A rule scoped
         // to `from = "domain"` therefore never examines this file at all,
         // even though it contains a real forbidden `crate::io` reference.
@@ -2979,220 +2762,5 @@ order = ["domain", "application", "infrastructure"]
             module_path_for_file(root, Path::new("/ws/my-core/build.rs")),
             None
         );
-    }
-
-    // -- change-coupling-signal --
-
-    /// Runs `git` in `dir` with a fixed test identity, mirroring
-    /// `crate::git`'s own test helper of the same name.
-    fn git(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=judge-test",
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("failed to run git — required for these fixtures");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
-    fn commit_touching(dir: &TempDir, files: &[(&str, &str)], message: &str) {
-        for (relative, content) in files {
-            std::fs::write(dir.join(relative), content).unwrap();
-        }
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "-q", "-m", message]);
-    }
-
-    fn workspace_of(root: std::path::PathBuf, crate_names: &[&str]) -> Workspace {
-        Workspace {
-            crates: crate_names
-                .iter()
-                .map(|name| CrateInfo {
-                    name: name.to_string(),
-                    version: "0.1.0".to_string(),
-                    manifest_path: root.join(name).join("Cargo.toml"),
-                    root: root.join(name),
-                    source_files: Vec::new(),
-                    entry_points: Vec::new(),
-                    dependencies: Vec::new(),
-                })
-                .collect(),
-            root,
-        }
-    }
-
-    #[test]
-    fn change_coupling_signal_fires_for_a_highly_correlated_crate_pair() {
-        let dir = TempDir::new("boundaries-change-coupling-fires");
-        git(&dir, &["init", "-q", "-b", "main"]);
-        write_workspace_manifest(&dir, &["crate-a", "crate-b"]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "init workspace"]);
-        // Each crate's own scaffolding commit is a *solo* touch — deliberately
-        // separate commits, so they don't themselves count as a co-change and
-        // skew the counts this test asserts on below.
-        write_crate(&dir, "crate-a", &[]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "add crate-a"]);
-        write_crate(&dir, "crate-b", &[]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "add crate-b"]);
-
-        for i in 0..6 {
-            commit_touching(
-                &dir,
-                &[
-                    ("crate-a/src/lib.rs", &format!("pub fn a{i}() {{}}\n")),
-                    ("crate-b/src/lib.rs", &format!("pub fn b{i}() {{}}\n")),
-                ],
-                &format!("touch both {i}"),
-            );
-        }
-
-        let workspace = workspace_of(dir.to_path_buf(), &["crate-a", "crate-b"]);
-        let config = BoundaryConfig {
-            layers: Some(layers_config(
-                LayerPreset::Layered,
-                &["inner", "outer"],
-                None,
-                &[("crate-a", "inner"), ("crate-b", "outer")],
-            )),
-            ..Default::default()
-        };
-
-        let findings =
-            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule, CHANGE_COUPLING_SIGNAL_RULE);
-        assert_eq!(findings[0].evidence_class, EvidenceClass::Heuristic);
-        assert!(!findings[0].is_gating());
-        let evidence = findings[0].evidence.as_ref().unwrap();
-        // 6 co-change commits, plus each crate's own solo scaffolding commit
-        // (1 apiece) in the denominator: 6 / (6 + 1) ≈ 0.857.
-        assert_eq!(evidence["co_change_commits"], 6);
-        let ratio = evidence["ratio"].as_f64().unwrap();
-        assert!(ratio > CHANGE_COUPLING_RATIO_THRESHOLD, "ratio was {ratio}");
-    }
-
-    #[test]
-    fn change_coupling_signal_does_not_fire_below_the_ratio_threshold() {
-        let dir = TempDir::new("boundaries-change-coupling-below-ratio");
-        git(&dir, &["init", "-q", "-b", "main"]);
-        write_workspace_manifest(&dir, &["crate-a", "crate-b"]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "init workspace"]);
-        write_crate(&dir, "crate-a", &[]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "add crate-a"]);
-        write_crate(&dir, "crate-b", &[]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "add crate-b"]);
-
-        // 5 co-change commits clear `MIN_CO_CHANGE_SAMPLE`, but each crate's
-        // own scaffolding commit plus 4 solo commits (5 solo touches apiece)
-        // pull the ratio (5 / 10) comfortably under
-        // `CHANGE_COUPLING_RATIO_THRESHOLD` (0.6).
-        for i in 0..5 {
-            commit_touching(
-                &dir,
-                &[
-                    ("crate-a/src/lib.rs", &format!("pub fn a{i}() {{}}\n")),
-                    ("crate-b/src/lib.rs", &format!("pub fn b{i}() {{}}\n")),
-                ],
-                &format!("touch both {i}"),
-            );
-        }
-        for i in 0..4 {
-            commit_touching(
-                &dir,
-                &[("crate-a/src/lib.rs", &format!("pub fn solo_a{i}() {{}}\n"))],
-                &format!("touch a alone {i}"),
-            );
-            commit_touching(
-                &dir,
-                &[("crate-b/src/lib.rs", &format!("pub fn solo_b{i}() {{}}\n"))],
-                &format!("touch b alone {i}"),
-            );
-        }
-
-        let workspace = workspace_of(dir.to_path_buf(), &["crate-a", "crate-b"]);
-        let config = BoundaryConfig {
-            layers: Some(layers_config(
-                LayerPreset::Layered,
-                &["inner", "outer"],
-                None,
-                &[("crate-a", "inner"), ("crate-b", "outer")],
-            )),
-            ..Default::default()
-        };
-
-        let findings =
-            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
-
-        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
-    }
-
-    #[test]
-    fn change_coupling_signal_ignores_a_pair_assigned_to_the_same_layer() {
-        let dir = TempDir::new("boundaries-change-coupling-same-layer");
-        git(&dir, &["init", "-q", "-b", "main"]);
-        write_workspace_manifest(&dir, &["crate-a", "crate-b"]);
-        write_crate(&dir, "crate-a", &[]);
-        write_crate(&dir, "crate-b", &[]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "initial"]);
-
-        for i in 0..6 {
-            commit_touching(
-                &dir,
-                &[
-                    ("crate-a/src/lib.rs", &format!("pub fn a{i}() {{}}\n")),
-                    ("crate-b/src/lib.rs", &format!("pub fn b{i}() {{}}\n")),
-                ],
-                &format!("touch both {i}"),
-            );
-        }
-
-        let workspace = workspace_of(dir.to_path_buf(), &["crate-a", "crate-b"]);
-        let config = BoundaryConfig {
-            layers: Some(layers_config(
-                LayerPreset::Layered,
-                &["inner"],
-                None,
-                &[("crate-a", "inner"), ("crate-b", "inner")],
-            )),
-            ..Default::default()
-        };
-
-        let findings =
-            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
-
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn change_coupling_signal_performs_no_analysis_without_layers_config() {
-        let dir = TempDir::new("boundaries-change-coupling-no-layers");
-        git(&dir, &["init", "-q", "-b", "main"]);
-        write_workspace_manifest(&dir, &["crate-a"]);
-        write_crate(&dir, "crate-a", &[]);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "initial"]);
-
-        let workspace = workspace_of(dir.to_path_buf(), &["crate-a"]);
-        let config = BoundaryConfig::default();
-
-        let findings =
-            change_coupling_signals(&workspace, &config, git::DEFAULT_WINDOW_DAYS).unwrap();
-
-        assert!(findings.is_empty());
     }
 }

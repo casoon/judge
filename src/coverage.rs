@@ -713,7 +713,7 @@ end_of_record
             git(&dir, &["commit", "-q", "-m", "rework"]);
         }
 
-        let churn = crate::git::churn(&dir, UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS).unwrap();
+        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         // Lines 10..=20 belong to the function (11 lines, matching the DA
         // records below one-to-one); only 3 of them are covered.
         let functions = vec![function_info(dir.join("src/hot.rs"), 10, 12, 11)];
@@ -765,19 +765,10 @@ end_of_record
     #[test]
     fn untested_hotspot_fires_despite_a_leading_curdir_in_the_lcov_path() {
         let dir = TempDir::new("coverage-untested-hotspot-leading-curdir");
-        git(&dir, &["init", "-q", "-b", "main"]);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/hot.rs"), "fn hot() {}\n").unwrap();
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "initial"]);
 
-        for i in 0..5 {
-            std::fs::write(dir.join("src/hot.rs"), format!("fn hot() {{ {i} }}\n")).unwrap();
-            git(&dir, &["add", "."]);
-            git(&dir, &["commit", "-q", "-m", "rework"]);
-        }
-
-        let churn = crate::git::churn(&dir, UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS).unwrap();
+        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         let functions = vec![function_info(dir.join("src/hot.rs"), 10, 12, 11)];
 
         let lcov = "\

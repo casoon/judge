@@ -68,26 +68,6 @@ fn run_dead_code_deep(
         false,
     );
 
-    // `orphaned-code` needs a file's dominant blame author and the repo's
-    // active-author set — same Fast Tier, git-blame-based data
-    // `low-bus-factor` already computes (see `judge::ownership` module
-    // docs). Only `.files` is used here; the low-bus-factor/
-    // ownership-fragmentation findings this also computes belong to `cargo
-    // judge distribution`, not this command, so they're discarded.
-    let window_days = judge::git::DEFAULT_WINDOW_DAYS;
-    let active_authors = judge::git::active_authors_since(&workspace.root, window_days)?;
-    let ownership_report = judge::ownership::analyze_workspace(&workspace, window_days)?;
-    let dominant_author_by_file: std::collections::HashMap<std::path::PathBuf, String> =
-        ownership_report
-            .files
-            .iter()
-            .filter_map(|file| {
-                file.authors
-                    .first()
-                    .map(|author| (file.file.clone(), author.email.clone()))
-            })
-            .collect();
-
     // `monomorphization-load` needs each function's `generic_param_count` —
     // cheap, Fast Tier, the same `Vec<FunctionInfo>` `signature-complexity`
     // already computes.
@@ -97,19 +77,10 @@ fn run_dead_code_deep(
         .flat_map(|krate| krate.source_files.iter());
     let complexity = judge::complexity::analyze_workspace(monomorphization_source_files, false);
 
-    // `connectivity-drop`/`duplicative-reinvention`/`orphaned-code` load
-    // their own second `DeepContext` here rather than sharing
-    // `dead_code`'s — `dead_code::analyze_workspace` doesn't expose the
-    // `RootDatabase` it loads internally, and threading one through would
-    // widen that module's public API for a performance-only concern.
-    // Accepted, documented extra cost (a second full workspace load; see
-    // `judge::deep`'s own cost note), not a correctness one.
     let structural_report = judge::slop_structural_deep::analyze_workspace(
         &workspace,
         &dupes,
         include_tests,
-        &dominant_author_by_file,
-        &active_authors,
         &complexity.functions,
     )?;
 
@@ -122,7 +93,6 @@ fn run_dead_code_deep(
     append_analysis_errors(&mut analysis_errors, &feature_matrix_report.errors);
     append_analysis_errors(&mut analysis_errors, &dead_trait_impl_report.errors);
     append_analysis_errors(&mut analysis_errors, &dupes.errors);
-    append_analysis_errors(&mut analysis_errors, &ownership_report.errors);
     append_analysis_errors(&mut analysis_errors, &complexity.errors);
     append_analysis_errors(&mut analysis_errors, &structural_report.errors);
 
@@ -176,10 +146,6 @@ fn run_dead_code_deep(
             (
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE.to_string(),
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE_REVISION,
-            ),
-            (
-                judge::slop_structural_deep::ORPHANED_CODE_RULE.to_string(),
-                judge::slop_structural_deep::ORPHANED_CODE_RULE_REVISION,
             ),
             (
                 judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE.to_string(),
@@ -256,7 +222,6 @@ fn run_dead_code_deep(
                 judge::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
                 judge::slop_structural_deep::CONNECTIVITY_DROP_RULE,
                 judge::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
-                judge::slop_structural_deep::ORPHANED_CODE_RULE,
                 judge::slop_structural_deep::MONOMORPHIZATION_LOAD_RULE,
             ] {
                 let rule_findings: Vec<&Finding> = findings

@@ -330,8 +330,8 @@ pub enum Verdict {
 
 /// A three-way verdict distinguishing `Warn` from `Fail` among
 /// `code_introduced` findings, instead of collapsing both into `Fail` like
-/// [`Delta::verdict`] does. Used by `audit --since` (see todo.md §6), which
-/// reports on `Warn`-severity findings rather than hard-failing on them.
+/// [`Delta::verdict`] does. It is retained for API consumers that need to
+/// distinguish warning-only deltas from failing deltas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriVerdict {

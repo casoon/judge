@@ -23,6 +23,14 @@ for consistent verdicts, evidence groups, source locations, color policy, and
 next steps. JSON, SARIF, and Markdown remain explicit machine or handoff
 contracts owned by judge.
 
+## 0.6.0 highlights
+
+- Complete repositioning as a deterministic post-refactoring analyzer for Rust workspaces.
+- Removed Git history dependency, `gix` dependency, and Git-bound commands (`distribution`, `provenance`, `audit --since`).
+- Artifact-based baseline comparison (`cargo judge compare`) works seamlessly without Git.
+- `ureq` HTTP dependency is now optional (`--features network`).
+- See [MIGRATION.md](file:///Users/jseidel/GitHub/judge/MIGRATION.md) for breaking changes and CLI migration details.
+
 ## 0.5.2 highlights
 
 - TTY reports now use `runemark` 0.1.1 for consistent verdicts, compact
@@ -82,7 +90,7 @@ Early stage. The Fast Tier (no build required, `syn`-, Cargo-metadata-, and mani
 - `cargo judge compare BASELINE` — compares the current project state with a saved findings artifact; works without Git
 - `cargo judge dead-code [--include-tests]` — Deep Tier, needs `--features deep` (see below)
 - `cargo judge explain <item-path> --why-live` — Deep Tier, needs `--features deep` (see below)
-- `--format json|sarif|markdown` — versioned JSON on every report command (written by default to `.judge/<command>.json`, or to `--output PATH`), SARIF 2.1.0 on the report-producing commands, and Markdown for the combined review summary as well as the `audit`/`--baseline` delta
+- `--format json|sarif|markdown` — versioned JSON on every report command (written by default to `.judge/<command>.json`, or to `--output PATH`), SARIF 2.1.0 on the report-producing commands, and Markdown for the combined review summary and baseline delta
 - `--save-baseline` / `--baseline PATH` — save or compare findings against a baseline
 
 Every written JSON artifact starts with a `header`, followed by the command payload. It

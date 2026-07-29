@@ -11,15 +11,11 @@ pub(super) fn run_dupes(
     let DupesOptions {
         mode,
         min_tokens,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
+        baseline_args,
         include_generated,
         include_tests,
     } = options;
+    let format = baseline_args.format;
     let workspace = judge::ingest::load(None)?;
 
     let source_files = workspace
@@ -36,37 +32,28 @@ pub(super) fn run_dupes(
     let refactoring_summary = report.refactoring_summary(&workspace.root, 5);
     let analysis_errors = analysis_errors(&report.errors);
 
-    // Inline `judge-ignore` suppression (todo.md §5): dropped here, before
-    // baseline diff/verdict or JSON/SARIF output — the TTY clone-family
-    // preview below still lists every family member (see `run_dupes`'s own
-    // scope note at its `Tty` arm), but nothing suppressed reaches a verdict.
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(report.to_findings(), &workspace.root)?;
-
-    let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
-    if let Some(result) = baseline_request.handle(
-        BaselineInput {
-            workspace_root: &workspace.root,
-            findings: &findings,
-            analysis_errors: &analysis_errors,
-            rule_revisions: std::collections::HashMap::from([(
-                judge::duplication::DUPLICATE_RULE.to_string(),
-                judge::duplication::DUPLICATE_RULE_REVISION,
-            )]),
-            default_save_path: Path::new(DEFAULT_BASELINE_DUPES),
-            total_loc: judge::health_score::total_authored_loc(&workspace),
-        },
+    let (findings, suppressed_inline) = match suppress_and_baseline(
+        report.to_findings(),
+        &workspace,
+        &analysis_errors,
+        &baseline_args,
+        std::collections::HashMap::from([(
+            judge::duplication::DUPLICATE_RULE.to_string(),
+            judge::duplication::DUPLICATE_RULE_REVISION,
+        )]),
+        Path::new(DEFAULT_BASELINE_DUPES),
         out,
-    ) {
-        return result;
-    }
+    )? {
+        std::ops::ControlFlow::Break(outcome) => return Ok(outcome),
+        std::ops::ControlFlow::Continue(rest) => rest,
+    };
 
     match format {
         OutputFormat::Json => {
             let report = Report::with_errors(findings, analysis_errors)
                 .with_suppressed_inline(suppressed_inline);
-            let mut envelope = serde_json::to_value(&report).unwrap();
-            envelope["refactoring_summary"] = serde_json::to_value(refactoring_summary).unwrap();
+            let mut envelope = serde_json::to_value(&report)?;
+            envelope["refactoring_summary"] = serde_json::to_value(refactoring_summary)?;
             write_json(out, &envelope)?;
         }
         OutputFormat::Sarif => {
@@ -178,22 +165,19 @@ pub(super) fn run_deps(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let DepsOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
+        baseline_args,
         check_crates_io,
         check_rustc_lints,
         audit_json,
     } = options;
+    let format = baseline_args.format;
     let workspace = judge::ingest::load(None)?;
 
     let report = judge::deps::analyze_workspace(&workspace);
     let mut analysis_errors = analysis_errors(&report.errors);
     let mut findings = report.findings;
 
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
     let mut rule_revisions = std::collections::HashMap::from([
         (
             judge::deps::MISPLACED_DEPENDENCY_KIND_RULE.to_string(),
@@ -319,25 +303,18 @@ pub(super) fn run_deps(
         );
     }
 
-    // Inline `judge-ignore` suppression (todo.md §5), applied after every
-    // detector above has merged its findings in.
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
-    if let Some(result) = baseline_request.handle(
-        BaselineInput {
-            workspace_root: &workspace.root,
-            findings: &findings,
-            analysis_errors: &analysis_errors,
-            rule_revisions,
-            default_save_path: Path::new(DEFAULT_BASELINE_DEPS),
-            total_loc: judge::health_score::total_authored_loc(&workspace),
-        },
+    let (findings, suppressed_inline) = match suppress_and_baseline(
+        findings,
+        &workspace,
+        &analysis_errors,
+        &baseline_args,
+        rule_revisions,
+        Path::new(DEFAULT_BASELINE_DEPS),
         out,
-    ) {
-        return result;
-    }
+    )? {
+        std::ops::ControlFlow::Break(outcome) => return Ok(outcome),
+        std::ops::ControlFlow::Continue(rest) => rest,
+    };
 
     match format {
         OutputFormat::Json => {
@@ -420,13 +397,9 @@ pub(super) fn run_coverage(
     let CoverageOptions {
         lcov,
         mutants_json,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
+        baseline_args,
     } = options;
+    let format = baseline_args.format;
     let workspace = judge::ingest::load(None)?;
 
     let coverage = judge::coverage::read_lcov(&lcov, &workspace.root)?;
@@ -444,20 +417,9 @@ pub(super) fn run_coverage(
         ));
     }
 
-    let churn = match judge::git::churn(
-        &workspace.root,
-        judge::coverage::UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS,
-    ) {
-        Ok(churn) => churn,
-        Err(err) => {
-            analysis_errors.push(err.to_string());
-            std::collections::HashMap::new()
-        }
-    };
-
     let mut findings = judge::coverage::untested_hotspots(
         &complexity_report.functions,
-        &churn,
+        &std::collections::HashMap::new(),
         &coverage,
         &workspace.root,
     );
@@ -488,32 +450,29 @@ pub(super) fn run_coverage(
 
     let test_ratios = judge::coverage::test_ratios(&workspace);
 
-    let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
-    if let Some(result) = baseline_request.handle(
-        BaselineInput {
-            workspace_root: &workspace.root,
-            findings: &findings,
-            analysis_errors: &analysis_errors,
-            rule_revisions,
-            default_save_path: Path::new(DEFAULT_BASELINE_COVERAGE),
-            total_loc: judge::health_score::total_authored_loc(&workspace),
-        },
+    let (findings, _suppressed_inline) = match suppress_and_baseline(
+        findings,
+        &workspace,
+        &analysis_errors,
+        &baseline_args,
+        rule_revisions,
+        Path::new(DEFAULT_BASELINE_COVERAGE),
         out,
-    ) {
-        return result;
-    }
+    )? {
+        std::ops::ControlFlow::Break(outcome) => return Ok(outcome),
+        std::ops::ControlFlow::Continue(rest) => rest,
+    };
 
     match format {
         OutputFormat::Json => {
             let report = Report::with_errors(findings, analysis_errors);
-            let mut value = serde_json::to_value(&report).unwrap();
+            let mut value = serde_json::to_value(&report)?;
             value["files_without_coverage_data"] = serde_json::to_value(
                 no_coverage_data
                     .iter()
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>(),
-            )
-            .unwrap();
+            )?;
             value["test_ratios"] = serde_json::to_value(
                 test_ratios
                     .iter()
@@ -526,8 +485,7 @@ pub(super) fn run_coverage(
                         })
                     })
                     .collect::<Vec<_>>(),
-            )
-            .unwrap();
+            )?;
             write_json(out, &value)?;
         }
         OutputFormat::Sarif => {
@@ -593,14 +551,10 @@ pub(super) fn run_boundaries(
 ) -> Result<CommandOutcome, CliError> {
     let BoundariesOptions {
         config: config_path,
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
+        baseline_args,
         graph,
     } = options;
+    let format = baseline_args.format;
 
     if let Some(graph_format) = graph {
         let crate_graph = judge::boundaries::build_crate_graph(None)?;
@@ -663,48 +617,40 @@ pub(super) fn run_boundaries(
         }
     }
 
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
-
-    let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
-    if baseline_request.is_requested() {
-        #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-        let mut rule_revisions = std::collections::HashMap::from([
-            (
-                judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
-                judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
-            ),
-            (
-                judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
-                judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
-            ),
-            (
-                judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE.to_string(),
-                judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
-            ),
-        ]);
-        #[cfg(feature = "deep")]
-        if judge::AnalysisTier::Deep.is_available() {
-            rule_revisions.insert(
-                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE.to_string(),
-                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE_REVISION,
-            );
-        }
-        return baseline_request
-            .handle(
-                BaselineInput {
-                    workspace_root: &workspace.root,
-                    findings: &findings,
-                    analysis_errors: &analysis_errors,
-                    rule_revisions,
-                    default_save_path: Path::new(DEFAULT_BASELINE_BOUNDARIES),
-                    total_loc: judge::health_score::total_authored_loc(&workspace),
-                },
-                out,
-            )
-            .expect("baseline request was checked above");
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut rule_revisions = std::collections::HashMap::from([
+        (
+            judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
+            judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
+        ),
+        (
+            judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
+            judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
+        ),
+        (
+            judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE.to_string(),
+            judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
+        ),
+    ]);
+    #[cfg(feature = "deep")]
+    if judge::AnalysisTier::Deep.is_available() {
+        rule_revisions.insert(
+            judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE.to_string(),
+            judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE_REVISION,
+        );
     }
+    let (findings, suppressed_inline) = match suppress_and_baseline(
+        findings,
+        &workspace,
+        &analysis_errors,
+        &baseline_args,
+        rule_revisions,
+        Path::new(DEFAULT_BASELINE_BOUNDARIES),
+        out,
+    )? {
+        std::ops::ControlFlow::Break(outcome) => return Ok(outcome),
+        std::ops::ControlFlow::Continue(rest) => rest,
+    };
 
     match format {
         OutputFormat::Json => {
@@ -748,142 +694,6 @@ pub(super) fn run_boundaries(
     Ok(CommandOutcome::Clean)
 }
 
-/// Ownership/bus-factor findings (see todo.md §3.E, §8). Window is the same
-/// `judge::git::DEFAULT_WINDOW_DAYS` used by hotspots — not a separate CLI
-/// flag, matching how hotspots hardcodes it today.
-pub(super) fn run_distribution(
-    options: DistributionOptions,
-    out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let DistributionOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-    } = options;
-    let workspace = judge::ingest::load(None)?;
-
-    let report = judge::ownership::analyze_workspace(&workspace, judge::git::DEFAULT_WINDOW_DAYS)?;
-    let analysis_errors = analysis_errors(&report.errors);
-    let files_analyzed = report.files.len();
-    let blame_errors = report.errors.len();
-    let history_unavailable = report.history_unavailable;
-
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
-
-    let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
-    if baseline_request.is_requested() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::ownership::LOW_BUS_FACTOR_RULE.to_string(),
-                judge::ownership::LOW_BUS_FACTOR_RULE_REVISION,
-            ),
-            (
-                judge::ownership::OWNERSHIP_FRAGMENTATION_RULE.to_string(),
-                judge::ownership::OWNERSHIP_FRAGMENTATION_RULE_REVISION,
-            ),
-        ]);
-        return baseline_request
-            .handle(
-                BaselineInput {
-                    workspace_root: &workspace.root,
-                    findings: &findings,
-                    analysis_errors: &analysis_errors,
-                    rule_revisions,
-                    default_save_path: Path::new(DEFAULT_BASELINE_DISTRIBUTION),
-                    total_loc: judge::health_score::total_authored_loc(&workspace),
-                },
-                out,
-            )
-            .expect("baseline request was checked above");
-    }
-
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline)
-                .with_history_unavailable(history_unavailable);
-            write_json(out, &report)?;
-        }
-        OutputFormat::Sarif => {
-            write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
-        }
-        OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`distribution`",
-                format,
-                "tty, json, sarif",
-            ));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "files analyzed: {files_analyzed}")?;
-            if blame_errors > 0 {
-                writeln!(out, "files skipped (blame errors): {blame_errors}")?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if !history_unavailable.is_empty() {
-                writeln!(
-                    out,
-                    "files without committed history: {}",
-                    history_unavailable.len()
-                )?;
-                for file in &history_unavailable {
-                    writeln!(out, "  {}", file.display())?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
-
-            let (bus_factor, fragmentation): (Vec<&Finding>, Vec<&Finding>) = findings
-                .iter()
-                .partition(|finding| finding.rule == judge::ownership::LOW_BUS_FACTOR_RULE);
-
-            writeln!(out)?;
-            writeln!(out, "low-bus-factor findings: {}", bus_factor.len())?;
-            for finding in &bus_factor {
-                writeln!(
-                    out,
-                    "  [{}] {}  primary author: {}",
-                    severity_label(finding.severity),
-                    finding.location.file.display(),
-                    finding.location.item_path
-                )?;
-            }
-
-            writeln!(out)?;
-            writeln!(
-                out,
-                "ownership-fragmentation findings (advisory, no verdict effect): {}",
-                fragmentation.len()
-            )?;
-            for finding in &fragmentation {
-                writeln!(
-                    out,
-                    "  [{}] {}  {}",
-                    severity_label(finding.severity),
-                    finding.location.file.display(),
-                    finding.location.item_path
-                )?;
-            }
-            if !fragmentation.is_empty() {
-                writeln!(
-                    out,
-                    "  note: {}",
-                    judge::ownership::OWNERSHIP_FRAGMENTATION_NOTE
-                )?;
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
-}
-
 /// `unlinked-file`/`orphan-module` findings from resolving each crate's real
 /// `mod` tree (see `judge::module_graph`). Subcommand-only, matching
 /// `Distribution`/`Provenance`/`ApiSurface`'s own opt-in precedent — no
@@ -893,27 +703,22 @@ pub(super) fn run_module_graph(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let ModuleGraphOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
+        baseline_args,
         include_generated,
     } = options;
+    let format = baseline_args.format;
     let workspace = judge::ingest::load(None)?;
 
     let report = judge::module_graph::analyze_workspace(&workspace, include_generated);
     let analysis_errors = analysis_errors(&report.errors);
     let excluded_generated = report.excluded_generated;
 
-    // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(report.findings, &workspace.root)?;
-
-    let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
-    if baseline_request.is_requested() {
-        let rule_revisions = std::collections::HashMap::from([
+    let (findings, suppressed_inline) = match suppress_and_baseline(
+        report.findings,
+        &workspace,
+        &analysis_errors,
+        &baseline_args,
+        std::collections::HashMap::from([
             (
                 judge::module_graph::UNLINKED_FILE_RULE.to_string(),
                 judge::module_graph::UNLINKED_FILE_RULE_REVISION,
@@ -922,21 +727,13 @@ pub(super) fn run_module_graph(
                 judge::module_graph::ORPHAN_MODULE_RULE.to_string(),
                 judge::module_graph::ORPHAN_MODULE_RULE_REVISION,
             ),
-        ]);
-        return baseline_request
-            .handle(
-                BaselineInput {
-                    workspace_root: &workspace.root,
-                    findings: &findings,
-                    analysis_errors: &analysis_errors,
-                    rule_revisions,
-                    default_save_path: Path::new(DEFAULT_BASELINE_MODULE_GRAPH),
-                    total_loc: judge::health_score::total_authored_loc(&workspace),
-                },
-                out,
-            )
-            .expect("baseline request was checked above");
-    }
+        ]),
+        Path::new(DEFAULT_BASELINE_MODULE_GRAPH),
+        out,
+    )? {
+        std::ops::ControlFlow::Break(outcome) => return Ok(outcome),
+        std::ops::ControlFlow::Continue(rest) => rest,
+    };
 
     match format {
         OutputFormat::Json => {
@@ -1408,135 +1205,40 @@ fn print_api_surface_size(
     Ok(())
 }
 
-/// Heuristic author-class breakdowns of churn, duplication, and suppression
-/// debt (see todo.md §3.G G6). Subcommand-only: deliberately not wired into
-/// `collect_findings`/`run_all`/`SLOP_RULES`, matching `Distribution`/
-/// `DeadCode`'s own opt-in precedent. Reuses `git::DEFAULT_WINDOW_DAYS`, same
-/// as `run_distribution`.
-pub(super) fn run_provenance(
-    options: ProvenanceOptions,
+fn suppress_and_baseline(
+    findings: Vec<Finding>,
+    workspace: &judge::ingest::Workspace,
+    analysis_errors: &[String],
+    baseline_args: &BaselineArgs,
+    rule_revisions: std::collections::HashMap<String, u32>,
+    default_save_path: &Path,
     out: &mut dyn Write,
-) -> Result<CommandOutcome, CliError> {
-    let ProvenanceOptions {
-        baseline_args:
-            BaselineArgs {
-                format,
-                save_baseline,
-                baseline,
-            },
-    } = options;
-    let workspace = judge::ingest::load(None)?;
+) -> Result<std::ops::ControlFlow<CommandOutcome, (Vec<Finding>, usize)>, CliError> {
+    let (findings, suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
 
-    let config = load_judge_toml(&workspace.root)?;
-
-    let breakdown = judge::provenance::analyze_workspace(
-        &workspace,
-        judge::git::DEFAULT_WINDOW_DAYS,
-        &config.provenance.labels,
+    let baseline_request = BaselineRequest::new(
+        baseline_args.save_baseline,
+        baseline_args.baseline.as_deref(),
+        baseline_args.format,
     );
-    let analysis_errors = analysis_errors(&breakdown.errors);
 
-    let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
-    if baseline_request.is_requested() {
-        let rule_revisions = std::collections::HashMap::from([
-            (
-                judge::provenance::PROVENANCE_CHURN_RULE.to_string(),
-                judge::provenance::PROVENANCE_CHURN_RULE_REVISION,
-            ),
-            (
-                judge::provenance::PROVENANCE_DUPLICATION_RATE_RULE.to_string(),
-                judge::provenance::PROVENANCE_DUPLICATION_RATE_RULE_REVISION,
-            ),
-            (
-                judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE.to_string(),
-                judge::provenance::PROVENANCE_SUPPRESSION_DEBT_RULE_REVISION,
-            ),
-            (
-                judge::provenance::DEP_ADDED_BY_AGENT_RULE.to_string(),
-                judge::provenance::DEP_ADDED_BY_AGENT_RULE_REVISION,
-            ),
-        ]);
-        return baseline_request
-            .handle(
-                BaselineInput {
-                    workspace_root: &workspace.root,
-                    findings: &breakdown.findings,
-                    analysis_errors: &analysis_errors,
-                    rule_revisions,
-                    default_save_path: Path::new(DEFAULT_BASELINE_PROVENANCE),
-                    total_loc: judge::health_score::total_authored_loc(&workspace),
-                },
-                out,
-            )
-            .expect("baseline request was checked above");
+    if let Some(result) = baseline_request.handle(
+        BaselineInput {
+            workspace_root: &workspace.root,
+            findings: &findings,
+            analysis_errors,
+            rule_revisions,
+            default_save_path,
+            total_loc: judge::health_score::total_authored_loc(workspace),
+        },
+        out,
+    ) {
+        return result.map(std::ops::ControlFlow::Break);
     }
 
-    match format {
-        OutputFormat::Json => {
-            let report = Report::with_errors(breakdown.findings, analysis_errors);
-            let mut envelope = serde_json::to_value(&report).unwrap();
-            envelope["caveat"] =
-                serde_json::Value::String(judge::provenance::PROVENANCE_CAVEAT.to_string());
-            write_json(out, &envelope)?;
-        }
-        // No SARIF: provenance output is inseparable from its caveat (a
-        // distribution trend, never a per-person judgement), and SARIF has
-        // no slot that CI annotators would surface it in.
-        OutputFormat::Sarif | OutputFormat::Markdown => {
-            return Err(unsupported_format("`provenance`", format, "tty, json"));
-        }
-        OutputFormat::Tty => {
-            writeln!(out, "{}", judge::provenance::PROVENANCE_CAVEAT)?;
-            writeln!(out)?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-                writeln!(out)?;
-            }
-            writeln!(
-                out,
-                "{:<24} {:>8} {:>12} {:>12}",
-                "class", "churn", "duplication", "suppression"
-            )?;
-            for summary in &breakdown.by_class {
-                writeln!(
-                    out,
-                    "{:<24} {:>8} {:>12} {:>12}",
-                    summary.class.key(),
-                    summary.churn,
-                    summary.duplication,
-                    summary.suppression_debt
-                )?;
-            }
-
-            // `dep-added-by-agent` findings are per-instance, not part of
-            // the `by_class` aggregate table above (see `ClassSummary`'s
-            // doc comment: it's a count model, this rule isn't a count).
-            let dep_added_findings: Vec<&Finding> = breakdown
-                .findings
-                .iter()
-                .filter(|finding| finding.rule == judge::provenance::DEP_ADDED_BY_AGENT_RULE)
-                .collect();
-            if !dep_added_findings.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "dependencies added in an agent-classified commit, with no same-commit usage found:"
-                )?;
-                for finding in dep_added_findings {
-                    let evidence = finding.evidence.as_ref().expect("always set");
-                    writeln!(
-                        out,
-                        "  {} (commit {}, {})",
-                        evidence["dependency"].as_str().unwrap_or("?"),
-                        evidence["commit"].as_str().unwrap_or("?"),
-                        evidence["author_class"].as_str().unwrap_or("?")
-                    )?;
-                }
-            }
-        }
-    }
-    Ok(CommandOutcome::Clean)
+    Ok(std::ops::ControlFlow::Continue((
+        findings,
+        suppressed_inline,
+    )))
 }

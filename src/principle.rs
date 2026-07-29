@@ -224,7 +224,7 @@ impl PrincipleHeuristicId {
         Self(format!(
             "principle:{}:{}",
             principle.slug(),
-            fnv1a_hex(&normalized)
+            crate::finding::fnv1a_hex(&normalized)
         ))
     }
 }
@@ -233,20 +233,6 @@ impl std::fmt::Display for PrincipleHeuristicId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-/// Deterministic, version-independent 64-bit FNV-1a hash, hex-encoded. Same
-/// algorithm as `crate::pattern::fnv1a_hex`, duplicated rather than shared
-/// because that function is private to `pattern.rs`.
-fn fnv1a_hex(input: &str) -> String {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for byte in input.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{hash:016x}")
 }
 
 /// A cautious interpretation of an abstract design principle, aggregated
@@ -813,9 +799,8 @@ fn sorted_joined(methods: &std::collections::BTreeSet<String>) -> String {
 /// Derives a source file's module path purely from its position under
 /// `crate_root/src/` — identical directory-convention logic to
 /// `crate::boundaries::module_path_for_file`, duplicated rather than shared
-/// because that function is private to `boundaries.rs` (same trade-off as
-/// this module's own `fnv1a_hex`, duplicated from `pattern.rs` for the same
-/// reason). See that function's doc comment for the exact convention.
+/// because that function is private to `boundaries.rs`. See that function's
+/// doc comment for the exact convention.
 fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Option<String> {
     let relative = file_path.strip_prefix(crate_root).ok()?;
     let mut components: Vec<String> = relative

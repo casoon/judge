@@ -4,7 +4,9 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, ValueEnum};
 use judge::AnalysisTier;
-use judge::baseline::{TriVerdict, Verdict};
+#[cfg(test)]
+use judge::baseline::TriVerdict;
+use judge::baseline::Verdict;
 use judge::duplication::DupeMode;
 use judge::finding::{Finding, Report};
 use serde::Serialize;
@@ -12,7 +14,6 @@ use serde::ser::SerializeMap;
 
 mod advisory_commands;
 mod analysis_commands;
-mod audit_command;
 mod baseline_output;
 mod combined;
 mod combined_analysis;
@@ -26,17 +27,16 @@ use advisory_commands::{
     run_principles,
 };
 use analysis_commands::{
-    run_api_surface, run_boundaries, run_coverage, run_deps, run_distribution, run_dupes,
-    run_errors, run_module_graph, run_provenance, run_slop, run_tests, run_unsafe,
+    run_api_surface, run_boundaries, run_coverage, run_deps, run_dupes, run_errors,
+    run_module_graph, run_slop, run_tests, run_unsafe,
 };
-#[cfg(test)]
-use audit_command::combine_verdict;
-use audit_command::run as run_audit;
 use baseline_output::{
     BaselineInput, BaselineOptions, BaselineRequest, analysis_errors, append_analysis_errors,
     handle_baseline_with_trend, print_pattern_delta_tty, write_json,
 };
-use combined_analysis::{collect_findings, collect_findings_with_progress};
+#[cfg(test)]
+use combined_analysis::collect_findings;
+use combined_analysis::collect_findings_with_progress;
 use commands::{BaselineArgs, Command};
 use deep_commands::{run_dead_code, run_explain};
 use health_command::run as run_health;
@@ -49,8 +49,6 @@ const DEFAULT_BASELINE_DUPES: &str = ".judge/baseline-dupes.json";
 const DEFAULT_BASELINE_DEPS: &str = ".judge/baseline-deps.json";
 const DEFAULT_BASELINE_BOUNDARIES: &str = ".judge/baseline-boundaries.json";
 const DEFAULT_BASELINE_ALL: &str = ".judge/baseline.json";
-const DEFAULT_BASELINE_DISTRIBUTION: &str = ".judge/baseline-distribution.json";
-const DEFAULT_BASELINE_PROVENANCE: &str = ".judge/baseline-provenance.json";
 const DEFAULT_BASELINE_COVERAGE: &str = ".judge/baseline-coverage.json";
 const DEFAULT_BASELINE_API_SURFACE: &str = ".judge/baseline-api-surface.json";
 const DEFAULT_BASELINE_MODULE_GRAPH: &str = ".judge/baseline-module-graph.json";
@@ -195,18 +193,6 @@ enum GraphFormat {
 }
 
 #[derive(Debug, Args)]
-struct DistributionOptions {
-    #[command(flatten)]
-    baseline_args: BaselineArgs,
-}
-
-#[derive(Debug, Args)]
-struct ProvenanceOptions {
-    #[command(flatten)]
-    baseline_args: BaselineArgs,
-}
-
-#[derive(Debug, Args)]
 struct DeadCodeOptions {
     /// Count a `#[test]`-only reference as usage. Off by default: a
     /// `pub` item only reachable from tests is still dead in production
@@ -248,43 +234,6 @@ struct ExplainOptions {
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
     format: OutputFormat,
-}
-
-#[derive(Debug, Args)]
-struct AuditOptions {
-    /// Commit-ish boundary findings are classified against (see
-    /// `judge::git::changed_files_since`). Requires a baseline already
-    /// saved via `cargo judge --save-baseline`.
-    #[arg(long)]
-    since: String,
-    /// Output format.
-    #[arg(long, value_enum, default_value = "tty")]
-    format: OutputFormat,
-    /// Baseline file to compare against. Defaults to
-    /// `.judge/baseline.json` (the file `cargo judge --save-baseline`
-    /// writes).
-    #[arg(long, value_name = "PATH")]
-    baseline: Option<PathBuf>,
-    /// Minimum touched authored LOC before a ratio gate is evaluated.
-    /// Shared by both ratio gates; a gate additionally needs its own
-    /// threshold flag (`--max-duplication-ratio` /
-    /// `--max-suppression-ratio`) — without both, that gate is skipped
-    /// and reported as not evaluated rather than assuming a threshold
-    /// (see todo.md §6, §11 "nicht optimierbar": a fixed ratio is a
-    /// policy decision judge deliberately doesn't invent a default for).
-    #[arg(long, value_name = "N")]
-    audit_min_sample: Option<u64>,
-    /// Maximum allowed ratio of duplicated tokens (falling back to a
-    /// raw finding count if no token count is available) to touched
-    /// authored LOC before the duplication gate fails.
-    #[arg(long, value_name = "RATIO")]
-    max_duplication_ratio: Option<f64>,
-    /// Maximum allowed ratio of code-introduced `suppression-debt`
-    /// findings (one per `#[allow]`/`#[expect]` occurrence, see
-    /// `judge::slop`) to touched authored LOC before the
-    /// suppression-debt gate fails.
-    #[arg(long, value_name = "RATIO")]
-    max_suppression_ratio: Option<f64>,
 }
 
 #[derive(Debug, Args)]
@@ -447,7 +396,7 @@ struct FocusedAnalysisOptions {
 
 /// Output format shared by commands that emit findings (see todo.md §7).
 /// Not every command supports every format: SARIF exists for the
-/// report-producing commands; Markdown exists for the audit/baseline delta
+/// report-producing commands; Markdown exists for the baseline delta
 /// and the bare `cargo judge` review report (the PR-comment use cases) —
 /// anything else is rejected as a config error instead of producing
 /// half-baked output.
@@ -459,7 +408,7 @@ enum OutputFormat {
     Json,
     /// SARIF 2.1.0 (report-producing commands only — see `judge::sarif`).
     Sarif,
-    /// Markdown: a delta table for `audit --since`/`--baseline` comparisons
+    /// Markdown: a delta table for baseline comparisons
     /// (see `judge::markdown`), or the shared-model review report for the
     /// bare `cargo judge` combined run (see `judge::report`).
     Markdown,
@@ -553,7 +502,7 @@ enum CommandOutcome {
     /// No verdict-failing findings: exit 0. Commands without a verdict
     /// (plain reports, `inspect`, …) are always `Clean`.
     Clean,
-    /// A baseline/audit verdict failed on introduced findings: exit 1.
+    /// A baseline verdict failed on introduced findings: exit 1.
     FindingsFound,
 }
 
@@ -566,7 +515,7 @@ enum CliError {
     /// An analyzer/toolchain failure: cargo metadata, git, the Deep Tier,
     /// an unavailable score, or an unsupported invocation.
     Analyzer(String),
-    /// Analysis produced errors, so a baseline/audit verdict was withheld
+    /// Analysis produced errors, so a baseline verdict was withheld
     /// (see todo.md §15.1: no verdict on an incomplete basis).
     AnalysisIncomplete {
         context: &'static str,
@@ -592,8 +541,8 @@ impl From<judge::ingest::IngestError> for CliError {
     }
 }
 
-impl From<judge::git::GitError> for CliError {
-    fn from(err: judge::git::GitError) -> Self {
+impl From<serde_json::Error> for CliError {
+    fn from(err: serde_json::Error) -> Self {
         Self::Analyzer(err.to_string())
     }
 }
@@ -1045,7 +994,6 @@ fn json_artifact_description(command: &str) -> &'static str {
         "impact" => "Direct analysis and Cargo-target context for one source file.",
         "patterns" => "Advisory Rust pattern candidates aggregated from project evidence.",
         "principles" => "Advisory design-principle heuristics aggregated from project evidence.",
-        "audit" => "Baseline-relative verdict, delta, and configured quality gates.",
         "judge" => "Combined Judge findings across the enabled default analyzers.",
         _ => "Versioned Judge analysis output for the selected command.",
     }
@@ -2779,53 +2727,6 @@ fn dup_two(x: i32) -> i32 {
         );
     }
 
-    /// `audit --format markdown` renders the PR-comment delta table,
-    /// including the not-evaluated gate lines (see `judge::markdown`).
-    #[test]
-    fn audit_format_markdown_renders_the_delta_table() {
-        let _guard = lock_cwd();
-        let (dir, base_commit) = suppression_audit_fixture("audit-markdown");
-
-        let mut out = Vec::new();
-        let outcome = run_in_dir_locked(
-            &dir,
-            cli_with(Command::Audit(AuditOptions {
-                since: base_commit,
-                format: OutputFormat::Markdown,
-                baseline: None,
-                audit_min_sample: None,
-                max_duplication_ratio: None,
-                max_suppression_ratio: None,
-            })),
-            &mut out,
-        )
-        .expect("audit markdown must not error");
-        assert_eq!(outcome, CommandOutcome::Clean);
-        let text = String::from_utf8(out).unwrap();
-        assert!(
-            text.contains("**verdict: pass**"),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains(
-                "- gate `suppression-debt-ratio`: not evaluated (pass --audit-min-sample and --max-suppression-ratio to enable)"
-            ),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains("### introduced: 3"),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains("| rule | severity | location | item |"),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains("| suppression-debt | info | src/suppressed.rs:1 |"),
-            "unexpected output: {text}"
-        );
-    }
-
     /// A writer that fails like a closed pipe (`cargo judge … | head`).
     struct BrokenPipeWriter;
 
@@ -2880,14 +2781,10 @@ fn dup_two(x: i32) -> i32 {
         );
     }
 
-    /// Exercises the wiring `run_audit` performs — `collect_findings`,
-    /// `judge::git::changed_files_since`, `judge::baseline::diff`, the
-    /// duplication ratio gate, and `combine_verdict` — without invoking the
-    /// CLI's exit-code translation directly (see todo.md §5 "audit
-    /// --since"). A new file's duplication finding must classify as
-    /// `code_introduced`.
+    /// Artifact comparison classifies newly added source findings without
+    /// consulting repository history.
     #[test]
-    fn audit_wiring_classifies_a_new_files_duplication_as_code_introduced() {
+    fn baseline_diff_classifies_a_new_files_duplication_as_introduced() {
         let _guard = lock_cwd();
         let dir = TempDir::new("audit-code-introduced");
         git(&dir, &["init", "-q", "-b", "main"]);
@@ -2914,13 +2811,6 @@ fn dup_two(x: i32) -> i32 {
         std::fs::write(dir.join("src/dupe.rs"), DUPE_FILE_CONTENT).unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "add duplicated code"]);
-        let head_commit = commit_sha(&dir, "HEAD");
-
-        assert!(judge::git::is_ancestor(&dir, &base_commit, &head_commit).unwrap());
-
-        let touched = judge::git::changed_files_since(&dir, &base_commit).unwrap();
-        assert!(touched.contains(&PathBuf::from("src/dupe.rs")));
-
         // Source file lists are captured at `ingest::load` time, not
         // re-scanned dynamically — reload to see the file added above.
         let workspace = judge::ingest::load(Some(&manifest)).unwrap();
@@ -2931,12 +2821,12 @@ fn dup_two(x: i32) -> i32 {
         let delta = judge::baseline::diff(
             &collected.findings,
             &baseline,
-            &touched,
+            &std::collections::HashSet::new(),
             &collected.rule_revisions,
         );
 
         let dupe_introduced: Vec<_> = delta
-            .code_introduced
+            .introduced
             .iter()
             .filter(|finding| finding.rule == judge::duplication::DUPLICATE_RULE)
             .collect();
@@ -2946,44 +2836,6 @@ fn dup_two(x: i32) -> i32 {
             assert_eq!(finding.severity, judge::finding::Severity::Warn);
         }
         assert_eq!(delta.tri_verdict(), TriVerdict::Warn);
-
-        // A high `--audit-min-sample` withholds judgement even though the
-        // duplicated-token ratio would fail any reasonable threshold —
-        // `NotEvaluatedSmallSample` must not force `Warn`/`Fail` on its own.
-        let numerator: u64 = dupe_introduced
-            .iter()
-            .map(|finding| {
-                finding
-                    .evidence
-                    .as_ref()
-                    .and_then(|evidence| evidence.get("token_count"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(1)
-            })
-            .sum();
-        assert!(numerator > 0);
-        let sample_size = judge::health_score::authored_loc_in(&workspace, &touched) as u64;
-
-        let small_sample_gate =
-            judge::gate::ratio_gate("duplication-ratio", numerator, sample_size, 1_000_000, 0.0);
-        assert_eq!(
-            small_sample_gate.verdict,
-            judge::gate::GateVerdict::NotEvaluatedSmallSample
-        );
-        assert_eq!(
-            combine_verdict(delta.tri_verdict(), Some(small_sample_gate.verdict)),
-            TriVerdict::Warn
-        );
-
-        // A low minimum sample lets the same (bad) ratio actually fail the
-        // gate, which then escalates the combined verdict past `Warn`.
-        let evaluated_gate =
-            judge::gate::ratio_gate("duplication-ratio", numerator, sample_size, 1, 0.0);
-        assert_eq!(evaluated_gate.verdict, judge::gate::GateVerdict::Fail);
-        assert_eq!(
-            combine_verdict(delta.tri_verdict(), Some(evaluated_gate.verdict)),
-            TriVerdict::Fail
-        );
     }
 
     /// Artifact comparisons retain an identical finding even when the rule
@@ -3002,11 +2854,6 @@ fn dup_two(x: i32) -> i32 {
         std::fs::write(dir.join("src/other.rs"), "pub fn other() {}\n").unwrap();
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "unrelated change"]);
-        let head_commit = commit_sha(&dir, "HEAD");
-
-        let touched = judge::git::changed_files_since(&dir, &base_commit).unwrap();
-        assert!(!touched.contains(&PathBuf::from("src/lib.rs")));
-        assert!(judge::git::is_ancestor(&dir, &base_commit, &head_commit).unwrap());
 
         let pre_existing = judge::finding::Finding::new(
             "duplicate-code:src/lib.rs:hello:0-20".to_string(),
@@ -3031,181 +2878,17 @@ fn dup_two(x: i32) -> i32 {
         let bumped_revisions =
             std::collections::HashMap::from([(judge::duplication::DUPLICATE_RULE.to_string(), 2)]);
 
-        let delta = judge::baseline::diff(&[pre_existing], &baseline, &touched, &bumped_revisions);
+        let delta = judge::baseline::diff(
+            &[pre_existing],
+            &baseline,
+            &std::collections::HashSet::new(),
+            &bumped_revisions,
+        );
 
         assert_eq!(delta.unchanged_count, 1);
         assert!(delta.introduced.is_empty());
         assert!(delta.rule_introduced.is_empty());
         assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
-        assert_eq!(combine_verdict(delta.tri_verdict(), None), TriVerdict::Pass);
-    }
-
-    /// A new file whose only findings are `suppression-debt` (Info severity,
-    /// derived fact): visible as gating code-introduced findings, but never
-    /// moving the tri-verdict past `pass` — so the suppression-debt ratio
-    /// gate alone decides whether the audit fails.
-    const SUPPRESSED_FILE_CONTENT: &str = r#"#[allow(dead_code)]
-pub fn quiet_one() -> u32 {
-    1
-}
-
-#[allow(unused_variables)]
-pub fn quiet_two() -> u32 {
-    2
-}
-
-#[allow(unreachable_code)]
-pub fn quiet_three() -> u32 {
-    3
-}
-"#;
-
-    /// Builds a git fixture whose saved `.judge/baseline.json` predates a
-    /// commit adding [`SUPPRESSED_FILE_CONTENT`], so `audit --since <base>`
-    /// classifies its three `suppression-debt` findings as code-introduced.
-    /// Returns the fixture dir and the baseline commit. The caller must hold
-    /// the [`CWD_LOCK`] guard — the baseline pass spawns `cargo metadata`.
-    fn suppression_audit_fixture(name: &str) -> (TempDir, String) {
-        let dir = TempDir::new(name);
-        git(&dir, &["init", "-q", "-b", "main"]);
-        write_fixture_crate(&dir);
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "initial"]);
-        let base_commit = commit_sha(&dir, "HEAD");
-
-        let manifest = dir.join("Cargo.toml");
-        let workspace = judge::ingest::load(Some(&manifest)).unwrap();
-        let collected = collect_findings(&workspace).unwrap();
-        assert!(collected.analysis_errors.is_empty());
-        let baseline = judge::baseline::Baseline::new(
-            &collected.findings,
-            base_commit.clone(),
-            collected.rule_revisions,
-            judge::health_score::total_authored_loc(&workspace),
-            judge::health_score::ScoreContext::from_profiles(&[]),
-        );
-        judge::baseline::save(&dir.join(DEFAULT_BASELINE_ALL), &baseline).unwrap();
-
-        std::fs::write(dir.join("src/suppressed.rs"), SUPPRESSED_FILE_CONTENT).unwrap();
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "add suppressions"]);
-        (dir, base_commit)
-    }
-
-    fn audit_cli(
-        since: &str,
-        audit_min_sample: Option<u64>,
-        max_suppression_ratio: Option<f64>,
-    ) -> Cli {
-        cli_with(Command::Audit(AuditOptions {
-            since: since.to_string(),
-            format: OutputFormat::Tty,
-            baseline: None,
-            audit_min_sample,
-            max_duplication_ratio: None,
-            max_suppression_ratio,
-        }))
-    }
-
-    /// Without gate flags both ratio gates are skipped but stay visible as
-    /// not evaluated, and the verdict is untouched — Info-severity
-    /// `suppression-debt` findings alone never fail an audit.
-    #[test]
-    fn audit_without_gate_flags_reports_the_suppression_gate_as_not_evaluated() {
-        let _guard = lock_cwd();
-        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-no-flags");
-
-        let mut out = Vec::new();
-        let outcome = run_in_dir_locked(&dir, audit_cli(&base_commit, None, None), &mut out)
-            .expect("audit without gate flags must not error");
-        assert_eq!(outcome, CommandOutcome::Clean);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("verdict: pass"), "unexpected output: {text}");
-        assert!(
-            text.contains("code-introduced: 3"),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains("gate: suppression-debt-ratio not evaluated"),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains("gate: duplication-ratio not evaluated"),
-            "unexpected output: {text}"
-        );
-    }
-
-    /// Over the threshold with a sufficient sample, the suppression gate
-    /// fails the audit (`CommandOutcome::FindingsFound`, exit 1), even
-    /// though the findings themselves are Info-severity.
-    #[test]
-    fn audit_fails_when_the_suppression_ratio_exceeds_the_threshold() {
-        let _guard = lock_cwd();
-        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-over-threshold");
-
-        let mut out = Vec::new();
-        let outcome =
-            run_in_dir_locked(&dir, audit_cli(&base_commit, Some(1), Some(0.0)), &mut out)
-                .expect("a failing gate is an outcome, not an error");
-        assert_eq!(outcome, CommandOutcome::FindingsFound);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("verdict: fail"), "unexpected output: {text}");
-        assert!(
-            text.contains("gate: suppression-debt-ratio — 3/"),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains("(fail, min sample 1, max ratio 0)"),
-            "unexpected output: {text}"
-        );
-    }
-
-    /// Below `--audit-min-sample` the gate withholds judgement — the report
-    /// must say `not_evaluated_small_sample` explicitly (todo.md §6), and
-    /// the verdict stays untouched instead of silently passing or failing.
-    #[test]
-    fn audit_reports_a_small_sample_suppression_gate_explicitly() {
-        let _guard = lock_cwd();
-        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-small-sample");
-
-        let mut out = Vec::new();
-        let outcome = run_in_dir_locked(
-            &dir,
-            audit_cli(&base_commit, Some(1_000_000), Some(0.0)),
-            &mut out,
-        )
-        .expect("a small-sample gate must not error");
-        assert_eq!(outcome, CommandOutcome::Clean);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("verdict: pass"), "unexpected output: {text}");
-        assert!(
-            text.contains("not_evaluated_small_sample"),
-            "unexpected output: {text}"
-        );
-    }
-
-    /// Below the threshold with a sufficient sample the gate passes — three
-    /// suppressions over the new file's LOC stay under a ratio of 1.
-    #[test]
-    fn audit_passes_when_the_suppression_ratio_is_within_the_threshold() {
-        let _guard = lock_cwd();
-        let (dir, base_commit) = suppression_audit_fixture("audit-suppression-under-threshold");
-
-        let mut out = Vec::new();
-        let outcome =
-            run_in_dir_locked(&dir, audit_cli(&base_commit, Some(1), Some(1.0)), &mut out)
-                .expect("a passing gate must not error");
-        assert_eq!(outcome, CommandOutcome::Clean);
-        let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("verdict: pass"), "unexpected output: {text}");
-        assert!(
-            text.contains("gate: suppression-debt-ratio — 3/"),
-            "unexpected output: {text}"
-        );
-        assert!(
-            text.contains("(pass, min sample 1, max ratio 1)"),
-            "unexpected output: {text}"
-        );
     }
 
     /// Tests todo.md §17.2/§17.5's advisory default at the wiring level: a
@@ -3279,17 +2962,14 @@ pub fn quiet_three() -> u32 {
 
         // (c) Newly introduced heuristic findings stay visible in the delta
         // but never break the verdict.
-        let touched = judge::git::changed_files_since(&dir, &base_commit).unwrap();
         let delta = judge::baseline::diff(
             &collected.findings,
             &baseline,
-            &touched,
+            &std::collections::HashSet::new(),
             &collected.rule_revisions,
         );
-        assert!(!delta.code_introduced.is_empty());
-        assert_eq!(delta.verdict(), Verdict::Pass);
+        assert!(!delta.introduced.is_empty());
         assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
-        assert_eq!(combine_verdict(delta.tri_verdict(), None), TriVerdict::Pass);
 
         // (a) The score takes no deductions from advisory findings, and the
         // report envelope records them as advisory.
@@ -3316,16 +2996,8 @@ pub fn quiet_three() -> u32 {
     fn collect_findings_omits_historical_hotspots() {
         let _guard = lock_cwd();
         let dir = TempDir::new("hotspot-limit");
-        git(&dir, &["init", "-q", "-b", "main"]);
         write_fixture_crate(&dir);
 
-        // 20 more files, each with a distinct, strictly increasing cyclomatic
-        // complexity (one more `if` branch than the last) — together with
-        // `write_fixture_crate`'s `src/lib.rs` (complexity 1, the unambiguous
-        // minimum), that's 21 hotspot candidates once all are committed
-        // together (one commit = one churn count each), well past
-        // `HOTSPOT_LIMIT`, with a strict score ranking so "top N by score"
-        // has one unambiguous answer.
         const FILE_COUNT: usize = 20;
         for branches in 1..=FILE_COUNT {
             let mut body = String::from("pub fn f(x: i32) -> i32 {\n    let mut total = x;\n");
@@ -3335,8 +3007,6 @@ pub fn quiet_three() -> u32 {
             body.push_str("    total\n}\n");
             std::fs::write(dir.join(format!("src/hotspot_{branches:02}.rs")), body).unwrap();
         }
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "initial"]);
 
         let manifest = dir.join("Cargo.toml");
         let workspace = judge::ingest::load(Some(&manifest)).unwrap();
@@ -3347,7 +3017,7 @@ pub fn quiet_three() -> u32 {
         let hotspot_files: std::collections::HashSet<&Path> = collected
             .findings
             .iter()
-            .filter(|finding| finding.rule == judge::git::HOTSPOT_RULE)
+            .filter(|finding| finding.rule == "hotspot")
             .map(|finding| finding.location.file.as_path())
             .collect();
         assert!(hotspot_files.is_empty());
@@ -3628,42 +3298,5 @@ pub fn quiet_three() -> u32 {
             panic!("progress misuse must be a configuration error");
         };
         assert!(message.contains("bare `cargo judge` combined run"));
-    }
-
-    #[test]
-    fn combine_verdict_prefers_fail_over_everything() {
-        assert_eq!(
-            combine_verdict(TriVerdict::Warn, Some(judge::gate::GateVerdict::Fail)),
-            TriVerdict::Fail
-        );
-        assert_eq!(
-            combine_verdict(TriVerdict::Fail, Some(judge::gate::GateVerdict::Pass)),
-            TriVerdict::Fail
-        );
-    }
-
-    #[test]
-    fn combine_verdict_small_sample_gate_is_purely_informational() {
-        assert_eq!(
-            combine_verdict(
-                TriVerdict::Pass,
-                Some(judge::gate::GateVerdict::NotEvaluatedSmallSample)
-            ),
-            TriVerdict::Pass
-        );
-        assert_eq!(
-            combine_verdict(
-                TriVerdict::Warn,
-                Some(judge::gate::GateVerdict::NotEvaluatedSmallSample)
-            ),
-            TriVerdict::Warn
-        );
-    }
-
-    #[test]
-    fn combine_verdict_without_a_gate_is_just_the_tri_verdict() {
-        assert_eq!(combine_verdict(TriVerdict::Pass, None), TriVerdict::Pass);
-        assert_eq!(combine_verdict(TriVerdict::Warn, None), TriVerdict::Warn);
-        assert_eq!(combine_verdict(TriVerdict::Fail, None), TriVerdict::Fail);
     }
 }

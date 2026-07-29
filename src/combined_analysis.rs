@@ -1,4 +1,4 @@
-//! Fast-Tier orchestration shared by the bare combined run and `audit`.
+//! Fast-Tier orchestration shared by the bare combined run and its tests.
 //!
 //! The phase boundaries are intentional: they are the same lifecycle exposed
 //! through `cargo judge --progress PATH`, while each phase owns only the
@@ -17,9 +17,9 @@ pub(super) struct CollectedFindings {
     pub(super) suppressed_inline: usize,
 }
 
-/// Runs every detector that doesn't need extra opt-in config (complexity +
-/// hotspots, duplication, dependency hygiene, ownership) plus boundaries if
-/// a `judge.toml` exists, and merges their findings. This is deliberately
+/// Runs every default current-state detector (complexity, duplication,
+/// dependency hygiene, and structural checks) plus boundaries if a
+/// `judge.toml` exists, and merges their findings. This is deliberately
 /// *not* the numeric 0-100 health score from §4 — that needs crate-type
 /// profiles and a weighting scheme that don't exist yet; merging findings
 /// doesn't require either. Findings are returned unsorted; callers that show
@@ -32,7 +32,7 @@ pub(super) fn collect_findings(
 
 /// Same analysis as [`collect_findings`], with lifecycle events at the
 /// natural Fast-Tier phase boundaries. The observer is optional to callers:
-/// audit and tests keep the exact old behavior through the wrapper above,
+/// tests keep a simple wrapper above,
 /// while the bare combined command can expose live progress separately from
 /// its final stdout report.
 pub(super) fn collect_findings_with_progress(

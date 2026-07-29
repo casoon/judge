@@ -219,7 +219,7 @@ impl PatternCandidateId {
         Self(format!(
             "pattern:{}:{}",
             pattern.slug(),
-            fnv1a_hex(&normalized)
+            crate::finding::fnv1a_hex(&normalized)
         ))
     }
 }
@@ -228,20 +228,6 @@ impl std::fmt::Display for PatternCandidateId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
-}
-
-/// Deterministic, version-independent 64-bit FNV-1a hash, hex-encoded. See
-/// [`PatternCandidateId`]'s doc comment for why this exists instead of
-/// blake3 or `std::hash::DefaultHasher`.
-fn fnv1a_hex(input: &str) -> String {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = OFFSET_BASIS;
-    for byte in input.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    format!("{hash:016x}")
 }
 
 /// A pattern recommendation aggregated from corroborated projectwide
