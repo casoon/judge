@@ -184,7 +184,7 @@ use syn::{
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::{has_test_attr, read_and_parse_source, type_name, walk_functions};
+use crate::functions::{has_test_attr, qualified_item_path, read_and_parse_source, type_name, walk_functions};
 use crate::ingest::SourceFile;
 use crate::slop_text::{CommentSpan, extract_comments};
 
@@ -948,11 +948,7 @@ struct SecretVisitor<'a> {
 
 impl<'a> SecretVisitor<'a> {
     fn current_path(&self) -> String {
-        if self.path.is_empty() {
-            self.file.display().to_string()
-        } else {
-            self.path.join("::")
-        }
+        qualified_item_path(self.file, &self.path)
     }
 
     fn item_path_for(&self) -> String {

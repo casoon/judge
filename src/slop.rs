@@ -73,9 +73,9 @@ use syn::{
     ReturnType, Stmt, Token, TraitItemFn, Type, TypeParamBound, Visibility,
 };
 
-use crate::api_surface::{build_finding, has_doc_comment, is_test_attributed};
+use crate::api_surface::{build_finding, has_doc_comment};
 use crate::finding::{Finding, Severity};
-use crate::functions::{read_and_parse_source, type_name};
+use crate::functions::{has_test_attr, qualified_item_path, read_and_parse_source, type_name};
 use crate::ingest::SourceFile;
 
 /// Rule id for a discarded fallible result: `let _ = fallible();` or a bare
@@ -330,11 +330,7 @@ impl SlopVisitor<'_> {
     /// The qualified name of the innermost enclosing named item, or the file
     /// path if there is none.
     fn current_item_path(&self) -> String {
-        if self.path.is_empty() {
-            self.file.display().to_string()
-        } else {
-            self.path.join("::")
-        }
+        qualified_item_path(self.file, &self.path)
     }
 
     fn record(
@@ -445,7 +441,7 @@ impl SlopVisitor<'_> {
     /// A `#[test]` fn (without `#[should_panic]`) whose body has no visible
     /// assertion path (see todo.md §G2 `assertion-free-test`).
     fn check_assertion_free_test(&mut self, node: &ItemFn) {
-        if !is_test_attributed(&node.attrs)
+        if !has_test_attr(&node.attrs)
             || node
                 .attrs
                 .iter()

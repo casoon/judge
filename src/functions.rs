@@ -128,9 +128,27 @@ fn has_test_cfg(attrs: &[syn::Attribute]) -> bool {
 
 /// Whether an item is itself `#[test]`-attributed. Shared with
 /// [`crate::security`], which folds this same check into its own
-/// visibility/test-scope predicates.
+/// visibility/test-scope predicates, and [`crate::api_surface`]/
+/// [`crate::slop`], which use it directly for `undocumented-public-item`'s
+/// `#[test]` exemption and `assertion-free-test`'s scope check.
 pub(crate) fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("test"))
+}
+
+/// The qualified name for a `path: Vec<String>` scope stack of the shape
+/// [`crate::api_surface::ApiSurfaceVisitor`], [`crate::pattern`]'s
+/// `TypedErrorVisitor`, [`crate::security::SecretVisitor`], and
+/// [`crate::slop::SlopVisitor`] all keep independently: the stack joined
+/// with `::`, or `file`'s own path if the stack is empty (top-level file
+/// scope, no enclosing named item). Those four visitors otherwise each
+/// repeat this identical three-line lookup verbatim under their own
+/// `current_item_path`/`current_path` method name.
+pub(crate) fn qualified_item_path(file: &Path, path: &[String]) -> String {
+    if path.is_empty() {
+        file.display().to_string()
+    } else {
+        path.join("::")
+    }
 }
 
 impl<'ast, F> Walker<F>

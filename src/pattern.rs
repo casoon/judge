@@ -638,11 +638,7 @@ struct TypedErrorVisitor<'a> {
 
 impl TypedErrorVisitor<'_> {
     fn current_item_path(&self) -> String {
-        if self.path.is_empty() {
-            self.file.display().to_string()
-        } else {
-            self.path.join("::")
-        }
+        crate::functions::qualified_item_path(self.file, &self.path)
     }
 
     fn record(&mut self) {

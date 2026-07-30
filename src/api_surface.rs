@@ -53,7 +53,7 @@ use syn::{
 };
 
 use crate::finding::{Finding, Location, Origin, Severity};
-use crate::functions::{read_and_parse_source, type_name};
+use crate::functions::{has_test_attr, qualified_item_path, read_and_parse_source, type_name};
 use crate::ingest::CrateInfo;
 
 /// Rule id for a module-level `pub` item with no doc comment (see todo.md
@@ -291,11 +291,7 @@ struct ApiSurfaceVisitor<'a> {
 
 impl ApiSurfaceVisitor<'_> {
     fn current_item_path(&self) -> String {
-        if self.path.is_empty() {
-            self.file.display().to_string()
-        } else {
-            self.path.join("::")
-        }
+        qualified_item_path(self.file, &self.path)
     }
 
     fn current_in_trait_impl(&self) -> bool {
@@ -393,7 +389,7 @@ impl ApiSurfaceVisitor<'_> {
         span: proc_macro2::Span,
         ident_span: proc_macro2::Span,
     ) {
-        if is_test_attributed(attrs) {
+        if has_test_attr(attrs) {
             return;
         }
         if self.is_checkable_pub_item(vis, attrs) {
@@ -467,15 +463,6 @@ impl ApiSurfaceVisitor<'_> {
 /// same way).
 pub(crate) fn has_doc_comment(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("doc"))
-}
-
-/// Whether `attrs` contains a `#[test]` attribute — shared by this module's
-/// own `check_doc_fn` (a `#[test]`-attributed `pub fn` is exempt from
-/// `undocumented-public-item`, see the module doc comment's "Scope" section)
-/// and [`crate::slop::SlopVisitor::check_assertion_free_test`] (only a
-/// `#[test]` fn is in scope for `assertion-free-test`).
-pub(crate) fn is_test_attributed(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attr| attr.path().is_ident("test"))
 }
 
 /// Builds the `Finding` both this module's [`ApiSurfaceVisitor::record`] and
