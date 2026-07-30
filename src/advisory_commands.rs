@@ -222,6 +222,19 @@ fn find_pattern_candidate(
         .ok_or_else(|| CliError::Analyzer(format!("unknown pattern candidate id: {id}")))
 }
 
+/// Rejects unsupported formats, loads the workspace, and resolves the
+/// pattern candidate `id` refers to — the identical setup shared by
+/// `explain-pattern` and `fix-preview` before they diverge on rendering.
+fn load_pattern_candidate(
+    id: &str,
+    format: OutputFormat,
+    command_name: &str,
+) -> Result<judge::pattern::PatternCandidate, CliError> {
+    reject_unsupported_advisory_format(format, command_name)?;
+    let workspace = judge::ingest::load(None)?;
+    find_pattern_candidate(&workspace, id)
+}
+
 /// Finds the principle heuristic `id` refers to, re-running the same
 /// analysis [`collect_principle_heuristics`] does. Unknown id ⇒
 /// [`CliError::Analyzer`] (exit 2) — a usage error, not a findings verdict,
@@ -234,6 +247,55 @@ fn find_principle_heuristic(
         .into_iter()
         .find(|heuristic| heuristic.id.as_str() == id)
         .ok_or_else(|| CliError::Analyzer(format!("unknown principle heuristic id: {id}")))
+}
+
+/// Renders a [`judge::pattern::CodeScope`]'s crate and modules. Shared by
+/// [`print_pattern_candidate_tty`] and [`print_principle_heuristic_tty`],
+/// whose `PatternCandidate`/`PrincipleHeuristic` types both scope themselves
+/// with the same `CodeScope`.
+fn print_scope_tty(
+    out: &mut dyn Write,
+    scope: &judge::pattern::CodeScope,
+) -> std::io::Result<()> {
+    writeln!(out, "  scope: crate `{}`", scope.krate)?;
+    if !scope.modules.is_empty() {
+        writeln!(out, "    modules:")?;
+        for module in &scope.modules {
+            writeln!(out, "      - {module}")?;
+        }
+    }
+    Ok(())
+}
+
+/// Renders one [`judge::pattern::MigrationStep`] and its affected paths,
+/// indented by `indent`. Shared by [`print_pattern_candidate_tty`] (nested
+/// further under its own section indentation) and `run_fix_preview` (a
+/// top-level rendering) — the affected-paths line is always three spaces
+/// deeper than the step line in both callers.
+fn print_migration_step_tty(
+    out: &mut dyn Write,
+    step: &judge::pattern::MigrationStep,
+    indent: &str,
+) -> std::io::Result<()> {
+    writeln!(out, "{indent}{}. {}", step.step, step.description)?;
+    for path in &step.affected_paths {
+        writeln!(out, "{indent}   - {}", path.display())?;
+    }
+    Ok(())
+}
+
+/// Renders the `contraindications:` section — shared by
+/// [`print_pattern_candidate_tty`] and [`print_principle_heuristic_tty`],
+/// both of which list a `Vec<Contraindication>` the same way.
+fn print_contraindications_tty(
+    out: &mut dyn Write,
+    contraindications: &[judge::pattern::Contraindication],
+) -> std::io::Result<()> {
+    writeln!(out, "  contraindications:")?;
+    for contraindication in contraindications {
+        writeln!(out, "    - {}", contraindication.description)?;
+    }
+    Ok(())
 }
 
 /// One [`judge::pattern::Evidence`] entry, TTY-rendered under `label`.
@@ -262,13 +324,7 @@ fn print_pattern_candidate_tty(
 ) -> std::io::Result<()> {
     writeln!(out, "pattern candidate: {}", candidate.id)?;
     writeln!(out, "  pattern: {}", candidate.pattern)?;
-    writeln!(out, "  scope: crate `{}`", candidate.scope.krate)?;
-    if !candidate.scope.modules.is_empty() {
-        writeln!(out, "    modules:")?;
-        for module in &candidate.scope.modules {
-            writeln!(out, "      - {module}")?;
-        }
-    }
+    print_scope_tty(out, &candidate.scope)?;
     print_evidence_tty(out, "primary", &candidate.evidence.primary)?;
     print_evidence_tty(out, "independent", &candidate.evidence.independent)?;
     for extra in &candidate.evidence.additional {
@@ -278,16 +334,10 @@ fn print_pattern_candidate_tty(
     for precondition in &candidate.preconditions {
         writeln!(out, "    - {}", precondition.description)?;
     }
-    writeln!(out, "  contraindications:")?;
-    for contraindication in &candidate.contraindications {
-        writeln!(out, "    - {}", contraindication.description)?;
-    }
+    print_contraindications_tty(out, &candidate.contraindications)?;
     writeln!(out, "  migration plan (no patch — text only):")?;
     for step in &candidate.migration {
-        writeln!(out, "    {}. {}", step.step, step.description)?;
-        for path in &step.affected_paths {
-            writeln!(out, "       - {}", path.display())?;
-        }
+        print_migration_step_tty(out, step, "    ")?;
     }
     writeln!(out, "  related findings:")?;
     for finding_id in &candidate.related_findings {
@@ -304,9 +354,7 @@ pub(super) fn run_explain_pattern(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let ExplainPatternOptions { id, format } = options;
-    reject_unsupported_advisory_format(format, "`explain-pattern`")?;
-    let workspace = judge::ingest::load(None)?;
-    let candidate = find_pattern_candidate(&workspace, &id)?;
+    let candidate = load_pattern_candidate(&id, format, "`explain-pattern`")?;
 
     render_advisory(
         out,
@@ -327,21 +375,12 @@ fn print_principle_heuristic_tty(
 ) -> std::io::Result<()> {
     writeln!(out, "principle heuristic: {}", heuristic.id)?;
     writeln!(out, "  principle: {}", heuristic.principle)?;
-    writeln!(out, "  scope: crate `{}`", heuristic.scope.krate)?;
-    if !heuristic.scope.modules.is_empty() {
-        writeln!(out, "    modules:")?;
-        for module in &heuristic.scope.modules {
-            writeln!(out, "      - {module}")?;
-        }
-    }
+    print_scope_tty(out, &heuristic.scope)?;
     for (index, evidence) in heuristic.evidence.iter().enumerate() {
         print_evidence_tty(out, &(index + 1).to_string(), evidence)?;
     }
     writeln!(out, "  interpretation: {}", heuristic.interpretation)?;
-    writeln!(out, "  contraindications:")?;
-    for contraindication in &heuristic.contraindications {
-        writeln!(out, "    - {}", contraindication.description)?;
-    }
+    print_contraindications_tty(out, &heuristic.contraindications)?;
     writeln!(out, "  missing evidence:")?;
     for missing in &heuristic.missing_evidence {
         writeln!(out, "    - {}", missing.description)?;
@@ -386,9 +425,7 @@ pub(super) fn run_fix_preview(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let FixPreviewOptions { id, format } = options;
-    reject_unsupported_advisory_format(format, "`fix-preview`")?;
-    let workspace = judge::ingest::load(None)?;
-    let candidate = find_pattern_candidate(&workspace, &id)?;
+    let candidate = load_pattern_candidate(&id, format, "`fix-preview`")?;
 
     render_advisory(
         out,
@@ -411,10 +448,7 @@ pub(super) fn run_fix_preview(
                 candidate.id, candidate.pattern
             )?;
             for step in &candidate.migration {
-                writeln!(out, "  {}. {}", step.step, step.description)?;
-                for path in &step.affected_paths {
-                    writeln!(out, "     - {}", path.display())?;
-                }
+                print_migration_step_tty(out, step, "  ")?;
             }
             writeln!(out)?;
             writeln!(

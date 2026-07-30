@@ -12,6 +12,23 @@ fn load_complexity_map(include_tests: bool) -> Result<judge::refactor_map::Refac
     Ok(judge::refactor_map::analyze(&workspace, include_tests))
 }
 
+/// Builds the `sarif`/`markdown` rejection every command in this module
+/// returns from its final match arm — only the command name differs, the
+/// supported-format list (`tty, json`) is identical across all of them.
+fn unsupported_workspace_format(command_name: &str, format: OutputFormat) -> CliError {
+    unsupported_format(command_name, format, "tty, json")
+}
+
+/// Prints "analysis errors: N" when `errors` is non-empty. Shared by
+/// `complexity` and `refactor`, which report only the count (unlike
+/// `structure`/`map`, which also list each error's text).
+fn print_analysis_error_count_tty(out: &mut dyn Write, errors: &[String]) -> std::io::Result<()> {
+    if !errors.is_empty() {
+        writeln!(out, "analysis errors: {}", errors.len())?;
+    }
+    Ok(())
+}
+
 /// Renders up to `limit` files ranked by measured complexity. Shared by
 /// `complexity` (top 20) and `map` (top 15) — the limit is the only
 /// difference between the two callers.
@@ -127,11 +144,7 @@ pub(super) fn run_structure(
             }
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`structure`",
-                options.format,
-                "tty, json",
-            ));
+            return Err(unsupported_workspace_format("`structure`", options.format));
         }
     }
     Ok(CommandOutcome::Clean)
@@ -165,16 +178,10 @@ pub(super) fn run_complexity(
                 }
             )?;
             print_top_complexity_files_tty(out, &map, 20)?;
-            if !map.analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", map.analysis_errors.len())?;
-            }
+            print_analysis_error_count_tty(out, &map.analysis_errors)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`complexity`",
-                options.format,
-                "tty, json",
-            ));
+            return Err(unsupported_workspace_format("`complexity`", options.format));
         }
     }
     Ok(CommandOutcome::Clean)
@@ -295,16 +302,10 @@ pub(super) fn run_refactor(
                     candidate.rules.join(", ")
                 )?;
             }
-            if !collected.analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", collected.analysis_errors.len())?;
-            }
+            print_analysis_error_count_tty(out, &collected.analysis_errors)?;
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
-            return Err(unsupported_format(
-                "`refactor`",
-                options.format,
-                "tty, json",
-            ));
+            return Err(unsupported_workspace_format("`refactor`", options.format));
         }
     }
     Ok(CommandOutcome::Clean)
@@ -413,7 +414,7 @@ pub(super) fn run_map(
             }
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
-            return Err(unsupported_format("`map`", options.format, "tty, json"));
+            return Err(unsupported_workspace_format("`map`", options.format));
         }
     }
     Ok(CommandOutcome::Clean)
@@ -476,7 +477,7 @@ pub(super) fn run_impact(
             }
         }
         OutputFormat::Sarif | OutputFormat::Markdown => {
-            return Err(unsupported_format("`impact`", options.format, "tty, json"));
+            return Err(unsupported_workspace_format("`impact`", options.format));
         }
     }
     Ok(CommandOutcome::Clean)
