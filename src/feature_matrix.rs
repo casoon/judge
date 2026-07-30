@@ -126,27 +126,23 @@ fn finding_for(candidate: &Candidate, combinations: &[Vec<String>]) -> Finding {
         "line": candidate.line,
         "reason": FEATURE_GATED_DEAD_CODE_REASON,
     });
-    Finding {
-        id: format!(
+    Finding::new(
+        format!(
             "{FEATURE_GATED_DEAD_CODE_RULE}:{}:{}",
             candidate.file_path.display(),
             candidate.qualified_name
-        )
-        .into(),
-        rule: FEATURE_GATED_DEAD_CODE_RULE.into(),
-        severity: Severity::Warn,
-        location: Location {
+        ),
+        FEATURE_GATED_DEAD_CODE_RULE,
+        Severity::Warn,
+        Location {
             file: candidate.file_path.clone(),
             line: OneBasedLine::new(candidate.line).expect("source line numbers are 1-based"),
             item_path: candidate.qualified_name.clone(),
         },
-        evidence_class: EvidenceClass::Heuristic,
-        origin: Origin::Code,
-        evidence: Some(evidence),
-        limitations: None,
-        caused_by: Vec::new(),
-        causes: Vec::new(),
-    }
+        EvidenceClass::Heuristic,
+        Origin::Code,
+        Some(evidence),
+    )
 }
 
 /// Checks every candidate item's reachability under every configured

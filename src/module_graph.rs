@@ -213,17 +213,14 @@ fn visit_mod_file(
     tree: &mut CrateModuleTree,
     errors: &mut Vec<ModuleGraphError>,
 ) {
-    let source = match std::fs::read_to_string(file) {
-        Ok(source) => source,
+    let ast = match crate::functions::read_and_parse_source(
+        file,
+        |err| ModuleGraphError::Io(file.to_path_buf(), err),
+        |err| ModuleGraphError::Parse(file.to_path_buf(), err),
+    ) {
+        Ok((_, ast)) => ast,
         Err(err) => {
-            errors.push(ModuleGraphError::Io(file.to_path_buf(), err));
-            return;
-        }
-    };
-    let ast = match syn::parse_file(&source) {
-        Ok(ast) => ast,
-        Err(err) => {
-            errors.push(ModuleGraphError::Parse(file.to_path_buf(), err));
+            errors.push(err);
             return;
         }
     };
@@ -478,10 +475,8 @@ fn unlinked_file_findings(
             let Some(cause_id) = id_by_path.get(file.path.as_path()).cloned() else {
                 continue;
             };
-            let Ok(source) = std::fs::read_to_string(&file.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&source) else {
+            let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
+            else {
                 continue;
             };
             for item in &ast.items {
@@ -600,8 +595,7 @@ impl<'ast> Visit<'ast> for ReferenceCollector<'_> {
     }
 
     fn visit_path(&mut self, node: &'ast syn::Path) {
-        let segments: Vec<String> = node.segments.iter().map(|s| s.ident.to_string()).collect();
-        if let Some(hit) = self.resolve(segments) {
+        if let Some(hit) = self.resolve(crate::boundaries::path_segments(node)) {
             self.hits.push(hit);
         }
         visit::visit_path(self, node);
@@ -620,10 +614,9 @@ fn module_has_recognized_entry_point(krate: &CrateInfo, file_set: &HashSet<&Path
         .iter()
         .filter(|file| file_set.contains(file.path.as_path()))
         .any(|file| {
-            let Ok(source) = std::fs::read_to_string(&file.path) else {
-                return false;
-            };
-            let Ok(ast) = syn::parse_file(&source) else {
+            let Ok((_, ast)) =
+                crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
+            else {
                 return false;
             };
             file_has_recognized_entry_point(&ast)
@@ -671,10 +664,8 @@ fn orphan_module_findings(
     let mut files_scanned = 0usize;
     for (krate, tree) in crates_with_trees(workspace, trees) {
         for file in &krate.source_files {
-            let Ok(source) = std::fs::read_to_string(&file.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&source) else {
+            let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
+            else {
                 continue;
             };
             files_scanned += 1;

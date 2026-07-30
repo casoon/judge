@@ -113,10 +113,7 @@ pub fn analyze_workspace(
             }
         }
 
-        for file in &krate.source_files {
-            let Some(module_path) = module_path_for_file(&krate.root, &file.path) else {
-                continue;
-            };
+        for (file, module_path) in crate::boundaries::files_with_module_path(krate) {
             let in_forbidden_scope = rule
                 .forbidden
                 .iter()
@@ -129,21 +126,14 @@ pub fn analyze_workspace(
                 continue;
             };
 
-            let source = match std::fs::read_to_string(&file.path) {
-                Ok(source) => source,
+            let ast = match crate::functions::read_and_parse_source(
+                &file.path,
+                |err| BoundaryDeepError::Io(file.path.clone(), err),
+                |err| BoundaryDeepError::Parse(file.path.clone(), err),
+            ) {
+                Ok((_, ast)) => ast,
                 Err(err) => {
-                    report
-                        .errors
-                        .push(BoundaryDeepError::Io(file.path.clone(), err));
-                    continue;
-                }
-            };
-            let ast = match syn::parse_file(&source) {
-                Ok(ast) => ast,
-                Err(err) => {
-                    report
-                        .errors
-                        .push(BoundaryDeepError::Parse(file.path.clone(), err));
+                    report.errors.push(err);
                     continue;
                 }
             };

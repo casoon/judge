@@ -940,16 +940,22 @@ fn evaluate_rule(rule: &BoundaryRule, graph: &CrateGraph, cargo_toml: &Path) -> 
     findings
 }
 
-fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) -> Finding {
-    let path_str = path.join(" -> ");
+/// Builds a `boundary-violation` finding — the shape both [`violation_finding`]
+/// and [`missing_required_finding`] share: `id_suffix` and `item_path` are
+/// each caller's own distinct claim (a concrete offending path vs. a
+/// required target never reached), everything else about a crate-level
+/// boundary violation's shape (rule id, `Severity::Fail`, anchored at
+/// `cargo_toml`'s first line, `bounded_semantic`, no evidence payload) is
+/// identical.
+fn boundary_violation_finding(rule_name: &str, id_suffix: &str, item_path: String, cargo_toml: &Path) -> Finding {
     Finding::new(
-        format!("{BOUNDARY_VIOLATION_RULE}:{}:{path_str}", rule.name),
+        format!("{BOUNDARY_VIOLATION_RULE}:{rule_name}:{id_suffix}"),
         BOUNDARY_VIOLATION_RULE,
         Severity::Fail,
         Location {
             file: cargo_toml.to_path_buf(),
             line: OneBasedLine::FIRST,
-            item_path: format!("{} [{}]: {path_str}", rule.name, rule.reach.label()),
+            item_path,
         },
         EvidenceClass::BoundedSemantic,
         Origin::Code,
@@ -957,27 +963,27 @@ fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) ->
     )
 }
 
+fn violation_finding(rule: &BoundaryRule, path: &[String], cargo_toml: &Path) -> Finding {
+    let path_str = path.join(" -> ");
+    boundary_violation_finding(
+        &rule.name,
+        &path_str,
+        format!("{} [{}]: {path_str}", rule.name, rule.reach.label()),
+        cargo_toml,
+    )
+}
+
 fn missing_required_finding(rule: &BoundaryRule, from: &str, cargo_toml: &Path) -> Finding {
-    Finding::new(
+    boundary_violation_finding(
+        &rule.name,
+        &format!("missing-required:{from}"),
         format!(
-            "{BOUNDARY_VIOLATION_RULE}:{}:missing-required:{from}",
-            rule.name
+            "{} [{}]: {from} does not reach any of [{}]",
+            rule.name,
+            rule.reach.label(),
+            rule.required.join(", ")
         ),
-        BOUNDARY_VIOLATION_RULE,
-        Severity::Fail,
-        Location {
-            file: cargo_toml.to_path_buf(),
-            line: OneBasedLine::FIRST,
-            item_path: format!(
-                "{} [{}]: {from} does not reach any of [{}]",
-                rule.name,
-                rule.reach.label(),
-                rule.required.join(", ")
-            ),
-        },
-        EvidenceClass::BoundedSemantic,
-        Origin::Code,
-        None,
+        cargo_toml,
     )
 }
 
@@ -1055,6 +1061,22 @@ pub(crate) fn module_path_for_file(crate_root: &Path, file_path: &Path) -> Optio
 /// match `"ioutils"`).
 pub(crate) fn module_path_under(module_path: &str, prefix: &str) -> bool {
     module_path == prefix || module_path.starts_with(&format!("{prefix}::"))
+}
+
+/// Pairs each of `krate`'s source files with its derived module path (see
+/// [`module_path_for_file`]), skipping any file the directory-convention
+/// heuristic can't place (e.g. one wired into the build via a `#[path =
+/// "..."]` attribute) — the shared prologue both the Fast-Tier
+/// ([`evaluate_module_boundary_rule`]) and Deep-Tier
+/// ([`crate::boundaries_deep::analyze_workspace`]) `[[module_boundary]]`
+/// walks start with, before applying their own (different) scope filter.
+pub(crate) fn files_with_module_path(
+    krate: &CrateInfo,
+) -> impl Iterator<Item = (&crate::ingest::SourceFile, String)> {
+    krate
+        .source_files
+        .iter()
+        .filter_map(|file| module_path_for_file(&krate.root, &file.path).map(|path| (file, path)))
 }
 
 /// Whether `segments` (a fully crate-root-relative path, see
@@ -1161,6 +1183,15 @@ pub(crate) fn use_tree_leaf_segments(
     }
 }
 
+/// Flattens a `syn::Path`'s identifier segments into owned strings — the
+/// same shape [`use_tree_leaf_segments`] produces for one `use` leaf, just
+/// for a path expression instead. `pub(crate)`: also used by
+/// `module_graph::ReferenceCollector`, which needs the same extraction
+/// before resolving a `visit_path` node.
+pub(crate) fn path_segments(path: &syn::Path) -> Vec<String> {
+    path.segments.iter().map(|s| s.ident.to_string()).collect()
+}
+
 /// Collects every `(line, forbidden target matched)` hit in one parsed file,
 /// scanning `use` statements and `crate::`/`super::`-qualified path
 /// expressions (see [`resolve_leading_segments`]).
@@ -1195,8 +1226,8 @@ impl<'ast> Visit<'ast> for ModuleBoundaryCollector<'_> {
     }
 
     fn visit_path(&mut self, node: &'ast syn::Path) {
-        let segments: Vec<String> = node.segments.iter().map(|s| s.ident.to_string()).collect();
-        if let Some(resolved) = resolve_leading_segments(self.current_module, segments) {
+        if let Some(resolved) = resolve_leading_segments(self.current_module, path_segments(node))
+        {
             self.record_if_forbidden(&resolved, node.span().start().line);
         }
         visit::visit_path(self, node);
@@ -1213,17 +1244,12 @@ impl<'ast> Visit<'ast> for ModuleBoundaryCollector<'_> {
 /// referencing a forbidden module, not each individual reference.
 fn evaluate_module_boundary_rule(rule: &ModuleBoundaryRule, krate: &CrateInfo) -> Vec<Finding> {
     let mut findings = Vec::new();
-    for file in &krate.source_files {
-        let Some(module_path) = module_path_for_file(&krate.root, &file.path) else {
-            continue;
-        };
+    for (file, module_path) in files_with_module_path(krate) {
         if !module_path_under(&module_path, &rule.from) {
             continue;
         }
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
-            continue;
-        };
-        let Ok(ast) = syn::parse_file(&source) else {
+        let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
+        else {
             continue;
         };
         let mut collector = ModuleBoundaryCollector {

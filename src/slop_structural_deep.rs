@@ -197,17 +197,14 @@ fn collect_function_fan_in(
                 }
             };
 
-            let source = match std::fs::read_to_string(&file.path) {
-                Ok(source) => source,
+            let ast = match crate::functions::read_and_parse_source(
+                &file.path,
+                |err| SlopStructuralDeepError::Io(file.path.clone(), err),
+                |err| SlopStructuralDeepError::Parse(file.path.clone(), err),
+            ) {
+                Ok((_, ast)) => ast,
                 Err(err) => {
-                    errors.push(SlopStructuralDeepError::Io(file.path.clone(), err));
-                    continue;
-                }
-            };
-            let ast = match syn::parse_file(&source) {
-                Ok(ast) => ast,
-                Err(err) => {
-                    errors.push(SlopStructuralDeepError::Parse(file.path.clone(), err));
+                    errors.push(err);
                     continue;
                 }
             };
@@ -339,34 +336,30 @@ fn duplicative_reinvention_findings(
         // `find_clone_families` only ever keeps families with more than one
         // member (see `duplication.rs`), so this is always populated.
         let anchor = &family.members[0];
-        findings.push(Finding {
-            id: format!(
+        findings.push(Finding::new(
+            format!(
                 "{DUPLICATIVE_REINVENTION_RULE}:{}:{}",
                 anchor.file.display(),
                 anchor.qualified_name
-            )
-            .into(),
-            rule: DUPLICATIVE_REINVENTION_RULE.into(),
-            severity: Severity::Info,
-            location: Location {
+            ),
+            DUPLICATIVE_REINVENTION_RULE,
+            Severity::Info,
+            Location {
                 file: anchor.file.clone(),
                 line: OneBasedLine::new(anchor.start_line)
                     .expect("proc-macro2 span lines are 1-based"),
                 item_path: anchor.qualified_name.clone(),
             },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(json!({
+            EvidenceClass::Heuristic,
+            Origin::Code,
+            Some(json!({
                 "tier": "deep",
                 "member_count": family.members.len(),
                 "files": family.members.iter()
                     .map(|member| member.file.display().to_string())
                     .collect::<Vec<_>>(),
             })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
+        ));
     }
     findings
 }
