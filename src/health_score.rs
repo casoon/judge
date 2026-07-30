@@ -235,10 +235,7 @@ impl std::error::Error for LocError {
 /// [`total_authored_loc_checked`] instead, so a read failure can never
 /// masquerade as a smaller codebase.
 pub fn total_authored_loc(workspace: &Workspace) -> usize {
-    authored_source_files(workspace)
-        .filter_map(|file| std::fs::read_to_string(&file.path).ok())
-        .map(|content| content.lines().count())
-        .sum()
+    count_loc(authored_source_files(workspace))
 }
 
 /// Like [`total_authored_loc`], but a read failure is a [`LocError`] instead
@@ -261,15 +258,11 @@ pub fn total_authored_loc_checked(workspace: &Workspace) -> Result<usize, LocErr
 /// denominator for a ratio gate judged against only what changed (see
 /// `audit --since`, todo.md §6), not the whole workspace total.
 pub fn authored_loc_in(workspace: &Workspace, files: &HashSet<PathBuf>) -> usize {
-    authored_source_files(workspace)
-        .filter(|file| {
-            file.path
-                .strip_prefix(&workspace.root)
-                .is_ok_and(|relative| files.contains(relative))
-        })
-        .filter_map(|file| std::fs::read_to_string(&file.path).ok())
-        .map(|content| content.lines().count())
-        .sum()
+    count_loc(authored_source_files(workspace).filter(|file| {
+        file.path
+            .strip_prefix(&workspace.root)
+            .is_ok_and(|relative| files.contains(relative))
+    }))
 }
 
 /// Every authored (non-generated) source file across `workspace` — the
@@ -282,6 +275,17 @@ fn authored_source_files(workspace: &Workspace) -> impl Iterator<Item = &SourceF
         .iter()
         .flat_map(|krate| krate.source_files.iter())
         .filter(|file| file.kind.is_locally_reportable())
+}
+
+/// Reads and sums line counts across `files`, silently skipping unreadable
+/// ones — the read-and-count core [`total_authored_loc`] and
+/// [`authored_loc_in`] share exactly; they differ only in which files they
+/// pass in.
+fn count_loc<'a>(files: impl Iterator<Item = &'a SourceFile>) -> usize {
+    files
+        .filter_map(|file| std::fs::read_to_string(&file.path).ok())
+        .map(|content| content.lines().count())
+        .sum()
 }
 
 /// Finds the workspace crate that owns `file` — the one whose `root` is the
@@ -335,29 +339,23 @@ pub fn compute(
         return ScoreOutcome::Unavailable(ScoreReason::NoAuthoredLoc);
     }
 
-    let mut fail_count = 0;
-    let mut warn_count = 0;
-    let mut deduction = 0.0;
-
-    for finding in findings {
-        if !finding.is_gating() {
-            continue;
-        }
-        let Some(weight) = score_severity(finding.severity, &mut fail_count, &mut warn_count) else {
-            continue;
-        };
-
-        let multiplier = multiplier_for(workspace, &finding.location.file, crate_profiles);
-        deduction += weight * multiplier.value();
-    }
+    let (fail_count, warn_count, deduction) = tally_deductions(
+        findings
+            .iter()
+            .filter(|finding| finding.is_gating())
+            .map(|finding| {
+                (
+                    finding.severity,
+                    multiplier_for(workspace, &finding.location.file, crate_profiles),
+                )
+            }),
+    );
 
     ScoreOutcome::Available(score_from(fail_count, warn_count, deduction, total_loc))
 }
 
 /// Scores one gating finding's `severity` as a fail/warn deduction weight,
-/// bumping the matching counter — the part of the scoring formula [`compute`]
-/// and [`trend`] share exactly; they differ only in what a "finding" is and
-/// how its file path is resolved. `None` for `Info`, which is never scored.
+/// bumping the matching counter. `None` for `Info`, which is never scored.
 fn score_severity(severity: Severity, fail_count: &mut usize, warn_count: &mut usize) -> Option<f64> {
     match severity {
         Severity::Fail => {
@@ -370,6 +368,25 @@ fn score_severity(severity: Severity, fail_count: &mut usize, warn_count: &mut u
         }
         Severity::Info => None,
     }
+}
+
+/// Tallies fail/warn counts and total weighted deduction across `entries` —
+/// the accumulation loop [`compute`] and [`trend`] share exactly; they differ
+/// only in what a "finding" is and how it's turned into a `(Severity,
+/// DeductionMultiplier)` pair before reaching here.
+fn tally_deductions(
+    entries: impl Iterator<Item = (Severity, DeductionMultiplier)>,
+) -> (usize, usize, f64) {
+    let mut fail_count = 0;
+    let mut warn_count = 0;
+    let mut deduction = 0.0;
+    for (severity, multiplier) in entries {
+        let Some(weight) = score_severity(severity, &mut fail_count, &mut warn_count) else {
+            continue;
+        };
+        deduction += weight * multiplier.value();
+    }
+    (fail_count, warn_count, deduction)
 }
 
 /// The score-formula conditions a baseline's findings were saved under:
@@ -527,25 +544,20 @@ pub fn trend(
         };
     }
 
-    let mut fail_count = 0;
-    let mut warn_count = 0;
-    let mut deduction = 0.0;
-
-    for finding in &baseline.findings {
-        // Same gating carve-out as `compute` — heuristic baseline findings
-        // are advisory and never deducted (see module docs).
-        if !finding.evidence_class.is_gating() {
-            continue;
-        }
-        let Some(weight) = score_severity(finding.severity, &mut fail_count, &mut warn_count) else {
-            continue;
-        };
-
-        // Stored paths are workspace-relative (`join` is a no-op for older
-        // baselines that stored absolute paths).
-        let file = workspace.root.join(&finding.file);
-        deduction += weight * multiplier_for(workspace, &file, crate_profiles).value();
-    }
+    // Same gating carve-out as `compute` — heuristic baseline findings are
+    // advisory and never deducted (see module docs).
+    let (fail_count, warn_count, deduction) = tally_deductions(
+        baseline
+            .findings
+            .iter()
+            .filter(|finding| finding.evidence_class.is_gating())
+            .map(|finding| {
+                // Stored paths are workspace-relative (`join` is a no-op for
+                // older baselines that stored absolute paths).
+                let file = workspace.root.join(&finding.file);
+                (finding.severity, multiplier_for(workspace, &file, crate_profiles))
+            }),
+    );
 
     let baseline_score = score_from(fail_count, warn_count, deduction, baseline.total_loc);
     Trend::Comparable {
