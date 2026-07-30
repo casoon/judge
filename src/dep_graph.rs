@@ -115,6 +115,21 @@ fn compat_bucket(version: &Version) -> (u64, u64, u64) {
     }
 }
 
+/// Every rule in this module reports its finding at the workspace manifest
+/// (line 1) with the affected crate/dependency name as `item_path` — the
+/// "location" of a graph-level dependency-hygiene concern is always
+/// `Cargo.toml`, never a source line. Shared by every `*_finding` site below
+/// rather than repeating the same three-field [`Location`] literal in each —
+/// mirrors `crate::deps::dep_location`/`crate::slopsquat::dep_location`'s
+/// identical precedent in the two sibling dependency-hygiene modules.
+fn manifest_location(manifest_path: &Path, item_path: impl Into<String>) -> Location {
+    Location {
+        file: manifest_path.to_path_buf(),
+        line: OneBasedLine::FIRST,
+        item_path: item_path.into(),
+    }
+}
+
 /// Resolves `id` to its package name via `metadata.packages`, falling back
 /// to the raw [`PackageId`] representation if the id isn't present (should
 /// not happen for a well-formed resolve, but reading it out of `metadata`
@@ -242,11 +257,7 @@ fn duplicate_crate_versions(metadata: &Metadata, workspace_root: &Path) -> Vec<F
             format!("{DUPLICATE_CRATE_VERSIONS_RULE}:{name}"),
             DUPLICATE_CRATE_VERSIONS_RULE,
             Severity::Warn,
-            Location {
-                file: manifest_path.clone(),
-                line: OneBasedLine::FIRST,
-                item_path: name.to_string(),
-            },
+            manifest_location(&manifest_path, name.to_string()),
             EvidenceClass::DerivedFact,
             Origin::Code,
             Some(serde_json::json!({
@@ -306,17 +317,14 @@ fn msrv_drift(
     errors: &mut Vec<DepGraphError>,
 ) -> Vec<Finding> {
     let manifest_path = workspace_root.join("Cargo.toml");
-    let text = match std::fs::read_to_string(&manifest_path) {
-        Ok(text) => text,
-        Err(err) => {
-            errors.push(DepGraphError::Io(manifest_path, err));
-            return Vec::new();
-        }
-    };
-    let manifest: toml::Value = match toml::from_str(&text) {
+    let manifest = match crate::deps::read_manifest_toml_typed(
+        &manifest_path,
+        DepGraphError::Io,
+        DepGraphError::Parse,
+    ) {
         Ok(manifest) => manifest,
         Err(err) => {
-            errors.push(DepGraphError::Parse(manifest_path, err));
+            errors.push(err);
             return Vec::new();
         }
     };
@@ -336,11 +344,7 @@ fn msrv_drift(
                     format!("{MSRV_DRIFT_RULE}:{}:{}", package.name, package.version),
                     MSRV_DRIFT_RULE,
                     Severity::Warn,
-                    Location {
-                        file: manifest_path.clone(),
-                        line: OneBasedLine::FIRST,
-                        item_path: package.name.clone(),
-                    },
+                    manifest_location(&manifest_path, package.name.clone()),
                     EvidenceClass::DerivedFact,
                     Origin::Code,
                     Some(serde_json::json!({
@@ -405,11 +409,7 @@ fn workspace_dep_drift(metadata: &Metadata, workspace_root: &Path) -> Vec<Findin
             format!("{WORKSPACE_DEP_DRIFT_RULE}:{dep_name}"),
             WORKSPACE_DEP_DRIFT_RULE,
             Severity::Info,
-            Location {
-                file: manifest_path.clone(),
-                line: OneBasedLine::FIRST,
-                item_path: dep_name.clone(),
-            },
+            manifest_location(&manifest_path, dep_name.clone()),
             EvidenceClass::DerivedFact,
             Origin::Code,
             Some(serde_json::json!({

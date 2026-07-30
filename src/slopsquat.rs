@@ -174,19 +174,6 @@ pub fn analyze_name_collision(workspace: &Workspace) -> Vec<Finding> {
     findings
 }
 
-/// Every rule in this module reports its finding at the crate's manifest
-/// (line 1) with the affected dependency/crate name as `item_path` — the
-/// "location" of a slopsquatting/supply-chain-hygiene concern is always
-/// `Cargo.toml`, never a source line. Shared by every `*_finding` renderer
-/// below rather than repeating the same three-field [`Location`] literal in
-/// each.
-fn dep_location(manifest_path: impl Into<PathBuf>, item_path: impl Into<String>) -> Location {
-    Location {
-        file: manifest_path.into(),
-        line: OneBasedLine::FIRST,
-        item_path: item_path.into(),
-    }
-}
 
 /// Renders a `name-collision-risk` finding. Its evidence class is
 /// `heuristic` — edit-distance proximity is prone to false positives
@@ -202,7 +189,7 @@ fn name_collision_finding(
         format!("{NAME_COLLISION_RISK_RULE}:{}:{}", krate.name, dep.name),
         NAME_COLLISION_RISK_RULE,
         Severity::Warn,
-        dep_location(krate.manifest_path.clone(), dep.name.clone()),
+        crate::deps::dep_location(krate, dep.name.clone()),
         EvidenceClass::Heuristic,
         Origin::Code,
         Some(serde_json::json!({
@@ -455,6 +442,15 @@ impl HttpClientState {
     }
 }
 
+/// Deserializes one crates.io REST JSON envelope, mapping a parse failure to
+/// `SlopsquatError::Other` — shared by [`RestMetadataClient::metadata`] and
+/// [`RestOwnersClient::owners`], whose only difference is which envelope type
+/// `T` they deserialize into.
+#[cfg(feature = "network")]
+fn parse_json_body<T: DeserializeOwned>(body: &str) -> Result<T, SlopsquatError> {
+    serde_json::from_str(body).map_err(|err| SlopsquatError::Other(err.into()))
+}
+
 /// The shared GET-and-classify plumbing behind every real [`CratesIoIndex`]/
 /// [`CratesIoMetadata`]/[`CratesIoOwners`] implementation: consult the
 /// on-disk cache, respect an already-tripped circuit breaker, issue the
@@ -604,8 +600,7 @@ impl CratesIoMetadata for RestMetadataClient {
     fn metadata(&self, crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError> {
         let url = format!("https://crates.io/api/v1/crates/{crate_name}");
         cached_get(&self.state, "meta", crate_name, &url, |body| {
-            let parsed: RestCrateResponse =
-                serde_json::from_str(body).map_err(|err| SlopsquatError::Other(err.into()))?;
+            let parsed: RestCrateResponse = parse_json_body(body)?;
             Ok(parsed.krate)
         })
     }
@@ -662,8 +657,7 @@ impl CratesIoOwners for RestOwnersClient {
     fn owners(&self, crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError> {
         let url = format!("https://crates.io/api/v1/crates/{crate_name}/owners");
         cached_get(&self.state, "owners", crate_name, &url, |body| {
-            let parsed: RestOwnersResponse =
-                serde_json::from_str(body).map_err(|err| SlopsquatError::Other(err.into()))?;
+            let parsed: RestOwnersResponse = parse_json_body(body)?;
             Ok(parsed.users)
         })
     }
@@ -770,12 +764,22 @@ impl FixtureMetadata {
     }
 }
 
+/// Shared body behind [`FixtureMetadata::metadata`]/[`FixtureOwners::owners`]:
+/// the forced error if set, else a plain lookup by crate name.
+fn fixture_lookup<T: Clone>(
+    crates: &HashMap<String, T>,
+    forced_error: &Option<String>,
+    crate_name: &str,
+) -> Result<Option<T>, SlopsquatError> {
+    if let Some(message) = forced_error {
+        return Err(SlopsquatError::Other(message.clone().into()));
+    }
+    Ok(crates.get(crate_name).cloned())
+}
+
 impl CratesIoMetadata for FixtureMetadata {
     fn metadata(&self, crate_name: &str) -> Result<Option<CrateMetadata>, SlopsquatError> {
-        if let Some(message) = &self.forced_error {
-            return Err(SlopsquatError::Other(message.clone().into()));
-        }
-        Ok(self.crates.get(crate_name).cloned())
+        fixture_lookup(&self.crates, &self.forced_error, crate_name)
     }
 }
 
@@ -807,10 +811,7 @@ impl FixtureOwners {
 
 impl CratesIoOwners for FixtureOwners {
     fn owners(&self, crate_name: &str) -> Result<Option<Vec<CrateOwner>>, SlopsquatError> {
-        if let Some(message) = &self.forced_error {
-            return Err(SlopsquatError::Other(message.clone().into()));
-        }
-        Ok(self.crates.get(crate_name).cloned())
+        fixture_lookup(&self.crates, &self.forced_error, crate_name)
     }
 }
 
@@ -858,33 +859,34 @@ fn record_lookup_error(
     }
 }
 
-/// Runs `phantom-crate` and `phantom-version` over every declared
-/// dependency in `workspace`, via `index`. One sparse-index lookup covers
-/// both rules per dependency.
-pub fn analyze_phantom_dependencies(
+/// Shared "for every declared dependency, do one network lookup and dispatch
+/// on the result" loop behind `analyze_phantom_dependencies`/
+/// `analyze_fresh_low_reputation`/`analyze_single_maintainer_dependencies` —
+/// only `lookup` (which endpoint) and `on_ok` (what a successful lookup does
+/// with its result, including whether `None` itself is meaningful — see
+/// `analyze_phantom_dependencies`'s `None` case below) differ per rule; the
+/// iteration and [`record_lookup_error`] dispatch are identical everywhere.
+fn analyze_dependencies_via_lookup<T>(
     workspace: &Workspace,
-    index: &dyn CratesIoIndex,
+    lookup: impl Fn(&str) -> Result<T, SlopsquatError>,
+    unreachable_message: &str,
+    lookup_label: &str,
+    mut on_ok: impl FnMut(&mut Vec<Finding>, &CrateInfo, &DeclaredDependency, T),
 ) -> SlopsquatNetworkReport {
     let mut report = SlopsquatNetworkReport::default();
     let mut connection_error_reported = false;
 
     for krate in &workspace.crates {
         for dep in &krate.dependencies {
-            match index.lookup(&dep.name) {
-                Ok(None) => report.findings.push(phantom_crate_finding(krate, dep)),
-                Ok(Some(entry)) => {
-                    if let Some(finding) = phantom_version_finding(krate, dep, &entry) {
-                        report.findings.push(finding);
-                    }
-                }
+            match lookup(&dep.name) {
+                Ok(result) => on_ok(&mut report.findings, krate, dep, result),
                 Err(err) => record_lookup_error(
                     &mut report,
                     &mut connection_error_reported,
                     err,
                     &dep.name,
-                    "crates.io sparse index unreachable, skipping remaining \
-                     phantom-crate/phantom-version checks",
-                    "crates.io",
+                    unreachable_message,
+                    lookup_label,
                 ),
             }
         }
@@ -893,12 +895,36 @@ pub fn analyze_phantom_dependencies(
     report
 }
 
+/// Runs `phantom-crate` and `phantom-version` over every declared
+/// dependency in `workspace`, via `index`. One sparse-index lookup covers
+/// both rules per dependency.
+pub fn analyze_phantom_dependencies(
+    workspace: &Workspace,
+    index: &dyn CratesIoIndex,
+) -> SlopsquatNetworkReport {
+    analyze_dependencies_via_lookup(
+        workspace,
+        |name| index.lookup(name),
+        "crates.io sparse index unreachable, skipping remaining \
+         phantom-crate/phantom-version checks",
+        "crates.io",
+        |findings, krate, dep, entry| match entry {
+            None => findings.push(phantom_crate_finding(krate, dep)),
+            Some(entry) => {
+                if let Some(finding) = phantom_version_finding(krate, dep, &entry) {
+                    findings.push(finding);
+                }
+            }
+        },
+    )
+}
+
 fn phantom_crate_finding(krate: &CrateInfo, dep: &DeclaredDependency) -> Finding {
     Finding::new(
         format!("{PHANTOM_CRATE_RULE}:{}:{}", krate.name, dep.name),
         PHANTOM_CRATE_RULE,
         Severity::Fail,
-        dep_location(krate.manifest_path.clone(), dep.name.clone()),
+        crate::deps::dep_location(krate, dep.name.clone()),
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({
@@ -932,7 +958,7 @@ fn phantom_version_finding(
         format!("{PHANTOM_VERSION_RULE}:{}:{}", krate.name, dep.name),
         PHANTOM_VERSION_RULE,
         Severity::Fail,
-        dep_location(krate.manifest_path.clone(), dep.name.clone()),
+        crate::deps::dep_location(krate, dep.name.clone()),
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({
@@ -1007,33 +1033,20 @@ pub fn analyze_fresh_low_reputation(
     metadata_source: &dyn CratesIoMetadata,
     config: &SlopsquatConfig,
 ) -> SlopsquatNetworkReport {
-    let mut report = SlopsquatNetworkReport::default();
-    let mut connection_error_reported = false;
-
-    for krate in &workspace.crates {
-        for dep in &krate.dependencies {
-            match metadata_source.metadata(&dep.name) {
-                Ok(Some(metadata)) => {
-                    if is_fresh_low_reputation(&metadata, config) {
-                        report
-                            .findings
-                            .push(fresh_low_reputation_finding(krate, dep, &metadata));
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => record_lookup_error(
-                    &mut report,
-                    &mut connection_error_reported,
-                    err,
-                    &dep.name,
-                    "crates.io API unreachable, skipping remaining fresh-low-reputation-dep checks",
-                    "crates.io metadata",
-                ),
+    analyze_dependencies_via_lookup(
+        workspace,
+        |name| metadata_source.metadata(name),
+        "crates.io API unreachable, skipping remaining fresh-low-reputation-dep checks",
+        "crates.io metadata",
+        |findings, krate, dep, metadata| {
+            let Some(metadata) = metadata else {
+                return;
+            };
+            if is_fresh_low_reputation(&metadata, config) {
+                findings.push(fresh_low_reputation_finding(krate, dep, &metadata));
             }
-        }
-    }
-
-    report
+        },
+    )
 }
 
 fn is_fresh_low_reputation(metadata: &CrateMetadata, config: &SlopsquatConfig) -> bool {
@@ -1062,7 +1075,7 @@ fn fresh_low_reputation_finding(
         ),
         FRESH_LOW_REPUTATION_DEP_RULE,
         Severity::Warn,
-        dep_location(krate.manifest_path.clone(), dep.name.clone()),
+        crate::deps::dep_location(krate, dep.name.clone()),
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({
@@ -1201,7 +1214,11 @@ fn yanked_dependency_finding(
         format!("{YANKED_DEPENDENCY_RULE}:{crate_name}:{resolved_version}"),
         YANKED_DEPENDENCY_RULE,
         Severity::Warn,
-        dep_location(manifest_path.to_path_buf(), crate_name.to_string()),
+        Location {
+            file: manifest_path.to_path_buf(),
+            line: OneBasedLine::FIRST,
+            item_path: crate_name.to_string(),
+        },
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({
@@ -1223,36 +1240,22 @@ pub fn analyze_single_maintainer_dependencies(
     workspace: &Workspace,
     owners: &dyn CratesIoOwners,
 ) -> SlopsquatNetworkReport {
-    let mut report = SlopsquatNetworkReport::default();
-    let mut connection_error_reported = false;
-
-    for krate in &workspace.crates {
-        for dep in &krate.dependencies {
-            match owners.owners(&dep.name) {
-                Ok(Some(owner_list)) => {
-                    if owner_list.len() < MIN_MAINTAINER_COUNT {
-                        report
-                            .findings
-                            .push(single_maintainer_finding(krate, dep, &owner_list));
-                    }
-                }
-                // A crate crates.io doesn't know about at all is
-                // `phantom-crate`'s concern, not this rule's.
-                Ok(None) => {}
-                Err(err) => record_lookup_error(
-                    &mut report,
-                    &mut connection_error_reported,
-                    err,
-                    &dep.name,
-                    "crates.io owners endpoint unreachable, skipping remaining \
-                     dep-single-maintainer checks",
-                    "crates.io owners",
-                ),
+    analyze_dependencies_via_lookup(
+        workspace,
+        |name| owners.owners(name),
+        "crates.io owners endpoint unreachable, skipping remaining dep-single-maintainer checks",
+        "crates.io owners",
+        |findings, krate, dep, owner_list| {
+            // A crate crates.io doesn't know about at all is
+            // `phantom-crate`'s concern, not this rule's.
+            let Some(owner_list) = owner_list else {
+                return;
+            };
+            if owner_list.len() < MIN_MAINTAINER_COUNT {
+                findings.push(single_maintainer_finding(krate, dep, &owner_list));
             }
-        }
-    }
-
-    report
+        },
+    )
 }
 
 /// Builds a `dep-single-maintainer` finding. Its evidence class is
@@ -1270,7 +1273,7 @@ fn single_maintainer_finding(
         format!("{DEP_SINGLE_MAINTAINER_RULE}:{}:{}", krate.name, dep.name),
         DEP_SINGLE_MAINTAINER_RULE,
         Severity::Warn,
-        dep_location(krate.manifest_path.clone(), dep.name.clone()),
+        crate::deps::dep_location(krate, dep.name.clone()),
         EvidenceClass::ExternalMeasurement,
         Origin::Code,
         Some(serde_json::json!({

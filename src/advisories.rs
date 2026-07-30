@@ -72,6 +72,36 @@ pub const KNOWN_VULNERABILITY_RULE: &str = "known-vulnerability";
 /// "Regelversions-Schutz").
 pub const KNOWN_VULNERABILITY_RULE_REVISION: u32 = 1;
 
+/// Shared plumbing behind every "import an already-generated tool report
+/// from PATH" module's single-variant `Io(PathBuf, std::io::Error)` error:
+/// [`AuditImportError`], [`crate::clippy_import::ClippyImportError`], and
+/// [`crate::mutants::MutantsImportError`] all wrap that same shape and
+/// report/read it identically — only the parse function and the produced
+/// item type differ per module. See each module's own doc comment for why
+/// judge never runs the underlying tool itself.
+pub(crate) fn describe_report_io_error(path: &Path, err: &std::io::Error) -> String {
+    format!("{}: failed to read file: {err}", path.display())
+}
+
+/// Shared `source()` body for the same `Io(PathBuf, std::io::Error)` variant
+/// (see [`describe_report_io_error`]).
+pub(crate) fn report_io_error_source(
+    err: &std::io::Error,
+) -> Option<&(dyn std::error::Error + 'static)> {
+    Some(err)
+}
+
+/// Shared body behind every `read_*_report` function (see
+/// [`describe_report_io_error`]): read `path`'s text, mapping an I/O failure
+/// through `to_err`; only the file read can fail, parsing never does, since
+/// each module's own `parse_*_report` tolerates malformed content.
+pub(crate) fn read_report_text<E>(
+    path: &Path,
+    to_err: impl FnOnce(PathBuf, std::io::Error) -> E,
+) -> Result<String, E> {
+    std::fs::read_to_string(path).map_err(|err| to_err(path.to_path_buf(), err))
+}
+
 #[derive(Debug)]
 pub enum AuditImportError {
     Io(PathBuf, std::io::Error),
@@ -80,7 +110,7 @@ pub enum AuditImportError {
 impl std::fmt::Display for AuditImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
+            Self::Io(path, err) => write!(f, "{}", describe_report_io_error(path, err)),
         }
     }
 }
@@ -88,7 +118,7 @@ impl std::fmt::Display for AuditImportError {
 impl std::error::Error for AuditImportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(_, err) => Some(err),
+            Self::Io(_, err) => report_io_error_source(err),
         }
     }
 }
@@ -157,8 +187,7 @@ pub fn parse_audit_report(text: &str) -> Vec<AuditVulnerability> {
 /// Reads and parses a `cargo audit --json` report from `path` (see
 /// [`parse_audit_report`]). Only the file read can fail; parsing never does.
 pub fn read_audit_report(path: &Path) -> Result<Vec<AuditVulnerability>, AuditImportError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| AuditImportError::Io(path.to_path_buf(), err))?;
+    let text = read_report_text(path, AuditImportError::Io)?;
     Ok(parse_audit_report(&text))
 }
 

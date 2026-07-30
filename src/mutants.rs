@@ -45,7 +45,9 @@ pub enum MutantsImportError {
 impl std::fmt::Display for MutantsImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
+            Self::Io(path, err) => {
+                write!(f, "{}", crate::advisories::describe_report_io_error(path, err))
+            }
         }
     }
 }
@@ -53,7 +55,7 @@ impl std::fmt::Display for MutantsImportError {
 impl std::error::Error for MutantsImportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(_, err) => Some(err),
+            Self::Io(_, err) => crate::advisories::report_io_error_source(err),
         }
     }
 }
@@ -154,8 +156,7 @@ pub fn parse_mutants_report(text: &str) -> MutantsReport {
 /// (see [`parse_mutants_report`]). Only the file read can fail; parsing
 /// never does.
 pub fn read_mutants_report(path: &Path) -> Result<MutantsReport, MutantsImportError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| MutantsImportError::Io(path.to_path_buf(), err))?;
+    let text = crate::advisories::read_report_text(path, MutantsImportError::Io)?;
     Ok(parse_mutants_report(&text))
 }
 

@@ -28,7 +28,9 @@ pub enum ClippyImportError {
 impl std::fmt::Display for ClippyImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(path, err) => write!(f, "{}: failed to read file: {err}", path.display()),
+            Self::Io(path, err) => {
+                write!(f, "{}", crate::advisories::describe_report_io_error(path, err))
+            }
         }
     }
 }
@@ -36,7 +38,7 @@ impl std::fmt::Display for ClippyImportError {
 impl std::error::Error for ClippyImportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io(_, err) => Some(err),
+            Self::Io(_, err) => crate::advisories::report_io_error_source(err),
         }
     }
 }
@@ -89,8 +91,7 @@ pub fn parse_clippy_report(text: &str) -> Vec<ClippyBoolParamsHit> {
 /// `path` (see [`parse_clippy_report`]). Only the file read can fail;
 /// parsing never does.
 pub fn read_clippy_report(path: &Path) -> Result<Vec<ClippyBoolParamsHit>, ClippyImportError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|err| ClippyImportError::Io(path.to_path_buf(), err))?;
+    let text = crate::advisories::read_report_text(path, ClippyImportError::Io)?;
     Ok(parse_clippy_report(&text))
 }
 

@@ -372,6 +372,21 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
     }
 }
 
+/// Reads `manifest_path`'s raw text and parses it as TOML, mapping either
+/// failure through `io_err`/`parse_err` into the caller's own error type —
+/// shared by [`read_manifest_toml`] and `crate::dep_graph::msrv_drift`, which
+/// both need to read a manifest's raw TOML directly (bypassing
+/// `cargo_metadata`) but tag failures with their own module's error enum.
+pub(crate) fn read_manifest_toml_typed<E>(
+    manifest_path: &Path,
+    io_err: impl FnOnce(PathBuf, std::io::Error) -> E,
+    parse_err: impl FnOnce(PathBuf, toml::de::Error) -> E,
+) -> Result<toml::Value, E> {
+    let text = std::fs::read_to_string(manifest_path)
+        .map_err(|err| io_err(manifest_path.to_path_buf(), err))?;
+    toml::from_str(&text).map_err(|err| parse_err(manifest_path.to_path_buf(), err))
+}
+
 /// Reads and parses `manifest_path` as TOML, once per crate — needed only by
 /// `default-features-unused`'s manifest lookup (see
 /// [`manifest_explicitly_enables_default_features`]): `cargo_metadata`'s
@@ -381,17 +396,10 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
 /// `None` is returned — the rule is then silently skipped for this crate
 /// rather than asserting an unbacked claim.
 fn read_manifest_toml(manifest_path: &Path, errors: &mut Vec<DepsError>) -> Option<toml::Value> {
-    let text = match std::fs::read_to_string(manifest_path) {
-        Ok(text) => text,
-        Err(err) => {
-            errors.push(DepsError::Io(manifest_path.to_path_buf(), err));
-            return None;
-        }
-    };
-    match toml::from_str(&text) {
+    match read_manifest_toml_typed(manifest_path, DepsError::Io, DepsError::ManifestParse) {
         Ok(manifest) => Some(manifest),
         Err(err) => {
-            errors.push(DepsError::ManifestParse(manifest_path.to_path_buf(), err));
+            errors.push(err);
             None
         }
     }
@@ -446,8 +454,10 @@ fn manifest_explicitly_enables_default_features(manifest: &toml::Value, dep_name
 /// — this crate's own feature name) as `item_path`: the "location" of a
 /// dependency-hygiene concern is `Cargo.toml`, not a source file. Shared by
 /// every `*_finding` renderer below rather than repeating the same
-/// three-field [`Location`] literal in each.
-fn dep_location(krate: &CrateInfo, item_path: impl Into<String>) -> Location {
+/// three-field [`Location`] literal in each — also reused by
+/// `crate::slopsquat`'s own `*_finding` renderers, which report the same
+/// convention.
+pub(crate) fn dep_location(krate: &CrateInfo, item_path: impl Into<String>) -> Location {
     Location {
         file: krate.manifest_path.clone(),
         line: OneBasedLine::FIRST,
