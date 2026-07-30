@@ -104,6 +104,26 @@ fn default_rule_revisions() -> std::collections::HashMap<String, u32> {
     revisions
 }
 
+/// The two `[[boundary]]`-gated rule revisions, shared between `run_boundaries`'s
+/// own baseline map (see `analysis_commands::run_boundaries`, which layers
+/// its Fast-Tier-only `module-boundary-violation` entry and, in a `--features
+/// deep` build, the Deep-Tier upgrade rule on top) and this module's
+/// `collect_boundaries`, which only ever needs these two — mirroring
+/// `deps_rule_revisions`'s same "both build this identical static core"
+/// precedent.
+pub(super) fn boundaries_rule_revisions() -> std::collections::HashMap<String, u32> {
+    std::collections::HashMap::from([
+        (
+            judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
+            judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
+        ),
+        (
+            judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
+            judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
+        ),
+    ])
+}
+
 /// Dependency-hygiene and dependency-graph rule revisions, plus the one G5
 /// slopsquatting rule that's fully local and always on
 /// (`name-collision-risk`). Shared between this module's own default map and
@@ -285,13 +305,7 @@ fn collect_slop(
     findings: &mut Vec<Finding>,
     analysis_errors: &mut Vec<String>,
 ) -> Result<(), CliError> {
-    let slop_source_files = super::analysis_commands::workspace_source_files(workspace);
-    let rules_config = load_judge_toml(&workspace.root)?.rules;
-    let slop = judge::slop::analyze_workspace(
-        slop_source_files,
-        false,
-        rules_config.catch_all_error.allow_anyhow_at_boundary,
-    );
+    let slop = super::analysis_commands::analyze_slop_workspace(workspace, false)?;
     append_analysis_errors(analysis_errors, &slop.errors);
     findings.extend(slop.findings);
     Ok(())
@@ -378,27 +392,11 @@ fn collect_boundaries(
     let boundaries_config_path = workspace.root.join("judge.toml");
     let mut boundary_rules_checked = 0;
     if boundaries_config_path.exists() {
-        let config_text = std::fs::read_to_string(&boundaries_config_path).map_err(|err| {
-            CliError::Config(format!("{}: {err}", boundaries_config_path.display()))
-        })?;
-        let config: judge::boundaries::BoundaryConfig =
-            toml::from_str(&config_text).map_err(|err| {
-                CliError::Config(format!(
-                    "{}: failed to parse: {err}",
-                    boundaries_config_path.display()
-                ))
-            })?;
+        let config = parse_boundary_config(&boundaries_config_path)?;
         boundary_rules_checked = config.boundaries.len();
         let evaluated = judge::boundaries::evaluate(workspace, &config)?;
         findings.extend(evaluated.findings);
-        rule_revisions.insert(
-            judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
-            judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
-        );
-        rule_revisions.insert(
-            judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
-            judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
-        );
+        rule_revisions.extend(boundaries_rule_revisions());
     }
 
     // `feature-graph-cycle` is always-on, unlike the `judge.toml`-gated

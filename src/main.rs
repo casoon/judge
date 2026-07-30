@@ -1007,7 +1007,21 @@ fn load_judge_toml(workspace_root: &Path) -> Result<judge::boundaries::BoundaryC
     if !config_path.exists() {
         return Ok(judge::boundaries::BoundaryConfig::default());
     }
-    let config_text = std::fs::read_to_string(&config_path)
+    parse_boundary_config(&config_path)
+}
+
+/// Reads and parses `judge.toml` at `config_path` into a
+/// [`judge::boundaries::BoundaryConfig`] — the "read, then parse, name the
+/// file in either error" recipe shared by `load_judge_toml`'s
+/// default-on-missing wrapper above, `run_boundaries`'s `--config`-overridable
+/// path (see `analysis_commands::run_boundaries`), and the bare combined
+/// run's own existence check (see `combined_analysis::collect_boundaries`) —
+/// all three only differ in how they handle a missing file, not in how they
+/// read one that exists.
+fn parse_boundary_config(
+    config_path: &Path,
+) -> Result<judge::boundaries::BoundaryConfig, CliError> {
+    let config_text = std::fs::read_to_string(config_path)
         .map_err(|err| CliError::Config(format!("{}: {err}", config_path.display())))?;
     toml::from_str(&config_text).map_err(|err| {
         CliError::Config(format!("{}: failed to parse: {err}", config_path.display()))

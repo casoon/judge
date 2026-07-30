@@ -17,6 +17,97 @@ pub(super) fn workspace_source_files(
         .flat_map(|krate| krate.source_files.iter())
 }
 
+/// Runs the slop analyzer with `judge.toml`'s `[rules]` config applied — the
+/// same "fresh source-file iterator, load the config, analyze" recipe
+/// `run_errors`/`run_slop` and `health_command::run`/
+/// `combined_analysis::collect_slop` all need before filtering or merging
+/// its findings differently.
+pub(super) fn analyze_slop_workspace(
+    workspace: &judge::ingest::Workspace,
+    include_generated: bool,
+) -> Result<judge::slop::WorkspaceSlop, CliError> {
+    let source_files = workspace_source_files(workspace);
+    let config = load_judge_toml(&workspace.root)?.rules;
+    Ok(judge::slop::analyze_workspace(
+        source_files,
+        include_generated,
+        config.catch_all_error.allow_anyhow_at_boundary,
+    ))
+}
+
+/// Renders a `<label>: <count>` line followed by one indented line per
+/// error, or nothing when `errors` is empty — the same shape every Fast-Tier
+/// command's TTY view uses for its "files skipped (parse errors)"/"analysis
+/// errors"/etc. block.
+pub(super) fn write_error_list<E: std::fmt::Display>(
+    out: &mut dyn Write,
+    label: &str,
+    errors: &[E],
+) -> std::io::Result<()> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "{label}: {}", errors.len())?;
+    for error in errors {
+        writeln!(out, "  {error}")?;
+    }
+    Ok(())
+}
+
+/// The single "suppressed (inline judge-ignore): N" TTY line, printed only
+/// when inline `judge-ignore` comments actually suppressed something.
+pub(super) fn write_suppressed_inline_line(
+    out: &mut dyn Write,
+    suppressed_inline: usize,
+) -> std::io::Result<()> {
+    if suppressed_inline > 0 {
+        writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
+    }
+    Ok(())
+}
+
+/// The "excluded (generated)"/"suppressed (inline judge-ignore)" TTY lines
+/// every command that supports `--include-generated` prints the same way,
+/// in the same order, when each count is nonzero.
+pub(super) fn write_excluded_and_suppressed_lines(
+    out: &mut dyn Write,
+    excluded_generated: usize,
+    suppressed_inline: usize,
+) -> std::io::Result<()> {
+    if excluded_generated > 0 {
+        writeln!(
+            out,
+            "excluded (generated): {excluded_generated} (see --include-generated)"
+        )?;
+    }
+    write_suppressed_inline_line(out, suppressed_inline)
+}
+
+/// The `--format json` report shape shared by `run_boundaries` and
+/// `run_module_graph`: a plain [`Report`] with only the inline-suppression
+/// count added on top (unlike `dupes`/`deps`/`coverage`/`api-surface`, which
+/// each embed their own extra JSON fields).
+pub(super) fn write_json_with_suppressed(
+    out: &mut dyn Write,
+    findings: Vec<Finding>,
+    analysis_errors: Vec<String>,
+    suppressed_inline: usize,
+) -> Result<(), CliError> {
+    let report =
+        Report::with_errors(findings, analysis_errors).with_suppressed_inline(suppressed_inline);
+    write_json(out, &report)?;
+    Ok(())
+}
+
+/// The non-`deep`-build arm of every Deep-Tier-gated `#[cfg(feature =
+/// "deep")]`/`#[cfg(not(feature = "deep"))]` split: unreachable because the
+/// caller already checked `AnalysisTier::Deep.is_available()` (compile-time
+/// `false` without the feature) before entering it.
+#[cfg(not(feature = "deep"))]
+pub(super) fn deep_tier_unreachable() -> ! {
+    unreachable!("AnalysisTier::Deep.is_available() is compile-time false without the deep feature")
+}
+
 /// matching the GitHub Action's default report-only mode).
 pub(super) fn run_dupes(
     options: DupesOptions,
@@ -95,22 +186,8 @@ pub(super) fn run_dupes(
             writeln!(out, "min tokens: {min_tokens}")?;
             writeln!(out, "clone families: {}", report.families.len())?;
             print_duplication_refactoring_summary(out, &refactoring_summary)?;
-            if !report.errors.is_empty() {
-                writeln!(out, "files skipped (parse errors): {}", report.errors.len())?;
-                for err in &report.errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if report.excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {} (see --include-generated)",
-                    report.excluded_generated
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
+            write_error_list(out, "files skipped (parse errors)", &report.errors)?;
+            write_excluded_and_suppressed_lines(out, report.excluded_generated, suppressed_inline)?;
 
             for (index, family) in report
                 .refactoring_order(&workspace.root)
@@ -309,15 +386,8 @@ pub(super) fn run_deps(
         }
         OutputFormat::Tty => {
             writeln!(out, "dependency findings: {}", findings.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "errors: {}", analysis_errors.len())?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
+            write_error_list(out, "errors", &analysis_errors)?;
+            write_suppressed_inline_line(out, suppressed_inline)?;
 
             for finding in &findings {
                 let krate = workspace
@@ -464,12 +534,7 @@ pub(super) fn run_coverage(
         }
         OutputFormat::Tty => {
             writeln!(out, "untested hotspots: {}", findings.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "errors: {}", analysis_errors.len())?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
+            write_error_list(out, "errors", &analysis_errors)?;
             for finding in &findings {
                 writeln!(
                     out,
@@ -545,12 +610,7 @@ pub(super) fn run_boundaries(
         return Ok(CommandOutcome::Clean);
     }
 
-    let config_text = std::fs::read_to_string(&config_path)
-        .map_err(|err| CliError::Config(format!("{}: {err}", config_path.display())))?;
-    let config: judge::boundaries::BoundaryConfig =
-        toml::from_str(&config_text).map_err(|err| {
-            CliError::Config(format!("{}: failed to parse: {err}", config_path.display()))
-        })?;
+    let config: judge::boundaries::BoundaryConfig = parse_boundary_config(&config_path)?;
 
     let boundaries = judge::boundaries::evaluate(&workspace, &config)?;
     #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
@@ -579,27 +639,16 @@ pub(super) fn run_boundaries(
         }
         #[cfg(not(feature = "deep"))]
         {
-            unreachable!(
-                "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-            );
+            deep_tier_unreachable();
         }
     }
 
     #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut rule_revisions = std::collections::HashMap::from([
-        (
-            judge::boundaries::BOUNDARY_VIOLATION_RULE.to_string(),
-            judge::boundaries::BOUNDARY_VIOLATION_RULE_REVISION,
-        ),
-        (
-            judge::boundaries::DEPENDENCY_CYCLE_RULE.to_string(),
-            judge::boundaries::DEPENDENCY_CYCLE_RULE_REVISION,
-        ),
-        (
-            judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE.to_string(),
-            judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
-        ),
-    ]);
+    let mut rule_revisions = super::combined_analysis::boundaries_rule_revisions();
+    rule_revisions.insert(
+        judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE.to_string(),
+        judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
+    );
     #[cfg(feature = "deep")]
     if judge::AnalysisTier::Deep.is_available() {
         rule_revisions.insert(
@@ -622,9 +671,7 @@ pub(super) fn run_boundaries(
 
     match format {
         OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
-            write_json(out, &report)?;
+            write_json_with_suppressed(out, findings, analysis_errors, suppressed_inline)?
         }
         OutputFormat::Sarif => {
             write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
@@ -639,15 +686,8 @@ pub(super) fn run_boundaries(
         OutputFormat::Tty => {
             writeln!(out, "boundary rules: {}", config.boundaries.len())?;
             writeln!(out, "findings: {}", findings.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
+            write_error_list(out, "analysis errors", &analysis_errors)?;
+            write_suppressed_inline_line(out, suppressed_inline)?;
             for finding in &findings {
                 writeln!(
                     out,
@@ -705,9 +745,7 @@ pub(super) fn run_module_graph(
 
     match format {
         OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
-            write_json(out, &report)?;
+            write_json_with_suppressed(out, findings, analysis_errors, suppressed_inline)?
         }
         OutputFormat::Sarif => {
             write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
@@ -723,25 +761,8 @@ pub(super) fn run_module_graph(
             let (unlinked, orphaned): (Vec<&Finding>, Vec<&Finding>) = findings
                 .iter()
                 .partition(|finding| finding.rule == judge::module_graph::UNLINKED_FILE_RULE);
-            if !analysis_errors.is_empty() {
-                writeln!(
-                    out,
-                    "files skipped (parse errors): {}",
-                    analysis_errors.len()
-                )?;
-                for err in &analysis_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {excluded_generated} (see --include-generated)"
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
+            write_error_list(out, "files skipped (parse errors)", &analysis_errors)?;
+            write_excluded_and_suppressed_lines(out, excluded_generated, suppressed_inline)?;
             writeln!(out, "unlinked-file findings: {}", unlinked.len())?;
             for finding in &unlinked {
                 writeln!(
@@ -775,16 +796,13 @@ pub(super) fn run_unsafe(
     let workspace = judge::ingest::load(None)?;
     let source_files = workspace_source_files(&workspace);
     let report = judge::security::analyze_workspace(source_files, options.include_generated);
-    let findings = report
-        .findings
-        .into_iter()
-        .filter(|finding| {
-            matches!(
-                finding.rule.as_str(),
-                judge::security::UNSAFE_SURFACE_RULE | judge::security::UNSAFE_DENSITY_RULE
-            )
-        })
-        .collect();
+    let findings = findings_matching(
+        report.findings,
+        &[
+            judge::security::UNSAFE_SURFACE_RULE,
+            judge::security::UNSAFE_DENSITY_RULE,
+        ],
+    );
     render_focused(
         "unsafe",
         options.format,
@@ -802,27 +820,17 @@ pub(super) fn run_errors(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let workspace = judge::ingest::load(None)?;
-    let source_files = workspace_source_files(&workspace);
-    let config = load_judge_toml(&workspace.root)?.rules;
-    let report = judge::slop::analyze_workspace(
-        source_files,
-        options.include_generated,
-        config.catch_all_error.allow_anyhow_at_boundary,
+    let report = analyze_slop_workspace(&workspace, options.include_generated)?;
+    let findings = findings_matching(
+        report.findings,
+        &[
+            judge::slop::SWALLOWED_RESULT_RULE,
+            judge::slop::EMPTY_ERROR_ARM_RULE,
+            judge::slop::CATCH_ALL_ERROR_RULE,
+            judge::slop::CONTEXT_FREE_PROPAGATION_RULE,
+            judge::slop::SILENT_DEFAULT_RULE,
+        ],
     );
-    let findings = report
-        .findings
-        .into_iter()
-        .filter(|finding| {
-            matches!(
-                finding.rule.as_str(),
-                judge::slop::SWALLOWED_RESULT_RULE
-                    | judge::slop::EMPTY_ERROR_ARM_RULE
-                    | judge::slop::CATCH_ALL_ERROR_RULE
-                    | judge::slop::CONTEXT_FREE_PROPAGATION_RULE
-                    | judge::slop::SILENT_DEFAULT_RULE
-            )
-        })
-        .collect();
     render_focused(
         "errors",
         options.format,
@@ -842,18 +850,14 @@ pub(super) fn run_tests(
     let workspace = judge::ingest::load(None)?;
     let source_files = workspace_source_files(&workspace);
     let report = judge::slop::analyze_workspace(source_files, options.include_generated, false);
-    let findings = report
-        .findings
-        .into_iter()
-        .filter(|finding| {
-            matches!(
-                finding.rule.as_str(),
-                judge::slop::ASSERTION_FREE_TEST_RULE
-                    | judge::slop::TAUTOLOGICAL_TEST_RULE
-                    | judge::slop::IGNORED_TEST_ACCUMULATION_RULE
-            )
-        })
-        .collect();
+    let findings = findings_matching(
+        report.findings,
+        &[
+            judge::slop::ASSERTION_FREE_TEST_RULE,
+            judge::slop::TAUTOLOGICAL_TEST_RULE,
+            judge::slop::IGNORED_TEST_ACCUMULATION_RULE,
+        ],
+    );
     render_focused(
         "tests",
         options.format,
@@ -871,13 +875,7 @@ pub(super) fn run_slop(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let workspace = judge::ingest::load(None)?;
-    let source_files = workspace_source_files(&workspace);
-    let config = load_judge_toml(&workspace.root)?.rules;
-    let report = judge::slop::analyze_workspace(
-        source_files,
-        options.include_generated,
-        config.catch_all_error.allow_anyhow_at_boundary,
-    );
+    let report = analyze_slop_workspace(&workspace, options.include_generated)?;
     render_focused(
         "slop",
         options.format,
@@ -886,6 +884,16 @@ pub(super) fn run_slop(
         analysis_errors(&report.errors),
         out,
     )
+}
+
+/// Keeps only the findings whose rule is one of `rules` — the shared
+/// "project this analyzer's full report down to one focused command's rule
+/// subset" step behind `run_unsafe`/`run_errors`/`run_tests`.
+fn findings_matching(findings: Vec<Finding>, rules: &[&str]) -> Vec<Finding> {
+    findings
+        .into_iter()
+        .filter(|finding| rules.contains(&finding.rule.as_str()))
+        .collect()
 }
 
 fn render_focused(
@@ -983,9 +991,7 @@ pub(super) fn run_api_surface(
         }
         #[cfg(not(feature = "deep"))]
         {
-            unreachable!(
-                "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-            );
+            deep_tier_unreachable();
         }
     }
 
@@ -1084,32 +1090,9 @@ pub(super) fn run_api_surface(
             if let Some(checked) = deep_checked {
                 writeln!(out, "pub fns checked (leaked_dependency_type): {checked}")?;
             }
-            if !report.errors.is_empty() {
-                writeln!(out, "files skipped (parse errors): {}", report.errors.len())?;
-                for err in report.errors.iter().map(ToString::to_string) {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if !deep_errors.is_empty() {
-                writeln!(
-                    out,
-                    "leaked-dependency-type analysis errors: {}",
-                    deep_errors.len()
-                )?;
-                for err in &deep_errors {
-                    writeln!(out, "  {err}")?;
-                }
-            }
-            if report.excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {} (see --include-generated)",
-                    report.excluded_generated
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
+            write_error_list(out, "files skipped (parse errors)", &report.errors)?;
+            write_error_list(out, "leaked-dependency-type analysis errors", &deep_errors)?;
+            write_excluded_and_suppressed_lines(out, report.excluded_generated, suppressed_inline)?;
             for finding in &findings {
                 writeln!(
                     out,

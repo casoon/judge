@@ -28,13 +28,7 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     // "Der Slop-Block ist Teil von `health`, kein eigener Sub-Command") — a
     // second, fresh iterator over the same source files, since the first one
     // was consumed by `complexity::analyze_workspace` above.
-    let slop_source_files = super::analysis_commands::workspace_source_files(&workspace);
-    let rules_config = load_judge_toml(&workspace.root)?.rules;
-    let slop = judge::slop::analyze_workspace(
-        slop_source_files,
-        include_generated,
-        rules_config.catch_all_error.allow_anyhow_at_boundary,
-    );
+    let slop = super::analysis_commands::analyze_slop_workspace(&workspace, include_generated)?;
     append_analysis_errors(&mut analysis_errors, &slop.errors);
     findings.extend(slop.findings);
 
@@ -164,21 +158,12 @@ pub(super) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
         }
         OutputFormat::Tty => {
             writeln!(out, "functions analyzed: {}", functions.len())?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            if excluded_generated > 0 {
-                writeln!(
-                    out,
-                    "excluded (generated): {excluded_generated} (see --include-generated)"
-                )?;
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
+            super::analysis_commands::write_error_list(out, "analysis errors", &analysis_errors)?;
+            super::analysis_commands::write_excluded_and_suppressed_lines(
+                out,
+                excluded_generated,
+                suppressed_inline,
+            )?;
 
             writeln!(out)?;
             writeln!(out, "top complexity (cyclomatic):")?;

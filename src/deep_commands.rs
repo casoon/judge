@@ -7,11 +7,7 @@ pub(super) fn run_dead_code(
     options: DeadCodeOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    if !judge::AnalysisTier::Deep.is_available() {
-        return Err(CliError::Analyzer(
-            "dead-code analysis needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)".to_string(),
-        ));
-    }
+    require_deep_tier("dead-code analysis")?;
 
     #[cfg(feature = "deep")]
     {
@@ -19,10 +15,20 @@ pub(super) fn run_dead_code(
     }
     #[cfg(not(feature = "deep"))]
     {
-        unreachable!(
-            "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-        )
+        super::analysis_commands::deep_tier_unreachable()
     }
+}
+
+/// Every Deep-Tier-only command rejects the same way when built without
+/// `--features deep` (see todo.md §2.1) — only the leading clause naming
+/// what needs the Deep Tier differs between `run_dead_code` and `run_explain`.
+fn require_deep_tier(what: &str) -> Result<(), CliError> {
+    if judge::AnalysisTier::Deep.is_available() {
+        return Ok(());
+    }
+    Err(CliError::Analyzer(format!(
+        "{what} needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)"
+    )))
 }
 
 #[cfg(feature = "deep")]
@@ -195,15 +201,8 @@ fn run_dead_code_deep(
                 "functions checked (connectivity-drop): {}",
                 structural_report.checked
             )?;
-            if !analysis_errors.is_empty() {
-                writeln!(out, "analysis errors: {}", analysis_errors.len())?;
-                for error in &analysis_errors {
-                    writeln!(out, "  {error}")?;
-                }
-            }
-            if suppressed_inline > 0 {
-                writeln!(out, "suppressed (inline judge-ignore): {suppressed_inline}")?;
-            }
+            super::analysis_commands::write_error_list(out, "analysis errors", &analysis_errors)?;
+            super::analysis_commands::write_suppressed_inline_line(out, suppressed_inline)?;
             for rule in [
                 judge::dead_code::UNUSED_PUB_WORKSPACE_RULE,
                 judge::dead_code::UNUSED_PUB_API_RULE,
@@ -300,11 +299,7 @@ pub(super) fn run_explain(
             "`judge explain` currently only supports `--why-live`".to_string(),
         ));
     }
-    if !judge::AnalysisTier::Deep.is_available() {
-        return Err(CliError::Analyzer(
-            "--why-live needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)".to_string(),
-        ));
-    }
+    require_deep_tier("--why-live")?;
 
     #[cfg(feature = "deep")]
     {
@@ -312,9 +307,7 @@ pub(super) fn run_explain(
     }
     #[cfg(not(feature = "deep"))]
     {
-        unreachable!(
-            "AnalysisTier::Deep.is_available() is compile-time false without the deep feature"
-        )
+        super::analysis_commands::deep_tier_unreachable()
     }
 }
 
