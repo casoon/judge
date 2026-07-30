@@ -23,46 +23,7 @@ for consistent verdicts, evidence groups, source locations, color policy, and
 next steps. JSON, SARIF, and Markdown remain explicit machine or handoff
 contracts owned by judge.
 
-## 0.6.0 highlights
-
-- Complete repositioning as a deterministic post-refactoring analyzer for Rust workspaces.
-- Removed Git history dependency, `gix` dependency, and Git-bound commands (`distribution`, `provenance`, `audit --since`).
-- Artifact-based baseline comparison (`cargo judge compare`) works seamlessly without Git.
-- `ureq` HTTP dependency is now optional (`--features network`).
-- See [MIGRATION.md](file:///Users/jseidel/GitHub/judge/MIGRATION.md) for breaking changes and CLI migration details.
-
-## 0.5.2 highlights
-
-- TTY reports now use `runemark` 0.1.1 for consistent verdicts, compact
-  evidence groups, source locations, color policy, and actionable next steps.
-- `structure`, `complexity`, `refactor`, `api`, `errors`, `tests`, `unsafe`,
-  and `slop` provide focused views of the current project state.
-- Baselines compare recorded artifacts with the current workspace through
-  `cargo judge compare`, without requiring Git history.
-
-## 0.5.1 highlights
-
-- The bare `cargo judge` report is now a compact, deterministic decision
-  summary: evidence-backed and advisory findings are grouped by rule with a
-  representative location. `--details` retains the complete terminal list.
-- `cargo judge --format markdown` writes a review-ready summary to
-  `.judge/judge.md` by default, or to `--output PATH` for PR and issue
-  handoffs.
-- A shared human-readable report model now keeps the combined TTY and
-  Markdown views structurally consistent while JSON remains the exhaustive
-  automation contract.
-
-## 0.2.0 highlights
-
-- JSON reports are persisted by default under `.judge/<command>.json`; use
-  `--output PATH` for an explicit location. Every artifact begins with a
-  contextual header and a non-binding triage assessment.
-- `map` and `impact` expose deterministic workspace and change context for
-  refactoring work; duplicate-code output includes a prioritized, compact
-  refactoring summary.
-- The command layer shares baseline, JSON-report, and analyzer-error handling
-  while preserving each command's established TTY, JSON, SARIF, and baseline
-  contracts.
+See [MIGRATION.md](file:///Users/jseidel/GitHub/judge/MIGRATION.md) for breaking changes and CLI migration details.
 
 ## Status
 
