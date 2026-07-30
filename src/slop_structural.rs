@@ -398,18 +398,21 @@ fn is_build_method_for(method: &ImplItemFn, target_name: &str) -> bool {
     )
 }
 
-fn abstraction_finding(
+/// Builds the shared [`Finding`] shape both [`abstraction_finding`] and
+/// [`fragile_substring_classification_finding`] produce: the same
+/// `rule:file:line:item_path` id format, `Severity::Warn`,
+/// `EvidenceClass::Heuristic`, and `Origin::Code` — only `rule_id` and
+/// `evidence` vary per call site.
+fn structural_finding(
+    rule_id: &str,
     file: &Path,
     line: usize,
     item_path: String,
     evidence: serde_json::Value,
 ) -> Finding {
     Finding::new(
-        format!(
-            "{ABSTRACTION_INFLATION_RULE}:{}:{line}:{item_path}",
-            file.display()
-        ),
-        ABSTRACTION_INFLATION_RULE,
+        format!("{rule_id}:{}:{line}:{item_path}", file.display()),
+        rule_id,
         Severity::Warn,
         Location {
             file: file.to_path_buf(),
@@ -420,6 +423,15 @@ fn abstraction_finding(
         Origin::Code,
         Some(evidence),
     )
+}
+
+fn abstraction_finding(
+    file: &Path,
+    line: usize,
+    item_path: String,
+    evidence: serde_json::Value,
+) -> Finding {
+    structural_finding(ABSTRACTION_INFLATION_RULE, file, line, item_path, evidence)
 }
 
 /// Three structural sub-patterns from todo.md §3.G `abstraction-inflation`
@@ -744,25 +756,16 @@ fn fragile_substring_classification_finding(
     line: usize,
     item_path: String,
 ) -> Finding {
-    Finding::new(
-        format!(
-            "{FRAGILE_SUBSTRING_CLASSIFICATION_RULE}:{}:{line}:{item_path}",
-            file.display()
-        ),
+    structural_finding(
         FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
-        Severity::Warn,
-        Location {
-            file: file.to_path_buf(),
-            line: OneBasedLine::new(line).expect("proc-macro2 span lines are 1-based"),
-            item_path,
-        },
-        EvidenceClass::Heuristic,
-        Origin::Code,
-        Some(json!({
+        file,
+        line,
+        item_path,
+        json!({
             "reason": "this if/else chain classifies via `.contains()` on a short string \
                 literal with no word-boundary check found in the condition — this can \
                 misclassify if the string appears as a substring of something unrelated",
-        })),
+        }),
     )
 }
 

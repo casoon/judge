@@ -265,6 +265,38 @@ macro_rules! visit_emitted_type_item {
     };
 }
 
+/// `visit_item_mod` override shared by [`walk_type_items`]'s and
+/// [`walk_enum_variants`]'s per-file `Walker`s: push the module's name onto
+/// `path` before descending into an inline `mod { .. }`, pop it back off
+/// afterward, or just descend unchanged into a `mod foo;` declaration with no
+/// inline body.
+macro_rules! visit_item_mod_tracking_path {
+    () => {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            if node.content.is_some() {
+                self.path.push(node.ident.to_string());
+                visit::visit_item_mod(self, node);
+                self.path.pop();
+            } else {
+                visit::visit_item_mod(self, node);
+            }
+        }
+    };
+}
+
+/// Joins `path` (the enclosing `mod`/`impl`/`trait` segments) and `name`
+/// (the item's own identifier) into one `::`-separated qualified name, or
+/// just `name` if `path` is empty — the shared naming scheme both
+/// [`walk_type_items`]'s and [`walk_enum_variants`]'s per-file `Walker`s
+/// apply identically.
+fn joined_qualified_name(path: &[String], name: &str) -> String {
+    if path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{name}", path.join("::"))
+    }
+}
+
 /// Visits every top-level `struct`, `enum`, `trait`, `const`, and `static` in
 /// `file`, plus every associated const/type inside an `impl` block, tracking
 /// the enclosing `mod`/`impl`/`trait` path the same way
@@ -283,11 +315,7 @@ pub(crate) fn walk_type_items<'ast>(
 
     impl<F> Walker<F> {
         fn qualified_name(&self, name: &str) -> String {
-            if self.path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}::{name}", self.path.join("::"))
-            }
+            joined_qualified_name(&self.path, name)
         }
     }
 
@@ -306,15 +334,7 @@ pub(crate) fn walk_type_items<'ast>(
     }
 
     impl<'ast, F: FnMut(TypeItemSite<'ast>)> Visit<'ast> for Walker<F> {
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            if node.content.is_some() {
-                self.path.push(node.ident.to_string());
-                visit::visit_item_mod(self, node);
-                self.path.pop();
-            } else {
-                visit::visit_item_mod(self, node);
-            }
-        }
+        visit_item_mod_tracking_path!();
 
         visit_emitted_type_item!(visit_item_struct, syn::ItemStruct, visit_item_struct);
         visit_emitted_type_item!(visit_item_enum, syn::ItemEnum, visit_item_enum);
@@ -385,24 +405,12 @@ fn walk_enum_variants<'ast>(file: &'ast syn::File, on_variant: impl FnMut(EnumVa
 
     impl<F> Walker<F> {
         fn qualified_name(&self, name: &str) -> String {
-            if self.path.is_empty() {
-                name.to_string()
-            } else {
-                format!("{}::{name}", self.path.join("::"))
-            }
+            joined_qualified_name(&self.path, name)
         }
     }
 
     impl<'ast, F: FnMut(EnumVariantSite<'ast>)> Visit<'ast> for Walker<F> {
-        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-            if node.content.is_some() {
-                self.path.push(node.ident.to_string());
-                visit::visit_item_mod(self, node);
-                self.path.pop();
-            } else {
-                visit::visit_item_mod(self, node);
-            }
-        }
+        visit_item_mod_tracking_path!();
 
         fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
             let enum_qualified_name = self.qualified_name(&node.ident.to_string());
@@ -555,13 +563,24 @@ fn file_constructs_variant(ast: &syn::File, variant_name: &str) -> bool {
 /// sharing its `Metadata` value — neither `dead_code` nor `ingest` currently
 /// holds one already loaded, and threading dep_graph's through would widen
 /// that module's API for a dependency this module doesn't otherwise need.
+/// Runs a full (non-`--no-deps`) `cargo metadata` resolve against
+/// `workspace_root`'s manifest — the shared call behind [`proc_macro_exposed_crates`]
+/// and [`publishable_crates`], which otherwise each ran their own
+/// `MetadataCommand` identically (see [`proc_macro_exposed_crates`]'s doc
+/// comment for why a full resolve, not [`crate::ingest::load`]'s `--no-deps`
+/// one, is needed).
+fn load_workspace_metadata(
+    workspace_root: &Path,
+) -> Result<cargo_metadata::Metadata, cargo_metadata::Error> {
+    MetadataCommand::new()
+        .manifest_path(workspace_root.join("Cargo.toml"))
+        .exec()
+}
+
 fn proc_macro_exposed_crates(
     workspace_root: &Path,
 ) -> Result<HashSet<String>, cargo_metadata::Error> {
-    let manifest_path = workspace_root.join("Cargo.toml");
-    let metadata = MetadataCommand::new()
-        .manifest_path(&manifest_path)
-        .exec()?;
+    let metadata = load_workspace_metadata(workspace_root)?;
 
     let proc_macro_packages: HashSet<&cargo_metadata::PackageId> = metadata
         .packages
@@ -619,10 +638,7 @@ fn proc_macro_exposed_crates(
 /// all, since [`crate::ingest::load`]'s own `--no-deps` resolve only reads
 /// the workspace member manifests' dependency declarations.
 fn publishable_crates(workspace_root: &Path) -> Result<HashSet<String>, cargo_metadata::Error> {
-    let manifest_path = workspace_root.join("Cargo.toml");
-    let metadata = MetadataCommand::new()
-        .manifest_path(&manifest_path)
-        .exec()?;
+    let metadata = load_workspace_metadata(workspace_root)?;
 
     Ok(metadata
         .packages
@@ -680,6 +696,22 @@ pub(crate) fn read_and_parse_file(path: &Path) -> Result<syn::File, DeadCodeErro
     let source =
         std::fs::read_to_string(path).map_err(|err| DeadCodeError::Io(path.to_path_buf(), err))?;
     syn::parse_file(&source).map_err(|err| DeadCodeError::Parse(path.to_path_buf(), err))
+}
+
+/// [`read_and_parse_file`], pushing a failure onto `report.errors` and
+/// returning `None` instead of propagating it — the shared "parse this file
+/// within a loop, or skip it and move on" step behind [`analyze_workspace`]'s
+/// own per-file walk and [`check_enum_variant`]'s re-parse of a referencing
+/// file, both of which need to `continue` their own loop on failure rather
+/// than visit an `on_file` callback the way [`for_each_parsed_file`] does.
+fn parsed_file_or_report(report: &mut WorkspaceDeadCode, path: &Path) -> Option<syn::File> {
+    match read_and_parse_file(path) {
+        Ok(ast) => Some(ast),
+        Err(err) => {
+            report.errors.push(err);
+            None
+        }
+    }
 }
 
 /// Walks every locally-reportable source file across `workspace`'s crates,
@@ -854,32 +886,86 @@ fn check_item(
                 .or_insert(0) += 1;
         }
     }
-    let used_externally = referencing.iter().any(|referencing_file| {
-        crate_of_file
-            .get(referencing_file)
-            .is_some_and(|owner| *owner != krate_name)
-    });
-    if used_externally {
+    if is_used_externally(&referencing, crate_of_file, krate_name) {
         return;
     }
 
-    match crate::reachability::is_reachable_from_entry(
+    let evidence = serde_json::json!({
+        "tier": "deep",
+        "searched_crates": searched_crates_count(crate_of_file),
+        "references_found": referencing.len(),
+        "root_set_size": entry_keys.len(),
+        "reason": reason,
+    });
+    push_finding_if_unreachable(
         analysis,
         entry_keys,
         position,
         include_tests,
-    ) {
+        proc_macro_exposed,
+        krate_name,
+        rule_id,
+        severity,
+        evidence_class,
+        file,
+        line,
+        qualified_name,
+        evidence,
+        report,
+    );
+}
+
+/// Whether any of `referencing`'s files belongs to a crate other than
+/// `krate_name` — the shared "does something outside this item's own crate
+/// use it" check both [`check_item`] and [`check_test_only_pub`] apply before
+/// consulting entry-point reachability at all.
+fn is_used_externally(
+    referencing: &HashSet<FileId>,
+    crate_of_file: &HashMap<FileId, &str>,
+    krate_name: &str,
+) -> bool {
+    referencing.iter().any(|referencing_file| {
+        crate_of_file
+            .get(referencing_file)
+            .is_some_and(|owner| *owner != krate_name)
+    })
+}
+
+/// Number of distinct crates `crate_of_file` covers — the "how wide a view
+/// did this query search" evidence figure both [`check_item`] and
+/// [`check_test_only_pub`] report alongside their reachability result.
+fn searched_crates_count(crate_of_file: &HashMap<FileId, &str>) -> usize {
+    crate_of_file.values().copied().collect::<HashSet<&str>>().len()
+}
+
+/// Runs [`crate::reachability::is_reachable_from_entry`] and, on `Ok(false)`
+/// (unreachable), pushes one [`dead_code_finding`] carrying `evidence`
+/// (already assembled by the caller, since each rule's evidence shape
+/// differs) plus this crate's proc-macro-expansion limitation; on `Err`,
+/// records it via [`reachability_error`] instead. [`check_item`] and
+/// [`check_unreachable_from_entry`] both wrap the same reachability query in
+/// this exact dispatch, differing only in which rule/evidence they attach.
+#[allow(clippy::too_many_arguments)]
+fn push_finding_if_unreachable(
+    analysis: &ra_ap_ide::Analysis,
+    entry_keys: &std::collections::HashSet<(FileId, u32)>,
+    position: ra_ap_ide::FilePosition,
+    include_tests: bool,
+    proc_macro_exposed: &HashSet<String>,
+    krate_name: &str,
+    rule_id: &str,
+    severity: Severity,
+    evidence_class: EvidenceClass,
+    file: &SourceFile,
+    line: usize,
+    qualified_name: &str,
+    evidence: serde_json::Value,
+    report: &mut WorkspaceDeadCode,
+) {
+    match crate::reachability::is_reachable_from_entry(analysis, entry_keys, position, include_tests)
+    {
         Ok(true) => {}
         Ok(false) => {
-            let searched_crates: std::collections::HashSet<&str> =
-                crate_of_file.values().copied().collect();
-            let evidence = serde_json::json!({
-                "tier": "deep",
-                "searched_crates": searched_crates.len(),
-                "references_found": referencing.len(),
-                "root_set_size": entry_keys.len(),
-                "reason": reason,
-            });
             let limitations = proc_macro_exposed
                 .contains(krate_name)
                 .then(|| vec!["proc_macro_expansion_disabled".to_string()]);
@@ -973,12 +1059,8 @@ fn check_enum_variant(
         let Some(path) = file_path_by_id.get(referencing_file_id) else {
             continue;
         };
-        let ast = match read_and_parse_file(path) {
-            Ok(ast) => ast,
-            Err(err) => {
-                report.errors.push(err);
-                continue;
-            }
+        let Some(ast) = parsed_file_or_report(report, path) else {
+            continue;
         };
         if file_constructs_variant(&ast, variant_name) {
             construction_found = true;
@@ -1067,12 +1149,7 @@ fn check_test_only_pub(
     let Some(referencing) = referencing_files_or_bail(analysis, position, true, report) else {
         return;
     };
-    let used_externally = referencing.iter().any(|referencing_file| {
-        crate_of_file
-            .get(referencing_file)
-            .is_some_and(|owner| *owner != krate_name)
-    });
-    if used_externally {
+    if is_used_externally(&referencing, crate_of_file, krate_name) {
         return;
     }
 
@@ -1096,11 +1173,9 @@ fn check_test_only_pub(
         return;
     }
 
-    let searched_crates: std::collections::HashSet<&str> =
-        crate_of_file.values().copied().collect();
     let evidence = serde_json::json!({
         "tier": "deep",
-        "searched_crates": searched_crates.len(),
+        "searched_crates": searched_crates_count(crate_of_file),
         "references_found": referencing.len(),
         "root_set_size_production": entry_keys_production.len(),
         "root_set_size_all": entry_keys_all.len(),
@@ -1149,35 +1224,27 @@ fn check_unreachable_from_entry(
 ) {
     let position = checked_position(report, file_id, offset);
 
-    match crate::reachability::is_reachable_from_entry(
+    let evidence = serde_json::json!({
+        "tier": "deep",
+        "root_set_size": entry_keys.len(),
+        "reason": UNREACHABLE_FROM_ENTRY_REASON,
+    });
+    push_finding_if_unreachable(
         analysis,
         entry_keys,
         position,
         include_tests,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            let evidence = serde_json::json!({
-                "tier": "deep",
-                "root_set_size": entry_keys.len(),
-                "reason": UNREACHABLE_FROM_ENTRY_REASON,
-            });
-            let limitations = proc_macro_exposed
-                .contains(krate_name)
-                .then(|| vec!["proc_macro_expansion_disabled".to_string()]);
-            report.findings.push(dead_code_finding(
-                UNREACHABLE_FROM_ENTRY_RULE,
-                Severity::Warn,
-                EvidenceClass::BoundedSemantic,
-                file,
-                line,
-                qualified_name,
-                evidence,
-                limitations,
-            ));
-        }
-        Err(err) => report.errors.push(reachability_error(err)),
-    }
+        proc_macro_exposed,
+        krate_name,
+        UNREACHABLE_FROM_ENTRY_RULE,
+        Severity::Warn,
+        EvidenceClass::BoundedSemantic,
+        file,
+        line,
+        qualified_name,
+        evidence,
+        report,
+    );
 }
 
 /// Finds `pub` functions/methods referenced only from their own defining
@@ -1293,12 +1360,8 @@ pub fn analyze_workspace(
                 continue;
             };
 
-            let ast = match read_and_parse_file(&file.path) {
-                Ok(ast) => ast,
-                Err(err) => {
-                    report.errors.push(err);
-                    continue;
-                }
+            let Some(ast) = parsed_file_or_report(&mut report, &file.path) else {
+                continue;
             };
 
             walk_functions(&ast, |site| {
@@ -1453,15 +1516,25 @@ pub fn analyze_workspace(
 /// afferent coupling counts — see [`CRATE_COUPLING_RULE`]). A crate with no
 /// cross-crate coupling at all is skipped, not flagged — there is nothing to
 /// report for it.
-fn crate_coupling_findings(
-    workspace: &Workspace,
+/// owner/referencer -> distinct counterpart keys, the Ca/Ce shape
+/// [`afferent_efferent_sets`] returns and [`coupling_metrics`] reads from.
+type CouplingSets<'a> = HashMap<&'a str, BTreeSet<&'a str>>;
+
+/// Ca, Ce, instability, and the sorted evidence lists [`coupling_metrics`]
+/// returns for one coupling key.
+type CouplingMetrics<'a> = (usize, usize, f64, Vec<&'a str>, Vec<&'a str>);
+
+/// Builds the Ca/Ce (afferent/efferent) sets `edge_counts` implies: owner ->
+/// distinct referencing keys (Ca) and referencer -> distinct referenced keys
+/// (Ce). `BTreeSet` for deterministic, sorted, deduped evidence lists.
+/// Shared by [`crate_coupling_findings`] and [`module_coupling_findings`] —
+/// keyed by crate name or module bucket string respectively, but otherwise
+/// the exact same fold.
+fn afferent_efferent_sets(
     edge_counts: &HashMap<(String, String), u32>,
-) -> Vec<Finding> {
-    // owner -> distinct crates referencing it (Ca); referencer -> distinct
-    // crates it references (Ce). `BTreeSet` for deterministic, sorted,
-    // deduped evidence lists.
-    let mut afferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
-    let mut efferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+) -> (CouplingSets<'_>, CouplingSets<'_>) {
+    let mut afferent: CouplingSets<'_> = HashMap::new();
+    let mut efferent: CouplingSets<'_> = HashMap::new();
     for (owner, referencer) in edge_counts.keys() {
         afferent
             .entry(owner.as_str())
@@ -1472,45 +1545,93 @@ fn crate_coupling_findings(
             .or_default()
             .insert(owner.as_str());
     }
+    (afferent, efferent)
+}
+
+/// Ca, Ce, instability (`Ce / (Ca + Ce)`), and the sorted evidence lists for
+/// one coupling key — `None` if it has no coupling at all (`Ca + Ce == 0`),
+/// the shared "nothing to report" skip both [`crate_coupling_findings`] and
+/// [`module_coupling_findings`] apply before pushing a finding.
+fn coupling_metrics<'a>(
+    key: &str,
+    afferent: &CouplingSets<'a>,
+    efferent: &CouplingSets<'a>,
+) -> Option<CouplingMetrics<'a>> {
+    let afferent_set = afferent.get(key);
+    let efferent_set = efferent.get(key);
+    let ca = afferent_set.map_or(0, BTreeSet::len);
+    let ce = efferent_set.map_or(0, BTreeSet::len);
+    if ca + ce == 0 {
+        return None;
+    }
+    let instability = ce as f64 / (ca + ce) as f64;
+    let efferent_list = efferent_set
+        .map(|set| set.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let afferent_list = afferent_set
+        .map(|set| set.iter().copied().collect::<Vec<_>>())
+        .unwrap_or_default();
+    Some((ca, ce, instability, efferent_list, afferent_list))
+}
+
+/// Builds the shared [`Finding`] tail both [`crate_coupling_findings`] and
+/// [`module_coupling_findings`] produce once their coupling metrics are
+/// computed: `Severity::Info`, `EvidenceClass::Heuristic`, `Origin::Code`,
+/// no limitations, empty `caused_by`/`causes` — only the id, rule, location,
+/// and evidence vary per coupling key.
+fn coupling_finding(
+    id: String,
+    rule_id: &str,
+    file: PathBuf,
+    item_path: String,
+    evidence: serde_json::Value,
+) -> Finding {
+    Finding {
+        id: id.into(),
+        rule: rule_id.into(),
+        severity: Severity::Info,
+        location: Location {
+            file,
+            line: OneBasedLine::FIRST,
+            item_path,
+        },
+        evidence_class: EvidenceClass::Heuristic,
+        origin: Origin::Code,
+        evidence: Some(evidence),
+        limitations: None,
+        caused_by: Vec::new(),
+        causes: Vec::new(),
+    }
+}
+
+fn crate_coupling_findings(
+    workspace: &Workspace,
+    edge_counts: &HashMap<(String, String), u32>,
+) -> Vec<Finding> {
+    let (afferent, efferent) = afferent_efferent_sets(edge_counts);
 
     let mut findings = Vec::new();
     for krate in &workspace.crates {
-        let afferent_crates = afferent.get(krate.name.as_str());
-        let efferent_crates = efferent.get(krate.name.as_str());
-        let ca = afferent_crates.map_or(0, BTreeSet::len);
-        let ce = efferent_crates.map_or(0, BTreeSet::len);
-        if ca + ce == 0 {
+        let Some((ca, ce, instability, efferent_crates, afferent_crates)) =
+            coupling_metrics(krate.name.as_str(), &afferent, &efferent)
+        else {
             continue;
-        }
-        let instability = ce as f64 / (ca + ce) as f64;
-        findings.push(Finding {
-            id: format!("{CRATE_COUPLING_RULE}:{}", krate.name).into(),
-            rule: CRATE_COUPLING_RULE.into(),
-            severity: Severity::Info,
-            location: Location {
-                file: krate.manifest_path.clone(),
-                line: OneBasedLine::FIRST,
-                item_path: krate.name.clone(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(serde_json::json!({
+        };
+        findings.push(coupling_finding(
+            format!("{CRATE_COUPLING_RULE}:{}", krate.name),
+            CRATE_COUPLING_RULE,
+            krate.manifest_path.clone(),
+            krate.name.clone(),
+            serde_json::json!({
                 "tier": "deep",
                 "krate": krate.name,
                 "efferent_coupling": ce,
                 "afferent_coupling": ca,
                 "instability": instability,
-                "efferent_crates": efferent_crates
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-                "afferent_crates": afferent_crates
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
+                "efferent_crates": efferent_crates,
+                "afferent_crates": afferent_crates,
+            }),
+        ));
     }
     findings
 }
@@ -1528,21 +1649,9 @@ fn module_coupling_findings(
     workspace: &Workspace,
     edge_counts: &HashMap<(String, String), u32>,
 ) -> Vec<Finding> {
-    // owner -> distinct modules referencing it (Ca); referencer -> distinct
-    // modules it references (Ce). `BTreeSet` for deterministic, sorted,
-    // deduped evidence lists — same shape as `crate_coupling_findings`.
-    let mut afferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
-    let mut efferent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    let (afferent, efferent) = afferent_efferent_sets(edge_counts);
     let mut modules: BTreeSet<&str> = BTreeSet::new();
     for (owner, referencer) in edge_counts.keys() {
-        afferent
-            .entry(owner.as_str())
-            .or_default()
-            .insert(referencer.as_str());
-        efferent
-            .entry(referencer.as_str())
-            .or_default()
-            .insert(owner.as_str());
         modules.insert(owner.as_str());
         modules.insert(referencer.as_str());
     }
@@ -1560,47 +1669,31 @@ fn module_coupling_findings(
 
     let mut findings = Vec::new();
     for module in modules {
-        let afferent_modules = afferent.get(module);
-        let efferent_modules = efferent.get(module);
-        let ca = afferent_modules.map_or(0, BTreeSet::len);
-        let ce = efferent_modules.map_or(0, BTreeSet::len);
-        if ca + ce == 0 {
+        let Some((ca, ce, instability, efferent_modules, afferent_modules)) =
+            coupling_metrics(module, &afferent, &efferent)
+        else {
             continue;
-        }
-        let instability = ce as f64 / (ca + ce) as f64;
+        };
         let krate_name = module.split("::").next().unwrap_or(module);
         let manifest_path = manifest_path_by_crate
             .get(krate_name)
             .copied()
             .unwrap_or_else(|| Path::new(""));
-        findings.push(Finding {
-            id: format!("{MODULE_COUPLING_RULE}:{module}").into(),
-            rule: MODULE_COUPLING_RULE.into(),
-            severity: Severity::Info,
-            location: Location {
-                file: manifest_path.to_path_buf(),
-                line: OneBasedLine::FIRST,
-                item_path: module.to_string(),
-            },
-            evidence_class: EvidenceClass::Heuristic,
-            origin: Origin::Code,
-            evidence: Some(serde_json::json!({
+        findings.push(coupling_finding(
+            format!("{MODULE_COUPLING_RULE}:{module}"),
+            MODULE_COUPLING_RULE,
+            manifest_path.to_path_buf(),
+            module.to_string(),
+            serde_json::json!({
                 "tier": "deep",
                 "module": module,
                 "efferent_coupling": ce,
                 "afferent_coupling": ca,
                 "instability": instability,
-                "efferent_modules": efferent_modules
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-                "afferent_modules": afferent_modules
-                    .map(|set| set.iter().copied().collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            })),
-            limitations: None,
-            caused_by: Vec::new(),
-            causes: Vec::new(),
-        });
+                "efferent_modules": efferent_modules,
+                "afferent_modules": afferent_modules,
+            }),
+        ));
     }
     findings
 }

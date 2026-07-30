@@ -101,14 +101,24 @@ impl std::error::Error for ComplexityError {
     }
 }
 
-/// Parses a single Rust source file and returns the complexity of every
-/// function, method, and default trait-method body it contains.
-pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
+/// [`read_and_parse_source`], mapping its I/O/parse errors to
+/// [`ComplexityError`]'s matching variants — the shared parse step behind
+/// both [`analyze_file`] (walks individual function bodies) and
+/// [`analyze_file_halstead`] (a second, independent parse of the whole file
+/// for its file-level metric).
+fn parse_complexity_file(path: &Path) -> Result<syn::File, ComplexityError> {
     let (_, ast) = read_and_parse_source(
         path,
         |err| ComplexityError::Io(path.to_path_buf(), err),
         |err| ComplexityError::Parse(path.to_path_buf(), err),
     )?;
+    Ok(ast)
+}
+
+/// Parses a single Rust source file and returns the complexity of every
+/// function, method, and default trait-method body it contains.
+pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
+    let ast = parse_complexity_file(path)?;
 
     let mut functions = Vec::new();
     walk_functions(&ast, |site| {
@@ -334,6 +344,14 @@ enum BoolOp {
     Or,
 }
 
+/// Whether `op` is one of the two boolean-chain operators (`&&`/`||`) this
+/// module scores as a chain — the shared discriminant both
+/// [`flatten_bool_chain`]'s and [`CognitiveComplexityVisitor::visit_expr`]'s
+/// match guards apply.
+fn is_bool_chain_op(op: &BinOp) -> bool {
+    matches!(op, BinOp::And(_) | BinOp::Or(_))
+}
+
 /// Flattens a chain of `&&`/`||` [`Expr::Binary`] nodes — transparently
 /// unwrapping [`Expr::Paren`] — into its left-to-right operators and leaf
 /// operands, so [`CognitiveComplexityVisitor`] can score operator-run
@@ -341,7 +359,7 @@ enum BoolOp {
 fn flatten_bool_chain<'ast>(expr: &'ast Expr, ops: &mut Vec<BoolOp>, leaves: &mut Vec<&'ast Expr>) {
     match expr {
         Expr::Paren(node) => flatten_bool_chain(&node.expr, ops, leaves),
-        Expr::Binary(node) if matches!(node.op, BinOp::And(_) | BinOp::Or(_)) => {
+        Expr::Binary(node) if is_bool_chain_op(&node.op) => {
             flatten_bool_chain(&node.left, ops, leaves);
             ops.push(match node.op {
                 BinOp::And(_) => BoolOp::And,
@@ -412,7 +430,7 @@ impl<'ast> Visit<'ast> for CognitiveComplexityVisitor {
             Expr::Continue(node) if node.label.is_some() => {
                 self.add_structural();
             }
-            Expr::Binary(node) if matches!(node.op, BinOp::And(_) | BinOp::Or(_)) => {
+            Expr::Binary(node) if is_bool_chain_op(&node.op) => {
                 let mut ops = Vec::new();
                 let mut leaves = Vec::new();
                 flatten_bool_chain(expr, &mut ops, &mut leaves);
@@ -803,11 +821,7 @@ struct FileHalstead {
 /// (which only walks individual function bodies), since Halstead Volume is a
 /// file-level metric with no natural per-function decomposition.
 fn analyze_file_halstead(path: &Path) -> Result<FileHalstead, ComplexityError> {
-    let (_, ast) = read_and_parse_source(
-        path,
-        |err| ComplexityError::Io(path.to_path_buf(), err),
-        |err| ComplexityError::Parse(path.to_path_buf(), err),
-    )?;
+    let ast = parse_complexity_file(path)?;
 
     let mut visitor = HalsteadVisitor::default();
     visitor.visit_file(&ast);
