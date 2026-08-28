@@ -173,57 +173,69 @@ pub(super) fn run_dupes(
             return Err(unsupported_format("`dupes`", format, "tty, json, sarif"));
         }
         OutputFormat::Tty => {
-            writeln!(
-                out,
-                "mode: {}",
-                match mode {
-                    DupeModeArg::Strict => "strict",
-                    DupeModeArg::Mild => "mild",
-                    DupeModeArg::Weak => "weak",
-                    DupeModeArg::Semantic => "semantic",
-                }
-            )?;
+            writeln!(out, "mode: {}", dupe_mode_label(mode))?;
             writeln!(out, "min tokens: {min_tokens}")?;
             writeln!(out, "clone families: {}", report.families.len())?;
             print_duplication_refactoring_summary(out, &refactoring_summary)?;
             write_error_list(out, "files skipped (parse errors)", &report.errors)?;
             write_excluded_and_suppressed_lines(out, report.excluded_generated, suppressed_inline)?;
-
-            for (index, family) in report
-                .refactoring_order(&workspace.root)
-                .into_iter()
-                .take(DUPE_FAMILY_TTY_LIMIT)
-                .enumerate()
-            {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "family #{} — {} members",
-                    index + 1,
-                    family.members.len()
-                )?;
-                for member in &family.members {
-                    writeln!(
-                        out,
-                        "  {:>4} tokens  {}:{}-{}  {}",
-                        member.token_count,
-                        member.file.display(),
-                        member.start_line,
-                        member.end_line,
-                        member.qualified_name
-                    )?;
-                }
-            }
-            if report.families.len() > DUPE_FAMILY_TTY_LIMIT {
-                writeln!(
-                    out,
-                    "\n... and {} more families (see --format json for the full list)",
-                    report.families.len() - DUPE_FAMILY_TTY_LIMIT
-                )?;
-            }
+            write_dupe_families_tty(out, &report, &workspace.root)?;
         }
     }
     Ok(CommandOutcome::Clean)
+}
+
+/// `--mode`'s TTY label, matching `DupeModeArg`'s variant names.
+fn dupe_mode_label(mode: DupeModeArg) -> &'static str {
+    match mode {
+        DupeModeArg::Strict => "strict",
+        DupeModeArg::Mild => "mild",
+        DupeModeArg::Weak => "weak",
+        DupeModeArg::Semantic => "semantic",
+    }
+}
+
+/// `run_dupes`'s TTY family listing: the top `DUPE_FAMILY_TTY_LIMIT`
+/// families in refactoring-priority order, one line per member, plus a
+/// "... and N more" trailer when the full list was truncated.
+fn write_dupe_families_tty(
+    out: &mut dyn Write,
+    report: &judge::duplication::WorkspaceDuplication,
+    workspace_root: &Path,
+) -> std::io::Result<()> {
+    for (index, family) in report
+        .refactoring_order(workspace_root)
+        .into_iter()
+        .take(DUPE_FAMILY_TTY_LIMIT)
+        .enumerate()
+    {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "family #{} — {} members",
+            index + 1,
+            family.members.len()
+        )?;
+        for member in &family.members {
+            writeln!(
+                out,
+                "  {:>4} tokens  {}:{}-{}  {}",
+                member.token_count,
+                member.file.display(),
+                member.start_line,
+                member.end_line,
+                member.qualified_name
+            )?;
+        }
+    }
+    if report.families.len() > DUPE_FAMILY_TTY_LIMIT {
+        writeln!(
+            out,
+            "\n... and {} more families (see --format json for the full list)",
+            report.families.len() - DUPE_FAMILY_TTY_LIMIT
+        )?;
+    }
+    Ok(())
 }
 
 fn print_duplication_refactoring_summary(
@@ -256,6 +268,159 @@ fn print_duplication_refactoring_summary(
 /// `fresh-low-reputation-dep` need real crates.io network access and only run
 /// when `--check-crates-io` is passed — judge makes no network calls by
 /// default (see todo.md §1 "kein SaaS, keine Telemetrie, lokal deterministisch").
+/// The `--check-crates-io` sub-steps of `run_deps`: phantom-crate/
+/// phantom-version, fresh-low-reputation-dep, yanked-dependency, and
+/// single-maintainer checks, each needing real crates.io network access —
+/// see todo.md §14.2 G5.
+fn apply_crates_io_checks(
+    workspace: &judge::ingest::Workspace,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+    rule_revisions: &mut std::collections::HashMap<String, u32>,
+) -> Result<(), CliError> {
+    let slopsquat_config = load_judge_toml(&workspace.root)?.slopsquat;
+    let cache_root = workspace.root.join("target/judge/slopsquat-cache");
+    let index_client = judge::slopsquat::SparseIndexClient::new(cache_root.clone());
+    let metadata_client = judge::slopsquat::RestMetadataClient::new(cache_root.clone());
+    let owners_client = judge::slopsquat::RestOwnersClient::new(cache_root);
+
+    apply_phantom_dependency_checks(workspace, &index_client, findings, analysis_errors, rule_revisions);
+    apply_fresh_low_reputation_check(
+        workspace,
+        &metadata_client,
+        &slopsquat_config,
+        findings,
+        analysis_errors,
+        rule_revisions,
+    );
+    apply_yanked_dependency_check(workspace, &index_client, findings, analysis_errors, rule_revisions);
+    apply_single_maintainer_check(workspace, &owners_client, findings, analysis_errors, rule_revisions);
+    Ok(())
+}
+
+/// The `phantom-crate`/`phantom-version` sub-check of [`apply_crates_io_checks`]:
+/// crates.io names/versions referenced in `Cargo.toml` that don't actually
+/// exist on the sparse index (see todo.md §14.2 G5).
+fn apply_phantom_dependency_checks(
+    workspace: &judge::ingest::Workspace,
+    index_client: &judge::slopsquat::SparseIndexClient,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+    rule_revisions: &mut std::collections::HashMap<String, u32>,
+) {
+    let phantom_report = judge::slopsquat::analyze_phantom_dependencies(workspace, index_client);
+    findings.extend(phantom_report.findings);
+    analysis_errors.extend(phantom_report.errors);
+    rule_revisions.insert(
+        judge::slopsquat::PHANTOM_CRATE_RULE.to_string(),
+        judge::slopsquat::PHANTOM_CRATE_RULE_REVISION,
+    );
+    rule_revisions.insert(
+        judge::slopsquat::PHANTOM_VERSION_RULE.to_string(),
+        judge::slopsquat::PHANTOM_VERSION_RULE_REVISION,
+    );
+}
+
+/// The `fresh-low-reputation-dep` sub-check of [`apply_crates_io_checks`]:
+/// recently published, low-reputation dependencies (see todo.md §14.2 G5).
+fn apply_fresh_low_reputation_check(
+    workspace: &judge::ingest::Workspace,
+    metadata_client: &judge::slopsquat::RestMetadataClient,
+    slopsquat_config: &judge::slopsquat::SlopsquatConfig,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+    rule_revisions: &mut std::collections::HashMap<String, u32>,
+) {
+    let fresh_report =
+        judge::slopsquat::analyze_fresh_low_reputation(workspace, metadata_client, slopsquat_config);
+    findings.extend(fresh_report.findings);
+    analysis_errors.extend(fresh_report.errors);
+    rule_revisions.insert(
+        judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE.to_string(),
+        judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE_REVISION,
+    );
+}
+
+/// The `yanked-dependency` sub-check of [`apply_crates_io_checks`]: pinned
+/// versions that have since been yanked from crates.io.
+fn apply_yanked_dependency_check(
+    workspace: &judge::ingest::Workspace,
+    index_client: &judge::slopsquat::SparseIndexClient,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+    rule_revisions: &mut std::collections::HashMap<String, u32>,
+) {
+    let yanked_report = judge::slopsquat::analyze_yanked_dependencies(workspace, index_client);
+    findings.extend(yanked_report.findings);
+    analysis_errors.extend(yanked_report.errors);
+    rule_revisions.insert(
+        judge::slopsquat::YANKED_DEPENDENCY_RULE.to_string(),
+        judge::slopsquat::YANKED_DEPENDENCY_RULE_REVISION,
+    );
+}
+
+/// The `dep-single-maintainer` sub-check of [`apply_crates_io_checks`]:
+/// dependencies owned by a single crates.io account (see todo.md §14.2 G5).
+fn apply_single_maintainer_check(
+    workspace: &judge::ingest::Workspace,
+    owners_client: &judge::slopsquat::RestOwnersClient,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+    rule_revisions: &mut std::collections::HashMap<String, u32>,
+) {
+    let single_maintainer_report =
+        judge::slopsquat::analyze_single_maintainer_dependencies(workspace, owners_client);
+    findings.extend(single_maintainer_report.findings);
+    analysis_errors.extend(single_maintainer_report.errors);
+    rule_revisions.insert(
+        judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE.to_string(),
+        judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE_REVISION,
+    );
+}
+
+/// The per-finding TTY line `run_deps` prints for each dependency-hygiene
+/// finding: `misplaced-dependency-kind` gets its build-dep-vs-dev-dep
+/// direction spelled out, every other rule gets the generic `[rule] crate
+/// item` line.
+fn write_deps_tty_findings(
+    out: &mut dyn Write,
+    workspace: &judge::ingest::Workspace,
+    findings: &[Finding],
+) -> std::io::Result<()> {
+    for finding in findings {
+        let krate = workspace
+            .crates
+            .iter()
+            .find(|krate| krate.manifest_path == finding.location.file);
+        let crate_name = krate.map_or("?", |krate| krate.name.as_str());
+        if finding.rule == judge::deps::MISPLACED_DEPENDENCY_KIND_RULE {
+            let is_build_dep = krate.is_some_and(|krate| {
+                krate.dependencies.iter().any(|dep| {
+                    dep.name == finding.location.item_path
+                        && dep.kind == judge::ingest::DependencyKind::Build
+                })
+            });
+            let direction = if is_build_dep {
+                "build-dependency appears unused by build.rs"
+            } else {
+                "should probably be a dev-dependency"
+            };
+            writeln!(
+                out,
+                "  {}  {} — {direction}",
+                crate_name, finding.location.item_path
+            )?;
+        } else {
+            writeln!(
+                out,
+                "  [{}] {}  {}",
+                finding.rule, crate_name, finding.location.item_path
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn run_deps(
     options: DepsOptions,
     out: &mut dyn Write,
@@ -282,54 +447,12 @@ pub(super) fn run_deps(
     findings.extend(dep_graph_report.findings);
 
     if check_crates_io {
-        let slopsquat_config = load_judge_toml(&workspace.root)?.slopsquat;
-        let cache_root = workspace.root.join("target/judge/slopsquat-cache");
-
-        let index_client = judge::slopsquat::SparseIndexClient::new(cache_root.clone());
-        let phantom_report =
-            judge::slopsquat::analyze_phantom_dependencies(&workspace, &index_client);
-        findings.extend(phantom_report.findings);
-        analysis_errors.extend(phantom_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::PHANTOM_CRATE_RULE.to_string(),
-            judge::slopsquat::PHANTOM_CRATE_RULE_REVISION,
-        );
-        rule_revisions.insert(
-            judge::slopsquat::PHANTOM_VERSION_RULE.to_string(),
-            judge::slopsquat::PHANTOM_VERSION_RULE_REVISION,
-        );
-
-        let metadata_client = judge::slopsquat::RestMetadataClient::new(cache_root.clone());
-        let fresh_report = judge::slopsquat::analyze_fresh_low_reputation(
+        apply_crates_io_checks(
             &workspace,
-            &metadata_client,
-            &slopsquat_config,
-        );
-        findings.extend(fresh_report.findings);
-        analysis_errors.extend(fresh_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE.to_string(),
-            judge::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE_REVISION,
-        );
-
-        let yanked_report =
-            judge::slopsquat::analyze_yanked_dependencies(&workspace, &index_client);
-        findings.extend(yanked_report.findings);
-        analysis_errors.extend(yanked_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::YANKED_DEPENDENCY_RULE.to_string(),
-            judge::slopsquat::YANKED_DEPENDENCY_RULE_REVISION,
-        );
-
-        let owners_client = judge::slopsquat::RestOwnersClient::new(cache_root);
-        let single_maintainer_report =
-            judge::slopsquat::analyze_single_maintainer_dependencies(&workspace, &owners_client);
-        findings.extend(single_maintainer_report.findings);
-        analysis_errors.extend(single_maintainer_report.errors);
-        rule_revisions.insert(
-            judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE.to_string(),
-            judge::slopsquat::DEP_SINGLE_MAINTAINER_RULE_REVISION,
-        );
+            &mut findings,
+            &mut analysis_errors,
+            &mut rule_revisions,
+        )?;
     }
 
     if check_rustc_lints {
@@ -389,37 +512,7 @@ pub(super) fn run_deps(
             write_error_list(out, "errors", &analysis_errors)?;
             write_suppressed_inline_line(out, suppressed_inline)?;
 
-            for finding in &findings {
-                let krate = workspace
-                    .crates
-                    .iter()
-                    .find(|krate| krate.manifest_path == finding.location.file);
-                let crate_name = krate.map_or("?", |krate| krate.name.as_str());
-                if finding.rule == judge::deps::MISPLACED_DEPENDENCY_KIND_RULE {
-                    let is_build_dep = krate.is_some_and(|krate| {
-                        krate.dependencies.iter().any(|dep| {
-                            dep.name == finding.location.item_path
-                                && dep.kind == judge::ingest::DependencyKind::Build
-                        })
-                    });
-                    let direction = if is_build_dep {
-                        "build-dependency appears unused by build.rs"
-                    } else {
-                        "should probably be a dev-dependency"
-                    };
-                    writeln!(
-                        out,
-                        "  {}  {} — {direction}",
-                        crate_name, finding.location.item_path
-                    )?;
-                } else {
-                    writeln!(
-                        out,
-                        "  [{}] {}  {}",
-                        finding.rule, crate_name, finding.location.item_path
-                    )?;
-                }
-            }
+            write_deps_tty_findings(out, &workspace, &findings)?;
 
             if !report.feature_only_candidates.is_empty() {
                 writeln!(out)?;
@@ -471,13 +564,12 @@ pub(super) fn run_coverage(
     )]);
 
     if let Some(mutants_json_path) = mutants_json {
-        let mutants_report = judge::mutants::read_mutants_report(&mutants_json_path)?;
-        findings.extend(mutants_report.findings);
-        analysis_errors.extend(mutants_report.errors);
-        rule_revisions.insert(
-            judge::mutants::MUTATION_SURVIVOR_RULE.to_string(),
-            judge::mutants::MUTATION_SURVIVOR_RULE_REVISION,
-        );
+        apply_mutants_report(
+            &mutants_json_path,
+            &mut findings,
+            &mut analysis_errors,
+            &mut rule_revisions,
+        )?;
     }
 
     let no_coverage_data_source_files = workspace_source_files(&workspace);
@@ -503,26 +595,11 @@ pub(super) fn run_coverage(
 
     match format {
         OutputFormat::Json => {
-            let report = Report::with_errors(findings, analysis_errors);
-            let mut value = serde_json::to_value(&report)?;
-            value["files_without_coverage_data"] = serde_json::to_value(
-                no_coverage_data
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>(),
-            )?;
-            value["test_ratios"] = serde_json::to_value(
-                test_ratios
-                    .iter()
-                    .map(|ratio| {
-                        serde_json::json!({
-                            "crate": ratio.crate_name,
-                            "production_loc": ratio.production_loc,
-                            "test_loc": ratio.test_loc,
-                            "ratio": ratio.ratio(),
-                        })
-                    })
-                    .collect::<Vec<_>>(),
+            let value = coverage_json_value(
+                findings,
+                analysis_errors,
+                &no_coverage_data,
+                &test_ratios,
             )?;
             write_json(out, &value)?;
         }
@@ -544,38 +621,147 @@ pub(super) fn run_coverage(
                     finding.location.item_path
                 )?;
             }
-            if !no_coverage_data.is_empty() {
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "no coverage data (not asserted as 0%): {}",
-                    no_coverage_data.len()
-                )?;
-                for file in &no_coverage_data {
-                    writeln!(out, "  {}", file.display())?;
-                }
-            }
-            if !test_ratios.is_empty() {
-                writeln!(out)?;
-                writeln!(out, "test-to-code LOC ratio (metric only, no verdict):")?;
-                for ratio in &test_ratios {
-                    match ratio.ratio() {
-                        Some(value) => writeln!(
-                            out,
-                            "  {}: {:.2} (test {} / production {})",
-                            ratio.crate_name, value, ratio.test_loc, ratio.production_loc
-                        )?,
-                        None => writeln!(
-                            out,
-                            "  {}: undefined (test {} / production 0)",
-                            ratio.crate_name, ratio.test_loc
-                        )?,
-                    }
-                }
-            }
+            write_coverage_no_data_tty(out, &no_coverage_data)?;
+            write_coverage_test_ratios_tty(out, &test_ratios)?;
         }
     }
     Ok(CommandOutcome::Clean)
+}
+
+/// `mutants_json`'s `run_coverage` sub-step: reads the externally generated
+/// `cargo-mutants` report and folds its `mutation-survivor` findings/errors/
+/// rule-revision into the coverage command's accumulators, the same "read
+/// report, extend, register revision" recipe `apply_crates_io_checks` uses
+/// for each crates.io sub-check.
+fn apply_mutants_report(
+    mutants_json_path: &Path,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+    rule_revisions: &mut std::collections::HashMap<String, u32>,
+) -> Result<(), CliError> {
+    let mutants_report = judge::mutants::read_mutants_report(mutants_json_path)?;
+    findings.extend(mutants_report.findings);
+    analysis_errors.extend(mutants_report.errors);
+    rule_revisions.insert(
+        judge::mutants::MUTATION_SURVIVOR_RULE.to_string(),
+        judge::mutants::MUTATION_SURVIVOR_RULE_REVISION,
+    );
+    Ok(())
+}
+
+/// `run_coverage`'s `--format json` envelope: the shared [`Report`] shape
+/// plus the two coverage-specific extra fields (`files_without_coverage_data`,
+/// `test_ratios`) that don't fit the `Finding`/error model.
+fn coverage_json_value(
+    findings: Vec<Finding>,
+    analysis_errors: Vec<String>,
+    no_coverage_data: &[PathBuf],
+    test_ratios: &[judge::coverage::CrateTestRatio],
+) -> Result<serde_json::Value, CliError> {
+    let report = Report::with_errors(findings, analysis_errors);
+    let mut value = serde_json::to_value(&report)?;
+    value["files_without_coverage_data"] = serde_json::to_value(
+        no_coverage_data
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+    )?;
+    value["test_ratios"] = serde_json::to_value(
+        test_ratios
+            .iter()
+            .map(|ratio| {
+                serde_json::json!({
+                    "crate": ratio.crate_name,
+                    "production_loc": ratio.production_loc,
+                    "test_loc": ratio.test_loc,
+                    "ratio": ratio.ratio(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    Ok(value)
+}
+
+/// The "no coverage data (not asserted as 0%)" TTY block, printed only when
+/// some workspace source file has no LCOV entry at all.
+fn write_coverage_no_data_tty(out: &mut dyn Write, no_coverage_data: &[PathBuf]) -> std::io::Result<()> {
+    if no_coverage_data.is_empty() {
+        return Ok(());
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "no coverage data (not asserted as 0%): {}",
+        no_coverage_data.len()
+    )?;
+    for file in no_coverage_data {
+        writeln!(out, "  {}", file.display())?;
+    }
+    Ok(())
+}
+
+/// The "test-to-code LOC ratio" TTY block, one line per crate with a
+/// production-LOC count (undefined ratio shown explicitly rather than
+/// dividing by zero).
+fn write_coverage_test_ratios_tty(
+    out: &mut dyn Write,
+    test_ratios: &[judge::coverage::CrateTestRatio],
+) -> std::io::Result<()> {
+    if test_ratios.is_empty() {
+        return Ok(());
+    }
+    writeln!(out)?;
+    writeln!(out, "test-to-code LOC ratio (metric only, no verdict):")?;
+    for ratio in test_ratios {
+        match ratio.ratio() {
+            Some(value) => writeln!(
+                out,
+                "  {}: {:.2} (test {} / production {})",
+                ratio.crate_name, value, ratio.test_loc, ratio.production_loc
+            )?,
+            None => writeln!(
+                out,
+                "  {}: undefined (test {} / production 0)",
+                ratio.crate_name, ratio.test_loc
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// The Deep-Tier upgrade to `[[module_boundary]]`: real symbol reference
+/// resolution instead of the Fast Tier's `syn`-based text scan — see
+/// `judge::boundaries_deep` module docs. Only available in a build compiled
+/// with `--features deep`; a Fast Tier build silently skips it (the
+/// Fast-Tier `module-boundary-violation` check already ran), matching
+/// `run_api_surface`'s same precedent for `semver-hazard`'s Deep-Tier
+/// sub-case.
+#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
+fn apply_boundaries_deep_tier(
+    workspace: &judge::ingest::Workspace,
+    config: &judge::boundaries::BoundaryConfig,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+    rule_revisions: &mut std::collections::HashMap<String, u32>,
+) -> Result<(), CliError> {
+    if judge::AnalysisTier::Deep.is_available() {
+        #[cfg(feature = "deep")]
+        {
+            let deep_report = judge::boundaries_deep::analyze_workspace(workspace, config)
+                .map_err(|err| CliError::Analyzer(err.to_string()))?;
+            findings.extend(deep_report.findings);
+            append_analysis_errors(analysis_errors, &deep_report.errors);
+            rule_revisions.insert(
+                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE.to_string(),
+                judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE_REVISION,
+            );
+        }
+        #[cfg(not(feature = "deep"))]
+        {
+            deep_tier_unreachable();
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn run_boundaries(
@@ -613,49 +799,25 @@ pub(super) fn run_boundaries(
     let config: judge::boundaries::BoundaryConfig = parse_boundary_config(&config_path)?;
 
     let boundaries = judge::boundaries::evaluate(&workspace, &config)?;
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
     let mut findings = boundaries.findings;
     // `evaluate()` itself has no per-file soft-error channel (its
     // `--no-deps` `cargo_metadata` resolve either succeeds outright or
     // fails via `?` above) — this only ever gets entries from the Deep-Tier
     // pass below.
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
     let mut analysis_errors: Vec<String> = Vec::new();
-
-    // Deep-Tier upgrade to `[[module_boundary]]`: real symbol reference
-    // resolution instead of the Fast Tier's `syn`-based text scan — see
-    // `judge::boundaries_deep` module docs. Only available in a build
-    // compiled with `--features deep`; a Fast Tier build silently skips it
-    // (the Fast-Tier `module-boundary-violation` check above already ran),
-    // matching `run_api_surface`'s same precedent for `semver-hazard`'s
-    // Deep-Tier sub-case.
-    if judge::AnalysisTier::Deep.is_available() {
-        #[cfg(feature = "deep")]
-        {
-            let deep_report = judge::boundaries_deep::analyze_workspace(&workspace, &config)
-                .map_err(|err| CliError::Analyzer(err.to_string()))?;
-            findings.extend(deep_report.findings);
-            append_analysis_errors(&mut analysis_errors, &deep_report.errors);
-        }
-        #[cfg(not(feature = "deep"))]
-        {
-            deep_tier_unreachable();
-        }
-    }
-
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
     let mut rule_revisions = super::combined_analysis::boundaries_rule_revisions();
     rule_revisions.insert(
         judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE.to_string(),
         judge::boundaries::MODULE_BOUNDARY_VIOLATION_RULE_REVISION,
     );
-    #[cfg(feature = "deep")]
-    if judge::AnalysisTier::Deep.is_available() {
-        rule_revisions.insert(
-            judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE.to_string(),
-            judge::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE_REVISION,
-        );
-    }
+    apply_boundaries_deep_tier(
+        &workspace,
+        &config,
+        &mut findings,
+        &mut analysis_errors,
+        &mut rule_revisions,
+    )?;
+
     let (findings, suppressed_inline) = match suppress_and_baseline(
         findings,
         &workspace,
