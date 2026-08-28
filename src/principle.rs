@@ -656,6 +656,30 @@ struct TraitImplementation {
 /// heuristic per trait: the first disjoint impl pair found, in
 /// deterministic (`self_type`, file) order.
 fn interface_segregation_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for krate in &workspace.crates {
+        let (traits, impls) = collect_trait_declarations_and_impls(krate);
+        for trait_decl in &traits {
+            if trait_decl.method_count < INTERFACE_SEGREGATION_METHOD_THRESHOLD {
+                continue;
+            }
+            if let Some((first, second)) = find_disjoint_impl_pair(trait_decl, &impls) {
+                heuristics.push(build_interface_segregation_heuristic(
+                    krate, trait_decl, first, second,
+                ));
+            }
+        }
+    }
+    heuristics
+}
+
+/// [`interface_segregation_candidates`]'s per-crate AST scan: every trait
+/// declaration (with its method count) and every `impl Trait for Type` block
+/// (with the methods it actually overrides), across all of the crate's
+/// source files.
+fn collect_trait_declarations_and_impls(
+    krate: &CrateInfo,
+) -> (Vec<TraitDeclaration>, Vec<TraitImplementation>) {
     use quote::ToTokens;
 
     struct Collector {
@@ -709,60 +733,53 @@ fn interface_segregation_candidates(workspace: &Workspace) -> Vec<PrincipleHeuri
         }
     }
 
-    let mut heuristics = Vec::new();
-    for krate in &workspace.crates {
-        let mut traits = Vec::new();
-        let mut impls = Vec::new();
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            let mut collector = Collector {
-                file: source.path.clone(),
-                traits: Vec::new(),
-                impls: Vec::new(),
-            };
-            collector.visit_file(&ast);
-            traits.extend(collector.traits);
-            impls.extend(collector.impls);
-        }
-
-        for trait_decl in &traits {
-            if trait_decl.method_count < INTERFACE_SEGREGATION_METHOD_THRESHOLD {
-                continue;
-            }
-            let mut candidates: Vec<&TraitImplementation> = impls
-                .iter()
-                .filter(|imp| {
-                    imp.trait_name == trait_decl.name && !imp.overridden_methods.is_empty()
-                })
-                .collect();
-            candidates.sort_by(|a, b| {
-                (&a.self_type, &a.location.file).cmp(&(&b.self_type, &b.location.file))
-            });
-
-            let disjoint_pair = candidates.iter().enumerate().find_map(|(i, first)| {
-                candidates[i + 1..]
-                    .iter()
-                    .find(|second| {
-                        first
-                            .overridden_methods
-                            .is_disjoint(&second.overridden_methods)
-                    })
-                    .map(|second| (*first, *second))
-            });
-
-            if let Some((first, second)) = disjoint_pair {
-                heuristics.push(build_interface_segregation_heuristic(
-                    krate, trait_decl, first, second,
-                ));
-            }
-        }
+    let mut traits = Vec::new();
+    let mut impls = Vec::new();
+    for source in &krate.source_files {
+        let Ok(text) = std::fs::read_to_string(&source.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&text) else {
+            continue;
+        };
+        let mut collector = Collector {
+            file: source.path.clone(),
+            traits: Vec::new(),
+            impls: Vec::new(),
+        };
+        collector.visit_file(&ast);
+        traits.extend(collector.traits);
+        impls.extend(collector.impls);
     }
-    heuristics
+    (traits, impls)
+}
+
+/// [`interface_segregation_candidates`]'s empirical-usage signal: the first
+/// pair of `trait_decl`'s implementors (in deterministic `self_type`/file
+/// order) whose overridden method sets are non-empty and pairwise disjoint —
+/// evidence that implementors cluster into non-overlapping capability
+/// groups, not another reading of trait size.
+fn find_disjoint_impl_pair<'a>(
+    trait_decl: &TraitDeclaration,
+    impls: &'a [TraitImplementation],
+) -> Option<(&'a TraitImplementation, &'a TraitImplementation)> {
+    let mut candidates: Vec<&TraitImplementation> = impls
+        .iter()
+        .filter(|imp| imp.trait_name == trait_decl.name && !imp.overridden_methods.is_empty())
+        .collect();
+    candidates
+        .sort_by(|a, b| (&a.self_type, &a.location.file).cmp(&(&b.self_type, &b.location.file)));
+
+    candidates.iter().enumerate().find_map(|(i, first)| {
+        candidates[i + 1..]
+            .iter()
+            .find(|second| {
+                first
+                    .overridden_methods
+                    .is_disjoint(&second.overridden_methods)
+            })
+            .map(|second| (*first, *second))
+    })
 }
 
 fn build_interface_segregation_heuristic(
@@ -2646,59 +2663,80 @@ struct GuardedParam {
 fn parse_dont_validate_candidates(workspace: &Workspace) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
     for krate in &workspace.crates {
-        let mut guarded: Vec<GuardedParam> = Vec::new();
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
-            };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            walk_functions(&ast, |site| {
-                for param_kind in parse_dont_validate_guard_kinds(site.sig, site.block) {
-                    guarded.push(GuardedParam {
-                        qualified_name: site.qualified_name.clone(),
-                        param_kind,
-                    });
-                }
-            });
-        }
+        let guarded = collect_guarded_params(krate);
+        heuristics.extend(parse_dont_validate_heuristics_for_crate(krate, &guarded));
+    }
+    heuristics
+}
 
-        for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
-                continue;
+/// [`parse_dont_validate_candidates`]'s usage-based signal: every parameter,
+/// across all of `krate`'s source files, that some function guards with
+/// validation-shaped control flow (see [`parse_dont_validate_guard_kinds`]).
+fn collect_guarded_params(krate: &CrateInfo) -> Vec<GuardedParam> {
+    let mut guarded: Vec<GuardedParam> = Vec::new();
+    for source in &krate.source_files {
+        let Ok(text) = std::fs::read_to_string(&source.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&text) else {
+            continue;
+        };
+        walk_functions(&ast, |site| {
+            for param_kind in parse_dont_validate_guard_kinds(site.sig, site.block) {
+                guarded.push(GuardedParam {
+                    qualified_name: site.qualified_name.clone(),
+                    param_kind,
+                });
+            }
+        });
+    }
+    guarded
+}
+
+/// [`parse_dont_validate_candidates`]'s structural signal: every `pub fn` in
+/// `krate` that itself guards a primitive/string parameter but still returns
+/// a primitive/string/bool shape (see [`parse_dont_validate_signal1`]), paired
+/// with any sibling functions from `guarded` that independently re-guard the
+/// same parameter kind.
+fn parse_dont_validate_heuristics_for_crate(
+    krate: &CrateInfo,
+    guarded: &[GuardedParam],
+) -> Vec<PrincipleHeuristic> {
+    let mut heuristics = Vec::new();
+    for source in &krate.source_files {
+        let Ok(text) = std::fs::read_to_string(&source.path) else {
+            continue;
+        };
+        let Ok(ast) = syn::parse_file(&text) else {
+            continue;
+        };
+        walk_functions(&ast, |site| {
+            if !matches!(site.vis, Some(syn::Visibility::Public(_))) {
+                return;
+            }
+            let Some(hit) = parse_dont_validate_signal1(site.sig, site.block) else {
+                return;
             };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            walk_functions(&ast, |site| {
-                if !matches!(site.vis, Some(syn::Visibility::Public(_))) {
-                    return;
-                }
-                let Some(hit) = parse_dont_validate_signal1(site.sig, site.block) else {
-                    return;
-                };
-                let mut siblings: Vec<String> = guarded
-                    .iter()
-                    .filter(|g| {
-                        g.param_kind == hit.param_kind && g.qualified_name != site.qualified_name
-                    })
-                    .map(|g| g.qualified_name.clone())
-                    .collect();
-                siblings.sort();
-                siblings.dedup();
-                if siblings.is_empty() {
-                    return;
-                }
-                heuristics.push(build_parse_dont_validate_heuristic(
-                    krate,
-                    &source.path,
-                    &site.qualified_name,
-                    &hit,
-                    &siblings,
-                ));
-            });
-        }
+            let mut siblings: Vec<String> = guarded
+                .iter()
+                .filter(|g| {
+                    g.param_kind == hit.param_kind && g.qualified_name != site.qualified_name
+                })
+                .map(|g| g.qualified_name.clone())
+                .collect();
+            siblings.sort();
+            siblings.dedup();
+            if siblings.is_empty() {
+                return;
+            }
+            heuristics.push(build_parse_dont_validate_heuristic(
+                krate,
+                &source.path,
+                &site.qualified_name,
+                &hit,
+                &siblings,
+            ));
+        });
     }
     heuristics
 }
@@ -3579,61 +3617,81 @@ fn make_illegal_states_unrepresentable_candidates(
 ) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
     for krate in &workspace.crates {
-        let (candidates, construction_sites): (
-            Vec<MisuStructCandidate>,
-            Vec<MisuConstructionSite>,
-        ) = collect_crate_wide_pair(krate, |file, ast| {
-            let mut struct_collector = MisuStructCollector {
-                file: file.clone(),
-                candidates: Vec::new(),
-            };
-            struct_collector.visit_file(ast);
-
-            let mut construction_collector = MisuConstructionCollector {
-                file,
-                sites: Vec::new(),
-            };
-            construction_collector.visit_file(ast);
-
-            (struct_collector.candidates, construction_collector.sites)
-        });
+        let (candidates, construction_sites) =
+            collect_crate_wide_pair(krate, collect_misu_candidates_and_sites);
 
         for candidate in &candidates {
-            let mut usable_sites: Vec<&MisuConstructionSite> = Vec::new();
-            let mut violates_exclusivity = false;
-            for site in construction_sites
-                .iter()
-                .filter(|site| site.type_name == candidate.name)
-            {
-                let determinable_count = candidate
-                    .option_fields
-                    .iter()
-                    .filter(|field| site.field_settings.contains_key(*field))
-                    .count();
-                if determinable_count == 0 {
-                    continue;
-                }
-                let some_count = candidate
-                    .option_fields
-                    .iter()
-                    .filter(|field| {
-                        site.field_settings.get(*field) == Some(&FieldSetting::SomeShaped)
-                    })
-                    .count();
-                if some_count > 1 {
-                    violates_exclusivity = true;
-                }
-                usable_sites.push(site);
-            }
-            if violates_exclusivity || usable_sites.len() < MISU_MIN_CONSTRUCTION_SITES {
+            let Some(usable_sites) = misu_usable_sites(candidate, &construction_sites) else {
                 continue;
-            }
-            usable_sites
-                .sort_by(|a, b| (&a.location.file, a.line).cmp(&(&b.location.file, b.line)));
+            };
             heuristics.push(build_misu_heuristic(krate, candidate, &usable_sites));
         }
     }
     heuristics
+}
+
+/// [`make_illegal_states_unrepresentable_candidates`]'s `collect_crate_wide_pair`
+/// callback: one file's `Option<T>`-heavy struct candidates ([`MisuStructCollector`])
+/// alongside its struct-literal construction sites ([`MisuConstructionCollector`]).
+fn collect_misu_candidates_and_sites(
+    file: PathBuf,
+    ast: &syn::File,
+) -> (Vec<MisuStructCandidate>, Vec<MisuConstructionSite>) {
+    let mut struct_collector = MisuStructCollector {
+        file: file.clone(),
+        candidates: Vec::new(),
+    };
+    struct_collector.visit_file(ast);
+
+    let mut construction_collector = MisuConstructionCollector {
+        file,
+        sites: Vec::new(),
+    };
+    construction_collector.visit_file(ast);
+
+    (struct_collector.candidates, construction_collector.sites)
+}
+
+/// [`make_illegal_states_unrepresentable_candidates`]'s usage-based signal
+/// for one struct candidate: every construction site that determinably sets
+/// at least one of its candidate `Option<T>` fields, sorted into
+/// deterministic (file, line) order — or `None` if any usable site sets more
+/// than one candidate field to `Some(..)` at once (disproving mutual
+/// exclusivity), or fewer than [`MISU_MIN_CONSTRUCTION_SITES`] usable sites
+/// exist.
+fn misu_usable_sites<'a>(
+    candidate: &MisuStructCandidate,
+    construction_sites: &'a [MisuConstructionSite],
+) -> Option<Vec<&'a MisuConstructionSite>> {
+    let mut usable_sites: Vec<&MisuConstructionSite> = Vec::new();
+    let mut violates_exclusivity = false;
+    for site in construction_sites
+        .iter()
+        .filter(|site| site.type_name == candidate.name)
+    {
+        let determinable_count = candidate
+            .option_fields
+            .iter()
+            .filter(|field| site.field_settings.contains_key(*field))
+            .count();
+        if determinable_count == 0 {
+            continue;
+        }
+        let some_count = candidate
+            .option_fields
+            .iter()
+            .filter(|field| site.field_settings.get(*field) == Some(&FieldSetting::SomeShaped))
+            .count();
+        if some_count > 1 {
+            violates_exclusivity = true;
+        }
+        usable_sites.push(site);
+    }
+    if violates_exclusivity || usable_sites.len() < MISU_MIN_CONSTRUCTION_SITES {
+        return None;
+    }
+    usable_sites.sort_by(|a, b| (&a.location.file, a.line).cmp(&(&b.location.file, b.line)));
+    Some(usable_sites)
 }
 
 fn build_misu_heuristic(
