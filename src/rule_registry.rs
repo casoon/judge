@@ -7,7 +7,7 @@
 //!
 //! Every rule-id constant defined anywhere in this crate (`grep -rn 'pub
 //! const.*_RULE\b.*: &str = "' src/*.rs`) has exactly one entry here,
-//! including the three `crate::pattern` aggregation rules — those never
+//! including the three `crate::rules::pattern` aggregation rules — those never
 //! produce a `Finding` (see that module's doc comment) and so are always
 //! `Heuristic`/[`VerdictEffect::AdvisoryOnly`] here, consistent with
 //! [`crate::finding::evidence_class_for_rule`]'s fallback for any rule id it
@@ -91,7 +91,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "undocumented-public-item",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; `cargo judge api-surface`, subcommand-only).",
-        exclusions: "Checks only whether the item itself is written `pub`, not the full visibility chain up through enclosing modules — a `pub fn` inside a private `mod` is not actually reachable from outside the crate but is still checked (see `crate::api_surface` module docs). Scoped to free `fn`/`struct`/`enum`/`trait`/`const`/`static`/`type` at module level plus inherent-impl methods; methods inside `impl Trait for Type` are exempt (typically inherit the trait's own documentation), as are `#[test]`-attributed functions and anything gated by `#[cfg(test)]`.",
+        exclusions: "Checks only whether the item itself is written `pub`, not the full visibility chain up through enclosing modules — a `pub fn` inside a private `mod` is not actually reachable from outside the crate but is still checked (see `crate::rules::api_surface` module docs). Scoped to free `fn`/`struct`/`enum`/`trait`/`const`/`static`/`type` at module level plus inherent-impl methods; methods inside `impl Trait for Type` are exempt (typically inherit the trait's own documentation), as are `#[test]`-attributed functions and anything gated by `#[cfg(test)]`.",
         allowed_wording: "State only that no doc comment was found on this `pub` item — never that its documentation is 'bad' or 'incomplete' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -133,7 +133,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
     RuleMetadata {
         id: "feature-graph-cycle",
         evidence_class: EvidenceClass::DerivedFact,
-        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`/`audit`) — deliberately not gated behind `judge.toml` the way `dependency-cycle` is: a `[features]` table is either cyclic or it isn't, needing no project-intent config to interpret (see `crate::boundaries` module docs 'feature-graph-cycle').",
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`/`audit`) — deliberately not gated behind `judge.toml` the way `dependency-cycle` is: a `[features]` table is either cyclic or it isn't, needing no project-intent config to interpret (see `crate::rules::boundaries` module docs 'feature-graph-cycle').",
         exclusions: "Reuses `dependency-cycle`'s own cycle-finding algorithm over a different graph: nodes are one crate's own declared feature names, edges are implication-list entries that exactly match another feature of the same package. A `dep:foo`/`pkg/feat`/`pkg?/feat` entry (a dependency activation, not a sibling feature) is excluded. Cargo tolerates a cyclic feature graph at resolution time — this is a structural-hygiene signal, not a claim the build is broken.",
         allowed_wording: "State only that this cyclic chain of feature implications exists — never that the crate 'fails to build' or that the cycle is 'a bug' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
@@ -146,7 +146,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "module-boundary-violation",
         evidence_class: EvidenceClass::BoundedSemantic,
         preconditions: "Requires a `judge.toml` with `[[module_boundary]]` config; opt-in — `cargo judge boundaries` (and the boundaries block of bare `cargo judge`/`audit`) does nothing without it.",
-        exclusions: "Module path resolution is a directory-convention heuristic, not `mod`-graph resolution — a file wired into the build unconventionally (e.g. a `#[path = \"...\"]` attribute) is missed (see `crate::boundaries` module docs 'Module-level boundaries'). Only `direct` reach is supported — `transitive` would need a real module call graph, which the Fast Tier doesn't have; requesting it is a config error, not a silent downgrade. Only `forbidden` is supported, not `required` (crate-level boundaries' other half).",
+        exclusions: "Module path resolution is a directory-convention heuristic, not `mod`-graph resolution — a file wired into the build unconventionally (e.g. a `#[path = \"...\"]` attribute) is missed (see `crate::rules::boundaries` module docs 'Module-level boundaries'). Only `direct` reach is supported — `transitive` would need a real module call graph, which the Fast Tier doesn't have; requesting it is a config error, not a silent downgrade. Only `forbidden` is supported, not `required` (crate-level boundaries' other half).",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: None,
@@ -155,8 +155,8 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
     RuleMetadata {
         id: "internal-leak",
         evidence_class: EvidenceClass::BoundedSemantic,
-        preconditions: "Requires `--features deep` and `cargo judge api-surface` (same subcommand as `semver-hazard`'s `leaked_dependency_type` sub-case, which this rule reuses the type resolution of), plus a `judge.toml` with a non-empty `internal_crates` list (see `crate::boundaries::BoundaryConfig::internal_crates`). With `internal_crates` empty or absent (the default), this rule performs no analysis at all and emits zero findings — that must never be read as 'no internal leaks found', only that none were checked for (todo.md §17 'Kein Raten von Projektabsicht': an architecture rule needs explicit config, not a guess).",
-        exclusions: "Same resolution and the same documented boundary as `semver-hazard`'s `leaked_dependency_type` sub-case (see `crate::api_surface_deep` module docs 'Ehrliche Grenze'): only direct parameter/return types plus one level of generic unwrapping through a `std`/`core`/`alloc` container are checked; a `dyn Trait` receiver, raw pointer, function pointer, tuple, or slice/array element type is not unwrapped.",
+        preconditions: "Requires `--features deep` and `cargo judge api-surface` (same subcommand as `semver-hazard`'s `leaked_dependency_type` sub-case, which this rule reuses the type resolution of), plus a `judge.toml` with a non-empty `internal_crates` list (see `crate::rules::boundaries::BoundaryConfig::internal_crates`). With `internal_crates` empty or absent (the default), this rule performs no analysis at all and emits zero findings — that must never be read as 'no internal leaks found', only that none were checked for (todo.md §17 'Kein Raten von Projektabsicht': an architecture rule needs explicit config, not a guess).",
+        exclusions: "Same resolution and the same documented boundary as `semver-hazard`'s `leaked_dependency_type` sub-case (see `crate::rules::api_surface_deep` module docs 'Ehrliche Grenze'): only direct parameter/return types plus one level of generic unwrapping through a `std`/`core`/`alloc` container are checked; a `dyn Trait` receiver, raw pointer, function pointer, tuple, or slice/array element type is not unwrapped.",
         allowed_wording: "State only that this pub item's signature resolves to a type defined in `<crate>`, which is configured as internal — never that crossing this boundary is 'unintentional' or that the crate's public API is 'broken' (todo.md §17.4); judge does not know whether crossing the boundary was deliberate.",
         verdict_effect: VerdictEffect::Gating,
         example: None,
@@ -164,7 +164,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
     RuleMetadata {
         id: "module-boundary-violation-deep",
         evidence_class: EvidenceClass::BoundedSemantic,
-        preconditions: "Requires `--features deep` and a `judge.toml` with `[[module_boundary]]` config; runs alongside (not instead of) the Fast-Tier `module-boundary-violation` check in `cargo judge boundaries` — see `crate::boundaries_deep` module docs.",
+        preconditions: "Requires `--features deep` and a `judge.toml` with `[[module_boundary]]` config; runs alongside (not instead of) the Fast-Tier `module-boundary-violation` check in `cargo judge boundaries` — see `crate::rules::boundaries_deep` module docs.",
         exclusions: "Real Deep-Tier symbol reference resolution replaces the Fast Tier's `syn`-based text scan for the *reference edge* itself (catching a re-export or aliased `use` the text scan misses), but the `from`/`forbidden` module-path *scoping* is still the same directory-convention heuristic as the Fast-Tier rule. Only free functions, inherent/trait-impl methods, and trait default methods are checked as the referenced item — unlike the Fast-Tier text scan, which is item-kind-agnostic, this Deep-Tier pass does not yet cover structs/enums/traits/consts/statics. `Reach::Transitive` is not supported here either, same restriction as the Fast Tier.",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
@@ -174,7 +174,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "re-export-chain",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Requires `--features deep` and `cargo judge api-surface` (same subcommand as `semver-hazard`/`internal-leak`); always evaluated when the Deep Tier is available, no `judge.toml` config needed.",
-        exclusions: "Only a plain, non-glob, non-braced `pub use path::Item;` (optionally renamed) at a file's own module-root level is considered a candidate or an intermediate hop — a `pub use` nested inside an inline `mod { .. }` block in the same file, a glob (`pub use foo::*;`), or a braced group (`pub use foo::{A, B};`) is invisible to this scan (see `crate::api_surface_deep` module docs). A hop count capped at 5 (`RE_EXPORT_CHAIN_MAX_HOPS`) is reported as `evidence.capped: true` rather than an exact count — chosen to bound the walk against a `pub use` cycle, not derived from a study of real-world chain depths. A single direct re-export (hop count 1) is deliberately never flagged — only 2 or more hops are, since curated top-level re-exports, prelude modules, and workspace umbrella crates routinely add exactly one hop and are not themselves a sign of obscured ownership.",
+        exclusions: "Only a plain, non-glob, non-braced `pub use path::Item;` (optionally renamed) at a file's own module-root level is considered a candidate or an intermediate hop — a `pub use` nested inside an inline `mod { .. }` block in the same file, a glob (`pub use foo::*;`), or a braced group (`pub use foo::{A, B};`) is invisible to this scan (see `crate::rules::api_surface_deep` module docs). A hop count capped at 5 (`RE_EXPORT_CHAIN_MAX_HOPS`) is reported as `evidence.capped: true` rather than an exact count — chosen to bound the walk against a `pub use` cycle, not derived from a study of real-world chain depths. A single direct re-export (hop count 1) is deliberately never flagged — only 2 or more hops are, since curated top-level re-exports, prelude modules, and workspace umbrella crates routinely add exactly one hop and are not themselves a sign of obscured ownership.",
         allowed_wording: "State only that this item's public path resolves through `<hop_count>` `pub use` hops before reaching its defining module `<defining_path>` — when `evidence.capped` is true, phrase `<hop_count>` as 'at least 5', not an exact count; never phrase a chain's existence as 'bad practice' or as 'hiding implementation details' (todo.md §17.4) — re-export facades are a common, legitimate pattern judge cannot tell apart from an unintentional one.",
         verdict_effect: VerdictEffect::AdvisoryOnly,
         // Three crates, one re-export hop each — this is what the rule
@@ -204,7 +204,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "maintainability-index",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block, same wiring as `signature-complexity`/`complexity-inflation` — reuses the same `Vec<FunctionInfo>` already computed over the loaded workspace for its per-file `lines_of_code`/`cyclomatic` sums, plus one additional `syn` parse per file for Halstead operator/operand counts). Computes the standard SEI-derived Maintainability Index, the same 0-100-normalized formula Visual Studio and most modern tooling use: `MI_raw = 171 - 5.2*ln(HalsteadVolume) - 0.23*CyclomaticComplexity - 16.2*ln(LinesOfCode)`, `MI = max(0, MI_raw * 100 / 171)`. Fires at the widely-cited 'yellow or worse' threshold: `MI < 10` is 'red' (hard to maintain), `10-19` is 'yellow' (moderately maintainable), `20+` is 'green' — this rule fires below 20.",
-        exclusions: "Halstead's operator/operand counting is a C-era definition that does not map 1:1 onto Rust; this rule's counting rules are a documented, reproducible approximation, not the canonical software-science definition (see `crate::complexity::HalsteadVisitor`). Operators counted: `syn::BinOp`/`syn::UnOp` variants (a binary and a unary use of the same token, e.g. `*`, count as two distinct kinds, not one), `if`/`match`/`for`/`while`/`loop`, `?`, plain `=` (compound assignment like `+=` is already its own `BinOp` variant), a path call and a method call as two distinct kinds, and any macro invocation. Operands counted: `Expr::Path` idents and `Expr::Lit` literal values, deduplicated by token-stream text within the file — a type-position path (e.g. a parameter's declared type) is not counted, only paths referenced in expression position. Only Halstead Volume is computed; Difficulty/Effort/Time are out of scope (Maintainability Index only needs Volume). A file with zero Halstead vocabulary or zero summed lines of code is skipped entirely rather than scored, to avoid a degenerate/misleading MI.",
+        exclusions: "Halstead's operator/operand counting is a C-era definition that does not map 1:1 onto Rust; this rule's counting rules are a documented, reproducible approximation, not the canonical software-science definition (see `crate::rules::complexity::HalsteadVisitor`). Operators counted: `syn::BinOp`/`syn::UnOp` variants (a binary and a unary use of the same token, e.g. `*`, count as two distinct kinds, not one), `if`/`match`/`for`/`while`/`loop`, `?`, plain `=` (compound assignment like `+=` is already its own `BinOp` variant), a path call and a method call as two distinct kinds, and any macro invocation. Operands counted: `Expr::Path` idents and `Expr::Lit` literal values, deduplicated by token-stream text within the file — a type-position path (e.g. a parameter's declared type) is not counted, only paths referenced in expression position. Only Halstead Volume is computed; Difficulty/Effort/Time are out of scope (Maintainability Index only needs Volume). A file with zero Halstead vocabulary or zero summed lines of code is skipped entirely rather than scored, to avoid a degenerate/misleading MI.",
         allowed_wording: HEURISTIC_WORDING,
         verdict_effect: VerdictEffect::AdvisoryOnly,
         example: Some(RuleExample {
@@ -227,7 +227,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "mutation-survivor",
         evidence_class: EvidenceClass::ExternalMeasurement,
         preconditions: "Requires `cargo judge coverage --mutants-json PATH`, an already-generated `cargo-mutants` `outcomes.json` report (opt-in; judge never runs `cargo-mutants` itself). Same evidence class and verdict effect as `untested-hotspot` — both are external-tool-derived test-strength signals.",
-        exclusions: "A mutant that is semantically identical to the original code (an 'equivalent mutant') can never be caught by any test, however thorough — there is no observable behavior difference to assert on. This is a well-known, unavoidable limitation of mutation testing itself, not a defect in this rule; a finding here is never proof that a test is missing, only that no test in the imported run distinguished the mutated behavior from the original. The parsed `\"MissedMutant\"` count is cross-checked against the report's own top-level `missed` field; a mismatch (e.g. a stale or partially malformed report) is recorded as a non-fatal error rather than dropping findings — see `crate::mutants` module docs.",
+        exclusions: "A mutant that is semantically identical to the original code (an 'equivalent mutant') can never be caught by any test, however thorough — there is no observable behavior difference to assert on. This is a well-known, unavoidable limitation of mutation testing itself, not a defect in this rule; a finding here is never proof that a test is missing, only that no test in the imported run distinguished the mutated behavior from the original. The parsed `\"MissedMutant\"` count is cross-checked against the report's own top-level `missed` field; a mismatch (e.g. a stale or partially malformed report) is recorded as a non-fatal error rather than dropping findings — see `crate::advisory::mutants` module docs.",
         allowed_wording: "State only that this mutant was not caught by a failing test in the imported cargo-mutants run — never that the mutated code is 'untested' or 'broken' (todo.md §17.4); an equivalent mutant would survive no matter how thorough the tests are.",
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -240,11 +240,11 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "unused-pub-workspace",
         evidence_class: EvidenceClass::BoundedSemantic,
         preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier).",
-        exclusions: "Every workspace crate is treated as workspace-internal; a crate whose resolved `publish` field allows publishing gets `unused-pub-api` instead of this rule for the same underlying condition (see `crate::dead_code::publishable_crates`).",
+        exclusions: "Every workspace crate is treated as workspace-internal; a crate whose resolved `publish` field allows publishing gets `unused-pub-api` instead of this rule for the same underlying condition (see `crate::rules::dead_code::publishable_crates`).",
         allowed_wording: "State as 'no reference found in the loaded workspace' — never as 'unused' outright or as clearance for deletion; external ecosystem usage is not_inferable (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::Gating,
         // `publish = false` is what routes a dead item to this rule rather
-        // than `unused-pub-api` — see `crate::dead_code::publishable_crates`.
+        // than `unused-pub-api` — see `crate::rules::dead_code::publishable_crates`.
         example: Some(RuleExample {
             before: "pub fn migrate_legacy_user_ids(raw: &str) -> String {\n    raw.trim().to_string()\n}\n",
             why_it_matters: "A public function nobody in the workspace calls anymore still has to be read, understood, and kept compiling through every future refactor — maintenance cost with no corresponding benefit.",
@@ -292,7 +292,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "unreachable-from-entry",
         evidence_class: EvidenceClass::BoundedSemantic,
         preconditions: "Requires `--features deep` and `cargo judge dead-code` (Deep Tier; semantic reachability isn't available at the Fast Tier). Scoped to non-`pub` items only (private, `pub(crate)`, `pub(super)`, `pub(in path)`) — a `pub` item is checked by `unused-pub-workspace`/`unused-pub-api`/`test-only-pub` instead, never by this rule.",
-        exclusions: "Scoped to non-`pub` items only, so it never runs `check_item`'s cross-crate reference check at all — a non-`pub` item can never be referenced from another crate by Rust's own visibility rules, so that check would be vacuously false here; only entry-point reachability is checked. Inherits every entry-point-detection limitation `crate::reachability`'s module docs describe: a workspace-internal crate's own `pub` API is not itself an automatic root, and registration macros (`inventory::submit!`, `linkme::distributed_slice`, `ctor`, …) are not recognized as entry points at all. Unlike `crate::slop_structural_deep`'s fan-in check, does not exclude trait-impl methods (`FunctionSite::in_trait_impl`) — that exclusion exists there because its literal-reference search can't see calls through operator/macro sugar, but this rule's `incoming_calls`-based call-hierarchy BFS does resolve calls through trait dispatch.",
+        exclusions: "Scoped to non-`pub` items only, so it never runs `check_item`'s cross-crate reference check at all — a non-`pub` item can never be referenced from another crate by Rust's own visibility rules, so that check would be vacuously false here; only entry-point reachability is checked. Inherits every entry-point-detection limitation `crate::reachability`'s module docs describe: a workspace-internal crate's own `pub` API is not itself an automatic root, and registration macros (`inventory::submit!`, `linkme::distributed_slice`, `ctor`, …) are not recognized as entry points at all. Unlike `crate::rules::slop_structural_deep`'s fan-in check, does not exclude trait-impl methods (`FunctionSite::in_trait_impl`) — that exclusion exists there because its literal-reference search can't see calls through operator/macro sugar, but this rule's `incoming_calls`-based call-hierarchy BFS does resolve calls through trait dispatch.",
         allowed_wording: "State as 'not reachable from any recognized entry point in the examined reachability view' — never as 'unused' or 'dead' outright or as clearance for deletion; usage the analysis can't see (e.g. through an unresolved macro expansion or a registration macro) is not_inferable (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -335,7 +335,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
     RuleMetadata {
         id: "feature-gated-dead-code",
         evidence_class: EvidenceClass::Heuristic,
-        preconditions: "Requires `--features deep` and `cargo judge dead-code`, plus a `judge.toml` with a non-empty `[feature_matrix] combinations` list (see `crate::boundaries::FeatureMatrixConfig`). With `combinations` absent or empty (the default), this rule performs no analysis at all and emits zero findings — that must never be read as 'no feature-gated dead code found', only that none were checked for (todo.md §17 'Kein Raten von Projektabsicht'). Re-loads the whole workspace once per configured combination (a real, accepted extra cost per combination — seconds to minutes each, same order as any other Deep Tier load) via `CargoFeatures::Selected { .., no_default_features: true }`, so a large configured matrix is a real, up-front performance trade-off the user opts into by listing more combinations.",
+        preconditions: "Requires `--features deep` and `cargo judge dead-code`, plus a `judge.toml` with a non-empty `[feature_matrix] combinations` list (see `crate::rules::boundaries::FeatureMatrixConfig`). With `combinations` absent or empty (the default), this rule performs no analysis at all and emits zero findings — that must never be read as 'no feature-gated dead code found', only that none were checked for (todo.md §17 'Kein Raten von Projektabsicht'). Re-loads the whole workspace once per configured combination (a real, accepted extra cost per combination — seconds to minutes each, same order as any other Deep Tier load) via `CargoFeatures::Selected { .., no_default_features: true }`, so a large configured matrix is a real, up-front performance trade-off the user opts into by listing more combinations.",
         exclusions: "Correctness depends entirely on the configured matrix being representative of real downstream usage: a feature combination not listed in `combinations` is never checked at all, and an item reachable only under an unconfigured combination is indistinguishable from genuinely dead code to this rule — this is why it is `Heuristic`/advisory rather than `unreachable-from-entry`'s `bounded_semantic`/gating classification, even though both share the same underlying entry-point BFS. Scoped to both `pub` and non-`pub` items alike (unlike `unreachable-from-entry`'s pub/non-pub split, which exists only to avoid duplicating `unused-pub-workspace`'s cross-crate reference check — a different concern this rule doesn't have). Inherits every entry-point-detection limitation `crate::reachability`'s module docs describe (registration macros like `inventory::submit!`/`ctor` are not recognized entry points).",
         allowed_wording: "State as 'not reachable from any recognized entry point under any of the configured [feature_matrix] combinations, in the examined reachability view' — never as 'unused', 'dead', or 'unreachable under all feature combinations' outright; a combination the config omits was never checked (todo.md §17.3, §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
@@ -345,7 +345,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
     RuleMetadata {
         id: "dead-trait-impl",
         evidence_class: EvidenceClass::BoundedSemantic,
-        preconditions: "Requires `--features deep` (Deep Tier; attributing a `.method()` call site to the specific impl it dispatches to needs real semantic resolution). Scoped to `impl Trait for Type` blocks where `Type` is a concrete named type and `Trait` is itself defined within the analyzed workspace's own source — never a trait from `std`/`core`/`alloc` or an external dependency crate (see `crate::dead_trait_impl` module docs for why this scoping is a deliberate, permanent cut, not a gap to fill later).",
+        preconditions: "Requires `--features deep` (Deep Tier; attributing a `.method()` call site to the specific impl it dispatches to needs real semantic resolution). Scoped to `impl Trait for Type` blocks where `Type` is a concrete named type and `Trait` is itself defined within the analyzed workspace's own source — never a trait from `std`/`core`/`alloc` or an external dependency crate (see `crate::rules::dead_trait_impl` module docs for why this scoping is a deliberate, permanent cut, not a gap to fill later).",
         exclusions: "Scoped only to traits defined within the analyzed workspace — impls of std/external-crate traits (`Drop`, the `std::ops::*` operator traits, `Display`/`Debug`, `Default`/`From`, `Hash`, `Iterator`, serde's `Serialize`/`Deserialize`, …) are never checked by this rule at all; this is an intentional, permanent scope boundary, not a gap to fill later, because those traits are invoked through compiler/operator/macro sugar this rule's plain `.method()` call-site scan cannot see. Inherits the same generic-dispatch blind spot `crate::reachability::classify_call_kind` documents: a call through a generic type bound (`fn foo<T: Trait>(x: T) { x.bar() }`) is not concretely dispatched at the call site, so it never marks a candidate impl as used. Blanket impls (`impl<T: Trait> Trait for T`) are excluded entirely, as is any impl gated by `#[cfg(test)]` (on itself or an enclosing item), and an impl overriding none of the trait's methods (relying entirely on default method bodies) — it has no assoc items of its own for a call site to resolve to, so it is never a candidate.",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
@@ -468,7 +468,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "unused-dependency",
         evidence_class: EvidenceClass::BoundedSemantic,
         preconditions: "Opt-in only: `cargo judge deps --check-rustc-lints` — runs a full `cargo check --workspace --all-targets` with rustc's stable `unused_crate_dependencies` lint enabled; never part of bare `cargo judge`, `audit`, or `cargo judge deps` without the flag (a full compile is a different order of cost than this module's other, instant syntactic passes).",
-        exclusions: "Restricted to `normal` dependencies (`dev`/`build` are out of scope; `dev-dependencies` has its own `unused-dev-dependency` detector). Only fires when rustc's lint reports the dependency unused in every target compiled for the package — a dependency used by only one target (e.g. only from a `[[test]]`) is a known, documented multi-target false positive of the raw lint and is deliberately not flagged (see `crate::deps` module docs). A workspace that does not currently compile produces a report error from this detector, never a finding.",
+        exclusions: "Restricted to `normal` dependencies (`dev`/`build` are out of scope; `dev-dependencies` has its own `unused-dev-dependency` detector). Only fires when rustc's lint reports the dependency unused in every target compiled for the package — a dependency used by only one target (e.g. only from a `[[test]]`) is a known, documented multi-target false positive of the raw lint and is deliberately not flagged (see `crate::rules::deps` module docs). A workspace that does not currently compile produces a report error from this detector, never a finding.",
         allowed_wording: BOUNDED_SEMANTIC_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: None,
@@ -490,7 +490,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "duplicate-code",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`/`audit` in `Mild` mode by default, and `cargo judge dupes` for any `--mode`).",
-        exclusions: "This entry reflects the default `Strict`/`Mild` classification. `Weak` mode normalizes literal values to placeholders; `Semantic` mode additionally normalizes local variable/parameter identifiers — both are overridden to `Heuristic` at the finding-creation site (see `crate::duplication::CloneMember::to_finding`), not `derived_fact`.",
+        exclusions: "This entry reflects the default `Strict`/`Mild` classification. `Weak` mode normalizes literal values to placeholders; `Semantic` mode additionally normalizes local variable/parameter identifiers — both are overridden to `Heuristic` at the finding-creation site (see `crate::rules::duplication::CloneMember::to_finding`), not `derived_fact`.",
         allowed_wording: "For `Strict`/`Mild` matches: state as an exact token-equality fact (todo.md §17.3). For `Weak`/`Semantic` matches: phrase as a possible/similar match, never an exact duplicate — those modes normalize literals and/or identifiers, so the underlying code is not byte-identical.",
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -503,7 +503,7 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         id: "size-distribution",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier, no git history needed — pure per-file LOC plus per-crate aggregation over the loaded workspace; part of bare `cargo judge` and `audit`).",
-        exclusions: "First-cut, adjustable Gini threshold (`SIZE_DISTRIBUTION_GINI_THRESHOLD`, 0.6, mirrors `crate::duplication::DEFAULT_MIN_TOKENS`'s style); only fires when a file's LOC is in its crate's top decile *and* the crate's own file-size Gini coefficient exceeds the threshold — a large, concentrated file (e.g. a CLI dispatch table or an enum-heavy config module) is routinely legitimate, not a defect. A crate with only one authored file always has Gini `0.0` by construction and never fires.",
+        exclusions: "First-cut, adjustable Gini threshold (`SIZE_DISTRIBUTION_GINI_THRESHOLD`, 0.6, mirrors `crate::rules::duplication::DEFAULT_MIN_TOKENS`'s style); only fires when a file's LOC is in its crate's top decile *and* the crate's own file-size Gini coefficient exceeds the threshold — a large, concentrated file (e.g. a CLI dispatch table or an enum-heavy config module) is routinely legitimate, not a defect. A crate with only one authored file always has Gini `0.0` by construction and never fires.",
         allowed_wording: "State only the file's LOC, the crate's file count, and the crate's Gini coefficient against the threshold — never that the file 'is too big' or 'needs refactoring' (todo.md §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
         // A single outlier file's real content, shown against a crate whose
@@ -852,7 +852,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "unsafe-surface",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
-        exclusions: "Scoped to `unsafe { .. }` expression blocks only — `unsafe fn`/`unsafe impl`/`unsafe trait` declarations are out of scope (a different existing convention: a `# Safety` doc section). The adjacency check for a `// SAFETY:` comment is a line-range heuristic (immediately preceding line, or the first inner line of the block) over `crate::slop_text`'s raw-source-text comment scan, not a semantic link between the comment and the block — a `SAFETY:` comment placed elsewhere (e.g. at the top of the enclosing function) is not credited.",
+        exclusions: "Scoped to `unsafe { .. }` expression blocks only — `unsafe fn`/`unsafe impl`/`unsafe trait` declarations are out of scope (a different existing convention: a `# Safety` doc section). The adjacency check for a `// SAFETY:` comment is a line-range heuristic (immediately preceding line, or the first inner line of the block) over `crate::rules::slop_text`'s raw-source-text comment scan, not a semantic link between the comment and the block — a `SAFETY:` comment placed elsewhere (e.g. at the top of the enclosing function) is not credited.",
         allowed_wording: "State only that no `SAFETY:` comment was found adjacent to this unsafe block — never that the code is 'unsound' or 'a vulnerability' (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -876,7 +876,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "integer-cast-risk",
         evidence_class: EvidenceClass::Heuristic,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
-        exclusions: "A syntax-only proxy, not a truncation proof: true truncation detection needs the source expression's real type (a type checker), not available at the Fast Tier — the same limitation already documented for `silent-default`/`context-free-propagation` in `crate::slop`'s module doc. Only the cast's written target type is checked (`u8`/`i8`/`u16`/`i16`/`u32`/`i32`/`usize`/`isize`); false-positives on an already-narrow source (e.g. `byte_var as u8`), and false-negatives on a float cast to `u64`/`i64`/`u128`/`i128` (still narrowing, but not covered by this v1 target-type list). A cast whose direct inner expression is itself a call to `clamp`/`min`/`max`/one of the `saturating_*` methods is treated as already bounded and not flagged (a syntax-only check on the cast's immediate child only, not a binary expression's operands or deeper nesting) — added after a 2026-07-24 precision audit against a real 135k-LOC corpus found this the dominant false-positive source (311 of 312 findings, nearly all otherwise-bounded scoring/percentage arithmetic; GitHub issue #9).",
+        exclusions: "A syntax-only proxy, not a truncation proof: true truncation detection needs the source expression's real type (a type checker), not available at the Fast Tier — the same limitation already documented for `silent-default`/`context-free-propagation` in `crate::rules::slop`'s module doc. Only the cast's written target type is checked (`u8`/`i8`/`u16`/`i16`/`u32`/`i32`/`usize`/`isize`); false-positives on an already-narrow source (e.g. `byte_var as u8`), and false-negatives on a float cast to `u64`/`i64`/`u128`/`i128` (still narrowing, but not covered by this v1 target-type list). A cast whose direct inner expression is itself a call to `clamp`/`min`/`max`/one of the `saturating_*` methods is treated as already bounded and not flagged (a syntax-only check on the cast's immediate child only, not a binary expression's operands or deeper nesting) — added after a 2026-07-24 precision audit against a real 135k-LOC corpus found this the dominant false-positive source (311 of 312 findings, nearly all otherwise-bounded scoring/percentage arithmetic; GitHub issue #9).",
         allowed_wording: "State only that this is a possible truncation candidate based on the cast's target type — never 'this truncates' or 'this is a bug' (todo.md §17.4).",
         verdict_effect: VerdictEffect::AdvisoryOnly,
         example: Some(RuleExample {
@@ -1026,7 +1026,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "conversational-artifact",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`, since `syn` discards non-doc comments entirely); `///`/`//!` doc comments are out of scope for this rule. A trigger phrase immediately enclosed by matching quote marks (`\"` or a backtick) is treated as quoted meta-discussion of the phrase, not a live disclaimer, and does not fire — which is why this very comment can quote \"as an AI\" below without self-triggering.",
+        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::rules::slop_text`, since `syn` discards non-doc comments entirely); `///`/`//!` doc comments are out of scope for this rule. A trigger phrase immediately enclosed by matching quote marks (`\"` or a backtick) is treated as quoted meta-discussion of the phrase, not a live disclaimer, and does not fire — which is why this very comment can quote \"as an AI\" below without self-triggering.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         // The trigger phrase ("as an AI") lives inside a Rust string literal
@@ -1042,7 +1042,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "restating-comment",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`); `///`/`//!` doc comments are out of scope for this rule (see `doc-restates-signature`).",
+        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::rules::slop_text`); `///`/`//!` doc comments are out of scope for this rule (see `doc-restates-signature`).",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -1054,7 +1054,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "step-comment-inflation",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::slop_text`); requires a chain of three or more `// Step N:`-shaped comments.",
+        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::rules::slop_text`); requires a chain of three or more `// Step N:`-shaped comments.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -1251,7 +1251,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
     RuleMetadata {
         id: "yanked-dependency",
         evidence_class: EvidenceClass::ExternalMeasurement,
-        preconditions: "Requires `cargo judge deps --check-crates-io` (opt-in network access to the crates.io sparse index). Runs its own full, non-`--no-deps` `cargo metadata` resolve to see actual resolved versions, not just declared requirements — see `crate::slopsquat::analyze_yanked_dependencies`.",
+        preconditions: "Requires `cargo judge deps --check-crates-io` (opt-in network access to the crates.io sparse index). Runs its own full, non-`--no-deps` `cargo metadata` resolve to see actual resolved versions, not just declared requirements — see `crate::rules::slopsquat::analyze_yanked_dependencies`.",
         exclusions: "Checked against every resolved, non-workspace-member package (direct and transitive), not just directly declared dependencies — distinct from `phantom-version`, which checks whether the declared *requirement* has any non-yanked satisfying version at all. A snapshot at lookup time — a publisher un-yanking a version moments after the check ran is indistinguishable from one that was never yanked.",
         allowed_wording: EXTERNAL_MEASUREMENT_WORDING,
         verdict_effect: VerdictEffect::Gating,
@@ -1275,7 +1275,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
     RuleMetadata {
         id: "known-vulnerability",
         evidence_class: EvidenceClass::ExternalMeasurement,
-        preconditions: "Requires `cargo judge deps --audit-json PATH`, an already-generated `cargo audit --json` report (opt-in; judge never runs `cargo-audit` itself). Runs its own full, non-`--no-deps` `cargo metadata` resolve to cross-reference reachability — see `crate::advisories` module docs.",
+        preconditions: "Requires `cargo judge deps --audit-json PATH`, an already-generated `cargo audit --json` report (opt-in; judge never runs `cargo-audit` itself). Runs its own full, non-`--no-deps` `cargo metadata` resolve to cross-reference reachability — see `crate::advisory::advisories` module docs.",
         exclusions: "Reachability is a dependency-graph classification (`production`/`dev_only`/`unknown` in `evidence.reachability`), not a call-graph one — RUSTSEC advisories are scoped to crate+version, not specific functions, so there is no function-level target for the Deep Tier `--why-live` engine to check. `production` is `Severity::Fail`; `dev_only`/`unknown` are `Severity::Warn` — never silently dropped, just not asserted with `Fail`-level confidence. A package/version cargo-audit reported that judge's own resolve doesn't find at all (a stale report, or a workspace-root mismatch) is `unknown`, still reported. Only `cargo audit --json`'s format is imported; `cargo deny --format json` is not.",
         allowed_wording: "State only the advisory id, the reachability classification, and its basis — never that the crate is 'exploited' or 'unsafe to use' beyond what the advisory itself claims (todo.md §17.4).",
         verdict_effect: VerdictEffect::Gating,
@@ -1373,62 +1373,62 @@ mod tests {
     #[test]
     fn every_fast_tier_rule_id_has_a_registry_entry() {
         let ids: &[&str] = &[
-            crate::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE,
-            crate::api_surface::SEMVER_HAZARD_RULE,
-            crate::boundaries::BOUNDARY_VIOLATION_RULE,
-            crate::boundaries::DEPENDENCY_CYCLE_RULE,
-            crate::boundaries::MODULE_BOUNDARY_VIOLATION_RULE,
-            crate::boundaries::FEATURE_GRAPH_CYCLE_RULE,
-            crate::complexity::SIGNATURE_COMPLEXITY_RULE,
-            crate::complexity::MAINTAINABILITY_INDEX_RULE,
-            crate::coverage::UNTESTED_HOTSPOT_RULE,
-            crate::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE,
-            crate::dep_graph::MSRV_DRIFT_RULE,
-            crate::dep_graph::WORKSPACE_DEP_DRIFT_RULE,
-            crate::deps::MISPLACED_DEPENDENCY_KIND_RULE,
-            crate::deps::UNUSED_DEV_DEPENDENCY_RULE,
-            crate::deps::HEAVY_DEPENDENCY_RULE,
-            crate::deps::UNUSED_FEATURE_FLAG_RULE,
-            crate::deps::DEFAULT_FEATURES_UNUSED_RULE,
-            crate::deps::UNUSED_FEATURE_RULE,
-            crate::deps::UNUSED_DEPENDENCY_RULE,
-            crate::duplication::DUPLICATE_RULE,
-            crate::module_graph::UNLINKED_FILE_RULE,
-            crate::module_graph::ORPHAN_MODULE_RULE,
-            crate::mutants::MUTATION_SURVIVOR_RULE,
-            crate::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
-            crate::security::UNSAFE_SURFACE_RULE,
-            crate::security::UNSAFE_DENSITY_RULE,
-            crate::security::INTEGER_CAST_RISK_RULE,
-            crate::security::PANIC_IN_LIB_RULE,
-            crate::security::HARDCODED_SECRET_RULE,
-            crate::slop::SWALLOWED_RESULT_RULE,
-            crate::slop::EMPTY_ERROR_ARM_RULE,
-            crate::slop::CATCH_ALL_ERROR_RULE,
-            crate::slop::SUPPRESSION_DEBT_RULE,
-            crate::slop::MERGED_STUB_RULE,
-            crate::slop::EMPTY_IMPL_RULE,
-            crate::slop::ASSERTION_FREE_TEST_RULE,
-            crate::slop::TAUTOLOGICAL_TEST_RULE,
-            crate::slop::IGNORED_TEST_ACCUMULATION_RULE,
-            crate::slop::CONVERSATIONAL_ARTIFACT_RULE,
-            crate::slop::RESTATING_COMMENT_RULE,
-            crate::slop::STEP_COMMENT_INFLATION_RULE,
-            crate::slop::GENERIC_NAMING_RULE,
-            crate::slop::DOC_RESTATES_SIGNATURE_RULE,
-            crate::slop::SILENT_DEFAULT_RULE,
-            crate::slop::CONTEXT_FREE_PROPAGATION_RULE,
-            crate::slop::DEBUG_FORMAT_LEAK_RULE,
-            crate::slop_structural::COMPLEXITY_INFLATION_RULE,
-            crate::slop_structural::ABSTRACTION_INFLATION_RULE,
-            crate::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
-            crate::slopsquat::NAME_COLLISION_RISK_RULE,
-            crate::slopsquat::PHANTOM_CRATE_RULE,
-            crate::slopsquat::PHANTOM_VERSION_RULE,
-            crate::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE,
-            crate::slopsquat::YANKED_DEPENDENCY_RULE,
-            crate::slopsquat::DEP_SINGLE_MAINTAINER_RULE,
-            crate::advisories::KNOWN_VULNERABILITY_RULE,
+            crate::rules::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE,
+            crate::rules::api_surface::SEMVER_HAZARD_RULE,
+            crate::rules::boundaries::BOUNDARY_VIOLATION_RULE,
+            crate::rules::boundaries::DEPENDENCY_CYCLE_RULE,
+            crate::rules::boundaries::MODULE_BOUNDARY_VIOLATION_RULE,
+            crate::rules::boundaries::FEATURE_GRAPH_CYCLE_RULE,
+            crate::rules::complexity::SIGNATURE_COMPLEXITY_RULE,
+            crate::rules::complexity::MAINTAINABILITY_INDEX_RULE,
+            crate::advisory::coverage::UNTESTED_HOTSPOT_RULE,
+            crate::rules::dep_graph::DUPLICATE_CRATE_VERSIONS_RULE,
+            crate::rules::dep_graph::MSRV_DRIFT_RULE,
+            crate::rules::dep_graph::WORKSPACE_DEP_DRIFT_RULE,
+            crate::rules::deps::MISPLACED_DEPENDENCY_KIND_RULE,
+            crate::rules::deps::UNUSED_DEV_DEPENDENCY_RULE,
+            crate::rules::deps::HEAVY_DEPENDENCY_RULE,
+            crate::rules::deps::UNUSED_FEATURE_FLAG_RULE,
+            crate::rules::deps::DEFAULT_FEATURES_UNUSED_RULE,
+            crate::rules::deps::UNUSED_FEATURE_RULE,
+            crate::rules::deps::UNUSED_DEPENDENCY_RULE,
+            crate::rules::duplication::DUPLICATE_RULE,
+            crate::rules::module_graph::UNLINKED_FILE_RULE,
+            crate::rules::module_graph::ORPHAN_MODULE_RULE,
+            crate::advisory::mutants::MUTATION_SURVIVOR_RULE,
+            crate::rules::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
+            crate::rules::security::UNSAFE_SURFACE_RULE,
+            crate::rules::security::UNSAFE_DENSITY_RULE,
+            crate::rules::security::INTEGER_CAST_RISK_RULE,
+            crate::rules::security::PANIC_IN_LIB_RULE,
+            crate::rules::security::HARDCODED_SECRET_RULE,
+            crate::rules::slop::SWALLOWED_RESULT_RULE,
+            crate::rules::slop::EMPTY_ERROR_ARM_RULE,
+            crate::rules::slop::CATCH_ALL_ERROR_RULE,
+            crate::rules::slop::SUPPRESSION_DEBT_RULE,
+            crate::rules::slop::MERGED_STUB_RULE,
+            crate::rules::slop::EMPTY_IMPL_RULE,
+            crate::rules::slop::ASSERTION_FREE_TEST_RULE,
+            crate::rules::slop::TAUTOLOGICAL_TEST_RULE,
+            crate::rules::slop::IGNORED_TEST_ACCUMULATION_RULE,
+            crate::rules::slop::CONVERSATIONAL_ARTIFACT_RULE,
+            crate::rules::slop::RESTATING_COMMENT_RULE,
+            crate::rules::slop::STEP_COMMENT_INFLATION_RULE,
+            crate::rules::slop::GENERIC_NAMING_RULE,
+            crate::rules::slop::DOC_RESTATES_SIGNATURE_RULE,
+            crate::rules::slop::SILENT_DEFAULT_RULE,
+            crate::rules::slop::CONTEXT_FREE_PROPAGATION_RULE,
+            crate::rules::slop::DEBUG_FORMAT_LEAK_RULE,
+            crate::rules::slop_structural::COMPLEXITY_INFLATION_RULE,
+            crate::rules::slop_structural::ABSTRACTION_INFLATION_RULE,
+            crate::rules::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
+            crate::rules::slopsquat::NAME_COLLISION_RISK_RULE,
+            crate::rules::slopsquat::PHANTOM_CRATE_RULE,
+            crate::rules::slopsquat::PHANTOM_VERSION_RULE,
+            crate::rules::slopsquat::FRESH_LOW_REPUTATION_DEP_RULE,
+            crate::rules::slopsquat::YANKED_DEPENDENCY_RULE,
+            crate::rules::slopsquat::DEP_SINGLE_MAINTAINER_RULE,
+            crate::advisory::advisories::KNOWN_VULNERABILITY_RULE,
         ];
         for id in ids {
             assert!(
@@ -1446,20 +1446,20 @@ mod tests {
     #[test]
     fn every_deep_tier_rule_id_has_a_registry_entry() {
         let ids: &[&str] = &[
-            crate::dead_code::UNUSED_PUB_WORKSPACE_RULE,
-            crate::dead_code::UNUSED_PUB_API_RULE,
-            crate::dead_code::DEAD_ENUM_VARIANT_RULE,
-            crate::dead_code::TEST_ONLY_PUB_RULE,
-            crate::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
-            crate::dead_code::CRATE_COUPLING_RULE,
-            crate::dead_code::MODULE_COUPLING_RULE,
-            crate::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
-            crate::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
-            crate::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
-            crate::slop_structural_deep::CONNECTIVITY_DROP_RULE,
-            crate::api_surface_deep::INTERNAL_LEAK_RULE,
-            crate::api_surface_deep::RE_EXPORT_CHAIN_RULE,
-            crate::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE,
+            crate::rules::dead_code::UNUSED_PUB_WORKSPACE_RULE,
+            crate::rules::dead_code::UNUSED_PUB_API_RULE,
+            crate::rules::dead_code::DEAD_ENUM_VARIANT_RULE,
+            crate::rules::dead_code::TEST_ONLY_PUB_RULE,
+            crate::rules::dead_code::UNREACHABLE_FROM_ENTRY_RULE,
+            crate::rules::dead_code::CRATE_COUPLING_RULE,
+            crate::rules::dead_code::MODULE_COUPLING_RULE,
+            crate::rules::feature_matrix::FEATURE_GATED_DEAD_CODE_RULE,
+            crate::rules::dead_trait_impl::DEAD_TRAIT_IMPL_RULE,
+            crate::rules::slop_structural_deep::DUPLICATIVE_REINVENTION_RULE,
+            crate::rules::slop_structural_deep::CONNECTIVITY_DROP_RULE,
+            crate::rules::api_surface_deep::INTERNAL_LEAK_RULE,
+            crate::rules::api_surface_deep::RE_EXPORT_CHAIN_RULE,
+            crate::rules::boundaries_deep::MODULE_BOUNDARY_VIOLATION_DEEP_RULE,
         ];
         for id in ids {
             assert!(
@@ -1476,7 +1476,7 @@ mod tests {
     /// diverge, see their entries' `exclusions`/module docs).
     #[test]
     fn known_rule_id_resolves_with_expected_fields() {
-        let entry = lookup(crate::slop::CATCH_ALL_ERROR_RULE).expect("catch-all-error entry");
+        let entry = lookup(crate::rules::slop::CATCH_ALL_ERROR_RULE).expect("catch-all-error entry");
         assert_eq!(entry.id, "catch-all-error");
         assert_eq!(entry.evidence_class, EvidenceClass::DerivedFact);
         assert_eq!(entry.verdict_effect, VerdictEffect::Gating);

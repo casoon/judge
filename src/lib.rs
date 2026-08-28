@@ -1,51 +1,23 @@
 //! Codebase intelligence for Rust workspaces.
 
-pub mod advisories;
-pub mod api_surface;
-#[cfg(feature = "deep")]
-pub mod api_surface_deep;
+pub mod advisory;
 pub mod baseline;
-pub mod boundaries;
-#[cfg(feature = "deep")]
-pub mod boundaries_deep;
-pub mod clippy_import;
-pub mod complexity;
-pub mod coverage;
-#[cfg(feature = "deep")]
-pub mod dead_code;
-#[cfg(feature = "deep")]
-pub mod dead_trait_impl;
 #[cfg(feature = "deep")]
 pub mod deep;
-pub mod dep_graph;
-pub mod deps;
-pub mod duplication;
-#[cfg(feature = "deep")]
-pub mod feature_matrix;
 pub mod finding;
 mod functions;
 pub mod health_score;
 pub mod impact;
 pub mod ingest;
 pub mod markdown;
-pub mod module_graph;
-pub mod mutants;
-pub mod pattern;
 pub mod pattern_baseline;
-pub mod principle;
 #[cfg(feature = "deep")]
 pub mod reachability;
 pub mod refactor_map;
 pub mod report;
 pub mod rule_registry;
+pub mod rules;
 pub mod sarif;
-pub mod security;
-pub mod slop;
-pub mod slop_structural;
-#[cfg(feature = "deep")]
-pub mod slop_structural_deep;
-mod slop_text;
-pub mod slopsquat;
 pub mod suppression;
 #[cfg(test)]
 mod test_util;

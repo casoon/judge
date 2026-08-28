@@ -13,9 +13,9 @@
 //! *not* recognized — there's no fixed attribute or call shape to key off
 //! generically, and guessing at specific crate names would be arbitrary. A
 //! workspace-internal crate's own `pub` API is deliberately *not* treated as
-//! an automatic root — that mirrors [`crate::dead_code`]'s same
+//! an automatic root — that mirrors [`crate::rules::dead_code`]'s same
 //! simplification (every crate counts as workspace-internal, not
-//! published), so the two stay consistent: something [`crate::dead_code`]
+//! published), so the two stay consistent: something [`crate::rules::dead_code`]
 //! calls dead is never reported "live" here just because it's `pub`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -52,8 +52,8 @@ impl std::fmt::Display for ReachabilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Deep(err) => write!(f, "{err}"),
-            Self::Io(path, err) => crate::dead_code::fmt_io_error(f, path, err),
-            Self::Parse(path, err) => crate::dead_code::fmt_parse_error(f, path, err),
+            Self::Io(path, err) => crate::rules::dead_code::fmt_io_error(f, path, err),
+            Self::Parse(path, err) => crate::rules::dead_code::fmt_parse_error(f, path, err),
             Self::UnknownItem(item_path) => {
                 write!(f, "no function named `{item_path}` found in the workspace")
             }
@@ -275,7 +275,7 @@ fn walk_crate_functions(
 /// `[[bin]]`/`[[example]]` target, `#[test]`/`#[bench]`-like functions when
 /// `include_tests` is set, and `#[no_mangle]`/`#[export_name]`/
 /// `#[wasm_bindgen]`-attributed functions unconditionally. Also used by
-/// [`crate::dead_code`] to treat an item reachable from its own crate's
+/// [`crate::rules::dead_code`] to treat an item reachable from its own crate's
 /// entry point as live, even with no cross-crate reference — a
 /// single-crate workspace has no "other crate" to ever reference anything,
 /// which would otherwise make `unused-pub-workspace` flag the entire public
@@ -330,7 +330,7 @@ pub(crate) fn entry_point_positions(
 /// deduplicated via `HashSet` — the shared "materialize the deterministic-
 /// comparison form of the entry-point set" step every [`is_reachable_from_entry`]
 /// caller repeats, computed once per analysis run (or per feature
-/// combination, for [`crate::feature_matrix`]) and reused across every
+/// combination, for [`crate::rules::feature_matrix`]) and reused across every
 /// queried item.
 pub(crate) fn entry_keys_from(entries: &[(String, FilePosition)]) -> HashSet<(FileId, u32)> {
     entries
@@ -456,7 +456,7 @@ fn deterministic_callers(
 /// Whether `target` is reachable from any recognized entry point (see module
 /// docs) — the same reverse-BFS as [`why_live`], but without building the
 /// human-readable path, for use in a hot loop over many candidate items
-/// (see [`crate::dead_code`]). `entry_keys` is `entry_point_positions`'
+/// (see [`crate::rules::dead_code`]). `entry_keys` is `entry_point_positions`'
 /// output, pre-converted with [`position_key`] — computed once by the
 /// caller and reused across every item, since it never changes within one
 /// analysis run.

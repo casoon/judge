@@ -7,40 +7,32 @@ use judge::AnalysisTier;
 #[cfg(test)]
 use judge::baseline::TriVerdict;
 use judge::baseline::Verdict;
-use judge::duplication::DupeMode;
 use judge::finding::{Finding, Report};
+use judge::rules::duplication::DupeMode;
 use serde::Serialize;
 use serde::ser::SerializeMap;
 
-mod advisory_commands;
-mod analysis_commands;
-mod baseline_output;
-mod combined;
-mod combined_analysis;
 mod commands;
-mod deep_commands;
-mod health_command;
-mod workspace_commands;
 
-use advisory_commands::{
+use commands::advisory_commands::{
     run_explain_pattern, run_explain_principle, run_explain_rule, run_fix_preview, run_patterns,
     run_principles,
 };
-use analysis_commands::{
+use commands::analysis_commands::{
     run_api_surface, run_boundaries, run_coverage, run_deps, run_dupes, run_errors,
     run_module_graph, run_slop, run_tests, run_unsafe,
 };
-use baseline_output::{
+use commands::baseline_output::{
     BaselineInput, BaselineOptions, BaselineRequest, analysis_errors, append_analysis_errors,
     handle_baseline_with_trend, print_pattern_delta_tty, write_json,
 };
+use commands::cli::{BaselineArgs, Command};
 #[cfg(test)]
-use combined_analysis::collect_findings;
-use combined_analysis::collect_findings_with_progress;
-use commands::{BaselineArgs, Command};
-use deep_commands::{run_dead_code, run_explain};
-use health_command::run as run_health;
-use workspace_commands::{
+use commands::combined_analysis::collect_findings;
+use commands::combined_analysis::collect_findings_with_progress;
+use commands::deep_commands::{run_dead_code, run_explain};
+use commands::health_command::run as run_health;
+use commands::workspace_commands::{
     run_complexity, run_impact, run_inspect, run_map, run_refactor, run_structure,
 };
 
@@ -109,7 +101,7 @@ struct DupesOptions {
     mode: DupeModeArg,
     /// Minimum span length, in tokens — spans shorter than this are
     /// ignored so trivial one-liners don't dominate every family.
-    #[arg(long, default_value_t = judge::duplication::DEFAULT_MIN_TOKENS)]
+    #[arg(long, default_value_t = judge::rules::duplication::DEFAULT_MIN_TOKENS)]
     min_tokens: usize,
     #[command(flatten)]
     baseline_args: BaselineArgs,
@@ -155,14 +147,14 @@ struct DepsOptions {
     /// rustc's stable `unused_crate_dependencies` lint enabled and import
     /// its result as `unused-dependency` findings. Off by default — unlike
     /// this command's other detectors, a full compile is a different order
-    /// of cost (see `judge::deps` module docs "Importing rustc's
+    /// of cost (see `judge::rules::deps` module docs "Importing rustc's
     /// `unused_crate_dependencies` lint").
     #[arg(long)]
     check_rustc_lints: bool,
     /// Opt-in: cross-reference an already-generated `cargo audit --json`
     /// report against the resolved dependency graph (`known-vulnerability`).
     /// judge never runs `cargo-audit` itself — generate the report with
-    /// `cargo audit --json > PATH` first (see `judge::advisories` module
+    /// `cargo audit --json > PATH` first (see `judge::advisory::advisories` module
     /// docs).
     #[arg(long, value_name = "PATH")]
     audit_json: Option<PathBuf>,
@@ -186,9 +178,9 @@ struct BoundariesOptions {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum GraphFormat {
-    /// Graphviz DOT (see `judge::boundaries::CrateGraph::to_dot`).
+    /// Graphviz DOT (see `judge::rules::boundaries::CrateGraph::to_dot`).
     Dot,
-    /// Mermaid `flowchart` (see `judge::boundaries::CrateGraph::to_mermaid`).
+    /// Mermaid `flowchart` (see `judge::rules::boundaries::CrateGraph::to_mermaid`).
     Mermaid,
 }
 
@@ -211,7 +203,7 @@ struct CoverageOptions {
     lcov: PathBuf,
     /// Opt-in: also import an externally generated `cargo-mutants`
     /// `outcomes.json` report and flag `mutation-survivor` findings (see
-    /// `judge::mutants` module docs). judge never runs `cargo-mutants`
+    /// `judge::advisory::mutants` module docs). judge never runs `cargo-mutants`
     /// itself — generate the report with `cargo mutants` first (writes
     /// `mutants.out/outcomes.json`), then pass that path here.
     #[arg(long, value_name = "PATH")]
@@ -256,7 +248,7 @@ struct PatternsOptions {
     /// signal (`clippy::fn_params_excessive_bools`) when clippy
     /// independently flags the same function. judge never runs `cargo
     /// clippy` itself — generate the report with `cargo clippy
-    /// --message-format=json > PATH` first (see `judge::clippy_import`
+    /// --message-format=json > PATH` first (see `judge::advisory::clippy_import`
     /// module docs).
     #[arg(long, value_name = "PATH")]
     clippy_json: Option<PathBuf>,
@@ -565,32 +557,32 @@ impl From<judge::pattern_baseline::PatternBaselineError> for CliError {
     }
 }
 
-impl From<judge::boundaries::BoundaryConfigError> for CliError {
-    fn from(err: judge::boundaries::BoundaryConfigError) -> Self {
+impl From<judge::rules::boundaries::BoundaryConfigError> for CliError {
+    fn from(err: judge::rules::boundaries::BoundaryConfigError) -> Self {
         Self::Config(err.to_string())
     }
 }
 
-impl From<judge::coverage::LcovError> for CliError {
-    fn from(err: judge::coverage::LcovError) -> Self {
+impl From<judge::advisory::coverage::LcovError> for CliError {
+    fn from(err: judge::advisory::coverage::LcovError) -> Self {
         Self::Config(err.to_string())
     }
 }
 
-impl From<judge::advisories::AuditImportError> for CliError {
-    fn from(err: judge::advisories::AuditImportError) -> Self {
+impl From<judge::advisory::advisories::AuditImportError> for CliError {
+    fn from(err: judge::advisory::advisories::AuditImportError) -> Self {
         Self::Config(err.to_string())
     }
 }
 
-impl From<judge::clippy_import::ClippyImportError> for CliError {
-    fn from(err: judge::clippy_import::ClippyImportError) -> Self {
+impl From<judge::advisory::clippy_import::ClippyImportError> for CliError {
+    fn from(err: judge::advisory::clippy_import::ClippyImportError) -> Self {
         Self::Config(err.to_string())
     }
 }
 
-impl From<judge::mutants::MutantsImportError> for CliError {
-    fn from(err: judge::mutants::MutantsImportError) -> Self {
+impl From<judge::advisory::mutants::MutantsImportError> for CliError {
+    fn from(err: judge::advisory::mutants::MutantsImportError) -> Self {
         Self::Config(err.to_string())
     }
 }
@@ -602,15 +594,15 @@ impl From<judge::suppression::SuppressionError> for CliError {
 }
 
 #[cfg(feature = "deep")]
-impl From<judge::dead_code::DeadCodeError> for CliError {
-    fn from(err: judge::dead_code::DeadCodeError) -> Self {
+impl From<judge::rules::dead_code::DeadCodeError> for CliError {
+    fn from(err: judge::rules::dead_code::DeadCodeError) -> Self {
         Self::Analyzer(err.to_string())
     }
 }
 
 #[cfg(feature = "deep")]
-impl From<judge::slop_structural_deep::SlopStructuralDeepError> for CliError {
-    fn from(err: judge::slop_structural_deep::SlopStructuralDeepError) -> Self {
+impl From<judge::rules::slop_structural_deep::SlopStructuralDeepError> for CliError {
+    fn from(err: judge::rules::slop_structural_deep::SlopStructuralDeepError) -> Self {
         Self::Analyzer(err.to_string())
     }
 }
@@ -677,7 +669,7 @@ fn main() -> ExitCode {
 /// [`main`] translates the result into a process exit code.
 fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
     match cli.command {
-        None => combined::run(
+        None => commands::combined::run(
             cli.baseline_args.format,
             cli.baseline_args.save_baseline,
             cli.baseline_args.baseline,
@@ -1002,16 +994,18 @@ fn json_artifact_description(command: &str) -> &'static str {
 /// Loads `judge.toml`'s `[[boundary]]`/`[[crate_profile]]` config, if
 /// present. Both are opt-in — a missing file is the default (empty) config,
 /// not an error.
-fn load_judge_toml(workspace_root: &Path) -> Result<judge::boundaries::BoundaryConfig, CliError> {
+fn load_judge_toml(
+    workspace_root: &Path,
+) -> Result<judge::rules::boundaries::BoundaryConfig, CliError> {
     let config_path = workspace_root.join("judge.toml");
     if !config_path.exists() {
-        return Ok(judge::boundaries::BoundaryConfig::default());
+        return Ok(judge::rules::boundaries::BoundaryConfig::default());
     }
     parse_boundary_config(&config_path)
 }
 
 /// Reads and parses `judge.toml` at `config_path` into a
-/// [`judge::boundaries::BoundaryConfig`] — the "read, then parse, name the
+/// [`judge::rules::boundaries::BoundaryConfig`] — the "read, then parse, name the
 /// file in either error" recipe shared by `load_judge_toml`'s
 /// default-on-missing wrapper above, `run_boundaries`'s `--config`-overridable
 /// path (see `analysis_commands::run_boundaries`), and the bare combined
@@ -1020,7 +1014,7 @@ fn load_judge_toml(workspace_root: &Path) -> Result<judge::boundaries::BoundaryC
 /// read one that exists.
 fn parse_boundary_config(
     config_path: &Path,
-) -> Result<judge::boundaries::BoundaryConfig, CliError> {
+) -> Result<judge::rules::boundaries::BoundaryConfig, CliError> {
     let config_text = std::fs::read_to_string(config_path)
         .map_err(|err| CliError::Config(format!("{}: {err}", config_path.display())))?;
     toml::from_str(&config_text).map_err(|err| {
@@ -1123,31 +1117,31 @@ fn trend_json(trend: &judge::health_score::Trend) -> serde_json::Value {
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
 const SLOP_RULES: [&str; 25] = [
-    judge::slop::SWALLOWED_RESULT_RULE,
-    judge::slop::EMPTY_ERROR_ARM_RULE,
-    judge::slop::CATCH_ALL_ERROR_RULE,
-    judge::slop::SUPPRESSION_DEBT_RULE,
-    judge::slop::MERGED_STUB_RULE,
-    judge::slop::EMPTY_IMPL_RULE,
-    judge::slop::ASSERTION_FREE_TEST_RULE,
-    judge::slop::TAUTOLOGICAL_TEST_RULE,
-    judge::slop::IGNORED_TEST_ACCUMULATION_RULE,
-    judge::slop::CONVERSATIONAL_ARTIFACT_RULE,
-    judge::slop::RESTATING_COMMENT_RULE,
-    judge::slop::STEP_COMMENT_INFLATION_RULE,
-    judge::slop::GENERIC_NAMING_RULE,
-    judge::slop::DOC_RESTATES_SIGNATURE_RULE,
-    judge::slop_structural::CHURN_HOTSPOT_RULE,
-    judge::slop_structural::COMPLEXITY_INFLATION_RULE,
-    judge::complexity::SIGNATURE_COMPLEXITY_RULE,
-    judge::complexity::MAINTAINABILITY_INDEX_RULE,
-    judge::slop_structural::ABSTRACTION_INFLATION_RULE,
-    judge::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
-    judge::security::UNSAFE_SURFACE_RULE,
-    judge::security::UNSAFE_DENSITY_RULE,
-    judge::security::INTEGER_CAST_RISK_RULE,
-    judge::security::PANIC_IN_LIB_RULE,
-    judge::security::HARDCODED_SECRET_RULE,
+    judge::rules::slop::SWALLOWED_RESULT_RULE,
+    judge::rules::slop::EMPTY_ERROR_ARM_RULE,
+    judge::rules::slop::CATCH_ALL_ERROR_RULE,
+    judge::rules::slop::SUPPRESSION_DEBT_RULE,
+    judge::rules::slop::MERGED_STUB_RULE,
+    judge::rules::slop::EMPTY_IMPL_RULE,
+    judge::rules::slop::ASSERTION_FREE_TEST_RULE,
+    judge::rules::slop::TAUTOLOGICAL_TEST_RULE,
+    judge::rules::slop::IGNORED_TEST_ACCUMULATION_RULE,
+    judge::rules::slop::CONVERSATIONAL_ARTIFACT_RULE,
+    judge::rules::slop::RESTATING_COMMENT_RULE,
+    judge::rules::slop::STEP_COMMENT_INFLATION_RULE,
+    judge::rules::slop::GENERIC_NAMING_RULE,
+    judge::rules::slop::DOC_RESTATES_SIGNATURE_RULE,
+    judge::rules::slop_structural::CHURN_HOTSPOT_RULE,
+    judge::rules::slop_structural::COMPLEXITY_INFLATION_RULE,
+    judge::rules::complexity::SIGNATURE_COMPLEXITY_RULE,
+    judge::rules::complexity::MAINTAINABILITY_INDEX_RULE,
+    judge::rules::slop_structural::ABSTRACTION_INFLATION_RULE,
+    judge::rules::slop_structural::FRAGILE_SUBSTRING_CLASSIFICATION_RULE,
+    judge::rules::security::UNSAFE_SURFACE_RULE,
+    judge::rules::security::UNSAFE_DENSITY_RULE,
+    judge::rules::security::INTEGER_CAST_RISK_RULE,
+    judge::rules::security::PANIC_IN_LIB_RULE,
+    judge::rules::security::HARDCODED_SECRET_RULE,
 ];
 
 fn print_slop(
@@ -1471,7 +1465,7 @@ mod tests {
 
     /// A fixture crate with two `catch-all-error` boundary functions and a
     /// crate-local typed error — corroborated evidence for exactly one
-    /// `stringly-error-boundary` pattern candidate (see `judge::pattern`).
+    /// `stringly-error-boundary` pattern candidate (see `judge::rules::pattern`).
     fn write_pattern_candidate_fixture_crate(dir: &Path) {
         std::fs::write(
             dir.join("Cargo.toml"),
@@ -1564,7 +1558,7 @@ mod tests {
     /// A fixture crate with one function satisfying both
     /// `functional-core-imperative-shell` signals: an `std::fs::read_to_string`
     /// call plus nine sequential `if`s (cyclomatic complexity 10, at
-    /// [`judge::principle::FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD`]).
+    /// [`judge::rules::principle::FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD`]).
     fn write_principle_heuristic_fixture_crate(dir: &Path) {
         std::fs::write(
             dir.join("Cargo.toml"),
@@ -1593,7 +1587,7 @@ mod tests {
     }
 
     /// A pair of duplicated function bodies (well over
-    /// `judge::duplication::DEFAULT_MIN_TOKENS`), both in one new file — a
+    /// `judge::rules::duplication::DEFAULT_MIN_TOKENS`), both in one new file — a
     /// self-contained `code_introduced` duplication finding once that file
     /// is committed.
     const DUPE_FILE_CONTENT: &str = r#"
@@ -1687,7 +1681,7 @@ fn dup_two(x: i32) -> i32 {
     fn dupes_cli(format: OutputFormat, save_baseline: bool, baseline: Option<PathBuf>) -> Cli {
         cli_with(Command::Dupes(DupesOptions {
             mode: DupeModeArg::Mild,
-            min_tokens: judge::duplication::DEFAULT_MIN_TOKENS,
+            min_tokens: judge::rules::duplication::DEFAULT_MIN_TOKENS,
             baseline_args: baseline_args(format, save_baseline, baseline),
             include_generated: false,
             include_tests: false,
@@ -2869,7 +2863,7 @@ fn dup_two(x: i32) -> i32 {
         let dupe_introduced: Vec<_> = delta
             .introduced
             .iter()
-            .filter(|finding| finding.rule == judge::duplication::DUPLICATE_RULE)
+            .filter(|finding| finding.rule == judge::rules::duplication::DUPLICATE_RULE)
             .collect();
         assert_eq!(dupe_introduced.len(), 2);
         for finding in &dupe_introduced {
@@ -2898,7 +2892,7 @@ fn dup_two(x: i32) -> i32 {
 
         let pre_existing = judge::finding::Finding::new(
             "duplicate-code:src/lib.rs:hello:0-20".to_string(),
-            judge::duplication::DUPLICATE_RULE.to_string(),
+            judge::rules::duplication::DUPLICATE_RULE.to_string(),
             judge::finding::Severity::Warn,
             judge::finding::Location {
                 file: PathBuf::from("src/lib.rs"),
@@ -2912,12 +2906,17 @@ fn dup_two(x: i32) -> i32 {
         let baseline = judge::baseline::Baseline::new(
             std::slice::from_ref(&pre_existing),
             base_commit,
-            std::collections::HashMap::from([(judge::duplication::DUPLICATE_RULE.to_string(), 1)]),
+            std::collections::HashMap::from([(
+                judge::rules::duplication::DUPLICATE_RULE.to_string(),
+                1,
+            )]),
             0,
             judge::health_score::ScoreContext::from_profiles(&[]),
         );
-        let bumped_revisions =
-            std::collections::HashMap::from([(judge::duplication::DUPLICATE_RULE.to_string(), 2)]);
+        let bumped_revisions = std::collections::HashMap::from([(
+            judge::rules::duplication::DUPLICATE_RULE.to_string(),
+            2,
+        )]);
 
         let delta = judge::baseline::diff(
             &[pre_existing],

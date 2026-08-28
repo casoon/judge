@@ -14,7 +14,7 @@
 //! A missing or empty reason after the separator is a hard config error
 //! (todo.md §5: "Das Fehlen der Begründung ist ein Syntaxfakt; eine
 //! Wartbarkeitsschuld ist die konfigurierte Interpretation"), matching
-//! [`crate::duplication::DuplicationError::MissingSuppressionReason`]'s
+//! [`crate::rules::duplication::DuplicationError::MissingSuppressionReason`]'s
 //! precedent for `judge-dupe-off`.
 //!
 //! Note for anyone editing this module's own comments: a doc line that

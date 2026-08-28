@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::complexity;
+use crate::rules::complexity;
 use crate::ingest::{CrateInfo, EntryPointKind, Workspace};
 
 /// Schema version for [`RefactorMap`]'s independent JSON contract.
@@ -25,7 +25,7 @@ pub struct RefactorMap {
     pub files: Vec<FileSummary>,
     /// Highest-volume production clone families. These are repeated-token
     /// facts to inspect, not automatic extraction instructions.
-    pub duplication: crate::duplication::RefactoringSummary,
+    pub duplication: crate::rules::duplication::RefactoringSummary,
     pub analysis_errors: Vec<String>,
 }
 
@@ -110,10 +110,10 @@ pub fn analyze(workspace: &Workspace, include_tests: bool) -> RefactorMap {
         .crates
         .iter()
         .flat_map(|krate| krate.source_files.iter());
-    let duplication = crate::duplication::analyze_workspace_with_options(
+    let duplication = crate::rules::duplication::analyze_workspace_with_options(
         duplication_source_files,
-        crate::duplication::DupeMode::Mild,
-        crate::duplication::DEFAULT_MIN_TOKENS,
+        crate::rules::duplication::DupeMode::Mild,
+        crate::rules::duplication::DEFAULT_MIN_TOKENS,
         false,
         include_tests,
     );

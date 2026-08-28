@@ -151,7 +151,7 @@ impl DeepContext {
 
     /// Same as [`load`](Self::load), but with an explicit Cargo feature
     /// selection instead of the `--all-features`-equivalent `CargoFeatures::All`.
-    /// Used by [`crate::feature_matrix`]'s `feature-gated-dead-code`, which
+    /// Used by [`crate::rules::feature_matrix`]'s `feature-gated-dead-code`, which
     /// needs one fresh, fully re-loaded workspace per user-configured feature
     /// combination rather than every feature active at once — every other
     /// fidelity trade-off documented on `load` above (no proc-macro
@@ -210,7 +210,7 @@ impl DeepContext {
     /// happen for any path built by `crate::ingest`, and callers may treat it
     /// as such. A path that *is* well-formed but was never indexed (e.g.
     /// excluded, or not part of a crate the loader discovered — see
-    /// `crate::feature_matrix`'s `#[cfg]`-exclusion case) is a legitimate,
+    /// `crate::rules::feature_matrix`'s `#[cfg]`-exclusion case) is a legitimate,
     /// expected skip, `Ok(None)`, never an error. Otherwise `Ok(Some(_))`.
     pub fn file_id(&self, path: &Path) -> Result<Option<FileId>, DeepError> {
         let abs_path = validated_utf8_abs(path)?;
@@ -296,7 +296,7 @@ pub fn reference_count(
 
 /// The set of files that contain at least one genuine reference to the item
 /// at `position` — the basis for cross-crate usage checks like
-/// `unused-pub-workspace` (see [`crate::dead_code`]): map each file back to
+/// `unused-pub-workspace` (see [`crate::rules::dead_code`]): map each file back to
 /// its owning crate, and check whether any of them differs from the item's
 /// own defining crate.
 pub fn referencing_files(

@@ -1,4 +1,4 @@
-//! Baseline snapshots and diffs for [`crate::pattern::PatternCandidate`]s
+//! Baseline snapshots and diffs for [`crate::rules::pattern::PatternCandidate`]s
 //! (see todo.md §16 "Pattern-Kandidaten separat baselinen").
 //!
 //! Deliberately a separate, parallel mechanism from [`crate::baseline`], not
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::pattern::{PatternCandidate, PatternCandidateId, RustPattern};
+use crate::rules::pattern::{PatternCandidate, PatternCandidateId, RustPattern};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -186,7 +186,7 @@ pub fn diff_patterns(current: &[PatternCandidate], baseline: &PatternBaseline) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pattern::{CodeScope, CorroboratedEvidence, Evidence};
+    use crate::rules::pattern::{CodeScope, CorroboratedEvidence, Evidence};
 
     /// `PatternCandidateId::compute` is private to `pattern.rs` (its inputs
     /// are meaningful only to the aggregation rules that call it), so tests

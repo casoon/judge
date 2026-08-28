@@ -16,7 +16,7 @@
 //!    ([`FAIL_WEIGHT`]/[`WARN_WEIGHT`]), not configurable per rule, so
 //!    there's no per-rule knob to game.
 //! 3. **Kontextrelativ** — crate-type profiles are opt-in via `judge.toml`
-//!    (`[[crate_profile]]`, see [`crate::boundaries::CrateProfile`]), not
+//!    (`[[crate_profile]]`, see [`crate::rules::boundaries::CrateProfile`]), not
 //!    auto-guessed from crate contents.
 //! 4. **Trend vor Absolutwert** — [`trend`] recomputes the same formula over
 //!    a saved baseline's stored findings, but only under the same formula
@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::baseline::Baseline;
-use crate::boundaries::CrateProfile;
+use crate::rules::boundaries::CrateProfile;
 use crate::finding::{Finding, Severity};
 use crate::ingest::{CrateInfo, SourceFile, Workspace};
 
@@ -89,7 +89,7 @@ impl Grade {
 }
 
 /// A crate profile's validated deduction multiplier (see
-/// [`crate::boundaries::CrateProfile`] and module docs, point 3).
+/// [`crate::rules::boundaries::CrateProfile`] and module docs, point 3).
 ///
 /// Valid range: finite and within `(0.0, 10.0]`. Zero or negative values
 /// would silently erase findings from the score, `NaN`/infinite values would
@@ -754,7 +754,7 @@ mod tests {
             let source = format!(
                 "[[crate_profile]]\nname = \"lenient\"\ncrates = [\"parser\"]\ndeduction_multiplier = {value}\n"
             );
-            let result = toml::from_str::<crate::boundaries::BoundaryConfig>(&source);
+            let result = toml::from_str::<crate::rules::boundaries::BoundaryConfig>(&source);
             assert!(result.is_err(), "multiplier {value} should be rejected");
         }
     }

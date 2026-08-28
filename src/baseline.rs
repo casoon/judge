@@ -51,10 +51,10 @@ pub struct Baseline {
     #[serde(default)]
     pub score_context: Option<ScoreContext>,
     /// Per-crate public-API-surface item count at save time (see
-    /// [`crate::api_surface::ApiSurfaceSize`]), used by `cargo judge
+    /// [`crate::rules::api_surface::ApiSurfaceSize`]), used by `cargo judge
     /// api-surface`'s trend line. `None` for baselines saved by older judge
     /// versions, and for baselines saved by any command other than
-    /// `api-surface` — [`crate::api_surface::size_trend`] then reports "not
+    /// `api-surface` — [`crate::rules::api_surface::size_trend`] then reports "not
     /// comparable" per crate instead of a false delta (see todo.md §I
     /// "API-Surface-Größe pro Crate, Trend gegen Baseline", and
     /// `score_context` above for the same additive-field pattern).
@@ -93,7 +93,7 @@ impl Baseline {
     }
 
     /// Attaches a per-crate api-surface-size count to this baseline before
-    /// saving (see [`crate::api_surface::ApiSurfaceSize`]) — builder-style,
+    /// saving (see [`crate::rules::api_surface::ApiSurfaceSize`]) — builder-style,
     /// so only `cargo judge api-surface --save-baseline` opts in and every
     /// other baseline keeps `api_surface_size: None`.
     pub fn with_api_surface_size(mut self, size: HashMap<String, usize>) -> Self {

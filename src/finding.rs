@@ -133,36 +133,36 @@ pub enum Severity {
 /// | Rule | Class |
 /// |---|---|
 /// | `swallowed-result`, `empty-error-arm`, `catch-all-error`, `suppression-debt`, `merged-stub`, `empty-impl`, `assertion-free-test`, `tautological-test`, `ignored-test-accumulation`, `conversational-artifact`, `restating-comment`, `step-comment-inflation`, `generic-naming`, `doc-restates-signature` | `derived_fact` (G1–G3: the reported pattern is a syntax fact) |
-/// | `undocumented-public-item` | `derived_fact` (the absence of a `#[doc = ...]` attribute on a `pub` item is an exact syntax fact — see `crate::api_surface`) |
-/// | `semver-hazard` | `derived_fact` for the two Fast-Tier sub-cases (the absence of a `#[non_exhaustive]` attribute on a `pub enum`/`pub struct` is an exact syntax fact — see `crate::api_surface`); `bounded_semantic` for the Deep-Tier `leaked_dependency_type` sub-case, overridden at its own creation site (see `crate::api_surface_deep`) |
-/// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::duplication::CloneMember::to_finding`]) |
+/// | `undocumented-public-item` | `derived_fact` (the absence of a `#[doc = ...]` attribute on a `pub` item is an exact syntax fact — see `crate::rules::api_surface`) |
+/// | `semver-hazard` | `derived_fact` for the two Fast-Tier sub-cases (the absence of a `#[non_exhaustive]` attribute on a `pub enum`/`pub struct` is an exact syntax fact — see `crate::rules::api_surface`); `bounded_semantic` for the Deep-Tier `leaked_dependency_type` sub-case, overridden at its own creation site (see `crate::rules::api_surface_deep`) |
+/// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::rules::duplication::CloneMember::to_finding`]) |
 /// | `duplicate-crate-versions`, `msrv-drift`, `workspace-dep-drift` | `derived_fact` (manifest/resolve-graph facts read directly from `cargo_metadata`) |
 /// | `dep-without-repo` | `derived_fact` (a manifest fact — the dependency's own `repository` field — read directly from a full `cargo_metadata` resolve, same class as `duplicate-crate-versions`/`msrv-drift`/`workspace-dep-drift`) |
-/// | `unsafe-surface` | `derived_fact` (a syntax-fact pairing: an `unsafe { .. }` block's span plus the absence of an adjacent `// SAFETY:` comment, both read directly from the parsed source — see `crate::security`) |
-/// | `panic-in-lib` | `derived_fact` (a `.unwrap()`/`.expect(..)`/`panic!(..)`/indexing construct's span, plus the enclosing function's `pub` visibility, both read directly from the parsed source — same class as `unsafe-surface`, not a claim that it panics at runtime — see `crate::security`) |
-/// | `unused-feature-flag` | `derived_fact` (the feature is declared in the manifest, and zero usage of the dependency was found anywhere in the examined view — both read directly from the declared inputs, see [`crate::deps`] module docs "Feature-only evidence") |
-/// | `default-features-unused` | `derived_fact` (the manifest text explicitly sets `default-features = true`, and zero usage of the dependency was found anywhere in the examined view — see [`crate::deps`] module docs "Feature-only evidence") |
-/// | `unused-feature` | `derived_fact` (a feature this crate itself declares, with no implied features/deps and no `cfg(feature = ...)`/`cfg!(feature = ...)` reference found anywhere in its own authored source — see [`crate::deps`] module docs "`unused-feature`") |
-/// | `feature-graph-cycle` | `derived_fact` (a cyclic implication chain within one crate's own, fully self-contained `[features]` table — no partial-view caveat, unlike `dependency-cycle`'s workspace-scoped crate graph — see [`crate::boundaries`] module docs "`feature-graph-cycle`") |
+/// | `unsafe-surface` | `derived_fact` (a syntax-fact pairing: an `unsafe { .. }` block's span plus the absence of an adjacent `// SAFETY:` comment, both read directly from the parsed source — see `crate::rules::security`) |
+/// | `panic-in-lib` | `derived_fact` (a `.unwrap()`/`.expect(..)`/`panic!(..)`/indexing construct's span, plus the enclosing function's `pub` visibility, both read directly from the parsed source — same class as `unsafe-surface`, not a claim that it panics at runtime — see `crate::rules::security`) |
+/// | `unused-feature-flag` | `derived_fact` (the feature is declared in the manifest, and zero usage of the dependency was found anywhere in the examined view — both read directly from the declared inputs, see [`crate::rules::deps`] module docs "Feature-only evidence") |
+/// | `default-features-unused` | `derived_fact` (the manifest text explicitly sets `default-features = true`, and zero usage of the dependency was found anywhere in the examined view — see [`crate::rules::deps`] module docs "Feature-only evidence") |
+/// | `unused-feature` | `derived_fact` (a feature this crate itself declares, with no implied features/deps and no `cfg(feature = ...)`/`cfg!(feature = ...)` reference found anywhere in its own authored source — see [`crate::rules::deps`] module docs "`unused-feature`") |
+/// | `feature-graph-cycle` | `derived_fact` (a cyclic implication chain within one crate's own, fully self-contained `[features]` table — no partial-view caveat, unlike `dependency-cycle`'s workspace-scoped crate graph — see [`crate::rules::boundaries`] module docs "`feature-graph-cycle`") |
 /// | `unused-pub-workspace`, `crate-boundary-violation`, `dependency-cycle` | `bounded_semantic` (proven only within the loaded workspace / configured crate graph) |
-/// | `dead-enum-variant`, `test-only-pub` | `bounded_semantic` (Deep Tier; same "every workspace crate is workspace-internal" simplification as `unused-pub-workspace` — see `crate::dead_code` module docs) |
-/// | `unreachable-from-entry` | `bounded_semantic` (Deep Tier; entry-point reachability only, scoped to non-`pub` items — see `crate::dead_code`'s `UNREACHABLE_FROM_ENTRY_RULE` doc comment) |
-/// | `dead-trait-impl` | `bounded_semantic` (Deep Tier; a real `Semantics::resolve_method_call`-backed call-site resolution, scoped to traits defined within the analyzed workspace only — see `crate::dead_trait_impl` module docs) |
-/// | `unused-pub-api` | `heuristic` (Deep Tier; a published crate's public surface is expected to have zero *internal* reference — see `crate::dead_code`'s `UNUSED_PUB_API_RULE` doc comment) |
-/// | `unlinked-file`, `orphan-module` | `bounded_semantic` (proven only within the crate's own resolved `mod` tree / the loaded workspace's cross-file reference scan — see `crate::module_graph`) |
-/// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::boundaries`] module docs "Module-level boundaries") |
-/// | `module-boundary-violation-deep` | `bounded_semantic` (Deep Tier; the reference edge itself is a real symbol fact, but the `from`/`forbidden` scoping is still the same directory-convention heuristic as the Fast-Tier rule above — see `crate::boundaries_deep` module docs) |
-/// | `internal-leak` | `bounded_semantic` (Deep Tier; an explicitly configured `internal_crates` edge over the same semantically resolved type reference `leaked_dependency_type`'s `bounded_semantic` override already relies on — see `crate::api_surface_deep`, [`crate::boundaries::BoundaryConfig::internal_crates`]) |
+/// | `dead-enum-variant`, `test-only-pub` | `bounded_semantic` (Deep Tier; same "every workspace crate is workspace-internal" simplification as `unused-pub-workspace` — see `crate::rules::dead_code` module docs) |
+/// | `unreachable-from-entry` | `bounded_semantic` (Deep Tier; entry-point reachability only, scoped to non-`pub` items — see `crate::rules::dead_code`'s `UNREACHABLE_FROM_ENTRY_RULE` doc comment) |
+/// | `dead-trait-impl` | `bounded_semantic` (Deep Tier; a real `Semantics::resolve_method_call`-backed call-site resolution, scoped to traits defined within the analyzed workspace only — see `crate::rules::dead_trait_impl` module docs) |
+/// | `unused-pub-api` | `heuristic` (Deep Tier; a published crate's public surface is expected to have zero *internal* reference — see `crate::rules::dead_code`'s `UNUSED_PUB_API_RULE` doc comment) |
+/// | `unlinked-file`, `orphan-module` | `bounded_semantic` (proven only within the crate's own resolved `mod` tree / the loaded workspace's cross-file reference scan — see `crate::rules::module_graph`) |
+/// | `module-boundary-violation` | `bounded_semantic` (an explicitly configured edge over a heuristically derived, directory-convention module view — see [`crate::rules::boundaries`] module docs "Module-level boundaries") |
+/// | `module-boundary-violation-deep` | `bounded_semantic` (Deep Tier; the reference edge itself is a real symbol fact, but the `from`/`forbidden` scoping is still the same directory-convention heuristic as the Fast-Tier rule above — see `crate::rules::boundaries_deep` module docs) |
+/// | `internal-leak` | `bounded_semantic` (Deep Tier; an explicitly configured `internal_crates` edge over the same semantically resolved type reference `leaked_dependency_type`'s `bounded_semantic` override already relies on — see `crate::rules::api_surface_deep`, [`crate::rules::boundaries::BoundaryConfig::internal_crates`]) |
 /// | `unused-dev-dependency` | `bounded_semantic` (no usage found in the examined view — tests/examples/benches and `#[cfg(test)]` modules of the declaring package; doctests are not scanned) |
-/// | `unused-dependency` | `bounded_semantic` (rustc's own `unused_crate_dependencies` lint result, narrowed to the intersection across every target compiled for the package — see [`crate::deps`] module docs "Importing rustc's `unused_crate_dependencies` lint") |
+/// | `unused-dependency` | `bounded_semantic` (rustc's own `unused_crate_dependencies` lint result, narrowed to the intersection across every target compiled for the package — see [`crate::rules::deps`] module docs "Importing rustc's `unused_crate_dependencies` lint") |
 /// | `phantom-crate`, `phantom-version`, `fresh-low-reputation-dep`, `yanked-dependency`, `dep-single-maintainer` | `external_measurement` (a crates.io lookup snapshot) |
-/// | `known-vulnerability` | `external_measurement` (an imported `cargo audit --json` snapshot — see `crate::advisories`) |
-/// | `untested-hotspot` | `external_measurement` (complexity and churn are `derived_fact`/`heuristic` in isolation, but the imported `cargo-llvm-cov` coverage snapshot is the rarest, least locally-verifiable ingredient in the combination, so it sets the class — see `crate::coverage::untested_hotspots`) |
-/// | `mutation-survivor` | `external_measurement` (an imported `cargo-mutants` `outcomes.json` snapshot — same class as `untested-hotspot`, judge's other external-tool-derived test-strength signal — see `crate::mutants`) |
+/// | `known-vulnerability` | `external_measurement` (an imported `cargo audit --json` snapshot — see `crate::advisory::advisories`) |
+/// | `untested-hotspot` | `external_measurement` (complexity and churn are `derived_fact`/`heuristic` in isolation, but the imported `cargo-llvm-cov` coverage snapshot is the rarest, least locally-verifiable ingredient in the combination, so it sets the class — see `crate::advisory::coverage::untested_hotspots`) |
+/// | `mutation-survivor` | `external_measurement` (an imported `cargo-mutants` `outcomes.json` snapshot — same class as `untested-hotspot`, judge's other external-tool-derived test-strength signal — see `crate::advisory::mutants`) |
 /// | `hotspot`, `churn-hotspot`, `low-bus-factor`, `ownership-fragmentation`, `abstraction-inflation`, `complexity-inflation`, `duplicative-reinvention`, `connectivity-drop`, `name-collision-risk`, `misplaced-dependency-kind`, `heavy-dependency`, `provenance-churn`, `provenance-duplication-rate`, `provenance-suppression-debt`, `dep-added-by-agent`, `integer-cast-risk`, `fragile-substring-classification`, `size-distribution`, `complexity-concentration`, `re-export-chain`, `hardcoded-secret`, `change-coupling-signal`, `signature-complexity` | `heuristic` (reproducible interpretation, not proof) |
-/// | `crate-coupling` | `heuristic` (Deep Tier; Robert C. Martin's Instability metric `Ce / (Ca + Ce)` over the same cross-crate reference edges `unused-pub-workspace`'s `check_item` already resolves — a purely descriptive distributional signal, never a claim that a crate is 'too coupled' — see `crate::dead_code` module docs) |
-/// | `feature-gated-dead-code` | `heuristic` (Deep Tier; reachability re-checked once per user-configured `judge.toml` `[feature_matrix]` combination, but correctness depends entirely on that matrix being representative of real downstream usage — a combination the config omits is never checked, so this stays advisory rather than `unreachable-from-entry`'s `bounded_semantic` — see `crate::feature_matrix` module docs) |
-/// | `silent-default`, `context-free-propagation`, `debug-format-leak` | `heuristic` (narrow syntax-only proxies for signals that would need real type/taint information for a complete check — see `crate::slop` module docs) |
+/// | `crate-coupling` | `heuristic` (Deep Tier; Robert C. Martin's Instability metric `Ce / (Ca + Ce)` over the same cross-crate reference edges `unused-pub-workspace`'s `check_item` already resolves — a purely descriptive distributional signal, never a claim that a crate is 'too coupled' — see `crate::rules::dead_code` module docs) |
+/// | `feature-gated-dead-code` | `heuristic` (Deep Tier; reachability re-checked once per user-configured `judge.toml` `[feature_matrix]` combination, but correctness depends entirely on that matrix being representative of real downstream usage — a combination the config omits is never checked, so this stays advisory rather than `unreachable-from-entry`'s `bounded_semantic` — see `crate::rules::feature_matrix` module docs) |
+/// | `silent-default`, `context-free-propagation`, `debug-format-leak` | `heuristic` (narrow syntax-only proxies for signals that would need real type/taint information for a complete check — see `crate::rules::slop` module docs) |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceClass {
@@ -200,7 +200,7 @@ impl EvidenceClass {
 ///
 /// `duplicate-code` maps to its `Strict`/`Mild` (default-mode, fact-backed)
 /// class here; `Weak`/`Semantic` creation sites override to `Heuristic` at
-/// the source (see [`crate::duplication::CloneMember::to_finding`]) — a
+/// the source (see [`crate::rules::duplication::CloneMember::to_finding`]) — a
 /// migrated v1 baseline entry can't recover the mode, and baseline entries
 /// only serve identity matching. Unknown rule ids (e.g. from a v1 baseline
 /// written by a different judge) conservatively map to `Heuristic`.
@@ -542,7 +542,7 @@ impl AnalysisUniverse {
     /// proc-macro server and without build scripts (see `judge::deep`).
     /// `include_generated` is fixed to `false`: generated files stay in the
     /// semantic graph but are never finding targets at the Deep Tier (see
-    /// `crate::dead_code`).
+    /// `crate::rules::dead_code`).
     pub fn deep(workspace: &crate::ingest::Workspace, include_tests: bool) -> Self {
         let mut entry_points = vec!["fn-main-bin".to_string(), "fn-main-example".to_string()];
         if include_tests {
@@ -645,7 +645,7 @@ pub struct Report {
     #[serde(skip_serializing_if = "is_zero")]
     pub suppressed_inline: usize,
     /// Per-crate public-API-surface item count (see
-    /// [`crate::api_surface::ApiSurfaceSize`], todo.md §I "API-Surface-Größe
+    /// [`crate::rules::api_surface::ApiSurfaceSize`], todo.md §I "API-Surface-Größe
     /// pro Crate, Trend gegen Baseline") — additive, no version bump; only
     /// `cargo judge api-surface` fills it in, matching `analysis_universe`'s
     /// pattern of an omitted-when-absent field.

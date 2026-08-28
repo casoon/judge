@@ -2,7 +2,7 @@
 //! item with a body (`fn`, impl method, default trait method), tracking the
 //! enclosing `mod`/`impl`/`trait` path so callers get a qualified name.
 //!
-//! Used by both [`crate::complexity`] and [`crate::duplication`] so the two
+//! Used by both [`crate::rules::complexity`] and [`crate::rules::duplication`] so the two
 //! detectors agree on what counts as "a function" without duplicating the
 //! traversal logic.
 
@@ -22,7 +22,7 @@ pub struct FunctionSite<'ast> {
     pub arg_count: usize,
     /// The function's full signature — return type, generics, `where`
     /// clause, and everything else `arg_count` doesn't already summarize.
-    /// Used by [`crate::complexity`] for signature-shape metrics (return-type
+    /// Used by [`crate::rules::complexity`] for signature-shape metrics (return-type
     /// nesting depth, generic/lifetime parameter counts, trait bound counts).
     pub sig: &'ast syn::Signature,
     /// Span of just the function's identifier — narrower than `span`, which
@@ -47,7 +47,7 @@ pub struct FunctionSite<'ast> {
     /// SomeType { .. }` (i.e. the enclosing `ItemImpl.trait_.is_some()`).
     /// `false` for free functions, inherent-impl methods, and trait default
     /// methods (which live in the trait definition, not an impl block).
-    /// Used by [`crate::slop_structural_deep`] to exclude trait-dispatch
+    /// Used by [`crate::rules::slop_structural_deep`] to exclude trait-dispatch
     /// methods (`Display::fmt`, `Iterator::next`, …) from checks that rely
     /// on literal `.method()` call-site references — those methods are
     /// routinely invoked through operator/macro sugar a reference search
@@ -127,18 +127,18 @@ fn has_test_cfg(attrs: &[syn::Attribute]) -> bool {
 }
 
 /// Whether an item is itself `#[test]`-attributed. Shared with
-/// [`crate::security`], which folds this same check into its own
-/// visibility/test-scope predicates, and [`crate::api_surface`]/
-/// [`crate::slop`], which use it directly for `undocumented-public-item`'s
+/// [`crate::rules::security`], which folds this same check into its own
+/// visibility/test-scope predicates, and [`crate::rules::api_surface`]/
+/// [`crate::rules::slop`], which use it directly for `undocumented-public-item`'s
 /// `#[test]` exemption and `assertion-free-test`'s scope check.
 pub(crate) fn has_test_attr(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| attr.path().is_ident("test"))
 }
 
 /// The qualified name for a `path: Vec<String>` scope stack of the shape
-/// [`crate::api_surface::ApiSurfaceVisitor`], [`crate::pattern`]'s
-/// `TypedErrorVisitor`, [`crate::security::SecretVisitor`], and
-/// [`crate::slop::SlopVisitor`] all keep independently: the stack joined
+/// [`crate::rules::api_surface::ApiSurfaceVisitor`], [`crate::rules::pattern`]'s
+/// `TypedErrorVisitor`, [`crate::rules::security::SecretVisitor`], and
+/// [`crate::rules::slop::SlopVisitor`] all keep independently: the stack joined
 /// with `::`, or `file`'s own path if the stack is empty (top-level file
 /// scope, no enclosing named item). Those four visitors otherwise each
 /// repeat this identical three-line lookup verbatim under their own
@@ -195,7 +195,7 @@ pub(crate) fn type_name(ty: &Type) -> String {
 /// A path's final segment name (e.g. `Foo` from `some::module::Foo`), or
 /// `"?"` for a path with no segments (never happens for a valid `syn::Path`,
 /// but avoids a panic on the off chance). Shared by [`type_name`] above and
-/// [`crate::slop_structural`]'s trait-impl collector, which extracts the
+/// [`crate::rules::slop_structural`]'s trait-impl collector, which extracts the
 /// same name from a bare `syn::Path` (a trait reference) rather than a
 /// `syn::Type`.
 pub(crate) fn path_last_segment_name(path: &syn::Path) -> String {
