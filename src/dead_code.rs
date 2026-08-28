@@ -1247,6 +1247,253 @@ fn check_unreachable_from_entry(
     );
 }
 
+/// Builds [`analyze_workspace`]'s three file-id-keyed lookup maps in one
+/// pass over every workspace source file: the owning crate name, its path
+/// (for `dead-enum-variant` evidence), and its `module-coupling` bucket (see
+/// [`MODULE_COUPLING_RULE`], [`top_level_module_bucket`]) — so `check_item`
+/// can look up both an item's own module and a referencing file's module
+/// without re-deriving either per query.
+fn build_file_maps<'a>(
+    workspace: &'a Workspace,
+    ctx: &DeepContext,
+) -> Result<
+    (
+        HashMap<FileId, &'a str>,
+        HashMap<FileId, PathBuf>,
+        HashMap<FileId, String>,
+    ),
+    DeadCodeError,
+> {
+    let mut crate_of_file: HashMap<FileId, &str> = HashMap::new();
+    let mut file_path_by_id: HashMap<FileId, PathBuf> = HashMap::new();
+    let mut module_of_file: HashMap<FileId, String> = HashMap::new();
+    for krate in &workspace.crates {
+        for file in &krate.source_files {
+            if let Some(file_id) = ctx.file_id(&file.path).map_err(DeadCodeError::Deep)? {
+                crate_of_file.insert(file_id, krate.name.as_str());
+                file_path_by_id.insert(file_id, file.path.clone());
+                if let Some(bucket) = top_level_module_bucket(&krate.root, &file.path, &krate.name)
+                {
+                    module_of_file.insert(file_id, bucket);
+                }
+            }
+        }
+    }
+    Ok((crate_of_file, file_path_by_id, module_of_file))
+}
+
+/// The "production" and "all" reachability entry-key sets [`analyze_workspace`]
+/// needs — `test-only-pub` (see [`check_test_only_pub`]) needs both modes
+/// regardless of `include_tests`, so both are computed unconditionally here.
+fn compute_entry_key_sets(
+    workspace: &Workspace,
+    ctx: &DeepContext,
+) -> Result<
+    (
+        std::collections::HashSet<(FileId, u32)>,
+        std::collections::HashSet<(FileId, u32)>,
+    ),
+    DeadCodeError,
+> {
+    let entries_production = crate::reachability::entry_point_positions(workspace, ctx, false)
+        .map_err(reachability_error)?;
+    let entry_keys_production = crate::reachability::entry_keys_from(&entries_production);
+    let entries_all = crate::reachability::entry_point_positions(workspace, ctx, true)
+        .map_err(reachability_error)?;
+    let entry_keys_all = crate::reachability::entry_keys_from(&entries_all);
+    Ok((entry_keys_production, entry_keys_all))
+}
+
+/// The two `cargo_metadata`-backed sets [`analyze_workspace`] needs before
+/// its crate loop: proc-macro-exposed crates (see [`proc_macro_exposed_crates`])
+/// and publishable crates (see [`publishable_crates`]). A metadata failure on
+/// either is recorded as a soft error and falls back to an empty set — for
+/// `publishable`, that conservatively treats every crate as non-publishable,
+/// i.e. the stricter, gating `unused-pub-workspace` rather than silently
+/// downgrading a real finding to `unused-pub-api`'s `Info`/advisory-only
+/// shape.
+fn load_proc_macro_and_publishable_sets(
+    workspace_root: &Path,
+    report: &mut WorkspaceDeadCode,
+) -> (HashSet<String>, HashSet<String>) {
+    let proc_macro_exposed = match proc_macro_exposed_crates(workspace_root) {
+        Ok(exposed) => exposed,
+        Err(err) => {
+            report.errors.push(DeadCodeError::Metadata(err));
+            HashSet::new()
+        }
+    };
+    let publishable = match publishable_crates(workspace_root) {
+        Ok(publishable) => publishable,
+        Err(err) => {
+            report.errors.push(DeadCodeError::Metadata(err));
+            HashSet::new()
+        }
+    };
+    (proc_macro_exposed, publishable)
+}
+
+/// The per-file body of [`analyze_workspace`]'s crate/file loop: walks one
+/// already-parsed file's functions/methods, top-level type items, and enum
+/// variants, routing each `pub` site to [`check_item`]/[`check_test_only_pub`]
+/// and each non-`pub` function/type-item site to [`check_unreachable_from_entry`].
+#[allow(clippy::too_many_arguments)]
+fn scan_file_for_dead_code(
+    analysis: &ra_ap_ide::Analysis,
+    crate_of_file: &HashMap<FileId, &str>,
+    module_of_file: &HashMap<FileId, String>,
+    file_path_by_id: &HashMap<FileId, PathBuf>,
+    entry_keys: &std::collections::HashSet<(FileId, u32)>,
+    entry_keys_production: &std::collections::HashSet<(FileId, u32)>,
+    entry_keys_all: &std::collections::HashSet<(FileId, u32)>,
+    proc_macro_exposed: &HashSet<String>,
+    ast: &syn::File,
+    file: &SourceFile,
+    file_id: FileId,
+    krate_name: &str,
+    include_tests: bool,
+    rule_id: &str,
+    severity: Severity,
+    evidence_class: EvidenceClass,
+    reason: &str,
+    edge_counts: &mut HashMap<(String, String), u32>,
+    module_edge_counts: &mut HashMap<(String, String), u32>,
+    report: &mut WorkspaceDeadCode,
+) {
+    walk_functions(ast, |site| {
+        let (offset, line) = offset_and_line(site.ident_span);
+        if let Some(syn::Visibility::Public(_)) = site.vis {
+            check_item(
+                analysis,
+                crate_of_file,
+                module_of_file,
+                entry_keys,
+                proc_macro_exposed,
+                file,
+                file_id,
+                krate_name,
+                &site.qualified_name,
+                offset,
+                line,
+                include_tests,
+                rule_id,
+                severity,
+                evidence_class,
+                reason,
+                edge_counts,
+                module_edge_counts,
+                report,
+            );
+            check_test_only_pub(
+                analysis,
+                crate_of_file,
+                entry_keys_production,
+                entry_keys_all,
+                file,
+                file_id,
+                krate_name,
+                &site.qualified_name,
+                offset,
+                line,
+                report,
+            );
+            return;
+        }
+        // `site.vis == None` is a trait's default method, which has
+        // no visibility of its own (see `FunctionSite::vis`'s doc
+        // comment) — ambiguous whether it belongs on the `pub` or
+        // non-`pub` side of this split, so it's left unchecked by
+        // both, same as today.
+        if let Some(syn::Visibility::Inherited | syn::Visibility::Restricted(_)) = site.vis {
+            check_unreachable_from_entry(
+                analysis,
+                entry_keys,
+                proc_macro_exposed,
+                file,
+                file_id,
+                krate_name,
+                &site.qualified_name,
+                offset,
+                line,
+                include_tests,
+                report,
+            );
+        }
+    });
+
+    walk_type_items(ast, |site| {
+        let (offset, line) = offset_and_line(site.ident_span);
+        if matches!(site.vis, syn::Visibility::Public(_)) {
+            check_item(
+                analysis,
+                crate_of_file,
+                module_of_file,
+                entry_keys,
+                proc_macro_exposed,
+                file,
+                file_id,
+                krate_name,
+                &site.qualified_name,
+                offset,
+                line,
+                include_tests,
+                rule_id,
+                severity,
+                evidence_class,
+                reason,
+                edge_counts,
+                module_edge_counts,
+                report,
+            );
+            check_test_only_pub(
+                analysis,
+                crate_of_file,
+                entry_keys_production,
+                entry_keys_all,
+                file,
+                file_id,
+                krate_name,
+                &site.qualified_name,
+                offset,
+                line,
+                report,
+            );
+            return;
+        }
+        check_unreachable_from_entry(
+            analysis,
+            entry_keys,
+            proc_macro_exposed,
+            file,
+            file_id,
+            krate_name,
+            &site.qualified_name,
+            offset,
+            line,
+            include_tests,
+            report,
+        );
+    });
+
+    walk_enum_variants(ast, |site| {
+        if !matches!(site.vis, syn::Visibility::Public(_)) {
+            return;
+        }
+        check_enum_variant(
+            analysis,
+            file_path_by_id,
+            file,
+            file_id,
+            &site.qualified_name,
+            &site.variant_name,
+            site.ident_span.byte_range().start as u32,
+            site.ident_span.start().line,
+            include_tests,
+            report,
+        );
+    });
+}
+
 /// Finds `pub` functions/methods referenced only from their own defining
 /// crate — or not at all — never from another workspace crate. This is
 /// `unused-pub-workspace`, todo.md §3.A's "Kernregel": exposing something as
@@ -1265,33 +1512,9 @@ pub fn analyze_workspace(
     let ctx = DeepContext::load(&workspace.root).map_err(DeadCodeError::Deep)?;
     let analysis = ctx.analysis();
 
-    let mut crate_of_file: HashMap<FileId, &str> = HashMap::new();
-    let mut file_path_by_id: HashMap<FileId, PathBuf> = HashMap::new();
-    // `module-coupling`'s file-to-module-bucket map (see
-    // [`MODULE_COUPLING_RULE`], [`top_level_module_bucket`]) — built once
-    // here, the same way `crate_of_file` is, so `check_item` can look up
-    // both an item's own module (via its `file_id`) and a referencing file's
-    // module without re-deriving either per query.
-    let mut module_of_file: HashMap<FileId, String> = HashMap::new();
-    for krate in &workspace.crates {
-        for file in &krate.source_files {
-            if let Some(file_id) = ctx.file_id(&file.path).map_err(DeadCodeError::Deep)? {
-                crate_of_file.insert(file_id, krate.name.as_str());
-                file_path_by_id.insert(file_id, file.path.clone());
-                if let Some(bucket) = top_level_module_bucket(&krate.root, &file.path, &krate.name)
-                {
-                    module_of_file.insert(file_id, bucket);
-                }
-            }
-        }
-    }
+    let (crate_of_file, file_path_by_id, module_of_file) = build_file_maps(workspace, &ctx)?;
 
-    let entries_production = crate::reachability::entry_point_positions(workspace, &ctx, false)
-        .map_err(reachability_error)?;
-    let entry_keys_production = crate::reachability::entry_keys_from(&entries_production);
-    let entries_all = crate::reachability::entry_point_positions(workspace, &ctx, true)
-        .map_err(reachability_error)?;
-    let entry_keys_all = crate::reachability::entry_keys_from(&entries_all);
+    let (entry_keys_production, entry_keys_all) = compute_entry_key_sets(workspace, &ctx)?;
     let entry_keys = if include_tests {
         &entry_keys_all
     } else {
@@ -1314,24 +1537,8 @@ pub fn analyze_workspace(
     // the crate loop.
     let mut module_edge_counts: HashMap<(String, String), u32> = HashMap::new();
 
-    let proc_macro_exposed = match proc_macro_exposed_crates(&workspace.root) {
-        Ok(exposed) => exposed,
-        Err(err) => {
-            report.errors.push(DeadCodeError::Metadata(err));
-            HashSet::new()
-        }
-    };
-    // On a metadata failure, an empty set conservatively treats every crate
-    // as non-publishable — falling back to the stricter, gating
-    // `unused-pub-workspace` rather than silently downgrading a real finding
-    // to `unused-pub-api`'s `Info`/advisory-only shape.
-    let publishable = match publishable_crates(&workspace.root) {
-        Ok(publishable) => publishable,
-        Err(err) => {
-            report.errors.push(DeadCodeError::Metadata(err));
-            HashSet::new()
-        }
-    };
+    let (proc_macro_exposed, publishable) =
+        load_proc_macro_and_publishable_sets(&workspace.root, &mut report);
 
     for krate in &workspace.crates {
         let (rule_id, severity, evidence_class, reason) = if publishable.contains(&krate.name) {
@@ -1364,139 +1571,28 @@ pub fn analyze_workspace(
                 continue;
             };
 
-            walk_functions(&ast, |site| {
-                let (offset, line) = offset_and_line(site.ident_span);
-                if let Some(syn::Visibility::Public(_)) = site.vis {
-                    check_item(
-                        &analysis,
-                        &crate_of_file,
-                        &module_of_file,
-                        entry_keys,
-                        &proc_macro_exposed,
-                        file,
-                        file_id,
-                        &krate.name,
-                        &site.qualified_name,
-                        offset,
-                        line,
-                        include_tests,
-                        rule_id,
-                        severity,
-                        evidence_class,
-                        reason,
-                        &mut edge_counts,
-                        &mut module_edge_counts,
-                        &mut report,
-                    );
-                    check_test_only_pub(
-                        &analysis,
-                        &crate_of_file,
-                        &entry_keys_production,
-                        &entry_keys_all,
-                        file,
-                        file_id,
-                        &krate.name,
-                        &site.qualified_name,
-                        offset,
-                        line,
-                        &mut report,
-                    );
-                    return;
-                }
-                // `site.vis == None` is a trait's default method, which has
-                // no visibility of its own (see `FunctionSite::vis`'s doc
-                // comment) — ambiguous whether it belongs on the `pub` or
-                // non-`pub` side of this split, so it's left unchecked by
-                // both, same as today.
-                if let Some(syn::Visibility::Inherited | syn::Visibility::Restricted(_)) = site.vis
-                {
-                    check_unreachable_from_entry(
-                        &analysis,
-                        entry_keys,
-                        &proc_macro_exposed,
-                        file,
-                        file_id,
-                        &krate.name,
-                        &site.qualified_name,
-                        offset,
-                        line,
-                        include_tests,
-                        &mut report,
-                    );
-                }
-            });
-
-            walk_type_items(&ast, |site| {
-                let (offset, line) = offset_and_line(site.ident_span);
-                if matches!(site.vis, syn::Visibility::Public(_)) {
-                    check_item(
-                        &analysis,
-                        &crate_of_file,
-                        &module_of_file,
-                        entry_keys,
-                        &proc_macro_exposed,
-                        file,
-                        file_id,
-                        &krate.name,
-                        &site.qualified_name,
-                        offset,
-                        line,
-                        include_tests,
-                        rule_id,
-                        severity,
-                        evidence_class,
-                        reason,
-                        &mut edge_counts,
-                        &mut module_edge_counts,
-                        &mut report,
-                    );
-                    check_test_only_pub(
-                        &analysis,
-                        &crate_of_file,
-                        &entry_keys_production,
-                        &entry_keys_all,
-                        file,
-                        file_id,
-                        &krate.name,
-                        &site.qualified_name,
-                        offset,
-                        line,
-                        &mut report,
-                    );
-                    return;
-                }
-                check_unreachable_from_entry(
-                    &analysis,
-                    entry_keys,
-                    &proc_macro_exposed,
-                    file,
-                    file_id,
-                    &krate.name,
-                    &site.qualified_name,
-                    offset,
-                    line,
-                    include_tests,
-                    &mut report,
-                );
-            });
-
-            walk_enum_variants(&ast, |site| {
-                if !matches!(site.vis, syn::Visibility::Public(_)) {
-                    return;
-                }
-                check_enum_variant(
-                    &analysis,
-                    &file_path_by_id,
-                    file,
-                    file_id,
-                    &site.qualified_name,
-                    &site.variant_name,
-                    site.ident_span.byte_range().start as u32,
-                    site.ident_span.start().line,
-                    include_tests,
-                    &mut report,
-                );
-            });
+            scan_file_for_dead_code(
+                &analysis,
+                &crate_of_file,
+                &module_of_file,
+                &file_path_by_id,
+                entry_keys,
+                &entry_keys_production,
+                &entry_keys_all,
+                &proc_macro_exposed,
+                &ast,
+                file,
+                file_id,
+                &krate.name,
+                include_tests,
+                rule_id,
+                severity,
+                evidence_class,
+                reason,
+                &mut edge_counts,
+                &mut module_edge_counts,
+                &mut report,
+            );
         }
     }
 
