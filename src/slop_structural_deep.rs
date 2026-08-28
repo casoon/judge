@@ -57,7 +57,7 @@ use crate::deep::{DeepContext, DeepError, FileId};
 use crate::duplication::WorkspaceDuplication;
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::walk_functions;
-use crate::ingest::Workspace;
+use crate::ingest::{SourceFile, Workspace};
 use crate::reachability::{ReachabilityError, has_attr_ending_in};
 
 pub const DUPLICATIVE_REINVENTION_RULE: &str = "duplicative-reinvention";
@@ -188,51 +188,65 @@ fn collect_function_fan_in(
             if !file.kind.is_locally_reportable() {
                 continue;
             }
-            let file_id = match ctx.file_id(&file.path) {
-                Ok(Some(file_id)) => file_id,
-                Ok(None) => continue,
-                Err(err) => {
-                    errors.push(SlopStructuralDeepError::Deep(err));
-                    continue;
-                }
-            };
-
-            let ast = match crate::functions::read_and_parse_source(
-                &file.path,
-                |err| SlopStructuralDeepError::Io(file.path.clone(), err),
-                |err| SlopStructuralDeepError::Parse(file.path.clone(), err),
-            ) {
-                Ok((_, ast)) => ast,
-                Err(err) => {
-                    errors.push(err);
-                    continue;
-                }
-            };
-
-            walk_functions(&ast, |site| {
-                if !is_reliably_checkable_for_fan_in(site.attrs, site.in_trait_impl) {
-                    return;
-                }
-
-                let offset = site.ident_span.byte_range().start as u32;
-                let position = ra_ap_ide::FilePosition {
-                    file_id,
-                    offset: offset.into(),
-                };
-                match cross_file_reference_count(analysis, file_id, position, include_tests) {
-                    Ok(cross_file_references) => records.push(FunctionFanIn {
-                        qualified_name: site.qualified_name,
-                        file: file.path.clone(),
-                        line: site.ident_span.start().line,
-                        cross_file_references,
-                    }),
-                    Err(err) => errors.push(SlopStructuralDeepError::Deep(err)),
-                }
-            });
+            collect_file_fan_in(ctx, analysis, file, include_tests, &mut records, &mut errors);
         }
     }
 
     (records, errors)
+}
+
+/// [`collect_function_fan_in`]'s per-file body: resolves one file to its
+/// `FileId`, parses it, then walks every reliably-checkable function-like
+/// item (see [`is_reliably_checkable_for_fan_in`]) to its cross-file fan-in.
+fn collect_file_fan_in(
+    ctx: &DeepContext,
+    analysis: &ra_ap_ide::Analysis,
+    file: &SourceFile,
+    include_tests: bool,
+    records: &mut Vec<FunctionFanIn>,
+    errors: &mut Vec<SlopStructuralDeepError>,
+) {
+    let file_id = match ctx.file_id(&file.path) {
+        Ok(Some(file_id)) => file_id,
+        Ok(None) => return,
+        Err(err) => {
+            errors.push(SlopStructuralDeepError::Deep(err));
+            return;
+        }
+    };
+
+    let ast = match crate::functions::read_and_parse_source(
+        &file.path,
+        |err| SlopStructuralDeepError::Io(file.path.clone(), err),
+        |err| SlopStructuralDeepError::Parse(file.path.clone(), err),
+    ) {
+        Ok((_, ast)) => ast,
+        Err(err) => {
+            errors.push(err);
+            return;
+        }
+    };
+
+    walk_functions(&ast, |site| {
+        if !is_reliably_checkable_for_fan_in(site.attrs, site.in_trait_impl) {
+            return;
+        }
+
+        let offset = site.ident_span.byte_range().start as u32;
+        let position = ra_ap_ide::FilePosition {
+            file_id,
+            offset: offset.into(),
+        };
+        match cross_file_reference_count(analysis, file_id, position, include_tests) {
+            Ok(cross_file_references) => records.push(FunctionFanIn {
+                qualified_name: site.qualified_name,
+                file: file.path.clone(),
+                line: site.ident_span.start().line,
+                cross_file_references,
+            }),
+            Err(err) => errors.push(SlopStructuralDeepError::Deep(err)),
+        }
+    });
 }
 
 /// `connectivity-drop`: a function with zero references from any file other
