@@ -810,6 +810,42 @@ fn dead_code_finding(
     }
 }
 
+/// [`check_item`]'s `crate-coupling`/`module-coupling` edge accumulation
+/// (see [`CRATE_COUPLING_RULE`], [`MODULE_COUPLING_RULE`]): for every file
+/// referencing this item, counts a crate-coupling edge whenever the
+/// referencing crate differs from `krate_name`, and a module-coupling edge
+/// whenever the item's own module (`file_id`, looked up in `module_of_file`)
+/// differs from the referencing file's module — independently of each other,
+/// and independently of whether the item turns out to be externally used.
+fn accumulate_coupling_edges(
+    referencing: &HashSet<FileId>,
+    file_id: FileId,
+    crate_of_file: &HashMap<FileId, &str>,
+    module_of_file: &HashMap<FileId, String>,
+    krate_name: &str,
+    edge_counts: &mut HashMap<(String, String), u32>,
+    module_edge_counts: &mut HashMap<(String, String), u32>,
+) {
+    for referencing_file in referencing {
+        if let Some(&referencing_crate) = crate_of_file.get(referencing_file)
+            && referencing_crate != krate_name
+        {
+            *edge_counts
+                .entry((krate_name.to_string(), referencing_crate.to_string()))
+                .or_insert(0) += 1;
+        }
+        if let (Some(owner_module), Some(referencing_module)) = (
+            module_of_file.get(&file_id),
+            module_of_file.get(referencing_file),
+        ) && owner_module != referencing_module
+        {
+            *module_edge_counts
+                .entry((owner_module.clone(), referencing_module.clone()))
+                .or_insert(0) += 1;
+        }
+    }
+}
+
 /// Checks one `pub` item for cross-crate usage and records a finding if
 /// neither that nor entry-point reachability found it live — the shared
 /// logic both [`walk_functions`]'s and [`walk_type_items`]'s callbacks
@@ -857,35 +893,21 @@ fn check_item(
     else {
         return;
     };
-    // `crate-coupling`'s edge accumulation (see [`CRATE_COUPLING_RULE`]):
-    // done here, over the *full* `referencing` set and before the
-    // `used_externally` early exit below, so no cross-crate reference is
-    // silently dropped just because this particular item also happens to be
-    // used_externally == false (unused-pub-workspace/unused-pub-api still
-    // want it flagged) or == true (which returns early, right after this).
-    for referencing_file in &referencing {
-        if let Some(&referencing_crate) = crate_of_file.get(referencing_file)
-            && referencing_crate != krate_name
-        {
-            *edge_counts
-                .entry((krate_name.to_string(), referencing_crate.to_string()))
-                .or_insert(0) += 1;
-        }
-        // `module-coupling`'s edge accumulation (see [`MODULE_COUPLING_RULE`]):
-        // the item's own module (this call's `file_id`, looked up in
-        // `module_of_file`) against the referencing file's module — counted
-        // whenever the two differ, whether or not they're in the same crate
-        // (unlike the cross-crate-only accumulation just above).
-        if let (Some(owner_module), Some(referencing_module)) = (
-            module_of_file.get(&file_id),
-            module_of_file.get(referencing_file),
-        ) && owner_module != referencing_module
-        {
-            *module_edge_counts
-                .entry((owner_module.clone(), referencing_module.clone()))
-                .or_insert(0) += 1;
-        }
-    }
+    // Done here, over the *full* `referencing` set and before the
+    // `used_externally` early exit below, so no cross-crate/cross-module
+    // reference is silently dropped just because this particular item also
+    // happens to be used_externally == false (unused-pub-workspace/
+    // unused-pub-api still want it flagged) or == true (which returns early,
+    // right after this).
+    accumulate_coupling_edges(
+        &referencing,
+        file_id,
+        crate_of_file,
+        module_of_file,
+        krate_name,
+        edge_counts,
+        module_edge_counts,
+    );
     if is_used_externally(&referencing, crate_of_file, krate_name) {
         return;
     }
