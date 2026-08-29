@@ -943,35 +943,52 @@ pub(crate) fn run_module_graph(
                 "tty, json, sarif",
             ));
         }
-        OutputFormat::Tty => {
-            let (unlinked, orphaned): (Vec<&Finding>, Vec<&Finding>) =
-                findings.iter().partition(|finding| {
-                    finding.rule == judge::rules::module_graph::UNLINKED_FILE_RULE
-                });
-            write_error_list(out, "files skipped (parse errors)", &analysis_errors)?;
-            write_excluded_and_suppressed_lines(out, excluded_generated, suppressed_inline)?;
-            writeln!(out, "unlinked-file findings: {}", unlinked.len())?;
-            for finding in &unlinked {
-                writeln!(
-                    out,
-                    "  [{}] {}",
-                    severity_label(finding.severity),
-                    finding.location.item_path
-                )?;
-            }
-            writeln!(out)?;
-            writeln!(out, "orphan-module findings: {}", orphaned.len())?;
-            for finding in &orphaned {
-                writeln!(
-                    out,
-                    "  [{}] {}",
-                    severity_label(finding.severity),
-                    finding.location.item_path
-                )?;
-            }
-        }
+        OutputFormat::Tty => write_module_graph_tty(
+            out,
+            &findings,
+            &analysis_errors,
+            excluded_generated,
+            suppressed_inline,
+        )?,
     }
     Ok(CommandOutcome::Clean)
+}
+
+/// `run_module_graph`'s TTY output: error/exclusion lines, then the
+/// `unlinked-file` findings followed by the `orphan-module` findings, each as
+/// its own `[severity] item` list.
+fn write_module_graph_tty(
+    out: &mut dyn Write,
+    findings: &[Finding],
+    analysis_errors: &[String],
+    excluded_generated: usize,
+    suppressed_inline: usize,
+) -> std::io::Result<()> {
+    let (unlinked, orphaned): (Vec<&Finding>, Vec<&Finding>) = findings
+        .iter()
+        .partition(|finding| finding.rule == judge::rules::module_graph::UNLINKED_FILE_RULE);
+    write_error_list(out, "files skipped (parse errors)", analysis_errors)?;
+    write_excluded_and_suppressed_lines(out, excluded_generated, suppressed_inline)?;
+    writeln!(out, "unlinked-file findings: {}", unlinked.len())?;
+    for finding in &unlinked {
+        writeln!(
+            out,
+            "  [{}] {}",
+            severity_label(finding.severity),
+            finding.location.item_path
+        )?;
+    }
+    writeln!(out)?;
+    writeln!(out, "orphan-module findings: {}", orphaned.len())?;
+    for finding in &orphaned {
+        writeln!(
+            out,
+            "  [{}] {}",
+            severity_label(finding.severity),
+            finding.location.item_path
+        )?;
+    }
+    Ok(())
 }
 
 /// Focused unsafe-code review. The result is a projection of concrete syntax
@@ -1121,6 +1138,47 @@ fn render_focused(
     Ok(CommandOutcome::Clean)
 }
 
+/// The third `semver-hazard` sub-case (`leaked_dependency_type`) of
+/// `run_api_surface`: needs the Deep Tier's type resolution — see
+/// `judge::rules::api_surface_deep`'s module docs. Only available in a build
+/// compiled with `--features deep`; a Fast Tier build silently skips it
+/// rather than erroring, unlike `dead-code` (whose *entire* subcommand needs
+/// the Deep Tier), because the other two `semver-hazard` sub-cases and
+/// `undocumented-public-item` are useful on their own. Extends `findings`/
+/// `analysis_errors` in place and returns the deep-tier-only error list plus
+/// the checked-fn count `run_api_surface`'s TTY view reports separately.
+#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
+fn apply_deep_api_surface_checks(
+    workspace: &judge::ingest::Workspace,
+    boundary_config: &judge::rules::boundaries::BoundaryConfig,
+    findings: &mut Vec<Finding>,
+    analysis_errors: &mut Vec<String>,
+) -> Result<(Vec<String>, Option<usize>), CliError> {
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut deep_errors: Vec<String> = Vec::new();
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut deep_checked: Option<usize> = None;
+    if judge::AnalysisTier::Deep.is_available() {
+        #[cfg(feature = "deep")]
+        {
+            let deep_report = judge::rules::api_surface_deep::analyze_workspace(
+                workspace,
+                &boundary_config.internal_crates,
+            )
+            .map_err(|err| CliError::Analyzer(err.to_string()))?;
+            deep_checked = Some(deep_report.checked);
+            findings.extend(deep_report.findings);
+            deep_errors = super::baseline_output::analysis_errors(&deep_report.errors);
+            analysis_errors.extend(deep_errors.iter().cloned());
+        }
+        #[cfg(not(feature = "deep"))]
+        {
+            deep_tier_unreachable();
+        }
+    }
+    Ok((deep_errors, deep_checked))
+}
+
 /// Public-API-surface findings (`undocumented-public-item` and
 /// `semver-hazard` — see todo.md §I). Subcommand-only: deliberately not
 /// wired into `collect_findings`/`run_all`/`SLOP_RULES`, matching
@@ -1149,40 +1207,10 @@ pub(crate) fn run_api_surface(
 
     let report =
         judge::rules::api_surface::analyze_workspace(workspace.crates.iter(), include_generated);
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
     let mut findings = report.findings;
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
     let mut analysis_errors = analysis_errors(&report.errors);
-
-    // The third `semver-hazard` sub-case (`leaked_dependency_type`) needs
-    // the Deep Tier's type resolution — see `judge::rules::api_surface_deep`'s
-    // module docs. Only available in a build compiled with `--features
-    // deep`; a Fast Tier build silently skips it rather than erroring,
-    // unlike `dead-code` (whose *entire* subcommand needs the Deep Tier),
-    // because the other two `semver-hazard` sub-cases and
-    // `undocumented-public-item` are useful on their own.
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut deep_errors: Vec<String> = Vec::new();
-    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-    let mut deep_checked: Option<usize> = None;
-    if judge::AnalysisTier::Deep.is_available() {
-        #[cfg(feature = "deep")]
-        {
-            let deep_report = judge::rules::api_surface_deep::analyze_workspace(
-                &workspace,
-                &boundary_config.internal_crates,
-            )
-            .map_err(|err| CliError::Analyzer(err.to_string()))?;
-            deep_checked = Some(deep_report.checked);
-            findings.extend(deep_report.findings);
-            deep_errors = super::baseline_output::analysis_errors(&deep_report.errors);
-            analysis_errors.extend(deep_errors.iter().cloned());
-        }
-        #[cfg(not(feature = "deep"))]
-        {
-            deep_tier_unreachable();
-        }
-    }
+    let (deep_errors, deep_checked) =
+        apply_deep_api_surface_checks(&workspace, &boundary_config, &mut findings, &mut analysis_errors)?;
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (findings, suppressed_inline) =
@@ -1209,45 +1237,14 @@ pub(crate) fn run_api_surface(
     }
 
     if save_baseline || baseline.is_some() {
-        #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
-        let mut rule_revisions = std::collections::HashMap::from([
-            (
-                judge::rules::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE.to_string(),
-                judge::rules::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION,
-            ),
-            (
-                judge::rules::api_surface::SEMVER_HAZARD_RULE.to_string(),
-                judge::rules::api_surface::SEMVER_HAZARD_RULE_REVISION,
-            ),
-        ]);
-        #[cfg(feature = "deep")]
-        rule_revisions.insert(
-            judge::rules::api_surface_deep::INTERNAL_LEAK_RULE.to_string(),
-            judge::rules::api_surface_deep::INTERNAL_LEAK_RULE_REVISION,
-        );
-        #[cfg(feature = "deep")]
-        rule_revisions.insert(
-            judge::rules::api_surface_deep::RE_EXPORT_CHAIN_RULE.to_string(),
-            judge::rules::api_surface_deep::RE_EXPORT_CHAIN_RULE_REVISION,
-        );
-        let current_size: std::collections::HashMap<String, usize> = size_trend
-            .iter()
-            .map(|trend| (trend.crate_name.clone(), trend.item_count))
-            .collect();
-        return handle_baseline_with_trend(
-            &workspace.root,
+        return save_or_compare_api_surface_baseline(
+            &workspace,
             &findings,
             &analysis_errors,
-            BaselineOptions {
-                rule_revisions,
-                save: save_baseline,
-                compare_path: baseline.as_deref(),
-                default_save_path: Path::new(DEFAULT_BASELINE_API_SURFACE),
-                format,
-                total_loc: judge::health_score::total_authored_loc(&workspace),
-            },
-            None,
-            Some(&current_size),
+            save_baseline,
+            baseline.as_deref(),
+            format,
+            &size_trend,
             out,
         );
     }
@@ -1274,27 +1271,107 @@ pub(crate) fn run_api_surface(
                 "tty, json, sarif",
             ));
         }
-        OutputFormat::Tty => {
-            writeln!(out, "undocumented public items: {}", findings.len())?;
-            if let Some(checked) = deep_checked {
-                writeln!(out, "pub fns checked (leaked_dependency_type): {checked}")?;
-            }
-            write_error_list(out, "files skipped (parse errors)", &report.errors)?;
-            write_error_list(out, "leaked-dependency-type analysis errors", &deep_errors)?;
-            write_excluded_and_suppressed_lines(out, report.excluded_generated, suppressed_inline)?;
-            for finding in &findings {
-                writeln!(
-                    out,
-                    "  [{}] {}:{}  {}",
-                    severity_label(finding.severity),
-                    finding.location.file.display(),
-                    finding.location.line,
-                    finding.location.item_path
-                )?;
-            }
-        }
+        OutputFormat::Tty => write_api_surface_tty(
+            out,
+            &findings,
+            &report.errors,
+            &deep_errors,
+            deep_checked,
+            report.excluded_generated,
+            suppressed_inline,
+        )?,
     }
     Ok(CommandOutcome::Clean)
+}
+
+/// The `run_api_surface` baseline-save/compare path, taken when
+/// `--save-baseline` or `--baseline` was given: builds the rule-revision map
+/// (including the two Deep-Tier-only `api_surface_deep` rules when compiled
+/// with `--features deep`) and the crate-size-trend map, then delegates to
+/// `handle_baseline_with_trend`.
+fn save_or_compare_api_surface_baseline(
+    workspace: &judge::ingest::Workspace,
+    findings: &[Finding],
+    analysis_errors: &[String],
+    save_baseline: bool,
+    baseline: Option<&Path>,
+    format: OutputFormat,
+    size_trend: &[judge::rules::api_surface::CrateSizeTrend],
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    #[cfg_attr(not(feature = "deep"), allow(unused_mut))]
+    let mut rule_revisions = std::collections::HashMap::from([
+        (
+            judge::rules::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE.to_string(),
+            judge::rules::api_surface::UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION,
+        ),
+        (
+            judge::rules::api_surface::SEMVER_HAZARD_RULE.to_string(),
+            judge::rules::api_surface::SEMVER_HAZARD_RULE_REVISION,
+        ),
+    ]);
+    #[cfg(feature = "deep")]
+    rule_revisions.insert(
+        judge::rules::api_surface_deep::INTERNAL_LEAK_RULE.to_string(),
+        judge::rules::api_surface_deep::INTERNAL_LEAK_RULE_REVISION,
+    );
+    #[cfg(feature = "deep")]
+    rule_revisions.insert(
+        judge::rules::api_surface_deep::RE_EXPORT_CHAIN_RULE.to_string(),
+        judge::rules::api_surface_deep::RE_EXPORT_CHAIN_RULE_REVISION,
+    );
+    let current_size: std::collections::HashMap<String, usize> = size_trend
+        .iter()
+        .map(|trend| (trend.crate_name.clone(), trend.item_count))
+        .collect();
+    handle_baseline_with_trend(
+        &workspace.root,
+        findings,
+        analysis_errors,
+        BaselineOptions {
+            rule_revisions,
+            save: save_baseline,
+            compare_path: baseline,
+            default_save_path: Path::new(DEFAULT_BASELINE_API_SURFACE),
+            format,
+            total_loc: judge::health_score::total_authored_loc(workspace),
+        },
+        None,
+        Some(&current_size),
+        out,
+    )
+}
+
+/// `run_api_surface`'s TTY output: summary counts, error/exclusion lines,
+/// then one `[severity] file:line item` line per `undocumented-public-item`/
+/// `semver-hazard` finding.
+fn write_api_surface_tty(
+    out: &mut dyn Write,
+    findings: &[Finding],
+    parse_errors: &[judge::rules::api_surface::ApiSurfaceError],
+    deep_errors: &[String],
+    deep_checked: Option<usize>,
+    excluded_generated: usize,
+    suppressed_inline: usize,
+) -> std::io::Result<()> {
+    writeln!(out, "undocumented public items: {}", findings.len())?;
+    if let Some(checked) = deep_checked {
+        writeln!(out, "pub fns checked (leaked_dependency_type): {checked}")?;
+    }
+    write_error_list(out, "files skipped (parse errors)", parse_errors)?;
+    write_error_list(out, "leaked-dependency-type analysis errors", deep_errors)?;
+    write_excluded_and_suppressed_lines(out, excluded_generated, suppressed_inline)?;
+    for finding in findings {
+        writeln!(
+            out,
+            "  [{}] {}:{}  {}",
+            severity_label(finding.severity),
+            finding.location.file.display(),
+            finding.location.line,
+            finding.location.item_path
+        )?;
+    }
+    Ok(())
 }
 
 /// One `api surface: <crate> <count> items` line per crate (see todo.md §I
