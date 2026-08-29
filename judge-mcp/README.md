@@ -62,7 +62,6 @@ The server speaks MCP over stdio.
 | `health` | `cargo-judge health --format json [--score]` |
 | `dupes` | `cargo-judge dupes --format json [--mode ...]` |
 | `dead_code` | `cargo-judge dead-code --format json` (needs a `--features deep` build) |
-| `audit` | `cargo-judge audit --since <ref> --format json` |
 | `explain_finding` | `cargo-judge explain-rule <rule-id> --format json` |
 | `inspect_symbol` | `cargo-judge explain <item-path> --why-live --format json` (needs a `--features deep` build) |
 | `fix_preview` | `cargo-judge fix-preview <pattern-id> --format json` |

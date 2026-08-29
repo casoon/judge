@@ -219,69 +219,6 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
-// audit -> `cargo-judge audit --since <ref> --format json`
-// ---------------------------------------------------------------------------
-const AuditInputSchema = {
-  workspace_root: workspaceRootField,
-  since: z
-    .string()
-    .describe("Commit-ish boundary findings are classified against (--since <ref>)."),
-  baseline: z
-    .string()
-    .optional()
-    .describe(
-      "Baseline file to compare against. Defaults to .judge/baseline.json, which must " +
-        "already exist (written by `analyze` with save_baseline).",
-    ),
-  audit_min_sample: z
-    .number()
-    .int()
-    .optional()
-    .describe("Minimum touched authored LOC before a ratio gate is evaluated (--audit-min-sample)."),
-  max_duplication_ratio: z
-    .number()
-    .optional()
-    .describe("Maximum allowed duplicated-token ratio before the duplication gate fails."),
-  max_suppression_ratio: z
-    .number()
-    .optional()
-    .describe("Maximum allowed suppression-debt ratio before the suppression-debt gate fails."),
-};
-
-server.registerTool(
-  "audit",
-  {
-    title: "judge PR audit verdict",
-    description:
-      "Runs `cargo-judge audit --since <ref> --format json`: a pass/warn/fail verdict " +
-      "scoped to findings introduced since <ref>, against an already-saved baseline. " +
-      "Read-only; computes nothing itself, only forwards judge's own JSON report.",
-    inputSchema: AuditInputSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false },
-  },
-  async ({
-    workspace_root,
-    since,
-    baseline,
-    audit_min_sample,
-    max_duplication_ratio,
-    max_suppression_ratio,
-  }) => {
-    const args: string[] = ["audit", "--since", since];
-    if (baseline) args.push("--baseline", baseline);
-    if (audit_min_sample !== undefined) args.push("--audit-min-sample", String(audit_min_sample));
-    if (max_duplication_ratio !== undefined) {
-      args.push("--max-duplication-ratio", String(max_duplication_ratio));
-    }
-    if (max_suppression_ratio !== undefined) {
-      args.push("--max-suppression-ratio", String(max_suppression_ratio));
-    }
-    args.push("--format", "json");
-    return callJudge(args, workspace_root);
-  },
-);
-
-// ---------------------------------------------------------------------------
 // explain_finding -> `cargo-judge explain-rule <rule-id> --format json`
 //
 // Deviation from todo.md §7's naming: judge's CLI has no
