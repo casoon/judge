@@ -445,6 +445,118 @@ fn write_deps_tty_findings(
     Ok(())
 }
 
+/// `cargo judge deps --why <crate>` (GitHub issue #22): renders
+/// [`judge::rules::deps::why`]'s result. Bypasses the whole findings/baseline
+/// path `run_deps` otherwise runs entirely — this is a query, not a check,
+/// the same precedent `run_boundaries`'s `--graph` early-return sets (see
+/// `DepsOptions::why`'s doc comment: it ignores every other flag).
+fn run_deps_why(
+    dependency_name: &str,
+    format: OutputFormat,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    if matches!(format, OutputFormat::Sarif | OutputFormat::Markdown) {
+        return Err(unsupported_format("`deps --why`", format, "tty, json"));
+    }
+
+    let workspace = judge::ingest::load(None)?;
+    let report = judge::rules::deps::why(&workspace, dependency_name);
+
+    match format {
+        OutputFormat::Json => {
+            let value = serde_json::json!({
+                "dependency_name": report.dependency_name,
+                "found": report.found,
+                "declared_by": report.declared_by,
+                "graph_paths": report.graph_paths,
+                "public_api_exposure": report.public_api_exposure,
+                "errors": analysis_errors(&report.errors),
+            });
+            write_json(out, &value)?;
+        }
+        OutputFormat::Tty => print_deps_why_tty(out, &report)?,
+        OutputFormat::Sarif | OutputFormat::Markdown => unreachable!("rejected above"),
+    }
+    Ok(CommandOutcome::Clean)
+}
+
+/// The TTY view for [`run_deps_why`].
+fn print_deps_why_tty(
+    out: &mut dyn Write,
+    report: &judge::rules::deps::DependencyWhyReport,
+) -> std::io::Result<()> {
+    if !report.found {
+        writeln!(
+            out,
+            "`{}` was not found anywhere in the resolved workspace dependency graph",
+            report.dependency_name
+        )?;
+        return Ok(());
+    }
+
+    writeln!(out, "{}", report.dependency_name)?;
+
+    if report.declared_by.is_empty() {
+        writeln!(
+            out,
+            "  not declared directly by any workspace crate (transitive only — see graph paths below)"
+        )?;
+    }
+    for declaration in &report.declared_by {
+        let target_note = declaration
+            .target
+            .as_deref()
+            .map(|target| format!(" (target: {target})"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "  declared by {} as a {} dependency{target_note}",
+            declaration.crate_name,
+            declaration.kind.label(),
+        )?;
+        if declaration.features.is_empty() {
+            writeln!(out, "    features: (none declared)")?;
+        } else {
+            writeln!(out, "    features: {}", declaration.features.join(", "))?;
+        }
+        writeln!(
+            out,
+            "    default-features = true (explicit): {}",
+            declaration.default_features_explicit
+        )?;
+        if declaration.usages.is_empty() {
+            writeln!(out, "    source usages: none found in the examined view")?;
+        } else {
+            writeln!(out, "    source usages: {}", declaration.usages.len())?;
+            for usage in &declaration.usages {
+                writeln!(
+                    out,
+                    "      {}:{}  ({})",
+                    usage.file.display(),
+                    usage.line,
+                    usage.domain.label(),
+                )?;
+            }
+        }
+    }
+
+    writeln!(out, "  public API exposure: {}", report.public_api_exposure)?;
+
+    writeln!(out, "  resolved graph paths:")?;
+    let mut crate_names: Vec<&String> = report.graph_paths.keys().collect();
+    crate_names.sort();
+    for crate_name in crate_names {
+        let path = &report.graph_paths[crate_name];
+        if path.is_empty() {
+            writeln!(out, "    {crate_name}: (no path found)")?;
+        } else {
+            writeln!(out, "    {crate_name} -> {}", path.join(" -> "))?;
+        }
+    }
+
+    write_error_list(out, "errors", &report.errors)
+}
+
 pub(crate) fn run_deps(
     options: DepsOptions,
     out: &mut dyn Write,
@@ -454,8 +566,14 @@ pub(crate) fn run_deps(
         check_crates_io,
         check_rustc_lints,
         audit_json,
+        why,
     } = options;
     let format = baseline_args.format;
+
+    if let Some(dependency_name) = why {
+        return run_deps_why(&dependency_name, format, out);
+    }
+
     let workspace = judge::ingest::load(None)?;
 
     let report = judge::rules::deps::analyze_workspace(&workspace);

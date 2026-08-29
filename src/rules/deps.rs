@@ -113,10 +113,38 @@
 //! dependencies: `dev`/`build` dependencies are out of scope here
 //! (`dev-dependencies` already has its own `unused-dev-dependency` detector
 //! above, built on judge's own usage scan rather than an imported lint).
+//!
+//! ## `cargo judge deps --why <crate>` (GitHub issue #22)
+//!
+//! [`why`] is a query view over the same per-crate usage evidence
+//! `analyze_workspace` already computes, not a new detector: it emits no
+//! findings. [`collect_crate_usage`]'s `code_identifier -> domains observed`
+//! map (what every rule above needs) collapses each usage down to a
+//! [`UsageDomain`] set; `why` instead keeps every usage's file:line location,
+//! via a fresh, narrower per-dependency parse ([`collect_usage_sites`]) —
+//! `--why` is opt-in and scoped to one dependency, so re-parsing the crate's
+//! source files once more for it is cheap and keeps `analyze_workspace`'s
+//! hot path unchanged. It also resolves the dependency graph path(s) from
+//! this workspace's own crate(s) to the named dependency
+//! ([`resolve_graph_paths`]) via a second, plain `cargo metadata` resolve —
+//! [`resolve_full_metadata`]'s own resolve discards its adjacency map once
+//! each node's reachable-set *size* is computed, so it isn't reused here.
+//!
+//! Public API exposure (does this dependency's type appear in this crate's
+//! own `pub fn`/`pub struct` signatures?) is reported as an explicit
+//! analysis limitation rather than computed. `judge::rules::api_surface_deep`
+//! does resolve exactly this question (`leaked_dependency_type`), but only
+//! via a full `ra_ap_hir` semantic database — Deep Tier, `--features deep`,
+//! its own expensive setup. Running that as a side effect of a Fast-Tier
+//! query command would be a different order of cost than everything else
+//! `--why` reports, and a real architecture decision of its own — left as a
+//! stated limitation rather than guessed at here (see `cargo judge
+//! api-surface`, built with `--features deep`, for that check instead).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
 use syn::visit::{self, Visit};
 use syn::{ItemUse, UseTree};
 
@@ -192,11 +220,25 @@ const SHORT_FEATURE_LIST_MAX: usize = 1;
 /// Where a source file sits, classified purely by path convention relative
 /// to its crate root (Fast Tier, directory-convention heuristic — not exact
 /// module-graph resolution, see todo.md §2.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UsageDomain {
     Normal,
     Dev,
     Build,
+}
+
+impl UsageDomain {
+    /// The short, lowercase label used in `cargo judge deps --why`'s TTY
+    /// output (see [`why`], GitHub issue #22) — mirrors
+    /// [`DependencyKind::label`]'s precedent rather than a bare `{:?}`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Dev => "dev",
+            Self::Build => "build",
+        }
+    }
 }
 
 /// Classifies `relative` (a source file path relative to its crate root).
@@ -370,6 +412,308 @@ pub fn analyze_workspace(workspace: &Workspace) -> WorkspaceDeps {
         feature_only_candidates,
         errors,
     }
+}
+
+/// Stated once and reused by both [`why`]'s TTY and JSON rendering (via the
+/// `--why` CLI command) — the honest answer to "does this dependency's type
+/// appear in this crate's own public API surface" is a fixed limitation
+/// statement, not a computed value (see module docs "`cargo judge deps --why
+/// <crate>`").
+const PUBLIC_API_EXPOSURE_LIMITATION: &str = "not determined \u{2014} public API exposure requires Deep-Tier semantic analysis (see `cargo judge api-surface`, built with `--features deep`); this Fast-Tier query cannot resolve whether this dependency's types appear in this crate's own public API surface";
+
+/// One location where a dependency's `code_identifier` was found referenced
+/// in source — the evidence [`why`] shows for "source usages" (GitHub issue
+/// #22). Unlike [`collect_crate_usage`]'s aggregated `code_identifier ->
+/// domains observed` map (all of `analyze_workspace`'s rules need only
+/// that), this keeps the file:line, collected by [`collect_usage_sites`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DependencyUsageSite {
+    pub file: PathBuf,
+    pub line: OneBasedLine,
+    pub domain: UsageDomain,
+}
+
+/// One workspace crate's declaration of the dependency named in a [`why`]
+/// query, plus every usage site [`collect_usage_sites`] found for it in that
+/// crate's own source files.
+#[derive(Debug, Serialize)]
+pub struct DependencyDeclaration {
+    pub crate_name: String,
+    pub kind: DependencyKind,
+    pub features: Vec<String>,
+    /// Whether the manifest explicitly sets `default-features = true` (see
+    /// [`manifest_explicitly_enables_default_features`]) — `false` also
+    /// covers "the manifest's `default-features` key is simply absent", the
+    /// same ambiguity that function's own doc comment explains.
+    pub default_features_explicit: bool,
+    pub target: Option<String>,
+    pub usages: Vec<DependencyUsageSite>,
+}
+
+/// [`why`]'s full result — `cargo judge deps --why <crate>` (GitHub issue
+/// #22). Not a [`WorkspaceDeps`]: a query view produces no findings and
+/// affects no verdict.
+#[derive(Debug)]
+pub struct DependencyWhyReport {
+    pub dependency_name: String,
+    /// Whether `dependency_name` was found anywhere: as a dependency
+    /// declared by any workspace crate, or as a package anywhere in the
+    /// resolved dependency graph (see [`resolve_graph_paths`]). `false` is
+    /// the CLI's "not found" case.
+    pub found: bool,
+    pub declared_by: Vec<DependencyDeclaration>,
+    /// Per workspace crate name, the shortest resolved-graph path from that
+    /// crate to `dependency_name` (see [`resolve_graph_paths`]) — package
+    /// names from the first hop (exclusive of the crate itself) to
+    /// `dependency_name` (inclusive). An empty `Vec` means no path was found
+    /// from that crate (including the crate declaring it directly, which
+    /// still has a one-element path).
+    pub graph_paths: HashMap<String, Vec<String>>,
+    pub public_api_exposure: &'static str,
+    pub errors: Vec<DepsError>,
+}
+
+/// Runs `cargo judge deps --why <crate>` (GitHub issue #22, see module docs
+/// "`cargo judge deps --why <crate>`"): every workspace crate's declaration
+/// of `dependency_name` (kind, features, `default-features = true`?, and
+/// every source location its code identifier is referenced from), plus the
+/// resolved dependency-graph path(s) reaching it. A query view, not a new
+/// detector — it never produces [`Finding`]s.
+pub fn why(workspace: &Workspace, dependency_name: &str) -> DependencyWhyReport {
+    let mut errors = Vec::new();
+    let mut declared_by = Vec::new();
+
+    for krate in &workspace.crates {
+        for dep in &krate.dependencies {
+            if dep.name != dependency_name {
+                continue;
+            }
+            let manifest = read_manifest_toml(&krate.manifest_path, &mut errors);
+            let default_features_explicit = manifest.as_ref().is_some_and(|manifest| {
+                manifest_explicitly_enables_default_features(manifest, &dep.name)
+            });
+            let (usages, usage_errors) = collect_usage_sites(krate, &dep.code_identifier);
+            errors.extend(usage_errors);
+            declared_by.push(DependencyDeclaration {
+                crate_name: krate.name.clone(),
+                kind: dep.kind,
+                features: dep.features.clone(),
+                default_features_explicit,
+                target: dep.target.clone(),
+                usages,
+            });
+        }
+    }
+
+    let manifest_path = workspace.root.join("Cargo.toml");
+    let (found_in_graph, graph_paths) = match resolve_graph_paths(&manifest_path, dependency_name) {
+        Ok(result) => result,
+        Err(err) => {
+            errors.push(DepsError::Metadata(err));
+            (false, HashMap::new())
+        }
+    };
+
+    DependencyWhyReport {
+        dependency_name: dependency_name.to_string(),
+        found: found_in_graph || !declared_by.is_empty(),
+        declared_by,
+        graph_paths,
+        public_api_exposure: PUBLIC_API_EXPOSURE_LIMITATION,
+        errors,
+    }
+}
+
+/// Every location in `krate`'s own source files where `target` (a
+/// dependency's `code_identifier`) is referenced by identifier — the
+/// evidence behind [`why`]'s "source usages". Parses each source file fresh
+/// via [`WhySiteCollector`] rather than sharing [`collect_crate_usage`]'s
+/// aggregated pass (see [`DependencyUsageSite`]'s doc comment for why). A
+/// file that fails to read or parse contributes a [`DepsError`] rather than
+/// being silently skipped: `--why`'s acceptance criterion is to identify
+/// every usage with a location or state its analysis limitation, so a gap in
+/// what it could examine has to surface, not pass silently as "no more
+/// usages found".
+fn collect_usage_sites(
+    krate: &CrateInfo,
+    target: &str,
+) -> (Vec<DependencyUsageSite>, Vec<DepsError>) {
+    let mut sites = Vec::new();
+    let mut errors = Vec::new();
+
+    for file in &krate.source_files {
+        let relative = file
+            .path
+            .strip_prefix(&krate.root)
+            .unwrap_or(file.path.as_path());
+        let domain = classify_domain(relative);
+
+        match read_and_parse_source(
+            &file.path,
+            |err| DepsError::Io(file.path.clone(), err),
+            |err| DepsError::Parse(file.path.clone(), err),
+        ) {
+            Ok((_, ast)) => {
+                let mut collector = WhySiteCollector {
+                    target,
+                    file: &file.path,
+                    domain,
+                    sites: Vec::new(),
+                };
+                collector.visit_file(&ast);
+                sites.extend(collector.sites);
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+
+    sites.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    sites.dedup();
+    (sites, errors)
+}
+
+/// Records every span where `target` appears as the first segment of a
+/// referenced path or `use` tree — the same walk [`PathIdentCollector`] does
+/// for [`collect_crate_usage`], narrowed to one identifier and keeping the
+/// span (via `syn::Ident::span`) instead of only recording "this identifier
+/// was seen somewhere".
+struct WhySiteCollector<'a> {
+    target: &'a str,
+    file: &'a Path,
+    domain: UsageDomain,
+    sites: Vec<DependencyUsageSite>,
+}
+
+impl WhySiteCollector<'_> {
+    fn record(&mut self, ident: &proc_macro2::Ident) {
+        if *ident != self.target {
+            return;
+        }
+        if let Some(line) = OneBasedLine::new(ident.span().start().line) {
+            self.sites.push(DependencyUsageSite {
+                file: self.file.to_path_buf(),
+                line,
+                domain: self.domain,
+            });
+        }
+    }
+
+    /// Mirrors [`PathIdentCollector::walk_use_tree`]: `UseTree` has no
+    /// `syn::Path` node, so `visit_path` never sees `use` items.
+    fn walk_use_tree(&mut self, tree: &UseTree) {
+        match tree {
+            UseTree::Path(use_path) => self.record(&use_path.ident),
+            UseTree::Name(use_name) => self.record(&use_name.ident),
+            UseTree::Rename(use_rename) => self.record(&use_rename.ident),
+            UseTree::Glob(_) => {}
+            UseTree::Group(group) => {
+                for item in &group.items {
+                    self.walk_use_tree(item);
+                }
+            }
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for WhySiteCollector<'_> {
+    fn visit_item_use(&mut self, node: &'ast ItemUse) {
+        self.walk_use_tree(&node.tree);
+    }
+
+    fn visit_path(&mut self, node: &'ast syn::Path) {
+        if let Some(first) = node.segments.first() {
+            self.record(&first.ident);
+        }
+        visit::visit_path(self, node);
+    }
+}
+
+/// Resolved dependency-graph paths from every workspace crate to
+/// `dependency_name`, via a plain full (non `--no-deps`) `cargo metadata`
+/// resolve. Not shared with [`resolve_full_metadata`]: that resolve needs
+/// the same graph shape, but discards its `adjacency` map once each node's
+/// reachable-set *size* is computed, while this needs the edges themselves.
+/// Returns `(found, paths)`: `found` is whether any package in the resolved
+/// graph is named `dependency_name` at all (independent of reachability from
+/// a workspace crate); `paths` maps each workspace crate's own name to the
+/// *shortest* resolved-graph path (breadth-first, so at most one path per
+/// workspace crate — an example route, not an exhaustive enumeration of
+/// every path) from that crate to `dependency_name`.
+fn resolve_graph_paths(
+    manifest_path: &Path,
+    dependency_name: &str,
+) -> Result<(bool, HashMap<String, Vec<String>>), cargo_metadata::Error> {
+    let metadata = cargo_metadata::MetadataCommand::new()
+        .manifest_path(manifest_path)
+        .exec()?;
+
+    let found = metadata
+        .packages
+        .iter()
+        .any(|package| package.name.as_str() == dependency_name);
+
+    let Some(resolve) = metadata.resolve else {
+        return Ok((found, HashMap::new()));
+    };
+
+    let adjacency: HashMap<&cargo_metadata::PackageId, &[cargo_metadata::PackageId]> = resolve
+        .nodes
+        .iter()
+        .map(|node| (&node.id, node.dependencies.as_slice()))
+        .collect();
+    let id_to_name: HashMap<&cargo_metadata::PackageId, &str> = metadata
+        .packages
+        .iter()
+        .map(|package| (&package.id, package.name.as_str()))
+        .collect();
+
+    let mut paths: HashMap<String, Vec<String>> = HashMap::new();
+    for member_id in &metadata.workspace_members {
+        let Some(&member_name) = id_to_name.get(member_id) else {
+            continue;
+        };
+        let path = shortest_graph_path(&adjacency, &id_to_name, member_id, dependency_name);
+        paths.insert(member_name.to_string(), path);
+    }
+
+    Ok((found, paths))
+}
+
+/// Breadth-first shortest path from `start` to the first node named
+/// `target_name`, over `adjacency` (see [`resolve_graph_paths`]) — package
+/// names from the first hop (exclusive of `start`) to the target
+/// (inclusive), or an empty `Vec` if no such node is reachable from `start`.
+fn shortest_graph_path(
+    adjacency: &HashMap<&cargo_metadata::PackageId, &[cargo_metadata::PackageId]>,
+    id_to_name: &HashMap<&cargo_metadata::PackageId, &str>,
+    start: &cargo_metadata::PackageId,
+    target_name: &str,
+) -> Vec<String> {
+    let mut visited: HashSet<&cargo_metadata::PackageId> = HashSet::new();
+    visited.insert(start);
+    let mut queue: VecDeque<(&cargo_metadata::PackageId, Vec<String>)> = VecDeque::new();
+    queue.push_back((start, Vec::new()));
+
+    while let Some((current, path)) = queue.pop_front() {
+        let Some(children) = adjacency.get(current) else {
+            continue;
+        };
+        for child in children.iter() {
+            if !visited.insert(child) {
+                continue;
+            }
+            let Some(&child_name) = id_to_name.get(child) else {
+                continue;
+            };
+            let mut next_path = path.clone();
+            next_path.push(child_name.to_string());
+            if child_name == target_name {
+                return next_path;
+            }
+            queue.push_back((child, next_path));
+        }
+    }
+    Vec::new()
 }
 
 /// Reads `manifest_path`'s raw text and parses it as TOML, mapping either
@@ -1724,6 +2068,59 @@ repository = "https://example.com/depcrate"
         // (the rename) is what's used for matching, not the registry name.
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].location.item_path, "real-name");
+    }
+
+    #[test]
+    fn why_finds_a_known_usage_location_and_the_direct_graph_path() {
+        let dir = TempDir::new("deps-why-usage");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[("src/lib.rs", "pub fn hello() { depcrate::noop(); }\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = why(&workspace, "depcrate");
+
+        assert!(report.found);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.declared_by.len(), 1);
+        let declaration = &report.declared_by[0];
+        assert_eq!(declaration.crate_name, "fixture");
+        assert_eq!(declaration.kind, DependencyKind::Normal);
+        assert!(declaration.features.is_empty());
+        assert_eq!(declaration.usages.len(), 1);
+        let usage = &declaration.usages[0];
+        assert!(usage.file.ends_with("src/lib.rs"), "{:?}", usage.file);
+        assert_eq!(usage.line.get(), 1);
+        assert_eq!(usage.domain, UsageDomain::Normal);
+
+        assert_eq!(
+            report.graph_paths.get("fixture"),
+            Some(&vec!["depcrate".to_string()])
+        );
+    }
+
+    #[test]
+    fn why_reports_not_found_for_an_unknown_dependency() {
+        let dir = TempDir::new("deps-why-not-found");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[("src/lib.rs", "pub fn hello() { depcrate::noop(); }\n")],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = why(&workspace, "does-not-exist");
+
+        assert!(!report.found);
+        assert!(report.declared_by.is_empty());
     }
 
     #[test]

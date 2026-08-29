@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use cargo_metadata::{MetadataCommand, TargetKind};
+use serde::Serialize;
 
 /// A crate discovered in the workspace.
 #[derive(Debug)]
@@ -18,7 +19,8 @@ pub struct CrateInfo {
 
 /// A dependency's declared kind in `Cargo.toml` (see todo.md §3.B, §14.2 P1
 /// "misplaced-dependency-kind").
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DependencyKind {
     Normal,
     Development,
@@ -37,6 +39,17 @@ impl DependencyKind {
             cargo_metadata::DependencyKind::Normal | cargo_metadata::DependencyKind::Unknown => {
                 Self::Normal
             }
+        }
+    }
+
+    /// The short, lowercase label used in `cargo judge deps --why`'s TTY
+    /// output (see `judge::rules::deps::why`, GitHub issue #22) — mirrors
+    /// [`EntryPointKind::label`]'s precedent rather than a bare `{:?}`.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Development => "dev",
+            Self::Build => "build",
         }
     }
 }

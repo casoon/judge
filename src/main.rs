@@ -158,6 +158,17 @@ struct DepsOptions {
     /// docs).
     #[arg(long, value_name = "PATH")]
     audit_json: Option<PathBuf>,
+    /// Explain one dependency instead of running the checks above: every
+    /// workspace crate's declaration of it (kind, features, `default-features
+    /// = true`?, and every source location its code identifier is referenced
+    /// from), its resolved dependency-graph path(s) from this workspace's own
+    /// crate(s), and an explicit statement of what judge cannot determine
+    /// about its public API exposure (see `judge::rules::deps` module docs
+    /// "`cargo judge deps --why <crate>`", GitHub issue #22). Ignores every
+    /// other flag above and does not run any of the checks they gate; prints
+    /// and exits. Only `tty`/`json` are supported.
+    #[arg(long, value_name = "CRATE")]
+    why: Option<String>,
 }
 
 #[derive(Debug, Args)]
