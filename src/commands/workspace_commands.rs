@@ -198,6 +198,53 @@ struct RefactorCandidate {
     reason_count: usize,
 }
 
+/// How many of the highest-ranked candidates surface as curated
+/// `next_actions` — a small, bounded summary layered on top of the full
+/// `candidates` queue, not a replacement for it.
+const NEXT_ACTIONS_LIMIT: usize = 10;
+
+/// A ranked, evidence-linked inspection step derived from an already-sorted
+/// `RefactorCandidate`. Every field is copied from the candidate it
+/// summarizes; nothing here is a separate analysis pass or an invented fix.
+#[derive(Serialize)]
+struct NextAction {
+    rank: usize,
+    action: String,
+    file: PathBuf,
+    severity: judge::finding::Severity,
+    reason_count: usize,
+    rules: Vec<String>,
+    finding_ids: Vec<String>,
+}
+
+/// Derives the curated `next_actions` list from `candidates`, which is
+/// already sorted deterministically by severity, then reason count, then
+/// file. Ranking here just takes the top `NEXT_ACTIONS_LIMIT` — it never
+/// recomputes or re-sorts.
+fn build_next_actions(candidates: &[RefactorCandidate]) -> Vec<NextAction> {
+    candidates
+        .iter()
+        .take(NEXT_ACTIONS_LIMIT)
+        .enumerate()
+        .map(|(index, candidate)| NextAction {
+            rank: index + 1,
+            action: format!(
+                "Inspect {}: {} finding{} across [{}], highest severity {}",
+                candidate.file.display(),
+                candidate.reason_count,
+                if candidate.reason_count == 1 { "" } else { "s" },
+                candidate.rules.join(", "),
+                severity_label(candidate.severity)
+            ),
+            file: candidate.file.clone(),
+            severity: candidate.severity,
+            reason_count: candidate.reason_count,
+            rules: candidate.rules.clone(),
+            finding_ids: candidate.finding_ids.clone(),
+        })
+        .collect()
+}
+
 /// Aggregates existing Fast-Tier findings into an inspection queue. It does
 /// not invent a fix: every reason is a stable finding id supplied in output.
 pub(crate) fn run_refactor(
@@ -254,6 +301,8 @@ pub(crate) fn run_refactor(
                 finding_ids: findings
                     .iter()
                     .map(|finding| finding.id.to_string())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
                     .collect(),
                 items,
                 reason_count: findings.len(),
@@ -277,6 +326,7 @@ pub(crate) fn run_refactor(
         })
         .cloned()
         .collect::<Vec<_>>();
+    let next_actions = build_next_actions(&candidates);
 
     match options.format {
         OutputFormat::Json => write_json(
@@ -286,6 +336,7 @@ pub(crate) fn run_refactor(
                 "scope": { "tier": "fast", "target": target },
                 "analysis_errors": collected.analysis_errors,
                 "candidates": candidates,
+                "next_actions": next_actions,
                 "findings": context_findings,
                 "contract": "Each candidate aggregates only the included findings. finding_ids resolve within this artifact to locations, evidence, limitations, and causal links; no candidate is an automatic refactoring instruction."
             }),
@@ -302,6 +353,12 @@ pub(crate) fn run_refactor(
                     candidate.reason_count,
                     candidate.rules.join(", ")
                 )?;
+            }
+            if !next_actions.is_empty() {
+                writeln!(out, "next actions:")?;
+                for next_action in &next_actions {
+                    writeln!(out, "  {}. {}", next_action.rank, next_action.action)?;
+                }
             }
             print_analysis_error_count_tty(out, &collected.analysis_errors)?;
         }

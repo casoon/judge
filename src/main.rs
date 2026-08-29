@@ -3277,6 +3277,112 @@ fn dup_two(x: i32) -> i32 {
         }));
     }
 
+    /// Two files with distinct duplicate-function pairs: `src/a.rs` holds two
+    /// separate clone families (4 duplication findings), `src/b.rs` holds one
+    /// (2 findings) — enough of a severity/reason_count spread to prove
+    /// `refactor`'s `next_actions` mirrors `candidates`' own ranking rather
+    /// than recomputing one.
+    fn write_two_file_duplication_fixture(dir: &Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+
+        let dup_fn = |value: usize, suffix: &str| {
+            format!(
+                "pub fn dup_{value}_{suffix}() -> i32 {{ let v0 = {value}; let v1 = {value}; \
+                 let v2 = {value}; let v3 = {value}; let v4 = {value}; let v5 = {value}; \
+                 let v6 = {value}; v0 + v1 + v2 + v3 + v4 + v5 + v6 }}\n"
+            )
+        };
+
+        let mut a = String::new();
+        for value in [0, 2] {
+            a.push_str(&dup_fn(value, "a"));
+            a.push_str(&dup_fn(value, "b"));
+        }
+        std::fs::write(dir.join("src/a.rs"), a).unwrap();
+
+        let mut b = String::new();
+        b.push_str(&dup_fn(1, "a"));
+        b.push_str(&dup_fn(1, "b"));
+        std::fs::write(dir.join("src/b.rs"), b).unwrap();
+
+        std::fs::write(dir.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+    }
+
+    /// GitHub issue #31: `refactor`'s `next_actions` is a ranked, evidence-
+    /// linked top-N summary of the same `candidates` list already computed —
+    /// not a separate analysis pass. Every field must mirror the candidate at
+    /// the same rank, and identical project state must yield byte-identical
+    /// output.
+    #[test]
+    fn refactor_json_next_actions_mirrors_the_ranked_candidates() {
+        let dir = TempDir::new("refactor-next-actions");
+        write_two_file_duplication_fixture(&dir);
+
+        let refactor_cli = || {
+            cli_with(Command::Refactor(RefactorOptions {
+                target: None,
+                format: OutputFormat::Json,
+            }))
+        };
+
+        let mut first_out = Vec::new();
+        let outcome = run_in_dir(&dir, refactor_cli(), &mut first_out).expect("refactor must run");
+        assert_eq!(outcome, CommandOutcome::Clean);
+
+        let mut second_out = Vec::new();
+        run_in_dir(&dir, refactor_cli(), &mut second_out).expect("refactor must run again");
+
+        let json: serde_json::Value = serde_json::from_slice(&first_out).expect("refactor JSON");
+        let second_json: serde_json::Value =
+            serde_json::from_slice(&second_out).expect("refactor JSON (second run)");
+        // `next_actions` is derived solely from `candidates`, which sorts
+        // deterministically by severity, reason_count, then file; both must
+        // be byte-stable across runs regardless of the underlying findings'
+        // discovery order (see GitHub issue #31).
+        assert_eq!(
+            json["candidates"], second_json["candidates"],
+            "identical project state must yield byte-identical candidates"
+        );
+        assert_eq!(
+            json["next_actions"], second_json["next_actions"],
+            "identical project state must yield byte-identical next_actions"
+        );
+        let candidates = json["candidates"].as_array().expect("candidates array");
+        let next_actions = json["next_actions"].as_array().expect("next_actions array");
+
+        assert_eq!(candidates.len(), 2, "unexpected candidates: {candidates:?}");
+        assert_eq!(candidates[0]["file"], "src/a.rs");
+        assert_eq!(candidates[0]["reason_count"], 4);
+        assert_eq!(candidates[1]["file"], "src/b.rs");
+        assert_eq!(candidates[1]["reason_count"], 2);
+
+        assert_eq!(next_actions.len(), candidates.len());
+        for (index, (candidate, next_action)) in
+            candidates.iter().zip(next_actions.iter()).enumerate()
+        {
+            assert_eq!(next_action["rank"], index + 1);
+            assert_eq!(next_action["file"], candidate["file"]);
+            assert_eq!(next_action["severity"], candidate["severity"]);
+            assert_eq!(next_action["reason_count"], candidate["reason_count"]);
+            assert_eq!(next_action["rules"], candidate["rules"]);
+            assert_eq!(next_action["finding_ids"], candidate["finding_ids"]);
+            let action = next_action["action"].as_str().expect("action string");
+            assert!(
+                action.contains(candidate["file"].as_str().unwrap()),
+                "action must reference the candidate's file: {action}"
+            );
+            assert!(
+                action.contains(&candidate["reason_count"].to_string()),
+                "action must reference the candidate's reason_count: {action}"
+            );
+        }
+    }
+
     #[test]
     fn map_include_tests_changes_ranking_scope_without_merging_metrics() {
         let dir = TempDir::new("map-include-tests-contract");
