@@ -1367,9 +1367,74 @@ fn load_proc_macro_and_publishable_sets(
     (proc_macro_exposed, publishable)
 }
 
+/// The `pub` site handling [`scan_file_for_dead_code`]'s `walk_functions` and
+/// `walk_type_items` closures both apply identically: run [`check_item`]
+/// (`unused-pub-workspace`/`unused-pub-api`) then [`check_test_only_pub`],
+/// back to back, for the same site — factored out because the two closures
+/// otherwise repeated this exact call sequence verbatim.
+#[allow(clippy::too_many_arguments)]
+fn check_pub_site(
+    analysis: &ra_ap_ide::Analysis,
+    crate_of_file: &HashMap<FileId, &str>,
+    module_of_file: &HashMap<FileId, String>,
+    entry_keys: &std::collections::HashSet<(FileId, u32)>,
+    entry_keys_production: &std::collections::HashSet<(FileId, u32)>,
+    entry_keys_all: &std::collections::HashSet<(FileId, u32)>,
+    proc_macro_exposed: &HashSet<String>,
+    file: &SourceFile,
+    file_id: FileId,
+    krate_name: &str,
+    qualified_name: &str,
+    offset: u32,
+    line: usize,
+    include_tests: bool,
+    rule_id: &str,
+    severity: Severity,
+    evidence_class: EvidenceClass,
+    reason: &str,
+    edge_counts: &mut HashMap<(String, String), u32>,
+    module_edge_counts: &mut HashMap<(String, String), u32>,
+    report: &mut WorkspaceDeadCode,
+) {
+    check_item(
+        analysis,
+        crate_of_file,
+        module_of_file,
+        entry_keys,
+        proc_macro_exposed,
+        file,
+        file_id,
+        krate_name,
+        qualified_name,
+        offset,
+        line,
+        include_tests,
+        rule_id,
+        severity,
+        evidence_class,
+        reason,
+        edge_counts,
+        module_edge_counts,
+        report,
+    );
+    check_test_only_pub(
+        analysis,
+        crate_of_file,
+        entry_keys_production,
+        entry_keys_all,
+        file,
+        file_id,
+        krate_name,
+        qualified_name,
+        offset,
+        line,
+        report,
+    );
+}
+
 /// The per-file body of [`analyze_workspace`]'s crate/file loop: walks one
 /// already-parsed file's functions/methods, top-level type items, and enum
-/// variants, routing each `pub` site to [`check_item`]/[`check_test_only_pub`]
+/// variants, routing each `pub` site to [`check_pub_site`]
 /// and each non-`pub` function/type-item site to [`check_unreachable_from_entry`].
 #[allow(clippy::too_many_arguments)]
 fn scan_file_for_dead_code(
@@ -1397,11 +1462,13 @@ fn scan_file_for_dead_code(
     walk_functions(ast, |site| {
         let (offset, line) = offset_and_line(site.ident_span);
         if let Some(syn::Visibility::Public(_)) = site.vis {
-            check_item(
+            check_pub_site(
                 analysis,
                 crate_of_file,
                 module_of_file,
                 entry_keys,
+                entry_keys_production,
+                entry_keys_all,
                 proc_macro_exposed,
                 file,
                 file_id,
@@ -1416,19 +1483,6 @@ fn scan_file_for_dead_code(
                 reason,
                 edge_counts,
                 module_edge_counts,
-                report,
-            );
-            check_test_only_pub(
-                analysis,
-                crate_of_file,
-                entry_keys_production,
-                entry_keys_all,
-                file,
-                file_id,
-                krate_name,
-                &site.qualified_name,
-                offset,
-                line,
                 report,
             );
             return;
@@ -1458,11 +1512,13 @@ fn scan_file_for_dead_code(
     walk_type_items(ast, |site| {
         let (offset, line) = offset_and_line(site.ident_span);
         if matches!(site.vis, syn::Visibility::Public(_)) {
-            check_item(
+            check_pub_site(
                 analysis,
                 crate_of_file,
                 module_of_file,
                 entry_keys,
+                entry_keys_production,
+                entry_keys_all,
                 proc_macro_exposed,
                 file,
                 file_id,
@@ -1477,19 +1533,6 @@ fn scan_file_for_dead_code(
                 reason,
                 edge_counts,
                 module_edge_counts,
-                report,
-            );
-            check_test_only_pub(
-                analysis,
-                crate_of_file,
-                entry_keys_production,
-                entry_keys_all,
-                file,
-                file_id,
-                krate_name,
-                &site.qualified_name,
-                offset,
-                line,
                 report,
             );
             return;
