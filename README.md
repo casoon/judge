@@ -23,7 +23,7 @@ for consistent verdicts, evidence groups, source locations, color policy, and
 next steps. JSON, SARIF, and Markdown remain explicit machine or handoff
 contracts owned by judge.
 
-See [MIGRATION.md](file:///Users/jseidel/GitHub/judge/MIGRATION.md) for breaking changes and CLI migration details.
+See [MIGRATION.md](MIGRATION.md) for breaking changes and CLI migration details.
 
 ## Status
 
@@ -43,11 +43,11 @@ Early stage. The Fast Tier (no build required, `syn`-, Cargo-metadata-, and mani
   it does not predict individual findings or reachability
 - `cargo judge health [--score]` — current-state complexity, syntax-level slop signals, and an optional health score (see below)
 - `cargo judge dupes --mode strict|mild|weak|semantic [--include-tests]` — duplicated token spans grouped into clone families; test-only code is opt-in
-- `cargo judge deps [--check-crates-io] [--audit-json PATH]` — dependency-kind hygiene plus local name-collision checks; the crates.io lookups (`phantom-crate`, `phantom-version`, `fresh-low-reputation-dep`, `yanked-dependency`, `dep-single-maintainer`) are opt-in because judge makes no network calls otherwise; `--audit-json` cross-references an already-generated `cargo audit --json` report against the resolved dependency graph (`known-vulnerability`) — judge never runs `cargo-audit` itself
+- `cargo judge deps [--check-crates-io] [--audit-json PATH] [--why CRATE]` — dependency-kind hygiene plus local name-collision checks; the crates.io lookups (`phantom-crate`, `phantom-version`, `fresh-low-reputation-dep`, `yanked-dependency`, `dep-single-maintainer`) are opt-in because judge makes no network calls otherwise; `--audit-json` cross-references an already-generated `cargo audit --json` report against the resolved dependency graph (`known-vulnerability`) — judge never runs `cargo-audit` itself; `--why CRATE` shows one dependency's source usages, enabled features, dependency kind, and resolved graph paths instead of running the hygiene checks
 - `cargo judge api` — focused public API surface analysis (the existing `api-surface` name remains available during migration)
 - `cargo judge boundaries` — opt-in crate boundaries from `judge.toml`, plus dependency cycles; `--graph dot|mermaid` prints the crate dependency graph itself instead of checking rules
 - `cargo judge errors`, `tests`, `unsafe`, `slop` — focused current-state projections with concrete locations and stated Fast-Tier limits
-- `cargo judge refactor [PATH]` — deterministic, evidence-backed refactoring review queue; it never invents a patch
+- `cargo judge refactor [PATH]` — deterministic, evidence-backed refactoring review queue; `--format json` includes a ranked `next_actions` summary (top 10, derived from the same candidate ranking) alongside the full candidate list; it never invents a patch
 - `cargo judge compare BASELINE` — compares the current project state with a saved findings artifact; works without Git
 - `cargo judge dead-code [--include-tests]` — Deep Tier, needs `--features deep` (see below)
 - `cargo judge explain <item-path> --why-live` — Deep Tier, needs `--features deep` (see below)
@@ -60,7 +60,9 @@ command description, and an assessment (`informational`, `review_recommended`,
 `analysis_incomplete`, or `blocking_findings`). The assessment is a triage
 hint, not an automatic refactoring instruction.
 
-Not yet implemented: module-level boundaries (only crate-level exists), several planned maintainability and dependency-hygiene rules, and the MCP server.
+Not yet implemented: module-level boundaries (only crate-level exists) and several planned maintainability and dependency-hygiene rules.
+
+An MCP server adapter is available separately in [`judge-mcp/`](judge-mcp/) — a thin stdio adapter that shells out to an already-built `cargo-judge` binary and returns its `--format json` output as MCP tool calls; it computes nothing itself and is not a build or install requirement of judge.
 
 ## Health Score
 
@@ -130,6 +132,7 @@ cargo judge impact src/lib.rs  # direct analysis and Cargo-target context
 cargo judge --progress judge-progress.jsonl  # live, versioned JSONL phases
 cargo judge dupes --mode mild  # production duplicate spans (test code: --include-tests)
 cargo judge deps --format json # dependency findings as JSON
+cargo judge deps --why syn      # one dependency's usages, features, kind, and graph paths
 cargo judge health --score     # health score, 0-100 + letter grade
 cargo judge --save-baseline    # save .judge/baseline.json
 cargo judge --baseline .judge/baseline.json
