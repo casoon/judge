@@ -1,0 +1,31 @@
+[1;93m⚠[0m Judge summary
+  [1;93mAnalysis context: [0m[2mboundary rules: 0 not checked (no judge.toml)[0m
+
+  [2mEvidence: [0m[1;93m671[0m   [2mAdvisory: [0m[36m333[0m
+
+  [1;96mTop issue rules:[0m
+     635x  [2mduplicate-code[0m
+     243x  [2mcomplexity-inflation[0m
+      39x  [2minteger-cast-risk[0m
+      39x  [2mmaintainability-index[0m
+      22x  [2mpanic-in-lib[0m
+
+● [1;96mEvidence-backed findings[0m [2m(671)[0m
+  - [1;93mswallowed-result in write_cache[0m [2m[swallowed-result][0m [2m(high confidence)[0m at [2msrc/rules/slopsquat.rs:356[0m
+  - [1;93mswallowed-result in write_cache[0m [2m[swallowed-result][0m [2m(high confidence)[0m at [2msrc/rules/slopsquat.rs:359[0m
+  - [1;93mduplicate-code in build_functional_core_imperative_shell_heuristic[0m [2m[duplicate-code][0m [2m(high confidence)[0m at [2msrc/rules/principle.rs:550[0m
+  [2m... 668 more finding(s) (use --details to view all)[0m
+
+● [1;96mAdvisory heuristics (no verdict or score effect)[0m [2m(333)[0m [36m[advisory][0m
+  - [1;93mcomplexity-inflation in known_vulnerability_finding[0m [2m[complexity-inflation][0m [2m(low confidence)[0m at [2msrc/advisory/advisories.rs:330[0m
+  - [1;93mcomplexity-inflation in tests::known_vulnerability_registry_example_still_triggers_the_rule[0m [2m[complexity-inflation][0m [2m(low confidence)[0m at [2msrc/advisory/advisories.rs:540[0m
+  - [1;93mcomplexity-inflation in parse_lcov[0m [2m[complexity-inflation][0m [2m(low confidence)[0m at [2msrc/advisory/coverage.rs:155[0m
+  [2m... 330 more finding(s) (use --details to view all)[0m
+
+[1;96mNext steps:[0m
+  • clone families, grouped and prioritized
+    [36m$ cargo judge dupes[0m
+  • every finding and location
+    [36m$ cargo judge --details[0m
+  • full machine-readable report in .judge/judge.json
+    [36m$ cargo judge --format json[0m

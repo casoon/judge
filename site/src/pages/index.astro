@@ -1,0 +1,110 @@
+---
+import {
+  Badge,
+  Badges,
+  BuildOutput,
+  CodeBlock,
+  Facts,
+  Features,
+  Hero,
+  Install,
+  Quickstart,
+  Terminal,
+} from '@casoon/pages-theme/components';
+import Base from '@casoon/pages-theme/layouts/Base.astro';
+import { fixture } from '../showcase';
+
+const summary = fixture('summary.ansi');
+const refactor = fixture('refactor.txt');
+
+const ciStep = `# Save a baseline once, on the main branch
+cargo judge --save-baseline          # writes .judge/baseline.json
+
+# In CI: compare the checked-out tree with it
+cargo judge compare .judge/baseline.json
+# exit 0: pass, 1: new gating findings (verdict fail), 2: error`;
+
+const judgeToml = `# judge.toml in the workspace root — opt-in crate boundaries
+[[boundary]]
+name = "ui-must-not-touch-db"
+from = ["ui"]
+forbidden = ["db"]
+reach = "transitive"`;
+---
+
+<Base>
+  <Hero
+    title="Know what a refactoring left behind."
+    lead="judge is a Cargo subcommand that reads the checked-out source tree, workspace structure, public APIs and dependency graph of a Rust workspace and turns them into deterministic, evidence-backed findings. It skips what the compiler and Clippy already report."
+  >
+    <Install
+      commands={[
+        { label: 'crates.io', command: 'cargo install cargo-judge' },
+        { label: 'deep tier', command: 'cargo install cargo-judge --features deep' },
+        { label: 'git', command: 'cargo install --git https://github.com/casoon/judge cargo-judge' },
+      ]}
+    />
+    <Badges>
+      <Badge>BUSL-1.1</Badge>
+      <Badge tone="brand">early stage</Badge>
+      <Badge>crates.io 0.7.0</Badge>
+      <Badge>Rust 1.95+</Badge>
+      <Badge>no telemetry</Badge>
+    </Badges>
+    <Terminal slot="output" title="cargo judge" dots ansi={summary} />
+  </Hero>
+
+  <Facts
+    items={[
+      { value: '78', label: 'rules in the registry: 49 gating, 29 advisory-only' },
+      { value: '4', label: 'output formats: terminal, JSON, SARIF 2.1.0, Markdown' },
+      { value: '696', label: 'tests in the default-feature build of 0.7.0' },
+      { value: '0', label: 'network calls by default; crates.io checks are opt-in' },
+    ]}
+  />
+
+  <Features
+    items={[
+      {
+        title: 'Deterministic findings',
+        body: 'The same tree gives the same findings. judge reads no Git history, authorship or telemetry, so it works on archives, CI artifacts and vendored code, and on code written by people or agents alike.',
+      },
+      {
+        title: 'Evidence, not opinions',
+        body: 'Every rule declares an evidence class and a verdict effect. Heuristics are reported as advisory and never change the verdict or the exit code; explain-rule shows what a rule checks and where it stops.',
+      },
+      {
+        title: 'Baselines and CI verdicts',
+        body: 'Save the current findings as a JSON artifact, then compare any later tree with it. compare reports introduced and resolved findings and exits with 1 when new gating findings fail the verdict.',
+      },
+      {
+        title: 'Output for people and tools',
+        body: 'A compact terminal triage view, versioned JSON with a header and triage assessment, SARIF for code scanning, and Markdown for pull requests. judge-mcp exposes the JSON to MCP clients.',
+      },
+      {
+        title: 'Deep tier when you need it',
+        body: 'With the deep feature, judge loads the workspace into rust-analyzer to find pub items no other crate uses and to show the call path that keeps an item alive.',
+      },
+    ]}
+  />
+
+  <BuildOutput
+    heading="Real output"
+    caption="judge 0.7.0 run on its own source tree. Every example on this site is captured the same way with examples/capture.sh; only the absolute checkout path is shortened."
+    file="examples/refactor.txt"
+  >
+    <Terminal title="cargo judge refactor" ansi={refactor} />
+  </BuildOutput>
+
+  <Quickstart
+    lead="From install to a CI verdict. The full walkthrough lives in the documentation."
+    steps={[
+      'Install <code>cargo-judge</code> from crates.io.',
+      'Run <code>cargo judge</code> in the workspace root for the grouped triage report.',
+      'Save a baseline and let CI run <code>cargo judge compare</code> against it.',
+    ]}
+  >
+    <CodeBlock code={ciStep} lang="sh" title="baseline and CI" label="CI" />
+    <CodeBlock code={judgeToml} lang="toml" title="judge.toml" label="Boundaries" />
+  </Quickstart>
+</Base>

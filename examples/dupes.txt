@@ -1,0 +1,89 @@
+mode: mild
+min tokens: 20
+clone families: 305
+refactoring summary: 305 clone families, 635 members (repeated tokens, not an automatic merge recommendation)
+  #1  5 members × 27 tokens = 135 repeated tokens across 1 files  build_functional_core_imperative_shell_heuristic, build_law_of_demeter_heuristic, build_bounded_resources_loop_heuristic
+  #2  4 members × 20 tokens = 80 repeated tokens across 2 files  run_dupes, run_deps, run_coverage
+  #3  3 members × 95 tokens = 285 repeated tokens across 3 files  attrs_have_cfg_test, attrs_have_cfg_test, attrs_have_cfg_test
+  #4  3 members × 58 tokens = 174 repeated tokens across 1 files  run_dupes, run_deps, run_coverage
+  #5  3 members × 41 tokens = 123 repeated tokens across 2 files  evaluate_module_boundary_rule, unlinked_file_findings, orphan_module_findings
+
+family #1 — 5 members
+    27 tokens  src/rules/principle.rs:550-554  build_functional_core_imperative_shell_heuristic
+    27 tokens  src/rules/principle.rs:1772-1776  build_law_of_demeter_heuristic
+    27 tokens  src/rules/principle.rs:1957-1961  build_bounded_resources_loop_heuristic
+    27 tokens  src/rules/principle.rs:2226-2230  build_bounded_resources_recursion_heuristic
+    27 tokens  src/rules/principle.rs:2753-2757  build_parse_dont_validate_heuristic
+
+family #2 — 4 members
+    20 tokens  src/commands/analysis_commands.rs:174-177  run_dupes
+    20 tokens  src/commands/analysis_commands.rs:650-653  run_deps
+    20 tokens  src/commands/analysis_commands.rs:749-752  run_coverage
+    20 tokens  src/commands/health_command.rs:159-162  run
+
+family #3 — 3 members
+    95 tokens  src/rules/api_surface.rs:516-529  attrs_have_cfg_test
+    95 tokens  src/rules/dead_trait_impl.rs:133-146  attrs_have_cfg_test
+    95 tokens  src/rules/deps.rs:1571-1584  attrs_have_cfg_test
+
+family #4 — 3 members
+    58 tokens  src/commands/analysis_commands.rs:155-164  run_dupes
+    58 tokens  src/commands/analysis_commands.rs:628-637  run_deps
+    58 tokens  src/commands/analysis_commands.rs:732-741  run_coverage
+
+family #5 — 3 members
+    41 tokens  src/rules/boundaries.rs:1258-1261  evaluate_module_boundary_rule
+    41 tokens  src/rules/module_graph.rs:482-485  unlinked_file_findings
+    41 tokens  src/rules/module_graph.rs:670-673  orphan_module_findings
+
+family #6 — 3 members
+    39 tokens  src/rules/dead_code.rs:1771-1778  coupling_finding
+    39 tokens  src/rules/dead_trait_impl.rs:306-313  finding_for
+    39 tokens  src/rules/duplication.rs:187-199  CloneMember::to_finding
+
+family #7 — 3 members
+    39 tokens  src/rules/deps.rs:300-304  DepsError::source
+    39 tokens  src/rules/duplication.rs:272-276  DuplicationError::source
+    39 tokens  src/rules/module_graph.rs:123-127  ModuleGraphError::source
+
+family #8 — 3 members
+    32 tokens  src/rules/pattern.rs:1042-1047  Finder::visit_macro
+    32 tokens  src/rules/principle.rs:1894-1899  Finder::visit_macro
+    32 tokens  src/rules/principle.rs:2431-2436  ReturnOrPanicFinder::visit_macro
+
+family #9 — 3 members
+    31 tokens  src/rules/slopsquat.rs:561-565  SparseIndexClient::lookup
+    31 tokens  src/rules/slopsquat.rs:620-624  RestMetadataClient::metadata
+    31 tokens  src/rules/slopsquat.rs:677-681  RestOwnersClient::owners
+
+family #10 — 3 members
+    30 tokens  src/rules/pattern.rs:997-1008  expr_references_ident
+    30 tokens  src/rules/principle.rs:2046-2060  expr_references_any
+    30 tokens  src/rules/principle.rs:2139-2163  has_parameter_guard_before
+
+family #11 — 3 members
+    28 tokens  src/commands/analysis_commands.rs:121-126  run_dupes
+    28 tokens  src/commands/analysis_commands.rs:679-684  run_coverage
+    28 tokens  src/commands/analysis_commands.rs:1019-1024  run_module_graph
+
+family #12 — 3 members
+    24 tokens  src/rules/api_surface.rs:504-508  has_non_exhaustive
+    24 tokens  src/rules/pattern.rs:1509-1513  has_non_exhaustive_attr
+    24 tokens  src/rules/principle.rs:2840-2844  struct_has_non_exhaustive
+
+family #13 — 3 members
+    24 tokens  src/rules/dead_code.rs:1408-1419  check_pub_site
+    24 tokens  src/rules/dead_code.rs:1476-1487  scan_file_for_dead_code
+    24 tokens  src/rules/dead_code.rs:1526-1537  scan_file_for_dead_code
+
+family #14 — 3 members
+    24 tokens  src/rules/security.rs:1047-1049  SecretVisitor::visit_item_fn
+    24 tokens  src/rules/security.rs:1053-1055  SecretVisitor::visit_impl_item_fn
+    24 tokens  src/rules/security.rs:1059-1061  SecretVisitor::visit_trait_item_fn
+
+family #15 — 3 members
+    23 tokens  src/rules/dead_code.rs:770-772  referencing_files_or_bail
+    23 tokens  src/rules/feature_matrix.rs:181-183  analyze_workspace
+    23 tokens  src/rules/feature_matrix.rs:206-208  analyze_workspace
+
+... and 290 more families (see --format json for the full list)

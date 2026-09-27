@@ -2,6 +2,8 @@
 
 > Deterministic post-refactoring analysis for Rust workspaces.
 
+**Website and documentation:** [casoon.github.io/judge](https://casoon.github.io/judge/)
+
 ## Overview
 
 `judge` analyzes the current Rust source tree, workspace structure, public APIs,

@@ -1,0 +1,11 @@
+rule: swallowed-result
+  evidence class: derived_fact
+  verdict effect: gating
+  preconditions: Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).
+  exclusions: Syntax-only: only `let _ = fallible();` and a bare `.ok();` statement are matched; other ways of discarding a `Result` are not. Exempt inside `Drop::drop`'s own body (`impl Drop for _ { fn drop(&mut self) { .. } }`, matched by trait path's last segment): `drop` cannot return a `Result`, so `let _ = fallible();` is the only correct idiom there, not a discarded error.
+  allowed wording: State as an exact fact of the declared inputs (e.g. an occurrence count) — never as a quality judgment. The syntax/manifest fact is certain; whether it constitutes a real problem is not (todo.md §17.3).
+  example:
+    fn save_settings(path: &std::path::Path, data: &str) {
+        let _ = std::fs::write(path, data);
+    }
+  why it matters: Discarding a `Result` with `let _ = ...` throws away the one signal that the operation could fail — a failed disk write here looks exactly like a successful save to every caller downstream.

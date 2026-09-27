@@ -1,0 +1,74 @@
+---
+title: Installation
+description: judge is published on crates.io as cargo-judge. Optional Cargo features add the rust-analyzer Deep Tier and crates.io lookups.
+order: 1
+---
+
+judge requires Rust 1.95 or newer (edition 2024).
+
+<Tabs
+  label="Source"
+  tabs={[
+    { id: 'crates', label: 'crates.io' },
+    { id: 'git', label: 'Git' },
+    { id: 'source', label: 'From source' },
+  ]}
+>
+<div slot="crates">
+
+```sh
+cargo install cargo-judge
+```
+
+</div>
+<div slot="git">
+
+```sh
+cargo install --git https://github.com/casoon/judge cargo-judge
+```
+
+</div>
+<div slot="source">
+
+```sh
+git clone https://github.com/casoon/judge.git
+cd judge
+cargo build --release
+./target/release/cargo-judge --help
+
+# or install the local checkout
+cargo install --path . --force
+```
+
+</div>
+</Tabs>
+
+## Optional features
+
+| Feature   | What it adds                                                              | Install                                         |
+| --------- | ------------------------------------------------------------------------- | ----------------------------------------------- |
+| `deep`    | rust-analyzer-based Deep Tier: `dead-code`, `explain --why-live`           | `cargo install cargo-judge --features deep`     |
+| `network` | crates.io lookups for `deps --check-crates-io`                            | `cargo install cargo-judge --features network`  |
+
+<Callout type="caution">
+  The `deep` feature compiles the `ra_ap_*` rust-analyzer crates. The first build takes
+  noticeably longer than the default build.
+</Callout>
+
+Without `network`, no HTTP client is compiled in. `deps --check-crates-io` then skips the
+crates.io checks and lists an error for each, stating that the binary was compiled without the
+feature.
+
+## Verify the install
+
+```sh
+cargo judge --version
+cargo judge inspect   # crates, entry points and available tiers
+```
+
+`inspect` lists the detected crates and entry points and whether the Deep Tier is available in
+this build.
+
+## Next steps
+
+Continue with the [Quickstart](../quickstart/).

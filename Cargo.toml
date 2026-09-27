@@ -11,7 +11,7 @@ homepage = "https://github.com/casoon/judge"
 documentation = "https://docs.rs/cargo-judge"
 keywords = ["cargo-plugin", "static-analysis", "code-quality", "complexity", "duplication"]
 categories = ["development-tools::cargo-plugins", "command-line-utilities"]
-exclude = [".claude/**", ".judge/**", "judge-mcp/**", "todo.md"]
+exclude = [".claude/**", ".judge/**", "judge-mcp/**", "todo.md", "site/**", "docs/**", "examples/**"]
 publish = true
 
 [lib]

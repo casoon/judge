@@ -1,0 +1,25 @@
+workspace map: 1 crates, 54 authored files
+
+complexity attention (production code, measured total cyclomatic, not a verdict):
+  #1   365 total,  16 max, 130 functions  src/rules/principle.rs
+  #2   266 total,  24 max,  41 functions  src/commands/analysis_commands.rs
+  #3   221 total,  16 max,  79 functions  src/rules/slop.rs
+  #4   189 total,  13 max,  74 functions  src/rules/pattern.rs
+  #5   181 total,  16 max,  40 functions  src/rules/duplication.rs
+  #6   168 total,  25 max,  48 functions  src/rules/deps.rs
+  #7   165 total,  14 max,  50 functions  src/rules/boundaries.rs
+  #8   144 total,  29 max,  29 functions  src/rules/complexity.rs
+  #9   134 total,  16 max,  42 functions  src/main.rs
+  #10  134 total,  14 max,  61 functions  src/rules/slopsquat.rs
+  #11  131 total,  18 max,  21 functions  src/commands/advisory_commands.rs
+  #12  124 total,  10 max,  51 functions  src/rules/dead_code.rs
+  #13  120 total,  17 max,  45 functions  src/rules/security.rs
+  #14  115 total,  23 max,  11 functions  src/commands/workspace_commands.rs
+  #15   97 total,  21 max,  25 functions  src/rules/api_surface_deep.rs
+
+duplication attention (repeated tokens, not an automatic merge recommendation):
+  #1  5 members × 27 tokens across 1 files  build_functional_core_imperative_shell_heuristic, build_law_of_demeter_heuristic, build_bounded_resources_loop_heuristic
+  #2  4 members × 20 tokens across 2 files  run_dupes, run_deps, run_coverage
+  #3  3 members × 95 tokens across 3 files  attrs_have_cfg_test, attrs_have_cfg_test, attrs_have_cfg_test
+  #4  3 members × 58 tokens across 1 files  run_dupes, run_deps, run_coverage
+  #5  3 members × 41 tokens across 2 files  evaluate_module_boundary_rule, unlinked_file_findings, orphan_module_findings

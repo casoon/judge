@@ -1,0 +1,62 @@
+refactoring candidates: 50
+  1. [warn] src/rules/principle.rs — 123 reasons: abstraction-inflation, complexity-inflation, duplicate-code, maintainability-index
+  2. [warn] src/commands/analysis_commands.rs — 80 reasons: complexity-inflation, duplicate-code, maintainability-index, silent-default
+  3. [warn] src/rules/dead_code.rs — 74 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index, silent-default, suppression-debt
+  4. [warn] src/rules/pattern.rs — 72 reasons: complexity-inflation, duplicate-code, maintainability-index
+  5. [warn] src/rules/deps.rs — 65 reasons: complexity-inflation, duplicate-code, maintainability-index, silent-default
+  6. [warn] src/rules/slop.rs — 42 reasons: duplicate-code, maintainability-index
+  7. [warn] src/rules/complexity.rs — 36 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index, panic-in-lib, restating-comment
+  8. [warn] src/rules/slop_structural_deep.rs — 31 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index
+  9. [warn] src/rules/duplication.rs — 29 reasons: complexity-inflation, duplicate-code, maintainability-index, panic-in-lib, suppression-debt
+  10. [warn] src/rules/slopsquat.rs — 27 reasons: complexity-inflation, duplicate-code, maintainability-index, swallowed-result
+  11. [warn] src/rules/boundaries.rs — 25 reasons: complexity-inflation, duplicate-code, maintainability-index
+  12. [warn] src/main.rs — 23 reasons: complexity-inflation, duplicate-code, maintainability-index
+  13. [warn] src/rules/dep_graph.rs — 23 reasons: complexity-inflation, duplicate-code, maintainability-index, silent-default
+  14. [warn] src/commands/workspace_commands.rs — 21 reasons: complexity-inflation, duplicate-code, maintainability-index
+  15. [warn] src/rules/module_graph.rs — 21 reasons: complexity-inflation, duplicate-code, maintainability-index, silent-default
+  16. [warn] src/commands/deep_commands.rs — 20 reasons: complexity-inflation, duplicate-code, maintainability-index
+  17. [warn] src/rules/api_surface.rs — 19 reasons: duplicate-code, maintainability-index
+  18. [warn] src/rules/api_surface_deep.rs — 19 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index
+  19. [warn] src/rules/slop_structural.rs — 19 reasons: complexity-inflation, duplicate-code, maintainability-index, panic-in-lib
+  20. [warn] src/finding.rs — 17 reasons: complexity-inflation, duplicate-code, maintainability-index, panic-in-lib
+  21. [warn] src/reachability.rs — 17 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index
+  22. [warn] src/deep.rs — 16 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index
+  23. [warn] src/rules/dead_trait_impl.rs — 16 reasons: complexity-inflation, duplicate-code, maintainability-index
+  24. [warn] src/rules/feature_matrix.rs — 15 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index, panic-in-lib
+  25. [warn] src/rules/security.rs — 15 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index
+  26. [warn] src/rules/boundaries_deep.rs — 14 reasons: complexity-inflation, duplicate-code, maintainability-index, panic-in-lib
+  27. [warn] src/advisory/advisories.rs — 12 reasons: complexity-inflation, duplicate-code, maintainability-index, silent-default
+  28. [warn] src/advisory/mutants.rs — 10 reasons: complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index
+  29. [warn] src/commands/combined_analysis.rs — 10 reasons: complexity-inflation, duplicate-code, maintainability-index
+  30. [warn] src/advisory/coverage.rs — 9 reasons: complexity-inflation, duplicate-code, maintainability-index, panic-in-lib
+  31. [warn] src/functions.rs — 9 reasons: complexity-inflation, duplicate-code, maintainability-index, suppression-debt
+  32. [warn] src/rules/slop_text.rs — 9 reasons: complexity-inflation, duplicate-code, maintainability-index
+  33. [warn] src/commands/combined.rs — 8 reasons: complexity-inflation, duplicate-code, suppression-debt
+  34. [warn] src/ingest.rs — 8 reasons: complexity-inflation, duplicate-code, maintainability-index
+  35. [warn] src/commands/advisory_commands.rs — 7 reasons: duplicate-code, maintainability-index
+  36. [warn] src/commands/health_command.rs — 6 reasons: complexity-inflation, duplicate-code
+  37. [warn] src/baseline.rs — 5 reasons: complexity-inflation, duplicate-code, maintainability-index
+  38. [warn] src/refactor_map.rs — 5 reasons: complexity-inflation, duplicate-code, silent-default
+  39. [warn] src/advisory/clippy_import.rs — 4 reasons: duplicate-code, integer-cast-risk
+  40. [warn] src/commands/baseline_output.rs — 4 reasons: duplicate-code, maintainability-index
+  41. [warn] src/health_score.rs — 3 reasons: complexity-inflation, duplicate-code, maintainability-index
+  42. [warn] src/sarif.rs — 3 reasons: complexity-inflation, panic-in-lib
+  43. [warn] src/impact.rs — 2 reasons: complexity-inflation
+  44. [warn] src/markdown.rs — 2 reasons: complexity-inflation, duplicate-code
+  45. [warn] src/pattern_baseline.rs — 2 reasons: duplicate-code
+  46. [warn] src/report.rs — 2 reasons: complexity-inflation, maintainability-index
+  47. [warn] src/suppression.rs — 2 reasons: maintainability-index, panic-in-lib
+  48. [warn] src/commands/cli.rs — 1 reasons: complexity-inflation
+  49. [warn] src/rule_registry.rs — 1 reasons: complexity-inflation
+  50. [warn] src/test_util.rs — 1 reasons: panic-in-lib
+next actions:
+  1. Inspect src/rules/principle.rs: 123 findings across [abstraction-inflation, complexity-inflation, duplicate-code, maintainability-index], highest severity warn
+  2. Inspect src/commands/analysis_commands.rs: 80 findings across [complexity-inflation, duplicate-code, maintainability-index, silent-default], highest severity warn
+  3. Inspect src/rules/dead_code.rs: 74 findings across [complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index, silent-default, suppression-debt], highest severity warn
+  4. Inspect src/rules/pattern.rs: 72 findings across [complexity-inflation, duplicate-code, maintainability-index], highest severity warn
+  5. Inspect src/rules/deps.rs: 65 findings across [complexity-inflation, duplicate-code, maintainability-index, silent-default], highest severity warn
+  6. Inspect src/rules/slop.rs: 42 findings across [duplicate-code, maintainability-index], highest severity warn
+  7. Inspect src/rules/complexity.rs: 36 findings across [complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index, panic-in-lib, restating-comment], highest severity warn
+  8. Inspect src/rules/slop_structural_deep.rs: 31 findings across [complexity-inflation, duplicate-code, integer-cast-risk, maintainability-index], highest severity warn
+  9. Inspect src/rules/duplication.rs: 29 findings across [complexity-inflation, duplicate-code, maintainability-index, panic-in-lib, suppression-debt], highest severity warn
+  10. Inspect src/rules/slopsquat.rs: 27 findings across [complexity-inflation, duplicate-code, maintainability-index, swallowed-result], highest severity warn
