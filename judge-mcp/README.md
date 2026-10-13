@@ -88,5 +88,9 @@ as well.
   an error. The JSON report is returned either way.
 - **2** (a real analyzer/config error) becomes an MCP tool error carrying
   judge's stderr text.
-- Unparsable JSON output also becomes an MCP tool error, with a diagnostic
-  hint (start of stdout + stderr).
+- cargo-judge writes `--format json` output to an artifact file instead of
+  stdout. The adapter points it at a unique temp file (`--output`), returns
+  the command's JSON payload without judge's artifact `header`, and always
+  deletes the file, so nothing is written into the analyzed workspace.
+- A missing or unparsable artifact also becomes an MCP tool error, with a
+  diagnostic hint (start of stdout or of the artifact, plus stderr).

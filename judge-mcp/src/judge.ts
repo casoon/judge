@@ -1,4 +1,8 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /** Path to the `cargo-judge` binary. judge-mcp never installs or builds it. */
 const JUDGE_BINARY = process.env.JUDGE_BINARY ?? "cargo-judge";
@@ -65,6 +69,14 @@ function runJudgeProcess({ args, cwd }: JudgeRunOptions): Promise<JudgeRunResult
 /**
  * Runs cargo-judge and returns its parsed `--format json` output.
  *
+ * cargo-judge writes `--format json` output to an artifact file (default
+ * `.judge/<command>.json` in the workspace) and only prints "JSON written to
+ * <path>" on stdout. To keep the analyzed workspace untouched, the artifact is
+ * written to a unique temp file via `--output`, read back and always deleted.
+ * judge adds a `header` object (artifact path, timestamp, assessment) in front
+ * of the command's normal versioned payload; it is dropped here, so the tool
+ * returns that payload as before.
+ *
  * Exit code convention (judge's own CLI contract, see src/main.rs `exit_code`):
  *   - 0: clean, no findings.
  *   - 1: findings present. This is NOT an error state for judge — a normal
@@ -73,30 +85,46 @@ function runJudgeProcess({ args, cwd }: JudgeRunOptions): Promise<JudgeRunResult
  *     carrying judge's stderr text.
  */
 export async function runJudgeJson(options: JudgeRunOptions): Promise<unknown> {
-  const result = await runJudgeProcess(options);
-
-  if (result.exitCode === 2) {
-    throw new JudgeExecutionError(
-      `cargo-judge reported a config/analyzer error (exit 2): ${
-        result.stderr.trim() || "(no stderr output)"
-      }`,
-    );
-  }
-  if (result.exitCode !== 0 && result.exitCode !== 1) {
-    throw new JudgeExecutionError(
-      `cargo-judge exited with unexpected code ${result.exitCode}. stderr: ${
-        result.stderr.trim() || "(none)"
-      }`,
-    );
-  }
-
+  const outputPath = join(tmpdir(), `judge-mcp-${randomUUID()}.json`);
   try {
-    return JSON.parse(result.stdout) as unknown;
-  } catch (err) {
-    throw new JudgeExecutionError(
-      `Failed to parse cargo-judge JSON output: ${err instanceof Error ? err.message : String(err)}. ` +
-        `First 500 chars of stdout: ${JSON.stringify(result.stdout.slice(0, 500))}. ` +
-        `stderr: ${result.stderr.trim() || "(none)"}`,
-    );
+    const result = await runJudgeProcess({ ...options, args: [...options.args, "--output", outputPath] });
+
+    if (result.exitCode === 2) {
+      throw new JudgeExecutionError(
+        `cargo-judge reported a config/analyzer error (exit 2): ${
+          result.stderr.trim() || "(no stderr output)"
+        }`,
+      );
+    }
+    if (result.exitCode !== 0 && result.exitCode !== 1) {
+      throw new JudgeExecutionError(
+        `cargo-judge exited with unexpected code ${result.exitCode}. stderr: ${
+          result.stderr.trim() || "(none)"
+        }`,
+      );
+    }
+
+    let artifact: string;
+    try {
+      artifact = await readFile(outputPath, "utf8");
+    } catch (err) {
+      throw new JudgeExecutionError(
+        `cargo-judge wrote no JSON artifact: ${err instanceof Error ? err.message : String(err)}. ` +
+          `First 500 chars of stdout: ${JSON.stringify(result.stdout.slice(0, 500))}. ` +
+          `stderr: ${result.stderr.trim() || "(none)"}`,
+      );
+    }
+    try {
+      const { header: _header, ...payload } = JSON.parse(artifact) as Record<string, unknown>;
+      return payload;
+    } catch (err) {
+      throw new JudgeExecutionError(
+        `Failed to parse cargo-judge JSON output: ${err instanceof Error ? err.message : String(err)}. ` +
+          `First 500 chars of the artifact: ${JSON.stringify(artifact.slice(0, 500))}. ` +
+          `stderr: ${result.stderr.trim() || "(none)"}`,
+      );
+    }
+  } finally {
+    await rm(outputPath, { force: true });
   }
 }
