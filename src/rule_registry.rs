@@ -1476,7 +1476,8 @@ mod tests {
     /// diverge, see their entries' `exclusions`/module docs).
     #[test]
     fn known_rule_id_resolves_with_expected_fields() {
-        let entry = lookup(crate::rules::slop::CATCH_ALL_ERROR_RULE).expect("catch-all-error entry");
+        let entry =
+            lookup(crate::rules::slop::CATCH_ALL_ERROR_RULE).expect("catch-all-error entry");
         assert_eq!(entry.id, "catch-all-error");
         assert_eq!(entry.evidence_class, EvidenceClass::DerivedFact);
         assert_eq!(entry.verdict_effect, VerdictEffect::Gating);

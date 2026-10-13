@@ -878,7 +878,7 @@ fn write_coverage_test_ratios_tty(
 /// Fast-Tier `module-boundary-violation` check already ran), matching
 /// `run_api_surface`'s same precedent for `semver-hazard`'s Deep-Tier
 /// sub-case.
-#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
+#[cfg_attr(not(feature = "deep"), allow(unused_variables, clippy::ptr_arg))]
 fn apply_boundaries_deep_tier(
     workspace: &judge::ingest::Workspace,
     config: &judge::rules::boundaries::BoundaryConfig,
@@ -1265,7 +1265,7 @@ fn render_focused(
 /// `undocumented-public-item` are useful on their own. Extends `findings`/
 /// `analysis_errors` in place and returns the deep-tier-only error list plus
 /// the checked-fn count `run_api_surface`'s TTY view reports separately.
-#[cfg_attr(not(feature = "deep"), allow(unused_variables))]
+#[cfg_attr(not(feature = "deep"), allow(unused_variables, clippy::ptr_arg))]
 fn apply_deep_api_surface_checks(
     workspace: &judge::ingest::Workspace,
     boundary_config: &judge::rules::boundaries::BoundaryConfig,
@@ -1327,8 +1327,12 @@ pub(crate) fn run_api_surface(
         judge::rules::api_surface::analyze_workspace(workspace.crates.iter(), include_generated);
     let mut findings = report.findings;
     let mut analysis_errors = analysis_errors(&report.errors);
-    let (deep_errors, deep_checked) =
-        apply_deep_api_surface_checks(&workspace, &boundary_config, &mut findings, &mut analysis_errors)?;
+    let (deep_errors, deep_checked) = apply_deep_api_surface_checks(
+        &workspace,
+        &boundary_config,
+        &mut findings,
+        &mut analysis_errors,
+    )?;
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (findings, suppressed_inline) =
@@ -1407,6 +1411,7 @@ pub(crate) fn run_api_surface(
 /// (including the two Deep-Tier-only `api_surface_deep` rules when compiled
 /// with `--features deep`) and the crate-size-trend map, then delegates to
 /// `handle_baseline_with_trend`.
+#[allow(clippy::too_many_arguments)]
 fn save_or_compare_api_surface_baseline(
     workspace: &judge::ingest::Workspace,
     findings: &[Finding],

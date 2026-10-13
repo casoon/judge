@@ -36,7 +36,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          # rust-src: the deep tier discovers the sysroot; without std sources
+          # rust-analyzer undercounts references (see src/deep.rs).
+          components: rustfmt, clippy, rust-src
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
         run: cargo fmt --all -- --check

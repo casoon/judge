@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::rules::complexity;
 use crate::ingest::{CrateInfo, EntryPointKind, Workspace};
+use crate::rules::complexity;
 
 /// Schema version for [`RefactorMap`]'s independent JSON contract.
 pub const SCHEMA_VERSION: u32 = 3;
