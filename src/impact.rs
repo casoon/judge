@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::rules::deps::{UsageDomain, classify_domain};
 use crate::ingest::{SourceKind, Workspace};
+use crate::rules::deps::{UsageDomain, classify_domain};
 
 /// Schema version for [`ImpactMap`]'s independent JSON contract.
 pub const SCHEMA_VERSION: u32 = 1;

@@ -212,7 +212,12 @@ where
     /// `visit` — shared by `mod` and `trait`, the two scopes that only track a
     /// path segment and test context (an `impl` block additionally tracks
     /// `in_trait_impl`, so it keeps its own visitor body).
-    fn visit_scoped(&mut self, name: String, attrs: &[syn::Attribute], visit: impl FnOnce(&mut Self)) {
+    fn visit_scoped(
+        &mut self,
+        name: String,
+        attrs: &[syn::Attribute],
+        visit: impl FnOnce(&mut Self),
+    ) {
         let is_test_context = self.current_test_context() || has_test_cfg(attrs);
         self.path.push(name);
         self.visit_fn_scoped(is_test_context, visit);
@@ -297,14 +302,21 @@ where
     }
 
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        let is_test_context = self.emit_fn(node, &node.sig, &node.block, &node.vis, &node.attrs, false);
+        let is_test_context =
+            self.emit_fn(node, &node.sig, &node.block, &node.vis, &node.attrs, false);
         self.visit_fn_scoped(is_test_context, |w| visit::visit_item_fn(w, node));
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         let in_trait_impl = self.current_in_trait_impl();
-        let is_test_context =
-            self.emit_fn(node, &node.sig, &node.block, &node.vis, &node.attrs, in_trait_impl);
+        let is_test_context = self.emit_fn(
+            node,
+            &node.sig,
+            &node.block,
+            &node.vis,
+            &node.attrs,
+            in_trait_impl,
+        );
         self.visit_fn_scoped(is_test_context, |w| visit::visit_impl_item_fn(w, node));
     }
 

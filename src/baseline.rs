@@ -144,10 +144,7 @@ pub(crate) enum StoreErrorRef<'a> {
     Io(&'a Path, &'a std::io::Error),
     Serialize(&'a serde_json::Error),
     Deserialize(&'a Path, &'a serde_json::Error),
-    UnsupportedSchemaVersion {
-        path: &'a Path,
-        found: Option<u64>,
-    },
+    UnsupportedSchemaVersion { path: &'a Path, found: Option<u64> },
 }
 
 /// Shared `Display` rendering for baseline-family store errors —
@@ -180,7 +177,10 @@ pub(crate) fn fmt_store_error(
                     path.display()
                 )?,
             }
-            write!(f, " — re-save it with a matching judge via `{resave_command}`")
+            write!(
+                f,
+                " — re-save it with a matching judge via `{resave_command}`"
+            )
         }
     }
 }
@@ -377,7 +377,9 @@ pub fn partition_gating<'a, I>(findings: I) -> (Vec<&'a Finding>, Vec<&'a Findin
 where
     I: IntoIterator<Item = &'a Finding>,
 {
-    findings.into_iter().partition(|finding| finding.is_gating())
+    findings
+        .into_iter()
+        .partition(|finding| finding.is_gating())
 }
 
 /// Compares `current` findings against a recorded project state. The legacy

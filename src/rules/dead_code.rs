@@ -1287,6 +1287,7 @@ fn check_unreachable_from_entry(
 /// [`MODULE_COUPLING_RULE`], [`top_level_module_bucket`]) — so `check_item`
 /// can look up both an item's own module and a referencing file's module
 /// without re-deriving either per query.
+#[allow(clippy::type_complexity)]
 fn build_file_maps<'a>(
     workspace: &'a Workspace,
     ctx: &DeepContext,
@@ -1319,6 +1320,7 @@ fn build_file_maps<'a>(
 /// The "production" and "all" reachability entry-key sets [`analyze_workspace`]
 /// needs — `test-only-pub` (see [`check_test_only_pub`]) needs both modes
 /// regardless of `include_tests`, so both are computed unconditionally here.
+#[allow(clippy::type_complexity)]
 fn compute_entry_key_sets(
     workspace: &Workspace,
     ctx: &DeepContext,

@@ -34,9 +34,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::baseline::Baseline;
-use crate::rules::boundaries::CrateProfile;
 use crate::finding::{Finding, Severity};
 use crate::ingest::{CrateInfo, SourceFile, Workspace};
+use crate::rules::boundaries::CrateProfile;
 
 /// Fixed per-severity deduction weight (see module docs, point 2 — not
 /// configurable per rule).
@@ -356,7 +356,11 @@ pub fn compute(
 
 /// Scores one gating finding's `severity` as a fail/warn deduction weight,
 /// bumping the matching counter. `None` for `Info`, which is never scored.
-fn score_severity(severity: Severity, fail_count: &mut usize, warn_count: &mut usize) -> Option<f64> {
+fn score_severity(
+    severity: Severity,
+    fail_count: &mut usize,
+    warn_count: &mut usize,
+) -> Option<f64> {
     match severity {
         Severity::Fail => {
             *fail_count += 1;
@@ -555,7 +559,10 @@ pub fn trend(
                 // Stored paths are workspace-relative (`join` is a no-op for
                 // older baselines that stored absolute paths).
                 let file = workspace.root.join(&finding.file);
-                (finding.severity, multiplier_for(workspace, &file, crate_profiles))
+                (
+                    finding.severity,
+                    multiplier_for(workspace, &file, crate_profiles),
+                )
             }),
     );
 
