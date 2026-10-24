@@ -14,7 +14,6 @@ export default defineConfig({
       tagline: 'Post-refactoring analysis for Rust',
       website: 'https://judge.casoon.de',
       repo: 'casoon/judge',
-      version: '0.7.0',
       license: 'BUSL-1.1',
       packages: [
         { label: 'crates.io', href: 'https://crates.io/crates/cargo-judge' },
