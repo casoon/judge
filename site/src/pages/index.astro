@@ -12,6 +12,7 @@ import {
   Terminal,
 } from '@casoon/pages-theme/components';
 import Base from '@casoon/pages-theme/layouts/Base.astro';
+import config from 'virtual:casoon-pages/config';
 import { fixture } from '../showcase';
 
 const summary = fixture('summary.ansi');
@@ -47,7 +48,7 @@ reach = "transitive"`;
     <Badges>
       <Badge>BUSL-1.1</Badge>
       <Badge tone="brand">early stage</Badge>
-      <Badge>crates.io 0.7.0</Badge>
+      <Badge>crates.io {config.version}</Badge>
       <Badge>Rust 1.95+</Badge>
       <Badge>no telemetry</Badge>
     </Badges>
