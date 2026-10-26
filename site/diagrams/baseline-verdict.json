@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "type": "flow",
+  "title": "From baseline to CI verdict",
+  "description": "cargo judge --save-baseline writes the findings of an accepted tree to .judge/baseline.json. cargo judge compare checks a later tree against it and sorts the findings into unchanged, resolved and introduced. If an introduced finding is gating and has warning or failure severity, the verdict fails and judge exits with 1; otherwise the verdict passes and judge exits with 0. Introduced advisory findings are listed but never change the verdict.",
+  "source": "src/baseline.rs (Delta::verdict), src/commands/baseline_output.rs, src/main.rs (exit codes)",
+  "width": 1240,
+  "height": 300,
+  "flow": {
+    "nodes": [
+      { "id": "save", "label": "Accepted tree", "sublabel": "cargo judge --save-baseline", "kind": "start" },
+      { "id": "baseline", "label": "baseline.json", "sublabel": "in .judge/", "kind": "store" },
+      { "id": "later", "label": "Later tree", "sublabel": "after the refactoring", "kind": "start" },
+      { "id": "compare", "label": "cargo judge compare", "sublabel": "unchanged, resolved, introduced" },
+      { "id": "gate", "label": "New gating findings?", "sublabel": "warning or failure severity", "kind": "decision" },
+      { "id": "fail", "label": "verdict: fail", "sublabel": "exit 1", "kind": "end" },
+      { "id": "pass", "label": "verdict: pass", "sublabel": "exit 0", "kind": "end" }
+    ],
+    "edges": [
+      { "from": "save", "to": "baseline", "label": "writes" },
+      { "from": "baseline", "to": "compare", "label": "reads" },
+      { "from": "later", "to": "compare", "label": "analyses" },
+      { "from": "compare", "to": "gate" },
+      { "from": "gate", "to": "fail", "label": "yes" },
+      { "from": "gate", "to": "pass", "label": "no" }
+    ],
+    "mainPath": ["save", "baseline", "compare", "gate", "fail"],
+    "orientation": "landscape"
+  }
+}
