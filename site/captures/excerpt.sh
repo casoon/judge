@@ -6,7 +6,7 @@
 #   resolved, introduced, introduced advisory, severity changed), without the finding lists.
 # The full output of both runs is in the showcase. Rebuild the scenes afterwards:
 #   cd site/captures && for f in judge.terminal.yaml judge-narrow.terminal.yaml; do
-#     npx -y -p @casoon/castwright@0.4.0 -p shiki castwright build "$f" --format svg -o .; done
+#     npx -y -p @casoon/castwright@0.5.0 -p shiki castwright build "$f" --format svg -o .; done
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
