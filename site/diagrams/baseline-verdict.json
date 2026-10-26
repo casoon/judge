@@ -11,7 +11,7 @@
       { "id": "save", "label": "Accepted tree", "sublabel": "cargo judge --save-baseline", "kind": "start" },
       { "id": "baseline", "label": "baseline.json", "sublabel": "in .judge/", "kind": "store" },
       { "id": "later", "label": "Later tree", "sublabel": "after the refactoring", "kind": "start" },
-      { "id": "compare", "label": "cargo judge compare", "sublabel": "unchanged, resolved, introduced" },
+      { "id": "compare", "label": "cargo judge compare", "sublabel": "unchanged, resolved, new" },
       { "id": "gate", "label": "New gating findings?", "sublabel": "warning or failure severity", "kind": "decision" },
       { "id": "fail", "label": "verdict: fail", "sublabel": "exit 1", "kind": "end" },
       { "id": "pass", "label": "verdict: pass", "sublabel": "exit 0", "kind": "end" }
