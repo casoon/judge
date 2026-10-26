@@ -19,6 +19,7 @@ export default defineConfig({
         { label: 'crates.io', href: 'https://crates.io/crates/cargo-judge' },
         { label: 'docs.rs', href: 'https://docs.rs/cargo-judge' },
       ],
+      mdxComponents: './src/mdx-components.ts',
       docsGroups: {
         'getting-started': 'Getting started',
         guides: 'Guides',

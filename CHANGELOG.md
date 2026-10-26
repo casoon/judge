@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Release dates are the dates the
 versions were published on crates.io.
 
+## [Unreleased]
+
+### Changed
+
+- **Project site:** the start page shows an animated terminal scene from real judge output and
+  a diagram of the baseline-to-verdict flow; install variants, `judge.toml`, the CI step and the
+  deep tier are covered in the [documentation](https://casoon.github.io/judge/docs/).
+- **Docs:** the [Baselines and CI](https://casoon.github.io/judge/docs/guides/baselines-and-ci/)
+  guide shows how `cargo judge compare` reaches its verdict and exit code as a diagram.
+
 ## [0.7.0] - 2026-08-29
 
 ### Added
