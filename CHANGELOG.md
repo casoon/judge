@@ -13,6 +13,7 @@ versions were published on crates.io.
   deep tier are covered in the [documentation](https://casoon.github.io/judge/docs/).
 - **Docs:** the [Baselines and CI](https://casoon.github.io/judge/docs/guides/baselines-and-ci/)
   guide shows how `cargo judge compare` reaches its verdict and exit code as a diagram.
+- **Project site:** the start page now carries a release teaser and an FAQ (theme 0.11.1).
 
 ## [0.7.0] - 2026-08-29
 

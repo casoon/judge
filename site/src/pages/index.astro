@@ -1,17 +1,21 @@
 ---
+import { readFile } from 'node:fs/promises';
 import {
   Badge,
   Badges,
   Button,
   CodeBlock,
   Facts,
+  Faq,
   Features,
   Hero,
   Install,
   Quickstart,
+  ReleaseHighlights,
 } from '@casoon/pages-theme/components';
 import Base from '@casoon/pages-theme/layouts/Base.astro';
 import config from 'virtual:casoon-pages/config';
+import { parseChangelog } from '@casoon/pages-theme/lib/changelog';
 import { url } from '@casoon/pages-theme/url';
 // Animated SVGs built with castwright from site/captures/judge*.terminal.yaml: excerpts of
 // examples/summary.ansi and examples/compare.txt (see site/captures/excerpt.sh). The narrow
@@ -23,6 +27,13 @@ import Diagram from '../components/Diagram.astro';
 const usage = `cargo judge                    # triage report
 cargo judge --save-baseline    # accept this state
 cargo judge compare .judge/baseline.json`;
+
+// Skip "Unreleased": it has no version to show as "New in v…" yet.
+const latestRelease = config.changelog
+  ? parseChangelog(await readFile(config.changelog, 'utf8')).find(
+      (r) => r.version.toLowerCase() !== 'unreleased'
+    )
+  : undefined;
 ---
 
 <Base>
@@ -108,6 +119,33 @@ cargo judge compare .judge/baseline.json`;
   >
     <CodeBlock code={usage} lang="sh" label="Three commands" />
   </Quickstart>
+
+  {latestRelease && <ReleaseHighlights release={latestRelease} />}
+
+  <Faq
+    items={[
+      {
+        q: "What does judge check that Clippy and the compiler don't?",
+        a: 'Structural and cross-file concerns that only become visible across a workspace — duplicated code, complexity concentration, public API surface and dependency hygiene. Anything the compiler or Clippy already tells you, judge does not repeat.',
+      },
+      {
+        q: 'Does judge look at Git history or who wrote the code?',
+        a: 'No. It analyzes only the current source tree, workspace structure and dependency graph, never commit history, authorship or telemetry, so human-written and agent-refactored code get the same findings.',
+      },
+      {
+        q: 'How does the CI verdict work?',
+        a: 'Save a baseline from a tree you accept with --save-baseline, then run cargo judge compare against it in CI. Only new findings backed by evidence and warning or failure severity fail the verdict; heuristic findings are listed but never block a merge.',
+      },
+      {
+        q: 'What is the Deep Tier, and do I need it?',
+        a: 'The default Fast Tier needs no build step. The Deep Tier, behind the deep Cargo feature, loads the workspace into rust-analyzer for dead-code and why-live analysis, at the cost of a noticeably longer build.',
+      },
+      {
+        q: 'Does judge make network calls?',
+        a: 'Not by default. Dependency checks against crates.io, such as phantom or yanked dependencies, are opt-in via --check-crates-io, and judge never runs cargo-audit itself.',
+      },
+    ]}
+  />
 </Base>
 
 <style>
