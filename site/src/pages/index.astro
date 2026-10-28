@@ -12,6 +12,7 @@ import {
   Install,
   Quickstart,
   ReleaseHighlights,
+  Spotlight,
 } from '@casoon/pages-theme/components';
 import Base from '@casoon/pages-theme/layouts/Base.astro';
 import config from 'virtual:casoon-pages/config';
@@ -27,6 +28,12 @@ import Diagram from '../components/Diagram.astro';
 const usage = `cargo judge                    # triage report
 cargo judge --save-baseline    # accept this state
 cargo judge compare .judge/baseline.json`;
+
+const deepTierUsage = `cargo install cargo-judge --features deep
+cargo judge inspect                      # "deep: available"
+
+cargo judge dead-code
+cargo judge explain my_crate::parser::parse --why-live`;
 
 // Skip "Unreleased": it has no version to show as "New in v…" yet.
 const latestRelease = config.changelog
@@ -108,6 +115,23 @@ const latestRelease = config.changelog
       <Button href={url('showcase/')} variant="quiet">Real output →</Button>
     </div>
   </section>
+
+  <Spotlight
+    eyebrow="Fast tier or deep tier"
+    title="One more build step, real reference data"
+    lead="**The default Fast Tier needs no build step and reads the tree as written.** Compiling in rust-analyzer itself, behind the `deep` Cargo feature, lets `dead-code` and `explain --why-live` work from real reference data instead of syntax-level guesses."
+    points={[
+      '**Dead code, with evidence.** `dead-code` reports `unused-pub-workspace` — no reference from another workspace crate and no reachability from a recognised entry point, not proof.',
+      '**Why something is still live.** `explain --why-live` prints the shortest evidenced route from `fn main`, a test or an FFI boundary to the item, each edge classified as static, dynamic, macro, generated or unknown.',
+      'The build cost is upfront, not per run. Compiling the `ra_ap_*` crates takes noticeably longer once; `cargo judge inspect` confirms `deep: available` afterward.',
+    ]}
+    links={[
+      { label: 'Deep Tier guide', href: url('docs/guides/deep-tier/') },
+      { label: 'All 78 rules', href: url('docs/reference/rules/') },
+    ]}
+  >
+    <CodeBlock code={deepTierUsage} lang="sh" label="Deep Tier" />
+  </Spotlight>
 
   <Quickstart
     lead="Install it, run it in the workspace root, and turn the result into a baseline for CI. Crate boundaries in judge.toml, the output formats and the rust-analyzer deep tier are covered in the documentation."
