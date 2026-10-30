@@ -18,7 +18,7 @@
 //!   via explicit `.drop()` call syntax.
 //! - The `std::ops::*` operator traits (`Add`, `Sub`, `Index`, `PartialEq`,
 //!   `PartialOrd`, …) are invoked via operator syntax (`a + b`, `a == b`,
-//!   `a[i]`), never as an [`ast::MethodCallExpr`] — [`Semantics::resolve_method_call`]
+//!   `a[i]`), never as an [`ast::MethodCallExpr`] — [`Semantics::resolve_method_call`](ra_ap_hir::SemanticsImpl::resolve_method_call)
 //!   only sees explicit `.method()` calls.
 //! - `Display`/`Debug::fmt` are invoked by formatting macros through
 //!   non-obvious internal paths, not a plain `.fmt()` call in user code.
@@ -48,13 +48,13 @@
 //!    items of its own for a call site to resolve to — see "Ehrliche Grenze"
 //!    below — so it is skipped too, rather than being flagged unconditionally.
 //! 2. **Deep-Tier trait-origin check**: each remaining candidate's trait is
-//!    resolved via [`Semantics::to_def`]/[`ra_ap_hir::Impl::trait_`], and kept
+//!    resolved via [`Semantics::to_def`](ra_ap_hir::SemanticsImpl::to_def)/[`ra_ap_hir::Impl::trait_`], and kept
 //!    only if that trait's defining crate is one of the analyzed workspace's
-//!    own crates (see [`is_workspace_local_trait`]) — never `std`/`core`/
+//!    own crates (see `is_workspace_local_trait`) — never `std`/`core`/
 //!    `alloc` or an external dependency.
 //! 3. **Deep-Tier call-site scan**: one pass over every [`ast::MethodCallExpr`]
 //!    in the whole workspace, resolving each via
-//!    [`Semantics::resolve_method_call`] to the concrete [`ra_ap_hir::Function`]
+//!    [`Semantics::resolve_method_call`](ra_ap_hir::SemanticsImpl::resolve_method_call) to the concrete [`ra_ap_hir::Function`]
 //!    Rust's own static dispatch selected — already the specific impl's own
 //!    function, not the trait's abstract signature — then
 //!    [`ra_ap_hir::AsAssocItem::as_assoc_item`]/[`ra_ap_hir::AssocItem::container`]
@@ -69,11 +69,11 @@
 //! ## Ehrliche Grenze — documented boundary, not a bug
 //!
 //! A call through a generic bound (`fn foo<T: Trait>(x: T) { x.bar() }`) is
-//! not concretely dispatched at the call site — [`Semantics::resolve_method_call`]
+//! not concretely dispatched at the call site — [`Semantics::resolve_method_call`](ra_ap_hir::SemanticsImpl::resolve_method_call)
 //! resolves it to the trait's own method, not any specific impl, so it never
 //! marks a candidate impl as called. This is legitimate and consistent with
 //! this rule's semantics ("never called through that *concrete* type"), the
-//! same generic-dispatch caveat [`crate::reachability::classify_call_kind`]'s
+//! same generic-dispatch caveat `crate::reachability::classify_call_kind`'s
 //! own doc comment documents for its own, analogous blind spot.
 
 use std::collections::HashSet;

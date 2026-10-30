@@ -22,9 +22,9 @@
 //! vulnerability-reachability cross-reference; deliberately left for a
 //! later, separate pass rather than folded in half-done here.
 //!
-//! ## Why this isn't [`crate::reachability`]
+//! ## Why this isn't `crate::reachability`
 //!
-//! [`crate::reachability`] (the Deep Tier `--why-live` engine) answers "is
+//! `crate::reachability` (the Deep Tier `--why-live` engine) answers "is
 //! *this specific function* reachable from a recognized entry point" — the
 //! right question for dead-code analysis, but the wrong granularity here.
 //! RUSTSEC advisories are scoped to a crate name and a version range, not to
@@ -32,7 +32,7 @@
 //! function-level target to hand that engine. What this module can honestly
 //! answer instead, from the *dependency graph* alone, is whether the
 //! affected crate is wired into the actual build at all — see
-//! [`production_reachable_packages`].
+//! `production_reachable_packages`.
 //!
 //! ## Reachability classification
 //!
@@ -266,7 +266,7 @@ pub struct AdvisoryReport {
 /// [`read_audit_report`]) with `workspace`'s own resolved dependency graph
 /// (see module doc). A local resolve failure never drops a vulnerability
 /// `cargo audit` already confirmed — every entry is still reported, just
-/// with [`Reachability::Unknown`] instead of a real classification.
+/// with `Reachability::Unknown` instead of a real classification.
 pub fn analyze_vulnerabilities(
     workspace: &Workspace,
     vulnerabilities: &[AuditVulnerability],

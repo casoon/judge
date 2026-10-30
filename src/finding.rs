@@ -128,7 +128,7 @@ pub enum Severity {
 /// former numeric `confidence` score (todo.md §17.2, §17.5: numbers like
 /// `0.95` suggest a calibrated probability that never existed).
 ///
-/// Rule → class mapping (see [`evidence_class_for_rule`], todo.md §17.3):
+/// Rule → class mapping (see `evidence_class_for_rule`, todo.md §17.3):
 ///
 /// | Rule | Class |
 /// |---|---|

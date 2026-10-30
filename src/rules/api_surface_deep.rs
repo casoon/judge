@@ -48,7 +48,7 @@
 //!
 //! ## Evidence class
 //!
-//! [`crate::finding::evidence_class_for_rule`] maps `semver-hazard` to
+//! `crate::finding::evidence_class_for_rule` maps `semver-hazard` to
 //! `derived_fact` by default — correct for the other two sub-cases (an exact
 //! syntax fact: an attribute is present or absent), but not for this one: a
 //! type's defining crate is a semantic fact, true only within the Deep
@@ -96,15 +96,15 @@ pub const INTERNAL_LEAK_RULE_REVISION: u32 = 1;
 /// A single direct re-export (one hop) is an extremely common, legitimate
 /// pattern (curated top-level re-exports, prelude modules, workspace
 /// umbrella crates) and is deliberately *not* the signal on its own — only a
-/// chain of [`RE_EXPORT_CHAIN_MIN_HOP_COUNT`] or more hops is.
+/// chain of `RE_EXPORT_CHAIN_MIN_HOP_COUNT` or more hops is.
 ///
 /// Deep-Tier-only, no Fast-Tier counterpart: following a `pub use` path
 /// across crate boundaries needs the same cross-crate `ra_ap_hir::Semantics`
-/// resolution [`leaked_type`] already relies on, plus one further step this
+/// resolution `leaked_type` already relies on, plus one further step this
 /// rule alone needs — at each hop, whether the resolved target is *itself*
 /// another `pub use` rather than an original item definition. That check
 /// needs the raw syntax of the target module's own source (see
-/// [`find_named_top_level_item`]), because `ra_ap_hir`'s own path resolution
+/// `find_named_top_level_item`), because `ra_ap_hir`'s own path resolution
 /// does not stop at one hop: it resolves a `use` path (its qualifier and its
 /// full leaf path alike) through the same crate-def-map import resolution
 /// used for any other path, and that resolution is not lazy per level —
@@ -113,7 +113,7 @@ pub const INTERNAL_LEAK_RULE_REVISION: u32 = 1;
 /// against the vendored `ra_ap_hir` 0.0.342 source: `goto_declaration`, the
 /// one IDE feature that *does* stop at one `use` hop, explicitly does not
 /// support structs/enums/fns — only module outlines, trait assoc items, and
-/// `extern crate`). This is why [`walk_hops`] resolves only a hop's
+/// `extern crate`). This is why `walk_hops` resolves only a hop's
 /// *qualifier* to a module via HIR, then classifies that module's own
 /// top-level item by syntax alone, one hop at a time, instead of resolving
 /// the whole path once and trying to recover a hop count from the result.

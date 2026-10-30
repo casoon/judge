@@ -44,7 +44,7 @@
 //!
 //! ## Bare/self-relative reference resolution — a narrow, sound exception
 //!
-//! Like `boundaries.rs`'s `resolve_leading_segments`, [`ReferenceCollector`]
+//! Like `boundaries.rs`'s `resolve_leading_segments`, `ReferenceCollector`
 //! only resolves a path whose leading segment is `crate`, `super`, or a
 //! known workspace crate's own identifier — a bare/unqualified reference
 //! (including `self::...`) is **not** resolved in general, since telling

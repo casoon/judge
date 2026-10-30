@@ -53,12 +53,12 @@
 //! `G3` ("Sprachliche Marker", see todo.md §3.G) splits across two modules.
 //! `generic-naming` and `doc-restates-signature` are structural/lexical
 //! checks over identifiers and `#[doc = ...]` attributes, so they extend
-//! [`SlopVisitor`] here exactly like the `G1`/`G2` rules above. The other
+//! `SlopVisitor` here exactly like the `G1`/`G2` rules above. The other
 //! three — `conversational-artifact`, `restating-comment`,
 //! `step-comment-inflation` — target plain `//`/`/* */` prose, which `syn`
 //! discards entirely during parsing (only `///`/`//!` doc comments survive,
 //! desugared to `#[doc = "..."]` attributes); there is no AST node for a
-//! regular comment, so those three live in [`crate::rules::slop_text`], a
+//! regular comment, so those three live in `crate::rules::slop_text`, a
 //! raw-source-text scanner run alongside this visitor.
 
 use std::path::{Path, PathBuf};
@@ -93,7 +93,7 @@ pub const EMPTY_ERROR_ARM_RULE_REVISION: u32 = 1;
 /// Rule id for a `pub fn` whose error type is erased (`Box<dyn Error>` /
 /// `anyhow::Error`) at a public API boundary *and* whose body discards the
 /// original error via a wildcard-parameter `.map_err(|_| ..)` (see todo.md
-/// §G1, [`discards_error_via_map_err`]).
+/// §G1, `discards_error_via_map_err`).
 pub const CATCH_ALL_ERROR_RULE: &str = "catch-all-error";
 /// Bump when the catch-all-error rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz"). v2 (2026-07-24, GitHub issue #11): added the
@@ -132,17 +132,17 @@ pub const IGNORED_TEST_ACCUMULATION_RULE: &str = "ignored-test-accumulation";
 pub const IGNORED_TEST_ACCUMULATION_RULE_REVISION: u32 = 1;
 
 /// Rule id for a phrase leaking AI-assistant framing into a plain comment
-/// (see todo.md §G3). Implemented in [`crate::rules::slop_text`].
+/// (see todo.md §G3). Implemented in `crate::rules::slop_text`.
 pub const CONVERSATIONAL_ARTIFACT_RULE: &str = "conversational-artifact";
 pub const CONVERSATIONAL_ARTIFACT_RULE_REVISION: u32 = 1;
 
 /// Rule id for a comment that only paraphrases the code line it precedes
-/// (see todo.md §G3). Implemented in [`crate::rules::slop_text`].
+/// (see todo.md §G3). Implemented in `crate::rules::slop_text`.
 pub const RESTATING_COMMENT_RULE: &str = "restating-comment";
 pub const RESTATING_COMMENT_RULE_REVISION: u32 = 1;
 
 /// Rule id for a `// Step N:` comment chain of three or more (see todo.md
-/// §G3). Implemented in [`crate::rules::slop_text`].
+/// §G3). Implemented in `crate::rules::slop_text`.
 pub const STEP_COMMENT_INFLATION_RULE: &str = "step-comment-inflation";
 pub const STEP_COMMENT_INFLATION_RULE_REVISION: u32 = 1;
 
@@ -159,7 +159,7 @@ pub const DOC_RESTATES_SIGNATURE_RULE_REVISION: u32 = 1;
 /// Rule id for `.unwrap_or_default()` / `.unwrap_or_else(|_| ..default())`
 /// on a function whose body has no error-observing call anywhere (see
 /// todo.md §G1). A narrow syntax-only proxy, not a taint proof — see
-/// [`check_silent_default`] and the module doc comment above.
+/// `check_silent_default` and the module doc comment above.
 pub const SILENT_DEFAULT_RULE: &str = "silent-default";
 pub const SILENT_DEFAULT_RULE_REVISION: u32 = 1;
 
@@ -167,14 +167,14 @@ pub const SILENT_DEFAULT_RULE_REVISION: u32 = 1;
 /// error idiom (`anyhow::Error`/`anyhow::Result`, `eyre::Report`/
 /// `eyre::Result`, `Box<dyn std::error::Error ..>`) and whose body has 2+
 /// distinct `?`-sites but zero `.context(`/`.with_context(` calls (see
-/// todo.md §G1). See [`check_context_free_propagation`] and the module doc
+/// todo.md §G1). See `check_context_free_propagation` and the module doc
 /// comment above.
 pub const CONTEXT_FREE_PROPAGATION_RULE: &str = "context-free-propagation";
 pub const CONTEXT_FREE_PROPAGATION_RULE_REVISION: u32 = 1;
 
 /// Rule id for a `{:?}`/`{:#?}` placeholder inside a `write!`/`format!` call
 /// within a manual `impl std::fmt::Display for T` block's body (see todo.md
-/// §K2). See [`SlopVisitor::visit_item_impl`] and the module doc comment
+/// §K2). See `SlopVisitor::visit_item_impl` and the module doc comment
 /// above.
 pub const DEBUG_FORMAT_LEAK_RULE: &str = "debug-format-leak";
 pub const DEBUG_FORMAT_LEAK_RULE_REVISION: u32 = 1;
@@ -209,7 +209,7 @@ pub struct WorkspaceSlop {
 }
 
 /// Parses a single Rust source file and returns every slop finding in it.
-/// See [`contains_catch_all_error`] for `allow_anyhow_at_boundary`.
+/// See `contains_catch_all_error` for `allow_anyhow_at_boundary`.
 pub fn analyze_file(
     path: &Path,
     allow_anyhow_at_boundary: bool,
@@ -245,7 +245,7 @@ pub fn analyze_file(
 /// Runs [`analyze_file`] over every file in `source_files` and aggregates the
 /// results. Generated files are skipped unless `include_generated` is set
 /// (see todo.md §3.A) — slop signals on generated code aren't actionable the
-/// way they are on authored code. See [`contains_catch_all_error`] for
+/// way they are on authored code. See `contains_catch_all_error` for
 /// `allow_anyhow_at_boundary`.
 pub fn analyze_workspace<'a>(
     source_files: impl IntoIterator<Item = &'a SourceFile>,

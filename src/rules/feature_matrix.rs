@@ -31,8 +31,8 @@
 //! single-load reachability check uses — see the registry entry in
 //! `crate::rule_registry` for the full wording constraint.
 //!
-//! Candidate items are collected once, via [`crate::functions::walk_functions`]
-//! and [`crate::rules::dead_code::walk_type_items`] (the same Fast-Tier `syn` walkers
+//! Candidate items are collected once, via `crate::functions::walk_functions`
+//! and `crate::rules::dead_code::walk_type_items` (the same Fast-Tier `syn` walkers
 //! `crate::rules::dead_code` itself uses) — independent of any single combination's
 //! active `#[cfg]` state, and scoped to both `pub` and non-`pub` items alike:
 //! unlike `unreachable-from-entry`'s pub/non-pub split (which exists to avoid

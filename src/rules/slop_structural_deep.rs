@@ -25,7 +25,7 @@
 //!
 //! **Two function shapes are excluded from both rules' candidate sets
 //! entirely, not just down-weighted** (see
-//! [`is_reliably_checkable_for_fan_in`]):
+//! `is_reliably_checkable_for_fan_in`):
 //!
 //! - `#[test]`/`#[bench]`-attributed functions. These are entry points by
 //!   design — [`crate::reachability`]'s own entry-point model already
@@ -70,7 +70,7 @@ pub const CONNECTIVITY_DROP_RULE_REVISION: u32 = 1;
 
 /// Rule id for `monomorphization-load` (todo.md §3.C "Rust-spezifisch:
 /// Monomorphisierungs-Last (Proxy für `cargo-llvm-lines`)") — see
-/// [`monomorphization_load_findings`].
+/// `monomorphization_load_findings`.
 pub const MONOMORPHIZATION_LOAD_RULE: &str = "monomorphization-load";
 /// Bump when the monomorphization-load rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").

@@ -17,7 +17,7 @@
 //! slop — churn, boilerplate, abstraction shape) is deliberately kept
 //! unblurred rather than absorbing security-shaped checks. `unsafe-surface`,
 //! `integer-cast-risk`, and `panic-in-lib` reuse
-//! [`crate::functions::walk_functions`] for the per-function-body traversal,
+//! `crate::functions::walk_functions` for the per-function-body traversal,
 //! exactly like [`crate::rules::complexity`] and [`crate::rules::duplication`] already do;
 //! `hardcoded-secret` and `unsafe-density` each need their own whole-file
 //! traversal instead (see their own scope sections below), since a
@@ -25,7 +25,7 @@
 //! visits — can itself contain both a hardcoded secret and an `unsafe { .. }`
 //! block.
 //!
-//! `unsafe-surface` additionally needs [`crate::rules::slop_text::extract_comments`]:
+//! `unsafe-surface` additionally needs `crate::rules::slop_text::extract_comments`:
 //! `syn` discards plain `//`/`/* */` comments entirely during parsing (only
 //! `///`/`//!` doc comments survive, desugared to `#[doc = "..."]`
 //! attributes — see that module's own doc comment), so a `// SAFETY:`
@@ -45,8 +45,8 @@
 //! [`UNSAFE_DENSITY_THRESHOLD`]/[`MAX_UNSAFE_BLOCK_SIZE_THRESHOLD`]). Files
 //! with zero `unsafe` blocks are skipped entirely — a density of `0.0` is not
 //! itself a finding. Runs its own whole-file [`syn::visit::Visit`] pass (see
-//! [`UnsafeBlockSizeVisitor`]) — deliberately separate from `unsafe-surface`'s
-//! own [`UnsafeVisitor`] rather than extending it, so this rule's aggregation
+//! `UnsafeBlockSizeVisitor`) — deliberately separate from `unsafe-surface`'s
+//! own `UnsafeVisitor` rather than extending it, so this rule's aggregation
 //! can never risk disturbing `unsafe-surface`'s existing per-site detection
 //! or its tests. A lexically nested `unsafe { .. }` block found inside
 //! another one (rare, and itself a target of rustc's own "unnecessary
@@ -66,7 +66,7 @@
 //! at the cast's written target type — with one syntax-only exemption: a
 //! cast whose direct inner expression is itself a call to
 //! `clamp`/`min`/`max`/one of the `saturating_*` methods (see
-//! [`is_clamped_immediately`]) is not
+//! `is_clamped_immediately`) is not
 //! flagged, since the value is already bounded to a safe range immediately
 //! before the cast. Added after a 2026-07-24 precision audit against a real
 //! 135k-LOC corpus (`auditmysite`) found this the single largest
@@ -84,7 +84,7 @@
 //! is still checked here as if it were reachable). `#[test]`-attributed
 //! functions are excluded directly; a `#[cfg(test)] mod tests { .. }` block
 //! is not tracked explicitly (this module doesn't walk module nesting, only
-//! individual function bodies via [`crate::functions::walk_functions`]), but
+//! individual function bodies via `crate::functions::walk_functions`), but
 //! its functions are almost never themselves `pub`, so the visibility filter
 //! already excludes nearly all of them in practice. A trait's default method
 //! (no visibility of its own) is never in scope — there is nothing to check
@@ -100,7 +100,7 @@
 //! same name is not distinguished from the standard, panicking one — the
 //! same accepted name-match imprecision `swallowed-result` already carries.
 //! An indexing expression's `evidence.kind` further distinguishes the index
-//! operand's shape (see [`classify_index_kind`]), added after the same
+//! operand's shape (see `classify_index_kind`), added after the same
 //! 2026-07-24 precision audit (todo.md §F "Praxisbeleg", GitHub issue #10)
 //! found ~100 of 116 `panic-in-lib` findings in `auditmysite` were
 //! `parsed["key"]`-style string-literal indexing into `serde_json::Value` —
@@ -135,11 +135,11 @@
 //! - **Entropy lane** (`high_entropy_assignment`): a string literal that is
 //!   the direct initializer of a `let`/`const`/`static` whose own name
 //!   contains a suspicious marker (`secret`, `token`, `password`, `api_key`,
-//!   …; see [`SUSPICIOUS_NAME_MARKERS`]), is at least [`MIN_SECRET_LENGTH`]
+//!   …; see `SUSPICIOUS_NAME_MARKERS`), is at least `MIN_SECRET_LENGTH`
 //!   characters long, and has a Shannon entropy of at least
-//!   [`MIN_SECRET_ENTROPY`] bits/char. Both thresholds are first-cut,
+//!   `MIN_SECRET_ENTROPY` bits/char. Both thresholds are first-cut,
 //!   adjustable constants, not calibrated against a corpus (mirrors
-//!   [`crate::git::SIZE_DISTRIBUTION_GINI_THRESHOLD`]'s same honest style).
+//!   `crate::git::SIZE_DISTRIBUTION_GINI_THRESHOLD`'s same honest style).
 //!   Gating the entropy lane on a suspicious *name* (rather than checking
 //!   every literal's entropy) is deliberate: plenty of ordinary strings
 //!   (hashes, UUIDs, encoded binary blobs) are legitimately high-entropy, and
@@ -157,17 +157,17 @@
 //! text.
 //!
 //! This detector runs its own [`syn::visit::Visit`] pass over the whole
-//! file rather than [`crate::functions::walk_functions`] (see the module
+//! file rather than `crate::functions::walk_functions` (see the module
 //! doc above), so it can see `const`/`static` items outside any function
 //! body — a common real-world location for a hardcoded secret. It tracks
 //! `mod`/`fn` nesting only (not `impl`/`trait` type names, unlike
-//! [`crate::functions::Walker`]) for a finding's `item_path` — a deliberately
+//! `crate::functions::Walker`) for a finding's `item_path` — a deliberately
 //! coarser location hint than the other three rules in this module, kept
 //! simple since it is supplementary context, not the finding's evidence.
 //! `#[test]`-attributed functions and any item nested under `#[cfg(test)]`
 //! (checked on `mod`/`fn`/`impl` — a crude, conservative raw-token parse
 //! mirroring `crate::rules::api_surface`'s own local `attrs_have_cfg_test`, kept
-//! local for the same reason [`crate::functions::type_name`] is) are
+//! local for the same reason `crate::functions::type_name` is) are
 //! excluded from both lanes: real secrets don't belong in test fixtures
 //! either, but a *placeholder* test credential is the single most common
 //! false-positive source this detector would otherwise have.
@@ -213,7 +213,7 @@ pub const UNSAFE_DENSITY_RULE_REVISION: u32 = 1;
 /// divided by the file's total lines of code) above which `unsafe-density`
 /// fires (see module doc). `0.1` (10%): a first-cut, adjustable constant, not
 /// calibrated against a corpus — same honest style as
-/// [`crate::git::SIZE_DISTRIBUTION_GINI_THRESHOLD`].
+/// `crate::git::SIZE_DISTRIBUTION_GINI_THRESHOLD`.
 pub const UNSAFE_DENSITY_THRESHOLD: f64 = 0.1;
 
 /// A single `unsafe { .. }` block's own line count above which
@@ -230,7 +230,7 @@ pub const MAX_UNSAFE_BLOCK_SIZE_THRESHOLD: u32 = 30;
 pub const INTEGER_CAST_RISK_RULE: &str = "integer-cast-risk";
 /// Bump when the integer-cast-risk rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz"). v2 (2026-07-24, GitHub issue #9): added the
-/// clamp-guard exemption (see module doc and [`is_clamped_immediately`]).
+/// clamp-guard exemption (see module doc and `is_clamped_immediately`).
 pub const INTEGER_CAST_RISK_RULE_REVISION: u32 = 2;
 
 /// Rule id for a panic-shaped construct (`.unwrap()`, `.expect(..)`,
@@ -240,7 +240,7 @@ pub const PANIC_IN_LIB_RULE: &str = "panic-in-lib";
 /// Bump when the panic-in-lib rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz"). v2 (2026-07-24, GitHub issue #10): split
 /// indexing's `evidence.kind` by index-operand shape (see module doc and
-/// [`classify_index_kind`]).
+/// `classify_index_kind`).
 pub const PANIC_IN_LIB_RULE_REVISION: u32 = 2;
 
 /// Rule id for a string literal matching a known secret-provider pattern, or

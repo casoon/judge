@@ -15,7 +15,7 @@
 //! a dependency's type leaking through a `pub fn`'s parameter or return type
 //! (`leaked_dependency_type`) — needs type resolution across crate
 //! boundaries the Fast Tier doesn't have; it lives in
-//! [`crate::rules::api_surface_deep`] instead, behind the `deep` feature, reusing
+//! `crate::rules::api_surface_deep` instead, behind the `deep` feature, reusing
 //! this module's [`PubFnCandidate`] item population but wired into the same
 //! `semver-hazard` rule id (see that module's docs).
 //!
@@ -36,7 +36,7 @@
 //! `static`, and `type` alias at module level, plus methods inside an
 //! *inherent* `impl` block. Not checked: methods inside `impl Trait for
 //! Type` (they typically inherit the trait's own documentation — see
-//! [`crate::functions::FunctionSite::in_trait_impl`]'s doc comment for the
+//! `crate::functions::FunctionSite::in_trait_impl`'s doc comment for the
 //! same exclusion reasoning elsewhere in this crate), `#[test]`-attributed
 //! functions, and anything gated by `#[cfg(test)]` (on the item itself or an
 //! enclosing item).
@@ -69,7 +69,7 @@ pub const UNDOCUMENTED_PUBLIC_ITEM_RULE_REVISION: u32 = 1;
 pub const SEMVER_HAZARD_RULE: &str = "semver-hazard";
 /// Bump when any semver-hazard sub-case's logic changes, including the
 /// Deep-Tier `leaked_dependency_type` sub-case in
-/// [`crate::rules::api_surface_deep`] (see todo.md §5 "Regelversions-Schutz").
+/// `crate::rules::api_surface_deep` (see todo.md §5 "Regelversions-Schutz").
 pub const SEMVER_HAZARD_RULE_REVISION: u32 = 2;
 
 #[derive(Debug)]
@@ -93,7 +93,7 @@ impl std::error::Error for ApiSurfaceError {}
 /// Per-crate count of public top-level API items — `pub fn`/`struct`/`enum`/
 /// `trait`/`const`/`static`/`type` at module level, plus a `pub fn` inside an
 /// inherent `impl` (the same item kinds
-/// [`check_doc`](ApiSurfaceVisitor::check_doc) already visits for
+/// `ApiSurfaceVisitor::check_doc` already visits for
 /// `undocumented-public-item`, reused rather than duplicated). A pure count,
 /// not a finding — a report metadatum like `Report.counts`/
 /// `analysis_universe`, with no fail/warn/info severity of its own (see
@@ -238,15 +238,15 @@ pub fn analyze_workspace<'a>(
 }
 
 /// One `pub fn` candidate for the Deep Tier's `leaked_dependency_type`
-/// `semver-hazard` sub-case (see [`crate::rules::api_surface_deep`]): a module-level
+/// `semver-hazard` sub-case (see `crate::rules::api_surface_deep`): a module-level
 /// free fn or inherent-impl method matching the exact item population
-/// [`check_doc_fn`](ApiSurfaceVisitor::check_doc_fn) already computes for
+/// `ApiSurfaceVisitor::check_doc_fn` already computes for
 /// `undocumented-public-item` — `pub`, not `#[test]`-attributed, not
 /// `#[cfg(test)]`-gated, not inside a trait impl (see the module doc
 /// comment's "Scope" section). Collected by the exact same walk rather than
 /// re-derived, so the Fast-Tier item population and the Deep-Tier one for
 /// this rule can never drift apart. Only consumed behind the `deep` feature,
-/// hence the conditional allow (mirrors [`crate::functions::FunctionSite`]'s
+/// hence the conditional allow (mirrors `crate::functions::FunctionSite`'s
 /// same pattern).
 #[derive(Debug, Clone)]
 #[cfg_attr(not(feature = "deep"), allow(dead_code))]
@@ -255,7 +255,7 @@ pub struct PubFnCandidate {
     pub file: PathBuf,
     /// Span of just the function's identifier — enough to position a Deep
     /// Tier query on the name token, from which the fn's parameter/return
-    /// types are reached structurally (see [`crate::rules::api_surface_deep`]).
+    /// types are reached structurally (see `crate::rules::api_surface_deep`).
     pub ident_span: proc_macro2::Span,
 }
 

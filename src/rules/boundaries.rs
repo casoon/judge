@@ -21,7 +21,7 @@
 //!   `mod`-graph resolution** — the same trade-off `deps.rs`'s
 //!   `UsageDomain` classification documents. A `.rs` file's module path is
 //!   derived purely from its position under `src/` (see
-//!   [`module_path_for_file`]). A file wired into the build in an
+//!   `module_path_for_file`). A file wired into the build in an
 //!   unconventional way — e.g. via a `#[path = "..."]` attribute — is
 //!   missed.
 //! - **Only `direct` reach is supported**, unlike crate-level
@@ -40,7 +40,7 @@
 //! edges are that feature's implication list, restricted to entries that
 //! exactly name another feature of the *same* package (a `dep:foo`,
 //! `pkg/feat`, or `pkg?/feat` entry names a dependency activation, not a
-//! sibling feature, and is excluded — see [`feature_implication_graph`]).
+//! sibling feature, and is excluded — see `feature_implication_graph`).
 //! Cargo tolerates a cyclic feature graph at resolution time (it's just a
 //! fixpoint activation set, not an error), so this is a structural-hygiene
 //! signal, not a claim that the build is broken.
@@ -59,7 +59,7 @@
 //!
 //! ## `change-coupling-signal`
 //!
-//! [`change_coupling_signals`] is an empirical counterpart to the structural
+//! `change_coupling_signals` is an empirical counterpart to the structural
 //! boundary rules above: instead of checking declared dependency edges, it
 //! asks whether two crates assigned to *different* `[layers]` (see
 //! [`LayersConfig::assign`]) change together, in the same commit, far more
@@ -198,7 +198,7 @@ pub struct CrateProfile {
 /// A named preset for `[layers]` (see todo.md §9 "Layer-Presets/Modul-
 /// Boundaries"). Each preset expands a compact crate-to-layer/role/group
 /// assignment into the same [`BoundaryRule`] edges a hand-written
-/// `[[boundary]]` entry produces, via [`generate_layer_rules`].
+/// `[[boundary]]` entry produces, via `generate_layer_rules`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LayerPreset {
@@ -261,7 +261,7 @@ pub struct BoundaryConfig {
     /// of (not instead of) `semver-hazard`'s own unconditional
     /// `leaked_dependency_type` sub-case. Validated to exist in the
     /// workspace, same precedent as `[[boundary]]`'s
-    /// `from`/`forbidden`/`required` (see [`validate_internal_crates_config`]).
+    /// `from`/`forbidden`/`required` (see `validate_internal_crates_config`).
     /// Empty by default — with no entries, `internal-leak` performs no
     /// analysis at all (todo.md §17 "Kein Raten von Projektabsicht": an
     /// architecture rule needs explicit config, not a guess).
@@ -478,7 +478,7 @@ impl CrateGraph {
 
     /// Renders this graph as a Mermaid `flowchart` (todo.md §H) — same
     /// edges as [`Self::to_dot`], Mermaid syntax instead of DOT. Node ids
-    /// are sanitized (see [`mermaid_node_id`]); each node's original crate
+    /// are sanitized (see `mermaid_node_id`); each node's original crate
     /// name is preserved as its display label.
     pub fn to_mermaid(&self) -> String {
         let mut out = String::from("flowchart TD\n");
@@ -570,7 +570,7 @@ fn validate_internal_crates_config(
 /// exposed separately from [`evaluate`] since `internal-leak` (see
 /// `crate::rules::api_surface_deep`) is evaluated by `cargo judge api-surface`, not
 /// `cargo judge boundaries`, but must apply the exact same hard-error
-/// precedent for an unknown crate name (see [`validate_internal_crates_config`]).
+/// precedent for an unknown crate name (see `validate_internal_crates_config`).
 pub fn validate_internal_crates(
     workspace: &Workspace,
     config: &BoundaryConfig,

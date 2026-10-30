@@ -15,7 +15,7 @@
 //! (JSON-lines, not a single JSON array) — most entries are
 //! `compiler-artifact` or other non-`compiler-message` noise. Only
 //! `clippy::fn_params_excessive_bools` is imported today — the rule this
-//! corroborates ([`crate::rules::pattern::boolean_state_cluster_candidates`]) is
+//! corroborates (`crate::rules::pattern::boolean_state_cluster_candidates`) is
 //! scoped to that one lint.
 
 use std::path::{Path, PathBuf};
@@ -48,7 +48,7 @@ impl std::error::Error for ClippyImportError {
 }
 
 /// One `clippy::fn_params_excessive_bools` hit, reduced to the fields
-/// [`crate::rules::pattern::boolean_state_cluster_candidates`] needs to match it
+/// `crate::rules::pattern::boolean_state_cluster_candidates` needs to match it
 /// against a function it already found via its own AST signals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClippyBoolParamsHit {

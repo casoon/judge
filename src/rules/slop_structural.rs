@@ -2,7 +2,7 @@
 //! Slop-Signale"). Three of the six G4 rules live here: `churn-hotspot`,
 //! `complexity-inflation`, `abstraction-inflation`. Unlike [`crate::rules::slop`],
 //! most of these don't parse files as their primary signal —
-//! `churn-hotspot` aggregates [`crate::git::churn`] output,
+//! `churn-hotspot` aggregates `crate::git::churn` output,
 //! `complexity-inflation` aggregates [`crate::rules::complexity::FunctionInfo`].
 //! `abstraction-inflation` is the exception: it needs its own
 //! workspace-wide `syn` pass (trait-impl counts, wrapper-struct delegation,
@@ -11,7 +11,7 @@
 //!
 //! The other two G4 rules, `duplicative-reinvention` and
 //! `connectivity-drop`, need cross-file reference data (fan-in per item)
-//! that only the Deep Tier's `find_all_refs` (see [`crate::deep`]) can
+//! that only the Deep Tier's `find_all_refs` (see `crate::deep`) can
 //! supply reliably — they are implemented separately as Deep Tier rules
 //! reusing that infrastructure, not here.
 //!
@@ -82,8 +82,8 @@ pub(crate) const CHURN_HOTSPOT_THRESHOLD: u32 = 5;
 /// `pub(crate)`: see [`CHURN_HOTSPOT_THRESHOLD`].
 pub(crate) const CHURN_HOTSPOT_WINDOW_DAYS: i64 = 14;
 
-/// Renders churn counts (see [`crate::git::churn`], called by the caller
-/// with a 14-day window) at or above [`CHURN_HOTSPOT_THRESHOLD`] as
+/// Renders churn counts (see `crate::git::churn`, called by the caller
+/// with a 14-day window) at or above `CHURN_HOTSPOT_THRESHOLD` as
 /// findings — a file reworked this often in two weeks is a rewrite in
 /// progress, not steady forward progress (todo.md §3.G). `churn`'s paths
 /// are already relative to the repository root, so findings here carry
@@ -155,8 +155,8 @@ const MAX_EXPRESSION_WIDTH_FOR_INFLATION: u32 = 6;
 /// more typical of copy-pasted/repetitive code than hand-written logic),
 /// deeply nested/hard to follow relative to their length, deeply nested in
 /// `async` constructs, or contain an implausibly wide single expression, per
-/// [`MAX_COMPLEXITY_FOR_INFLATION`]/[`MAX_COGNITIVE_FOR_INFLATION`]/
-/// [`MAX_ASYNC_NESTING_FOR_INFLATION`]/[`MAX_EXPRESSION_WIDTH_FOR_INFLATION`]
+/// `MAX_COMPLEXITY_FOR_INFLATION`/`MAX_COGNITIVE_FOR_INFLATION`/
+/// `MAX_ASYNC_NESTING_FOR_INFLATION`/`MAX_EXPRESSION_WIDTH_FOR_INFLATION`
 /// (see todo.md §3.G).
 pub fn complexity_inflation(functions: &[FunctionInfo]) -> Vec<Finding> {
     functions
@@ -776,7 +776,7 @@ fn fragile_substring_classification_finding(
 /// a practice finding from `auditmysite`).
 ///
 /// Scope, kept simple for v1: only chains of at least
-/// [`MIN_CHAIN_CONDITIONS`] conditions (i.e. at least one `else if`) are
+/// `MIN_CHAIN_CONDITIONS` conditions (i.e. at least one `else if`) are
 /// considered — a plain `if cond { .. } else { .. }` has only one condition
 /// and is out of scope, since a single binary branch has no competing
 /// substring candidates the way a longer classification chain does. Within a

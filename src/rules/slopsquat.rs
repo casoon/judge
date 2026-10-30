@@ -11,7 +11,7 @@
 //!
 //! - `name-collision-risk` — fully local, offline, deterministic: a declared
 //!   dependency name is Levenshtein-close to a well-known crate from a
-//!   bundled static list ([`POPULAR_CRATES_RAW`]).
+//!   bundled static list (`POPULAR_CRATES_RAW`).
 //! - `phantom-crate` — the declared crate does not exist on crates.io at
 //!   all, checked via the sparse index.
 //! - `phantom-version` — the crate exists, but no published, non-yanked
@@ -27,7 +27,7 @@
 //!   auto-upgrade away from a yanked lockfile entry, so this is the more
 //!   common, more directly actionable case.
 //! - `dep-single-maintainer` — a declared dependency has fewer than
-//!   [`MIN_MAINTAINER_COUNT`] owners on crates.io (crates.io's `/owners`
+//!   `MIN_MAINTAINER_COUNT` owners on crates.io (crates.io's `/owners`
 //!   REST endpoint) — a single compromised or inactive account/team is
 //!   enough to block a security response for the whole crate.
 //!

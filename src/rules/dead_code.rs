@@ -3,12 +3,12 @@
 //! semantic reachability isn't available at the Fast Tier.
 //!
 //! Scope: `unused-pub-workspace`/`unused-pub-api`, for free functions,
-//! impl/trait methods ([`crate::functions::walk_functions`]'s items), and
+//! impl/trait methods (`crate::functions::walk_functions`'s items), and
 //! top-level structs/enums/traits/consts/statics plus associated
-//! consts/types inside impls ([`walk_type_items`], below); `dead-enum-variant`
-//! for individual enum variants ([`walk_enum_variants`]); `test-only-pub` for
+//! consts/types inside impls (`walk_type_items`, below); `dead-enum-variant`
+//! for individual enum variants (`walk_enum_variants`); `test-only-pub` for
 //! the same items `unused-pub-workspace`/`unused-pub-api` check;
-//! `unreachable-from-entry` for the same [`walk_functions`]/[`walk_type_items`]
+//! `unreachable-from-entry` for the same `walk_functions`/`walk_type_items`
 //! items but scoped to non-`pub` visibility instead — `pub` items stay
 //! `unused-pub-workspace`/`unused-pub-api`/`test-only-pub`'s territory (see
 //! [`UNREACHABLE_FROM_ENTRY_RULE`]).
@@ -18,7 +18,7 @@
 //! `test-only-pub` — todo.md §3.A's distinction between a real
 //! `unused-pub-workspace` finding and an info-only `unused-pub-api` finding
 //! on a *published* crate is only implemented for the top-level
-//! function/type-item check below (see [`publishable_crates`]); the other
+//! function/type-item check below (see `publishable_crates`); the other
 //! two rules don't yet narrow their scope by a crate's `publish` field
 //! either.
 
@@ -41,7 +41,7 @@ pub const UNUSED_PUB_WORKSPACE_RULE: &str = "unused-pub-workspace";
 pub const UNUSED_PUB_WORKSPACE_RULE_REVISION: u32 = 1;
 
 /// The `unused-pub-workspace` sibling for a crate whose resolved `publish`
-/// field allows publishing (see [`publishable_crates`]): the same
+/// field allows publishing (see `publishable_crates`): the same
 /// referencing_files + is_reachable_from_entry query, but `Info`/`Heuristic`
 /// rather than `Warn`/`BoundedSemantic` — a published crate's whole purpose
 /// is exposing API to consumers outside the loaded workspace, so "zero
@@ -56,8 +56,8 @@ pub const UNUSED_PUB_API_RULE: &str = "unused-pub-api";
 pub const UNUSED_PUB_API_RULE_REVISION: u32 = 1;
 
 /// An enum variant with no construction-position reference found anywhere in
-/// the examined workspace view (see [`walk_enum_variants`],
-/// [`check_enum_variant`]) — a variant only ever matched against, never
+/// the examined workspace view (see `walk_enum_variants`,
+/// `check_enum_variant`) — a variant only ever matched against, never
 /// constructed, is a stronger and more specific signal than
 /// `unused-pub-workspace` sees at the whole-item granularity `walk_type_items`
 /// checks an enum at.
@@ -69,7 +69,7 @@ pub const DEAD_ENUM_VARIANT_RULE_REVISION: u32 = 1;
 /// A `pub` item reachable only through `#[cfg(test)]`/test-target code —
 /// unreachable in the "production" reachability mode but reachable in the
 /// "all" mode, and with no cross-crate reference either (see
-/// [`check_test_only_pub`]). Same v1 simplification as
+/// `check_test_only_pub`). Same v1 simplification as
 /// `unused-pub-workspace`'s own module doc: every workspace crate is treated
 /// as workspace-internal, so this doesn't yet narrow by a crate's `publish`
 /// field the way `unused-pub-api` does for the top-level item check.
@@ -80,23 +80,23 @@ pub const TEST_ONLY_PUB_RULE_REVISION: u32 = 1;
 
 /// A non-`pub` item (private, `pub(crate)`, `pub(super)`, `pub(in path)`)
 /// with no path from any recognized entry point in the examined
-/// reachability view (see [`check_unreachable_from_entry`]) — todo.md §3.A's
+/// reachability view (see `check_unreachable_from_entry`) — todo.md §3.A's
 /// standalone rule, closing the gap where
-/// [`crate::reachability::is_reachable_from_entry`]'s reverse-BFS previously
+/// `crate::reachability::is_reachable_from_entry`'s reverse-BFS previously
 /// only backed `--why-live`'s path search, with no Finding-producing rule of
 /// its own.
 ///
 /// Deliberately scoped to non-`pub` items only: a `pub` item's
 /// unreachability is already fully owned by `unused-pub-workspace`/
 /// `unused-pub-api`/`test-only-pub` above — this rule does not duplicate
-/// their cross-crate reference check ([`check_item`]'s `used_externally`) at
+/// their cross-crate reference check (`check_item`'s `used_externally`) at
 /// all, since a non-`pub` item cannot be referenced from another crate by
 /// Rust's own visibility rules; that check would be vacuously false here.
 /// Unlike [`crate::rules::slop_structural_deep`]'s fan-in check, this does *not*
 /// exclude trait-impl methods (`FunctionSite::in_trait_impl`): that
 /// exclusion exists there because its literal-reference search
 /// ([`crate::deep::referencing_files`]) can't see calls through
-/// operator/macro sugar, but [`crate::reachability::is_reachable_from_entry`]
+/// operator/macro sugar, but `crate::reachability::is_reachable_from_entry`
 /// walks `incoming_calls`, rust-analyzer's semantic call hierarchy, which
 /// does resolve calls through trait dispatch (see
 /// `crate::reachability::classify_call_kind`'s `Dynamic`/`Static`
@@ -113,7 +113,7 @@ pub const UNREACHABLE_FROM_ENTRY_RULE_REVISION: u32 = 1;
 /// already take. `Ce` (efferent coupling) is the number of distinct other
 /// workspace crates this crate references code from; `Ca` (afferent
 /// coupling) is the number of distinct other workspace crates that reference
-/// code from this crate. Both counts fall directly out of [`check_item`]'s
+/// code from this crate. Both counts fall directly out of `check_item`'s
 /// existing [`crate::deep::referencing_files`] call — this rule adds no new
 /// Deep-Tier query of its own, only a side-aggregation over the full
 /// `referencing` set that call already computes for every `pub` item in the
@@ -133,7 +133,7 @@ pub const CRATE_COUPLING_RULE_REVISION: u32 = 1;
 /// Fan-out auf Modul-/Crate-Ebene" item (the crate-level half is
 /// `crate-coupling`, above). Same Martin's Instability `I = Ce / (Ca + Ce)`
 /// computation, same `edge_counts`-style side-aggregation over
-/// [`check_item`]'s existing per-`pub`-item [`crate::deep::referencing_files`]
+/// `check_item`'s existing per-`pub`-item [`crate::deep::referencing_files`]
 /// call (no second Deep-Tier pass), same "skip if `Ca + Ce == 0`" gate, and
 /// the same never-good-or-bad, purely descriptive posture as
 /// `crate-coupling` (see that rule's doc comment).
@@ -151,13 +151,13 @@ pub const CRATE_COUPLING_RULE_REVISION: u32 = 1;
 /// `krate_name::<root>` bucket rather than being silently dropped or merged
 /// into an arbitrary sibling.
 ///
-/// **Module identity comes from [`crate::rules::boundaries::module_path_for_file`],
+/// **Module identity comes from `crate::rules::boundaries::module_path_for_file`,
 /// not a fresh per-item AST walk.** An item's own module is resolved from
 /// the *file* it's declared in — the same directory/`mod.rs` convention
 /// resolver `module-boundary-violation`/`module-boundary-violation-deep`
 /// already rely on for exactly this "which module is this file in"
 /// question — rather than tracking `mod { .. }` nesting from scratch:
-/// [`crate::functions::walk_functions`]'s/[`walk_type_items`]'s own
+/// `crate::functions::walk_functions`'s/`walk_type_items`'s own
 /// `path`-tracking only records *inline* `mod` blocks written within the
 /// same file being walked (each walk starts a fresh, empty path per file);
 /// it has no notion of the file-to-file `mod foo;` linkage that gives most
@@ -1582,7 +1582,7 @@ fn scan_file_for_dead_code(
 /// `include_tests` selects between the "production" and "all" reachability
 /// modes from todo.md §3.A — a reference only from a `#[test]` doesn't count
 /// as external use when `include_tests` is `false`. `test-only-pub` (see
-/// [`check_test_only_pub`]) needs both modes regardless of this parameter, so
+/// `check_test_only_pub`) needs both modes regardless of this parameter, so
 /// both are computed unconditionally below.
 pub fn analyze_workspace(
     workspace: &Workspace,

@@ -205,7 +205,7 @@ impl DeepContext {
     ///
     /// Three-way outcome, kept distinct because the two failure-shaped cases
     /// mean different things (todo.md §17.5): a path that is not absolute
-    /// UTF-8 (see [`validated_utf8_abs`]) cannot name a vfs file at all and
+    /// UTF-8 (see `validated_utf8_abs`) cannot name a vfs file at all and
     /// is a real error, `Err(DeepError::InvalidPath)` — this should not
     /// happen for any path built by `crate::ingest`, and callers may treat it
     /// as such. A path that *is* well-formed but was never indexed (e.g.
