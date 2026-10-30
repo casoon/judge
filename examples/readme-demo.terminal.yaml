@@ -1,5 +1,10 @@
 version: 1
 
+# Recorded with: castwright build examples/readme-demo.terminal.yaml --allow-exec --record
+# SVG export:    castwright build examples/readme-demo.terminal.yaml --format svg --loop-delay 9000 -o <dir>
+#                (the file <dir>/readme-demo.svg is .github/readme/cargo-judge.svg; a trailing wait: is dropped
+#                in SVG, the end frame holds for --loop-delay)
+
 terminal:
   title: cargo judge
   cols: 112
