@@ -254,7 +254,7 @@ pub fn total_authored_loc_checked(workspace: &Workspace) -> Result<usize, LocErr
 }
 
 /// Like [`total_authored_loc`], but scoped to `files` (repository-root
-/// relative paths — see [`crate::git::changed_files_since`]) — the LOC
+/// relative paths — see `crate::git::changed_files_since`) — the LOC
 /// denominator for a ratio gate judged against only what changed (see
 /// `audit --since`, todo.md §6), not the whole workspace total.
 pub fn authored_loc_in(workspace: &Workspace, files: &HashSet<PathBuf>) -> usize {

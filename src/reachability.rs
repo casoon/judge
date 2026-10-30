@@ -37,7 +37,7 @@ pub enum ReachabilityError {
     Io(PathBuf, std::io::Error),
     Parse(PathBuf, syn::Error),
     /// No function with this qualified name was found anywhere in the
-    /// workspace (see [`crate::functions::walk_functions`]'s naming scheme).
+    /// workspace (see `crate::functions::walk_functions`'s naming scheme).
     UnknownItem(String),
     /// More than one function matches this qualified name — `walk_functions`
     /// tracks the `mod`/`impl`/`trait` path *within* a file, but not the

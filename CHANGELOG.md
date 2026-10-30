@@ -15,6 +15,11 @@ versions were published on crates.io.
   guide shows how `cargo judge compare` reaches its verdict and exit code as a diagram.
 - **Project site:** the start page now carries a release teaser and an FAQ (theme 0.11.1).
 
+### Fixed
+
+- **Docs:** the library API docs build without warnings, with and without `--all-features`;
+  links to private, feature-gated or removed items are now plain code spans.
+
 ## [0.7.0] - 2026-08-29
 
 ### Added

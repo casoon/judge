@@ -90,7 +90,7 @@ pub struct CoverageReport {
 
 impl CoverageReport {
     /// Coverage for a workspace source file, looked up the same way
-    /// [`crate::git::hotspots`] matches complexity to churn: `file` is an
+    /// `crate::git::hotspots` matches complexity to churn: `file` is an
     /// absolute path (as `FunctionInfo::file`/`crate::ingest::SourceFile`
     /// paths are), stripped of `workspace_root` before the lookup. `None`
     /// means "no coverage data for this file" — a state distinct from 0%
@@ -165,7 +165,7 @@ pub fn read_lcov(path: &Path, workspace_root: &Path) -> Result<CoverageReport, L
 /// resolve to the same key — since [`CoverageReport::for_file`] strips
 /// `function.file` (always an absolute, `.`-free path) the same way and a
 /// stray leading `./` would otherwise silently miss an existing entry (see
-/// [`resolve_lcov_path`]). Case (on case-insensitive filesystems) is *not*
+/// `resolve_lcov_path`). Case (on case-insensitive filesystems) is *not*
 /// normalized — a `SF:` path differing only in case from the workspace path
 /// still misses, since judge cannot know a given filesystem's case
 /// sensitivity from its inputs alone. After parsing, every resulting path is

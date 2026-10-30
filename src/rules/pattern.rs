@@ -37,19 +37,19 @@ use crate::ingest::{CrateInfo, Workspace};
 pub const STRINGLY_ERROR_BOUNDARY_RULE: &str = "stringly-error-boundary";
 
 /// The rule id for the `primitive-domain-value` aggregation implemented in
-/// this module (see [`primitive_domain_value_candidates`]).
+/// this module (see `primitive_domain_value_candidates`).
 pub const PRIMITIVE_DOMAIN_VALUE_RULE: &str = "primitive-domain-value";
 
 /// The rule id for the `boolean-state-cluster` aggregation implemented in
-/// this module (see [`boolean_state_cluster_candidates`]).
+/// this module (see `boolean_state_cluster_candidates`).
 pub const BOOLEAN_STATE_CLUSTER_RULE: &str = "boolean-state-cluster";
 
 /// The rule id for the `public-invariant-bypass` aggregation implemented in
-/// this module (see [`public_invariant_bypass_candidates`]).
+/// this module (see `public_invariant_bypass_candidates`).
 pub const PUBLIC_INVARIANT_BYPASS_RULE: &str = "public-invariant-bypass";
 
 /// The rule id for the `manual-resource-lifecycle` aggregation implemented in
-/// this module (see [`manual_resource_lifecycle_candidates`]).
+/// this module (see `manual_resource_lifecycle_candidates`).
 pub const MANUAL_RESOURCE_LIFECYCLE_RULE: &str = "manual-resource-lifecycle";
 
 /// A recommended Rust design pattern (todo.md §16.2, §16.3). Exactly the enum
@@ -294,7 +294,7 @@ pub fn analyze_workspace(workspace: &Workspace, findings: &[Finding]) -> Vec<Pat
 /// Same as [`analyze_workspace`], plus `clippy_hits` — parsed
 /// `clippy::fn_params_excessive_bools` results (see
 /// [`crate::advisory::clippy_import::read_clippy_report`]) that
-/// [`boolean_state_cluster_candidates`] uses as optional, additive
+/// `boolean_state_cluster_candidates` uses as optional, additive
 /// corroborating evidence. Passing an empty slice is exactly
 /// [`analyze_workspace`]'s behavior — the clippy import is fully opt-in.
 pub fn analyze_workspace_with_clippy(

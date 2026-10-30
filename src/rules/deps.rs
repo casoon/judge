@@ -24,8 +24,8 @@
 //! the crate actually references).
 //!
 //! `dep-without-repo` (todo.md §F) shares `heavy-dependency`'s single full
-//! (non `--no-deps`) `cargo_metadata` resolve (see [`resolve_full_metadata`],
-//! [`analyze_full_metadata_dependencies`]) rather than resolving again: it
+//! (non `--no-deps`) `cargo_metadata` resolve (see `resolve_full_metadata`,
+//! `analyze_full_metadata_dependencies`) rather than resolving again: it
 //! flags a declared dependency whose own manifest has no (or an empty)
 //! `repository` field. A missing `repository` field is not itself a defect —
 //! private/internal crates legitimately omit it — so this is reported as
@@ -59,7 +59,7 @@
 //!   feature vocabulary per dependency, which judge does not maintain.
 //! - **`default-features-unused`**: a dependency whose manifest entry
 //!   explicitly sets `default-features = true` — the raw TOML text says so
-//!   (see [`manifest_explicitly_enables_default_features`]), not just
+//!   (see `manifest_explicitly_enables_default_features`), not just
 //!   Cargo's own implicit default — and that has the same zero-usage
 //!   evidence as above. Deliberately does *not* cover "used, but only
 //!   non-default features": telling default from non-default items apart
@@ -70,10 +70,10 @@
 //! A different direction from the two rules above: not a *dependency's*
 //! feature, but a feature *this crate itself* declares in its own
 //! `[features]` table (read from the same already-parsed manifest
-//! [`read_manifest_toml`] gives `default-features-unused`) with no
+//! `read_manifest_toml` gives `default-features-unused`) with no
 //! `#[cfg(feature = "...")]`/`#[cfg_attr(..., feature = "...")]`/
 //! `cfg!(feature = "...")` reference to it found anywhere in the crate's own
-//! authored source (see [`feature_is_referenced`]) — a plain substring scan
+//! authored source (see `feature_is_referenced`) — a plain substring scan
 //! for the two common spacing variants (`feature = "x"`/`feature="x"`), not
 //! a `syn`/token-tree parse of the `cfg` predicate: both attribute and macro
 //! forms use identical text for the part this rule cares about, so a full
@@ -83,7 +83,7 @@
 //! well-known `default` (its entire purpose is enabling *other* features, so
 //! not being individually `cfg`-tested is normal, not a defect), and any
 //! feature whose own declared value list is *non-empty* (see
-//! [`declared_features_without_implications`]) — such a feature enables
+//! `declared_features_without_implications`) — such a feature enables
 //! other features/optional dependencies by existing at all, which is a real
 //! effect even if no code ever tests for it directly with `cfg`; treating
 //! that as "unused" would be a real false-positive class (umbrella/bundle
@@ -118,16 +118,16 @@
 //!
 //! [`why`] is a query view over the same per-crate usage evidence
 //! `analyze_workspace` already computes, not a new detector: it emits no
-//! findings. [`collect_crate_usage`]'s `code_identifier -> domains observed`
+//! findings. `collect_crate_usage`'s `code_identifier -> domains observed`
 //! map (what every rule above needs) collapses each usage down to a
 //! [`UsageDomain`] set; `why` instead keeps every usage's file:line location,
-//! via a fresh, narrower per-dependency parse ([`collect_usage_sites`]) —
+//! via a fresh, narrower per-dependency parse (`collect_usage_sites`) —
 //! `--why` is opt-in and scoped to one dependency, so re-parsing the crate's
 //! source files once more for it is cheap and keeps `analyze_workspace`'s
 //! hot path unchanged. It also resolves the dependency graph path(s) from
 //! this workspace's own crate(s) to the named dependency
-//! ([`resolve_graph_paths`]) via a second, plain `cargo metadata` resolve —
-//! [`resolve_full_metadata`]'s own resolve discards its adjacency map once
+//! (`resolve_graph_paths`) via a second, plain `cargo metadata` resolve —
+//! `resolve_full_metadata`'s own resolve discards its adjacency map once
 //! each node's reachable-set *size* is computed, so it isn't reused here.
 //!
 //! Public API exposure (does this dependency's type appear in this crate's
@@ -195,7 +195,7 @@ pub const UNUSED_DEPENDENCY_RULE_REVISION: u32 = 1;
 /// Rule id used for dep-without-repo findings (see todo.md §F): a dependency
 /// whose own manifest declares no `repository` field, read from the same
 /// full `cargo_metadata` resolve as `heavy-dependency` (see
-/// [`resolve_full_metadata`]).
+/// `resolve_full_metadata`).
 pub const DEP_WITHOUT_REPO_RULE: &str = "dep-without-repo";
 /// Bump when the rule's logic changes (see todo.md §5 "Regelversions-Schutz").
 pub const DEP_WITHOUT_REPO_RULE_REVISION: u32 = 1;
@@ -265,7 +265,7 @@ pub enum DepsError {
     /// A full (non `--no-deps`) `cargo metadata` resolve failed — only
     /// produced by `heavy-dependency`'s transitive-count lookup and
     /// `dep-without-repo`'s repository-field lookup, which share one resolve
-    /// (see [`resolve_full_metadata`]).
+    /// (see `resolve_full_metadata`).
     Metadata(cargo_metadata::Error),
     /// A crate's manifest failed to parse as TOML — only produced by
     /// `default-features-unused`'s manifest lookup (see
@@ -423,9 +423,9 @@ const PUBLIC_API_EXPOSURE_LIMITATION: &str = "not determined \u{2014} public API
 
 /// One location where a dependency's `code_identifier` was found referenced
 /// in source — the evidence [`why`] shows for "source usages" (GitHub issue
-/// #22). Unlike [`collect_crate_usage`]'s aggregated `code_identifier ->
+/// #22). Unlike `collect_crate_usage`'s aggregated `code_identifier ->
 /// domains observed` map (all of `analyze_workspace`'s rules need only
-/// that), this keeps the file:line, collected by [`collect_usage_sites`].
+/// that), this keeps the file:line, collected by `collect_usage_sites`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DependencyUsageSite {
     pub file: PathBuf,
@@ -434,7 +434,7 @@ pub struct DependencyUsageSite {
 }
 
 /// One workspace crate's declaration of the dependency named in a [`why`]
-/// query, plus every usage site [`collect_usage_sites`] found for it in that
+/// query, plus every usage site `collect_usage_sites` found for it in that
 /// crate's own source files.
 #[derive(Debug, Serialize)]
 pub struct DependencyDeclaration {
@@ -442,7 +442,7 @@ pub struct DependencyDeclaration {
     pub kind: DependencyKind,
     pub features: Vec<String>,
     /// Whether the manifest explicitly sets `default-features = true` (see
-    /// [`manifest_explicitly_enables_default_features`]) — `false` also
+    /// `manifest_explicitly_enables_default_features`) — `false` also
     /// covers "the manifest's `default-features` key is simply absent", the
     /// same ambiguity that function's own doc comment explains.
     pub default_features_explicit: bool,
@@ -458,12 +458,12 @@ pub struct DependencyWhyReport {
     pub dependency_name: String,
     /// Whether `dependency_name` was found anywhere: as a dependency
     /// declared by any workspace crate, or as a package anywhere in the
-    /// resolved dependency graph (see [`resolve_graph_paths`]). `false` is
+    /// resolved dependency graph (see `resolve_graph_paths`). `false` is
     /// the CLI's "not found" case.
     pub found: bool,
     pub declared_by: Vec<DependencyDeclaration>,
     /// Per workspace crate name, the shortest resolved-graph path from that
-    /// crate to `dependency_name` (see [`resolve_graph_paths`]) — package
+    /// crate to `dependency_name` (see `resolve_graph_paths`) — package
     /// names from the first hop (exclusive of the crate itself) to
     /// `dependency_name` (inclusive). An empty `Vec` means no path was found
     /// from that crate (including the crate declaring it directly, which

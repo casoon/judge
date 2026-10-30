@@ -27,24 +27,24 @@
 //! infrastructure for the full §16.7 taxonomy ([`DesignPrinciple`] lists all
 //! sixteen table entries), plus ten real detectors —
 //! [`FunctionalCoreImperativeShell`](DesignPrinciple::FunctionalCoreImperativeShell)
-//! (see [`functional_core_imperative_shell_candidates`]),
+//! (see `functional_core_imperative_shell_candidates`),
 //! [`InterfaceSegregation`](DesignPrinciple::InterfaceSegregation) (see
-//! [`interface_segregation_candidates`]),
+//! `interface_segregation_candidates`),
 //! [`DependencyInversion`](DesignPrinciple::DependencyInversion) (see
-//! [`dependency_inversion_candidates`]),
-//! [`Cohesion`](DesignPrinciple::Cohesion) (see [`cohesion_candidates`]),
+//! `dependency_inversion_candidates`),
+//! [`Cohesion`](DesignPrinciple::Cohesion) (see `cohesion_candidates`),
 //! [`LawOfDemeter`](DesignPrinciple::LawOfDemeter) (see
-//! [`law_of_demeter_candidates`]),
+//! `law_of_demeter_candidates`),
 //! [`BoundedResources`](DesignPrinciple::BoundedResources) (see
-//! [`bounded_resources_candidates`]),
+//! `bounded_resources_candidates`),
 //! [`ParseDontValidate`](DesignPrinciple::ParseDontValidate) (see
-//! [`parse_dont_validate_candidates`]),
+//! `parse_dont_validate_candidates`),
 //! [`ApiEvolvability`](DesignPrinciple::ApiEvolvability) (see
-//! [`api_evolvability_candidates`]),
+//! `api_evolvability_candidates`),
 //! [`UnsafeContainment`](DesignPrinciple::UnsafeContainment) (see
-//! [`unsafe_containment_candidates`]), and
+//! `unsafe_containment_candidates`), and
 //! [`MakeIllegalStatesUnrepresentable`](DesignPrinciple::MakeIllegalStatesUnrepresentable)
-//! (see [`make_illegal_states_unrepresentable_candidates`]). The remaining
+//! (see `make_illegal_states_unrepresentable_candidates`). The remaining
 //! `DesignPrinciple` variants are unused for now; they document the target
 //! space rather than being implemented.
 
@@ -65,7 +65,7 @@ use crate::rules::complexity::WorkspaceComplexity;
 use crate::rules::pattern::{CodeScope, Contraindication, Evidence, EvidenceLocation};
 use crate::rules::slop_text::{CommentSpan, extract_comments};
 
-/// Cyclomatic-complexity threshold [`functional_core_imperative_shell_candidates`]
+/// Cyclomatic-complexity threshold `functional_core_imperative_shell_candidates`
 /// uses as "non-trivial branching" (signal 2). Chosen to mean more than a
 /// couple of straight-line conditionals — contrast with `complexity-
 /// inflation`'s much lower ≤3 threshold for a *newly introduced* function,
@@ -74,27 +74,27 @@ use crate::rules::slop_text::{CommentSpan, extract_comments};
 /// substantial branching).
 pub const FUNCTIONAL_CORE_COMPLEXITY_THRESHOLD: u32 = 10;
 
-/// Minimum method count [`interface_segregation_candidates`] treats as "a
+/// Minimum method count `interface_segregation_candidates` treats as "a
 /// large trait" (signal 1) — chosen to mean noticeably more than a small,
 /// focused interface (contrast with a two- or three-method trait, which is
 /// unremarkable on its own).
 pub const INTERFACE_SEGREGATION_METHOD_THRESHOLD: usize = 5;
 
 /// Minimum count of public top-level items (`pub fn`, `pub struct`, `pub
-/// enum`, `pub trait`) [`cohesion_candidates`] treats as "several public
+/// enum`, `pub trait`) `cohesion_candidates` treats as "several public
 /// items in one file" (signal 1) — chosen to mean more than the one or two
 /// items a small, single-purpose file typically declares.
 pub const COHESION_ITEM_THRESHOLD: usize = 3;
 
 /// Minimum number of chained method calls in one unbroken expression
-/// [`law_of_demeter_candidates`] treats as "a long reach through an
+/// `law_of_demeter_candidates` treats as "a long reach through an
 /// intermediate object's own interface" (signal 1) — chosen to mean more
 /// than a single extra hop (`a.b().c()`, two calls, is unremarkable) while
 /// still being cheap to reach by adding one more call to an
 /// already-two-call chain.
 pub const LAW_OF_DEMETER_CHAIN_THRESHOLD: usize = 3;
 
-/// Minimum field count [`api_evolvability_candidates`] treats as "an
+/// Minimum field count `api_evolvability_candidates` treats as "an
 /// evolvability concern" (signal 1) — chosen to mean more than a 0-1-field
 /// struct, where adding a field isn't meaningfully different from the
 /// struct's only field already being present; the concern this heuristic
@@ -111,7 +111,7 @@ pub const MISU_MIN_OPTION_FIELDS: usize = 2;
 
 /// Minimum count of usable struct-literal construction sites (sites that
 /// determinably set at least one candidate `Option<T>` field to either
-/// `Some(..)` or `None`) [`make_illegal_states_unrepresentable_candidates`]
+/// `Some(..)` or `None`) `make_illegal_states_unrepresentable_candidates`
 /// requires before drawing any conclusion from signal 2 — one data point is
 /// a coincidence, not corroboration.
 pub const MISU_MIN_CONSTRUCTION_SITES: usize = 2;
@@ -326,16 +326,16 @@ macro_rules! principle_heuristic {
 /// Runs every implemented principle-heuristic detector over `workspace`,
 /// using `complexity` (the already-computed `judge::rules::complexity::analyze_workspace`
 /// result) as one of the independent evidence sources for
-/// [`functional_core_imperative_shell_candidates`], and `boundary_config`
+/// `functional_core_imperative_shell_candidates`, and `boundary_config`
 /// (the already-loaded `judge.toml` `[[boundary]]`/`[[module_boundary]]`
-/// config, if any) as [`dependency_inversion_candidates`]' precondition —
+/// config, if any) as `dependency_inversion_candidates`' precondition —
 /// that detector produces nothing when `boundary_config` is `None` or has no
 /// `[[module_boundary]]` entries (todo.md §17: never guess project intent).
-/// Merges results from [`interface_segregation_candidates`],
-/// [`dependency_inversion_candidates`], and [`cohesion_candidates`] — this is
+/// Merges results from `interface_segregation_candidates`,
+/// `dependency_inversion_candidates`, and `cohesion_candidates` — this is
 /// the dispatch point future detectors from todo.md §16.7's table attach to.
 ///
-/// Returns [`BoundaryConfigError`] only via [`dependency_inversion_candidates`]
+/// Returns [`BoundaryConfigError`] only via `dependency_inversion_candidates`
 /// (an invalid `[[module_boundary]]`/`[[boundary]]` rule in `boundary_config`
 /// is a config error, not a finding) — the same exit-2 treatment
 /// `judge::rules::boundaries::evaluate` gets everywhere else it's called.

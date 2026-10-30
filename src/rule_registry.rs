@@ -10,7 +10,7 @@
 //! including the three `crate::rules::pattern` aggregation rules — those never
 //! produce a `Finding` (see that module's doc comment) and so are always
 //! `Heuristic`/[`VerdictEffect::AdvisoryOnly`] here, consistent with
-//! [`crate::finding::evidence_class_for_rule`]'s fallback for any rule id it
+//! `crate::finding::evidence_class_for_rule`'s fallback for any rule id it
 //! doesn't recognize.
 
 use crate::finding::EvidenceClass;

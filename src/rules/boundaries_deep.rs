@@ -1,7 +1,7 @@
 //! Deep-Tier upgrade to `[[module_boundary]]` (see `crate::rules::boundaries`
 //! module docs "Module-level boundaries", todo.md §H "Modul-Boundaries im
 //! Deep Tier"): the same rule config, the same directory-convention
-//! module-path scoping ([`crate::rules::boundaries::module_path_for_file`]), but
+//! module-path scoping (`crate::rules::boundaries::module_path_for_file`), but
 //! real symbol reference resolution ([`crate::deep::referencing_files`])
 //! instead of a `syn`-based qualified-path text scan — catches a
 //! re-export, an aliased `use`, or any other reference shape the Fast-Tier
@@ -16,7 +16,7 @@
 //!
 //! **v1 scope, honestly narrower than the Fast-Tier text scan in one way**:
 //! only free functions, inherent/trait-impl methods, and trait default
-//! methods ([`crate::functions::walk_functions`]'s item population) are
+//! methods (`crate::functions::walk_functions`'s item population) are
 //! checked as the *referenced* item. The Fast-Tier text scan is
 //! item-kind-agnostic (a qualified path naming a struct/enum/const/...
 //! counts equally) — this Deep-Tier pass does not yet cover those kinds.
@@ -25,7 +25,7 @@
 //!
 //! `Reach::Transitive` is not supported here either — same restriction as
 //! the Fast Tier. Not re-validated in this module:
-//! [`crate::rules::boundaries::validate_module_boundary_config`] already rejects
+//! `crate::rules::boundaries::validate_module_boundary_config` already rejects
 //! it (and an unknown `krate`, and an empty `forbidden`) as a config error
 //! before this module ever runs, since `evaluate()` always runs first in
 //! `cargo judge boundaries` (see `main.rs`'s `run_boundaries`).

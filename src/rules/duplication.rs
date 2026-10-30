@@ -16,7 +16,7 @@
 //! - [`DupeMode::Semantic`]: like `Weak`, plus bare local variable/parameter
 //!   identifiers are normalized to positional placeholders, so a
 //!   renamed-but-otherwise-identical clone still matches. See
-//!   [`assign_semantic_text`] for the identifier-role heuristic and its
+//!   `assign_semantic_text` for the identifier-role heuristic and its
 //!   known recall/precision limitations.
 //!
 //! ## Approach
@@ -28,7 +28,7 @@
 //! matches include inter-token whitespace/comments), and every window of
 //! exactly `min_tokens` tokens is fingerprinted with an O(1) polynomial
 //! rolling hash into a shared table — no per-window `String` is ever built
-//! (see [`build_fingerprints`]). Windows from *different* functions that
+//! (see `build_fingerprints`). Windows from *different* functions that
 //! land in the same bucket are seed matches; a hash bucket can contain
 //! collisions, so every seed pair is verified with an exact slice comparison
 //! before use. Seed pairs that can be extended one token backward are
@@ -79,7 +79,7 @@ pub enum DupeMode {
     /// Like [`DupeMode::Weak`], plus bare local variable/parameter
     /// identifiers are normalized to positional placeholders (`__ID_0__`,
     /// `__ID_1__`, …) so a renamed-but-otherwise-identical clone still
-    /// matches. See [`assign_semantic_text`] for the identifier-role
+    /// matches. See `assign_semantic_text` for the identifier-role
     /// heuristic and its known precision/recall limitations. Confidence
     /// `0.55`.
     Semantic,

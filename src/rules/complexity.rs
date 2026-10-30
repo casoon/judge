@@ -27,7 +27,7 @@ pub struct FunctionInfo {
     /// code from production refactoring signals without guessing from names.
     pub is_test_context: bool,
     pub cyclomatic: u32,
-    /// Cognitive Complexity (see [`CognitiveComplexityVisitor`]) — a
+    /// Cognitive Complexity (see `CognitiveComplexityVisitor`) — a
     /// best-effort approximation of SonarSource's metric, distinct from
     /// `cyclomatic`: it weights nesting depth instead of counting every
     /// branch point equally.
@@ -46,7 +46,7 @@ pub struct FunctionInfo {
     pub arg_count: usize,
     /// Nesting depth of the return type's generic arguments (see todo.md
     /// §3.C "Return-Type-Komplexität") — `bool`/`()` is 0, `Result<T, E>` is
-    /// 1, `Result<Option<Vec<T>>, E>` is 3. Computed by [`type_depth`].
+    /// 1, `Result<Option<Vec<T>>, E>` is 3. Computed by `type_depth`.
     pub return_type_depth: u32,
     /// Number of type parameters in the function's signature — i.e.
     /// `syn::GenericParam::Type` entries in `sig.generics.params`, excluding
@@ -64,13 +64,13 @@ pub struct FunctionInfo {
     pub trait_bound_count: u32,
     /// Maximum nesting depth of `async` blocks/closures found *inside* the
     /// function body — distinct from the function's own `async fn` status,
-    /// which does not itself count (see [`ExpressionShapeVisitor`], todo.md
+    /// which does not itself count (see `ExpressionShapeVisitor`, todo.md
     /// §3.C "`async`-Verschachtelungstiefe").
     pub async_nesting_depth: u32,
     /// Maximum "width" (direct child count) of any single expression in the
     /// function body — a call's argument count, a tuple/array/struct
     /// literal's element count, or a flattened chain of same-operator binary
-    /// expressions' operand count (see [`ExpressionShapeVisitor`], todo.md
+    /// expressions' operand count (see `ExpressionShapeVisitor`, todo.md
     /// §3.C "Ausdrucksbreite").
     pub max_expression_width: u32,
 }
@@ -556,8 +556,8 @@ const MAX_TRAIT_BOUND_COUNT: u32 = 5;
 /// Flags functions whose *signature* — independent of their body — is
 /// disproportionately complex by any of three measures: an over-nested
 /// return type, too many generic type parameters, or too many trait bounds
-/// (see [`MAX_RETURN_TYPE_DEPTH`]/[`MAX_GENERIC_PARAM_COUNT`]/
-/// [`MAX_TRAIT_BOUND_COUNT`], todo.md §3.C). Unlike `complexity-inflation`,
+/// (see `MAX_RETURN_TYPE_DEPTH`/`MAX_GENERIC_PARAM_COUNT`/
+/// `MAX_TRAIT_BOUND_COUNT`, todo.md §3.C). Unlike `complexity-inflation`,
 /// there is no LOC floor — a one-line function can still have a complex
 /// signature.
 pub fn signature_complexity(functions: &[FunctionInfo]) -> Vec<Finding> {
@@ -889,9 +889,9 @@ pub const MAINTAINABILITY_INDEX_LOW_THRESHOLD: f64 = 20.0;
 /// MI = max(0, MI_raw * 100 / 171)
 /// ```
 /// `CyclomaticComplexity`/`LinesOfCode` are the file-level sums folded by
-/// [`fold_by_file`] over `functions`; `HalsteadVolume` comes from a second,
-/// independent parse of the file via [`analyze_file_halstead`] — see
-/// [`HalsteadVisitor`] for the Rust-adapted counting rules. A file with
+/// `fold_by_file` over `functions`; `HalsteadVolume` comes from a second,
+/// independent parse of the file via `analyze_file_halstead` — see
+/// `HalsteadVisitor` for the Rust-adapted counting rules. A file with
 /// `HalsteadVolume <= 0.0` or zero summed lines of code is skipped entirely
 /// rather than scored (no meaningful MI for a file with no measurable
 /// content).
