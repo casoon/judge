@@ -66,4 +66,4 @@ steps:
 
         \    \e[36m$ cargo judge --format json\e[0m\n"
     delay: 60
-  - wait: 3000
+  - wait: 9000
