@@ -29,7 +29,7 @@ analysis and never exits with 1.
 
 **Gating** rules can fail a baseline verdict (exit code 1) and count towards the health score.
 **Advisory only** rules are listed separately as advisory heuristics and never change the verdict,
-the exit code or the score. In 0.7.0, 49 rules are gating and 29 are advisory only.
+the exit code or the score. In 0.7.1, 49 rules are gating and 29 are advisory only.
 
 Many rules only run under preconditions: some need `judge.toml` configuration, the Deep Tier
 (`--features deep`), a specific subcommand, an imported report or the `network` feature.

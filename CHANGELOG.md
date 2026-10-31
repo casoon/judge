@@ -6,6 +6,8 @@ versions were published on crates.io.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-31
+
 ### Changed
 
 - **CLI help and `explain-rule`:** removed references to the internal, unpublished `todo.md`.

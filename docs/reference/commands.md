@@ -1,6 +1,6 @@
 ---
 title: Commands
-description: Every cargo judge subcommand in 0.7.0, the global options and the exit-code convention.
+description: Every cargo judge subcommand in 0.7.1, the global options and the exit-code convention.
 order: 1
 ---
 
