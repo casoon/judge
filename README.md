@@ -27,6 +27,10 @@ contracts owned by judge.
 
 See [MIGRATION.md](MIGRATION.md) for breaking changes and CLI migration details.
 
+<p align="center">
+  <img src=".github/readme/cargo-judge.svg" alt="cargo judge run on its own source tree: a summary with the evidence-backed and advisory finding counts, the top issue rules by count, the first findings with their source locations, and next steps." width="900">
+</p>
+
 ## Status
 
 Early stage. The Fast Tier (no build required, `syn`-, Cargo-metadata-, and manifest-based) and a first slice of the Deep Tier (rust-analyzer-based, behind the `deep` Cargo feature) are implemented:
