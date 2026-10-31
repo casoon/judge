@@ -8,6 +8,8 @@ versions were published on crates.io.
 
 ### Changed
 
+- **CLI help and `explain-rule`:** removed references to the internal, unpublished `todo.md`.
+- **README:** lists every subcommand and the `network` feature.
 - **Project site:** the start page shows an animated terminal scene from real judge output and
   a diagram of the baseline-to-verdict flow; install variants, `judge.toml`, the CI step and the
   deep tier are covered in the [documentation](https://casoon.github.io/judge/docs/).
