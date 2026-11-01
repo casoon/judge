@@ -4,6 +4,7 @@ import {
   Badge,
   Badges,
   Button,
+  CallToAction,
   CodeBlock,
   Facts,
   Faq,
@@ -169,6 +170,12 @@ const latestRelease = config.changelog
         a: 'Not by default. Dependency checks against crates.io, such as phantom or yanked dependencies, are opt-in via --check-crates-io, and judge never runs cargo-audit itself.',
       },
     ]}
+  />
+
+  <CallToAction
+    title="Your first report in a few minutes."
+    href={url('docs/getting-started/quickstart/')}
+    label="Read the quickstart"
   />
 </Base>
 
