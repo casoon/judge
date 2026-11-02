@@ -6,6 +6,11 @@ versions were published on crates.io.
 
 ## [Unreleased]
 
+### Changed
+
+- **Pages:** the project site uses the current shared theme (0.12.5).
+
+
 ## [0.7.1] - 2026-10-31
 
 ### Changed
