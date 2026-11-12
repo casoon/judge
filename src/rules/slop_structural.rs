@@ -1,9 +1,8 @@
 //! Structural slop signals (see todo.md §3.G "G4 — Strukturelle
-//! Slop-Signale"). Three of the six G4 rules live here: `churn-hotspot`,
-//! `complexity-inflation`, `abstraction-inflation`. Unlike [`crate::rules::slop`],
-//! most of these don't parse files as their primary signal —
-//! `churn-hotspot` aggregates `crate::git::churn` output,
-//! `complexity-inflation` aggregates [`crate::rules::complexity::FunctionInfo`].
+//! Slop-Signale"). Two of the G4 rules live here: `complexity-inflation` and
+//! `abstraction-inflation`. Unlike [`crate::rules::slop`], `complexity-inflation`
+//! doesn't parse files as its primary signal — it aggregates
+//! [`crate::rules::complexity::FunctionInfo`].
 //! `abstraction-inflation` is the exception: it needs its own
 //! workspace-wide `syn` pass (trait-impl counts, wrapper-struct delegation,
 //! builder-struct shape), since none of the existing analyzers already
@@ -40,13 +39,6 @@ use crate::functions::{path_last_segment_name, type_name, walk_functions};
 use crate::ingest::{SourceFile, SourceKind};
 use crate::rules::complexity::FunctionInfo;
 
-/// Rule id for a file reworked often within a short window (see todo.md
-/// §3.G).
-pub const CHURN_HOTSPOT_RULE: &str = "churn-hotspot";
-/// Bump when the churn-hotspot rule's logic changes (see todo.md §5
-/// "Regelversions-Schutz").
-pub const CHURN_HOTSPOT_RULE_REVISION: u32 = 1;
-
 /// Rule id for a long function with implausibly low branching (see todo.md
 /// §3.G).
 pub const COMPLEXITY_INFLATION_RULE: &str = "complexity-inflation";
@@ -67,56 +59,6 @@ pub const FRAGILE_SUBSTRING_CLASSIFICATION_RULE: &str = "fragile-substring-class
 /// Bump when the fragile-substring-classification rule's logic changes (see
 /// todo.md §5 "Regelversions-Schutz").
 pub const FRAGILE_SUBSTRING_CLASSIFICATION_RULE_REVISION: u32 = 1;
-
-/// Minimum commits touching a single file within the 14-day churn window
-/// (see todo.md §3.G `churn-hotspot`: "hoher 2-Wochen-Churn — Rework, nicht
-/// Fortschritt") for it to count as a hotspot. First-cut, adjustable
-/// threshold — not yet backed by a distribution study of what counts as
-/// normal churn for a healthy file (mirrors
-/// [`crate::rules::duplication::DEFAULT_MIN_TOKENS`]'s arbitrary-but-documented
-/// style).
-/// `pub(crate)`: also reused by `crate::advisory::coverage::untested_hotspots`, so the
-/// two rules agree on what "high churn" means for the same workspace.
-pub(crate) const CHURN_HOTSPOT_THRESHOLD: u32 = 5;
-/// The churn window this rule assumes its caller used — see [`churn_hotspots`].
-/// `pub(crate)`: see [`CHURN_HOTSPOT_THRESHOLD`].
-pub(crate) const CHURN_HOTSPOT_WINDOW_DAYS: i64 = 14;
-
-/// Renders churn counts (see `crate::git::churn`, called by the caller
-/// with a 14-day window) at or above `CHURN_HOTSPOT_THRESHOLD` as
-/// findings — a file reworked this often in two weeks is a rewrite in
-/// progress, not steady forward progress (todo.md §3.G). `churn`'s paths
-/// are already relative to the repository root, so findings here carry
-/// that same relative path, unlike most other `collect_findings` rules
-/// (which use absolute paths sourced from [`crate::ingest::SourceFile`]).
-pub fn churn_hotspots(churn: &HashMap<PathBuf, u32>) -> Vec<Finding> {
-    let mut findings: Vec<Finding> = churn
-        .iter()
-        .filter(|&(_, &count)| count >= CHURN_HOTSPOT_THRESHOLD)
-        .map(|(file, &count)| {
-            Finding::new(
-                format!("{CHURN_HOTSPOT_RULE}:{}", file.display()),
-                CHURN_HOTSPOT_RULE,
-                Severity::Warn,
-                Location {
-                    file: file.clone(),
-                    line: OneBasedLine::FIRST,
-                    item_path: file.display().to_string(),
-                },
-                EvidenceClass::Heuristic,
-                Origin::Code,
-                Some(json!({
-                    "commits_in_window": count,
-                    "window_days": CHURN_HOTSPOT_WINDOW_DAYS,
-                })),
-            )
-        })
-        .collect();
-    // `churn` is a `HashMap`, so its iteration order isn't stable — sort for
-    // deterministic output.
-    findings.sort_by(|a, b| a.location.file.cmp(&b.location.file));
-    findings
-}
 
 /// Minimum function size, in lines, for `complexity-inflation` to consider
 /// firing (see todo.md §3.G: "Hohe LOC bei niedriger Cyclomatic Complexity
@@ -820,23 +762,6 @@ mod tests {
     use super::*;
     use crate::test_util::TempDir;
 
-    #[test]
-    fn churn_hotspots_fires_at_or_above_threshold() {
-        let churn = HashMap::from([(PathBuf::from("hot.rs"), 5), (PathBuf::from("cold.rs"), 2)]);
-
-        let findings = churn_hotspots(&churn);
-
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].rule, CHURN_HOTSPOT_RULE);
-        assert_eq!(findings[0].location.file, PathBuf::from("hot.rs"));
-        assert_eq!(
-            findings[0].evidence,
-            Some(json!({"commits_in_window": 5, "window_days": 14}))
-        );
-    }
-
-    /// `churn-hotspot` (todo.md §17.5 candidate 1) — unentscheidbar: a file
-    /// renamed mid-window. [`crate::git::churn`] walks a plain tree diff
     fn function_info(lines_of_code: usize, cyclomatic: u32) -> FunctionInfo {
         function_info_with_cognitive(lines_of_code, cyclomatic, 0)
     }

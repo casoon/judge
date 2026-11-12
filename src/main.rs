@@ -679,12 +679,14 @@ fn main() -> ExitCode {
 fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
     match cli.command {
         None => commands::combined::run(
-            cli.baseline_args.format,
-            cli.baseline_args.save_baseline,
-            cli.baseline_args.baseline,
-            cli.progress.as_deref(),
-            cli.details,
-            cli.color.is_enabled(),
+            commands::combined::CombinedOptions {
+                format: cli.baseline_args.format,
+                save_baseline: cli.baseline_args.save_baseline,
+                baseline: cli.baseline_args.baseline,
+                progress_path: cli.progress.as_deref(),
+                details: cli.details,
+                color: cli.color.is_enabled(),
+            },
             out,
         ),
         Some(command) => {
@@ -1139,7 +1141,7 @@ fn trend_json(trend: &judge::health_score::Trend) -> serde_json::Value {
 /// by rule with a per-rule count, then listed root-findings-first unless
 /// `show_cascades` is set (see todo.md §14.2 P0#2), same convention as
 /// `print_hotspots`.
-const SLOP_RULES: [&str; 25] = [
+const SLOP_RULES: [&str; 27] = [
     judge::rules::slop::SWALLOWED_RESULT_RULE,
     judge::rules::slop::EMPTY_ERROR_ARM_RULE,
     judge::rules::slop::CATCH_ALL_ERROR_RULE,
@@ -1154,7 +1156,9 @@ const SLOP_RULES: [&str; 25] = [
     judge::rules::slop::STEP_COMMENT_INFLATION_RULE,
     judge::rules::slop::GENERIC_NAMING_RULE,
     judge::rules::slop::DOC_RESTATES_SIGNATURE_RULE,
-    judge::rules::slop_structural::CHURN_HOTSPOT_RULE,
+    judge::rules::slop::SILENT_DEFAULT_RULE,
+    judge::rules::slop::CONTEXT_FREE_PROPAGATION_RULE,
+    judge::rules::slop::DEBUG_FORMAT_LEAK_RULE,
     judge::rules::slop_structural::COMPLEXITY_INFLATION_RULE,
     judge::rules::complexity::SIGNATURE_COMPLEXITY_RULE,
     judge::rules::complexity::MAINTAINABILITY_INDEX_RULE,

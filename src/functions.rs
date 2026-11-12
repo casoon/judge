@@ -117,13 +117,38 @@ impl<F> Walker<F> {
     }
 }
 
-fn has_test_cfg(attrs: &[syn::Attribute]) -> bool {
+/// Whether `attrs` hold a `#[cfg(..)]` whose predicate can only be true in a
+/// test build: `test`, `all(..)` with such a part, or `any(..)` whose parts
+/// all are. `not(test)`, `feature = ".."` and `any(test, other)` are not
+/// test-only. The single place every rule asks "is this item test code?".
+pub(crate) fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         attr.path().is_ident("cfg")
             && attr
-                .parse_args::<syn::Ident>()
-                .is_ok_and(|condition| condition == "test")
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|predicate| cfg_predicate_requires_test(&predicate))
     })
+}
+
+fn cfg_predicate_requires_test(predicate: &syn::Meta) -> bool {
+    use syn::punctuated::Punctuated;
+
+    match predicate {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let Ok(parts) =
+                list.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+            else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                parts.iter().any(cfg_predicate_requires_test)
+            } else {
+                !parts.is_empty() && parts.iter().all(cfg_predicate_requires_test)
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Whether an item is itself `#[test]`-attributed. Shared with
@@ -218,7 +243,7 @@ where
         attrs: &[syn::Attribute],
         visit: impl FnOnce(&mut Self),
     ) {
-        let is_test_context = self.current_test_context() || has_test_cfg(attrs);
+        let is_test_context = self.current_test_context() || attrs_have_cfg_test(attrs);
         self.path.push(name);
         self.visit_fn_scoped(is_test_context, visit);
         self.path.pop();
@@ -227,7 +252,7 @@ where
     /// Whether a function-like item is test-only: its enclosing scope is, or
     /// it's `#[cfg(test)]`, or it's `#[test]` itself.
     fn compute_is_test_context(&self, attrs: &[syn::Attribute]) -> bool {
-        self.current_test_context() || has_test_cfg(attrs) || has_test_attr(attrs)
+        self.current_test_context() || attrs_have_cfg_test(attrs) || has_test_attr(attrs)
     }
 
     /// Runs `visit` with `is_test_context` pushed onto the test-context stack
@@ -285,7 +310,7 @@ where
     }
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
-        let is_test_context = self.current_test_context() || has_test_cfg(&node.attrs);
+        let is_test_context = self.current_test_context() || attrs_have_cfg_test(&node.attrs);
         self.path.push(type_name(&node.self_ty));
         self.in_trait_impl.push(node.trait_.is_some());
         self.test_context.push(is_test_context);
@@ -342,7 +367,23 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::walk_functions;
+    use super::{attrs_have_cfg_test, walk_functions};
+
+    fn gated(attr: &str) -> bool {
+        let item: syn::ItemFn = syn::parse_str(&format!("{attr} fn f() {{}}")).unwrap();
+        attrs_have_cfg_test(&item.attrs)
+    }
+
+    #[test]
+    fn cfg_test_detection_follows_the_predicate_not_the_word() {
+        assert!(gated("#[cfg(test)]"));
+        assert!(gated("#[cfg(all(test, feature = \"x\"))]"));
+        assert!(gated("#[cfg(any(test, test))]"));
+        assert!(!gated("#[cfg(any(test, feature = \"x\"))]"));
+        assert!(!gated("#[cfg(not(test))]"));
+        assert!(!gated("#[cfg(feature = \"test-util\")]"));
+        assert!(!gated("#[inline]"));
+    }
 
     #[test]
     fn qualifies_names_across_mod_impl_and_trait() {

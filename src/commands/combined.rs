@@ -74,18 +74,47 @@ impl ProgressWriter {
     }
 }
 
-/// Bare `cargo judge` (see todo.md §4 "Decision Surface", §8 "Vollanalyse"):
-/// runs [`collect_findings`], sorts the result worst-first, then either
-/// saves/compares a baseline or prints the merged report.
+/// How a combined run is invoked: what to render and whether to save or
+/// compare a baseline.
+pub(crate) struct CombinedOptions<'a> {
+    pub(crate) format: OutputFormat,
+    pub(crate) save_baseline: bool,
+    pub(crate) baseline: Option<PathBuf>,
+    pub(crate) progress_path: Option<&'a Path>,
+    pub(crate) details: bool,
+    pub(crate) color: bool,
+}
+
+impl CombinedOptions<'_> {
+    /// `cargo judge compare BASELINE`: the combined run against a saved
+    /// baseline, without details, progress or forced colors.
+    pub(crate) fn compare(format: OutputFormat, baseline: PathBuf) -> Self {
+        Self {
+            format,
+            save_baseline: false,
+            baseline: Some(baseline),
+            progress_path: None,
+            details: false,
+            color: false,
+        }
+    }
+}
+
+/// Bare `cargo judge`: runs [`collect_findings`], sorts the result
+/// worst-first, then either saves/compares a baseline or prints the merged
+/// report.
 pub(crate) fn run(
-    format: OutputFormat,
-    save_baseline: bool,
-    baseline: Option<PathBuf>,
-    progress_path: Option<&Path>,
-    details: bool,
-    color: bool,
+    options: CombinedOptions<'_>,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
+    let CombinedOptions {
+        format,
+        save_baseline,
+        baseline,
+        progress_path,
+        details,
+        color,
+    } = options;
     let workspace = judge::ingest::load(None)?;
     let progress_path = progress_path.map(|path| {
         if path.is_absolute() {

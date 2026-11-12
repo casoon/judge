@@ -89,7 +89,7 @@ use syn::visit::{self, Visit};
 
 use crate::deep::{DeepContext, FileId};
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::type_name;
+use crate::functions::{attrs_have_cfg_test, type_name};
 use crate::ingest::Workspace;
 use crate::rules::dead_code::DeadCodeError;
 
@@ -124,25 +124,6 @@ struct ImplCandidate {
     type_name: String,
     impl_token_span: Span,
     line: usize,
-}
-
-/// Mirrors `crate::rules::api_surface`'s own private `attrs_have_cfg_test` — a
-/// crude but conservative parse of a `#[cfg(...)]` attribute's raw tokens
-/// for the word `test`, kept local rather than shared for the same reason
-/// that helper is kept local in every module that needs it.
-fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        if !attr.path().is_ident("cfg") {
-            return false;
-        }
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        list.tokens
-            .to_string()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|word| word == "test")
-    })
 }
 
 /// Whether `node` is a blanket impl (`impl<T: Trait> Trait for T`) — its self

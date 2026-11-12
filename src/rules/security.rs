@@ -185,7 +185,8 @@ use syn::{
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::{
-    has_test_attr, qualified_item_path, read_and_parse_source, type_name, walk_functions,
+    attrs_have_cfg_test, has_test_attr, qualified_item_path, read_and_parse_source, type_name,
+    walk_functions,
 };
 use crate::ingest::SourceFile;
 use crate::rules::slop_text::{CommentSpan, extract_comments};
@@ -874,27 +875,6 @@ fn is_suspicious_name(name: &str) -> bool {
     SUSPICIOUS_NAME_MARKERS
         .iter()
         .any(|marker| normalized.contains(&format!("_{marker}_")))
-}
-
-/// Whether `attrs` contains a `#[cfg(...)]` attribute whose predicate
-/// mentions `test` as a whole word (`#[cfg(test)]`, `#[cfg(any(test, ...))]`,
-/// `#[cfg(all(test, ...))]`) — a crude but conservative parse of the
-/// attribute's raw tokens, not a full `cfg` predicate evaluator (mirrors
-/// `crate::rules::api_surface`'s private `attrs_have_cfg_test`, kept local for the
-/// same reason `type_name` is).
-fn attrs_have_cfg_test(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        if !attr.path().is_ident("cfg") {
-            return false;
-        }
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        list.tokens
-            .clone()
-            .into_iter()
-            .any(|token| matches!(&token, proc_macro2::TokenTree::Ident(ident) if ident == "test"))
-    })
 }
 
 /// Whether an item with these attributes is out of scope for

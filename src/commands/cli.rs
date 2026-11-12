@@ -154,12 +154,7 @@ impl Command {
             Self::DeadCode(options) => run_dead_code(options, out),
             Self::Explain(options) => run_explain(options, out),
             Self::Compare(options) => combined::run(
-                options.format,
-                false,
-                Some(options.baseline),
-                None,
-                false,
-                false,
+                combined::CombinedOptions::compare(options.format, options.baseline),
                 out,
             ),
             Self::Init => {

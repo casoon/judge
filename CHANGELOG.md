@@ -15,11 +15,21 @@ versions were published on crates.io.
 ### Changed
 
 - **Pages:** the project site uses the current shared theme (0.12.12).
+- **Test-code detection:** one shared `#[cfg(..)]` check now decides what is test-only code in
+  every rule. `cfg(all(test, ..))` counts, while `cfg(not(test))` and `cfg(any(test, ..))` no
+  longer do; items behind them are analysed as production code.
 - **`untested-hotspot`:** flags high-complexity, mostly uncovered functions without a churn
   criterion (judge reads no Git history). Before, `cargo judge coverage` could never report it.
 
+### Removed
+
+- **Library API:** `judge::rules::slop_structural::churn_hotspots` and the `CHURN_HOTSPOT_*`
+  constants; the rule had no caller since judge stopped reading Git history.
+
 ### Fixed
 
+- **`health`:** the slop block lists `silent-default`, `context-free-propagation` and
+  `debug-format-leak`, and no longer the never-emitted `churn-hotspot`.
 - **Baselines:** a finding that only moved because of an edit above it is no longer reported as
   resolved plus introduced; `--baseline` matches the rest per rule and file.
 - **`dupes --mode strict`:** no longer panics on a doc comment inside a duplicated body.

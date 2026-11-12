@@ -149,7 +149,7 @@ use syn::visit::{self, Visit};
 use syn::{ItemUse, UseTree};
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
-use crate::functions::read_and_parse_source;
+use crate::functions::{attrs_have_cfg_test, read_and_parse_source};
 use crate::ingest::{CrateInfo, DependencyKind, Workspace};
 
 /// Rule id used for misplaced-dependency-kind findings (see todo.md §3.B).
@@ -1562,25 +1562,6 @@ fn collect_identifiers(path: &Path) -> Result<(HashSet<String>, HashSet<String>)
     cfg_test_collector.visit_file(&ast);
 
     Ok((collector.idents, cfg_test_collector.idents))
-}
-
-/// Whether `attrs` contains a `#[cfg(...)]` attribute whose predicate
-/// mentions `test` as a whole word (`#[cfg(test)]`, `#[cfg(any(test, ...))]`,
-/// `#[cfg(all(test, ...))]`) — a crude but conservative parse of the
-/// attribute's raw tokens, not a full `cfg` predicate evaluator.
-pub(crate) fn attrs_have_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        if !attr.path().is_ident("cfg") {
-            return false;
-        }
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        list.tokens
-            .to_string()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|word| word == "test")
-    })
 }
 
 /// Collects identifiers referenced inside `#[cfg(test)]`-attributed modules

@@ -53,7 +53,9 @@ use syn::{
 };
 
 use crate::finding::{Finding, Location, Origin, Severity};
-use crate::functions::{has_test_attr, qualified_item_path, read_and_parse_source, type_name};
+use crate::functions::{
+    attrs_have_cfg_test, has_test_attr, qualified_item_path, read_and_parse_source, type_name,
+};
 use crate::ingest::CrateInfo;
 
 /// Rule id for a module-level `pub` item with no doc comment (see todo.md
@@ -505,27 +507,6 @@ fn has_non_exhaustive(attrs: &[Attribute]) -> bool {
     attrs
         .iter()
         .any(|attr| attr.path().is_ident("non_exhaustive"))
-}
-
-/// Whether `attrs` contains a `#[cfg(...)]` attribute whose predicate
-/// mentions `test` as a whole word (`#[cfg(test)]`, `#[cfg(any(test, ...))]`,
-/// `#[cfg(all(test, ...))]`) — a crude but conservative parse of the
-/// attribute's raw tokens, not a full `cfg` predicate evaluator (mirrors
-/// `deps.rs`'s private `attrs_have_cfg_test`, kept local for the same reason
-/// `type_name` is).
-fn attrs_have_cfg_test(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        if !attr.path().is_ident("cfg") {
-            return false;
-        }
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        list.tokens
-            .to_string()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|word| word == "test")
-    })
 }
 
 /// Generates callbacks for module-scoped items that share the same

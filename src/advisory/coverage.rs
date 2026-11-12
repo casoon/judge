@@ -360,7 +360,7 @@ impl CrateTestRatio {
 /// in a parsed file — adapts `crate::rules::deps`'s `CfgTestIdentCollector` (which
 /// collects identifiers referenced inside such a module) into a span
 /// collector instead, reusing its exact `#[cfg(test)]` detection
-/// (`crate::rules::deps::attrs_have_cfg_test`) rather than re-parsing attributes
+/// (`crate::functions::attrs_have_cfg_test`) rather than re-parsing attributes
 /// from scratch. Like `CfgTestIdentCollector`, doesn't descend into a
 /// `#[cfg(test)]` module once found, so sibling/nested test modules never
 /// double-count a line.
@@ -371,7 +371,7 @@ struct CfgTestModSpanCollector {
 
 impl<'ast> Visit<'ast> for CfgTestModSpanCollector {
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if crate::rules::deps::attrs_have_cfg_test(&node.attrs) {
+        if crate::functions::attrs_have_cfg_test(&node.attrs) {
             let start_line = node.span().start().line;
             let end_line = node.span().end().line.max(start_line);
             self.spans.push((start_line, end_line));
