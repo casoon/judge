@@ -160,8 +160,22 @@ fn cross_file_reference_count(
 /// (whose fan-in lookup only has entries for functions this let through, so
 /// a clone member outside this set is treated as "not isolated" the same
 /// way a generated-and-excluded member already is).
-fn is_reliably_checkable_for_fan_in(attrs: &[syn::Attribute], in_trait_impl: bool) -> bool {
-    !in_trait_impl && !has_attr_ending_in(attrs, "test") && !has_attr_ending_in(attrs, "bench")
+fn is_reliably_checkable_for_fan_in(site: &crate::functions::FunctionSite<'_>) -> bool {
+    let is_entry = site.qualified_name == "main"
+        || [
+            "no_mangle",
+            "export_name",
+            "wasm_bindgen",
+            "proc_macro",
+            "proc_macro_derive",
+        ]
+        .iter()
+        .any(|attr| has_attr_ending_in(site.attrs, attr));
+    !site.in_trait_impl
+        && !site.is_test_context
+        && !is_entry
+        && !has_attr_ending_in(site.attrs, "test")
+        && !has_attr_ending_in(site.attrs, "bench")
 }
 
 /// Walks every function-like item in the workspace (see
@@ -235,7 +249,7 @@ fn collect_file_fan_in(
     };
 
     walk_functions(&ast, |site| {
-        if !is_reliably_checkable_for_fan_in(site.attrs, site.in_trait_impl) {
+        if !is_reliably_checkable_for_fan_in(&site) {
             return;
         }
 

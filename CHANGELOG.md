@@ -28,6 +28,9 @@ versions were published on crates.io.
   test code outside `--include-tests`, proc-macro and build-script functions, or functions named
   in a `const`/`static` of the same file. For a publishable library, its public API now counts as
   entry points, so private helpers called from it are live.
+  Its findings now state that calls inside macro arguments may be unresolved.
+- **`connectivity-drop` (deep tier):** no longer reports `fn main`, test helpers, FFI exports and
+  proc-macro entry points.
 - **`module-graph`:** `mod x;` inside an inline `mod { .. }` resolves below it, and
   `pub use self::x::Y` counts as a reference to `x`.
 

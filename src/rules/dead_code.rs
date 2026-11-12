@@ -996,9 +996,14 @@ fn push_finding_if_unreachable(
     ) {
         Ok(true) => {}
         Ok(false) => {
-            let limitations = proc_macro_exposed
-                .contains(krate_name)
-                .then(|| vec!["proc_macro_expansion_disabled".to_string()]);
+            let mut limitations = Vec::new();
+            if rule_id == UNREACHABLE_FROM_ENTRY_RULE {
+                limitations.push("calls_inside_macro_arguments_may_be_unresolved".to_string());
+            }
+            if proc_macro_exposed.contains(krate_name) {
+                limitations.push("proc_macro_expansion_disabled".to_string());
+            }
+            let limitations = (!limitations.is_empty()).then_some(limitations);
             report.findings.push(dead_code_finding(
                 rule_id,
                 severity,
