@@ -6,6 +6,12 @@ versions were published on crates.io.
 
 ## [Unreleased]
 
+### Added
+
+- **SARIF:** every result carries a position-independent `partialFingerprints` entry, so code
+  scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear
+  as tool notifications and mark the invocation as unsuccessful.
+
 ### Changed
 
 - **Pages:** the project site uses the current shared theme (0.12.12).

@@ -6,7 +6,7 @@
 //! relativize finding paths (see [`crate::finding::relativize_paths`])
 //! before building the report, matching SARIF's relative-URI convention.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::finding::{Report, Severity};
@@ -26,6 +26,31 @@ fn level(severity: Severity) -> &'static str {
 /// yields portable URIs.
 pub(crate) fn artifact_uri(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// Position-independent identity of each finding, for SARIF
+/// `partialFingerprints`: `rule|file|item|n`, where `n` numbers findings that
+/// share the first three parts in source order. Code scanning uses it to
+/// match a result across runs, so an unrelated edit above a finding that
+/// shifts its line does not read as "fixed" plus "new".
+fn fingerprints(report: &Report) -> Vec<String> {
+    let mut order: Vec<usize> = (0..report.findings.len()).collect();
+    order.sort_by_key(|&index| report.findings[index].location.line.get());
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut result = vec![String::new(); report.findings.len()];
+    for index in order {
+        let finding = &report.findings[index];
+        let key = format!(
+            "{}|{}|{}",
+            finding.rule,
+            artifact_uri(&finding.location.file),
+            finding.location.item_path
+        );
+        let occurrence = seen.entry(key.clone()).or_insert(0);
+        result[index] = format!("{key}|{occurrence}");
+        *occurrence += 1;
+    }
+    result
 }
 
 /// Renders `report` as a minimal, valid SARIF 2.1.0 log: one run, one
@@ -49,10 +74,12 @@ pub fn render(report: &Report) -> serde_json::Value {
         })
         .collect();
 
+    let fingerprints = fingerprints(report);
     let results: Vec<serde_json::Value> = report
         .findings
         .iter()
-        .map(|finding| {
+        .zip(&fingerprints)
+        .map(|(finding, fingerprint)| {
             serde_json::json!({
                 "ruleId": finding.rule.as_str(),
                 "level": level(finding.severity),
@@ -65,6 +92,7 @@ pub fn render(report: &Report) -> serde_json::Value {
                         "region": { "startLine": finding.location.line.get() },
                     },
                 }],
+                "partialFingerprints": { "judgeFinding/v1": fingerprint },
                 "properties": {
                     "evidence_class": finding.evidence_class,
                     "gating": finding.is_gating(),
@@ -83,6 +111,14 @@ pub fn render(report: &Report) -> serde_json::Value {
             },
         },
         "results": results,
+        "invocations": [{
+            "executionSuccessful": report.errors.is_empty(),
+            "toolExecutionNotifications": report
+                .errors
+                .iter()
+                .map(|error| serde_json::json!({ "level": "error", "message": { "text": error } }))
+                .collect::<Vec<_>>(),
+        }],
     });
     if let Some(universe) = &report.analysis_universe {
         run["properties"] = serde_json::json!({ "analysis_universe": universe });
@@ -160,6 +196,57 @@ mod tests {
         assert_eq!(physical["region"]["startLine"], 42);
         assert_eq!(result["properties"]["evidence_class"], "derived_fact");
         assert_eq!(result["properties"]["gating"], true);
+    }
+
+    #[test]
+    fn fingerprints_ignore_the_line_and_number_repeated_findings() {
+        let mut first = finding(
+            "swallowed-result",
+            Severity::Warn,
+            EvidenceClass::DerivedFact,
+            "src/a.rs",
+        );
+        let mut second = first.clone();
+        second.id = "swallowed-result:src/a.rs:b".into();
+        second.location.line = OneBasedLine::new(50).unwrap();
+        first.location.line = OneBasedLine::new(10).unwrap();
+
+        let before = render(&Report::new(vec![first.clone(), second.clone()]));
+        // An edit above both findings shifts their lines.
+        first.location.line = OneBasedLine::new(11).unwrap();
+        second.location.line = OneBasedLine::new(51).unwrap();
+        let after = render(&Report::new(vec![first, second]));
+
+        let prints = |sarif: &serde_json::Value| -> Vec<String> {
+            sarif["runs"][0]["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|result| {
+                    result["partialFingerprints"]["judgeFinding/v1"]
+                        .as_str()
+                        .unwrap()
+                        .to_string()
+                })
+                .collect()
+        };
+        assert_eq!(prints(&before), prints(&after));
+        assert_ne!(prints(&before)[0], prints(&before)[1]);
+    }
+
+    #[test]
+    fn analysis_errors_become_tool_notifications() {
+        let mut report = Report::new(Vec::new());
+        report.errors.push("src/broken.rs: parse error".to_string());
+
+        let sarif = render(&report);
+
+        let invocation = &sarif["runs"][0]["invocations"][0];
+        assert_eq!(invocation["executionSuccessful"], false);
+        assert_eq!(
+            invocation["toolExecutionNotifications"][0]["message"]["text"],
+            "src/broken.rs: parse error"
+        );
     }
 
     #[test]
