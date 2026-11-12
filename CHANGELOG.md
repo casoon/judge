@@ -58,7 +58,10 @@ versions were published on crates.io.
 - **CLI help and README:** removed remaining `todo.md` references and the outdated note that
   module-level boundaries are missing.
 - **`module-graph`:** `mod x;` inside an inline `mod { .. }` resolves below it, and
-  `pub use self::x::Y` counts as a reference to `x`.
+  `pub use self::x::Y` counts as a reference to `x`; a bare `use x::Y;` inside an inline module
+  does too.
+- **`slop`, `errors`, `tests`, `unsafe`:** honour `// judge-ignore` comments like the other
+  commands.
 
 ## [0.7.1] - 2026-10-31
 

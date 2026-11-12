@@ -594,11 +594,22 @@ struct ReferenceCollector<'a> {
     crate_by_identifier: &'a HashMap<String, String>,
     /// `mod` names declared at the top level of the current file — see
     /// module docs "Bare/self-relative reference resolution".
-    local_mod_names: &'a HashSet<String>,
+    local_mod_names: &'a HashMap<Vec<String>, HashSet<String>>,
+    /// Names of the inline `mod x { .. }` blocks enclosing the node being
+    /// visited, outermost first.
+    inline_stack: Vec<String>,
     hits: Vec<(String, String)>,
 }
 
 impl ReferenceCollector<'_> {
+    /// Module path of the code being visited: the file's module plus the
+    /// enclosing inline modules.
+    fn base_path(&self) -> Option<Vec<String>> {
+        let mut parts = module_path_segments(self.current_module?);
+        parts.extend(self.inline_stack.iter().cloned());
+        Some(parts)
+    }
+
     fn resolve(&self, mut segments: Vec<String>) -> Option<(String, String)> {
         if segments.is_empty() {
             return None;
@@ -611,19 +622,23 @@ impl ReferenceCollector<'_> {
             return Some((owner.clone(), segments.join("::")));
         }
         if head == "super" {
-            let mut parts = module_path_segments(self.current_module?);
+            let mut parts = self.base_path()?;
             parts.pop()?;
             crate::rules::boundaries::pop_leading_supers(&mut parts, &mut segments)?;
             parts.extend(segments);
             return Some((self.own_crate.to_string(), parts.join("::")));
         }
         if head == "self" {
-            let mut parts = module_path_segments(self.current_module?);
+            let mut parts = self.base_path()?;
             parts.extend(segments);
             return Some((self.own_crate.to_string(), parts.join("::")));
         }
-        if self.local_mod_names.contains(&head) {
-            let mut parts = module_path_segments(self.current_module?);
+        if self
+            .local_mod_names
+            .get(&self.inline_stack)
+            .is_some_and(|names| names.contains(&head))
+        {
+            let mut parts = self.base_path()?;
             parts.push(head);
             parts.extend(segments);
             return Some((self.own_crate.to_string(), parts.join("::")));
@@ -643,11 +658,41 @@ impl<'ast> Visit<'ast> for ReferenceCollector<'_> {
         }
     }
 
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if node.content.is_some() {
+            self.inline_stack.push(node.ident.to_string());
+            visit::visit_item_mod(self, node);
+            self.inline_stack.pop();
+        } else {
+            visit::visit_item_mod(self, node);
+        }
+    }
+
     fn visit_path(&mut self, node: &'ast syn::Path) {
         if let Some(hit) = self.resolve(crate::rules::boundaries::path_segments(node)) {
             self.hits.push(hit);
         }
         visit::visit_path(self, node);
+    }
+}
+
+/// `mod` names declared directly in each inline-module scope of a file, keyed
+/// by the enclosing inline modules (empty key = the file's top level).
+fn collect_local_mod_names(
+    items: &[Item],
+    stack: &mut Vec<String>,
+    out: &mut HashMap<Vec<String>, HashSet<String>>,
+) {
+    for item in items {
+        let Item::Mod(item_mod) = item else { continue };
+        out.entry(stack.clone())
+            .or_default()
+            .insert(item_mod.ident.to_string());
+        if let Some((_, inner)) = &item_mod.content {
+            stack.push(item_mod.ident.to_string());
+            collect_local_mod_names(inner, stack, out);
+            stack.pop();
+        }
     }
 }
 
@@ -718,19 +763,14 @@ fn orphan_module_findings(
             };
             files_scanned += 1;
             let current_module = tree.file_module_path.get(&file.path).cloned();
-            let local_mod_names: HashSet<String> = ast
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Mod(item_mod) => Some(item_mod.ident.to_string()),
-                    _ => None,
-                })
-                .collect();
+            let mut local_mod_names: HashMap<Vec<String>, HashSet<String>> = HashMap::new();
+            collect_local_mod_names(&ast.items, &mut Vec::new(), &mut local_mod_names);
             let mut collector = ReferenceCollector {
                 own_crate: krate.name.as_str(),
                 current_module: current_module.as_deref(),
                 crate_by_identifier: &crate_by_identifier,
                 local_mod_names: &local_mod_names,
+                inline_stack: Vec::new(),
                 hits: Vec::new(),
             };
             collector.visit_file(&ast);
@@ -859,6 +899,26 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.join("src/foo.rs"), "pub struct Bar;\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true);
+
+        assert!(rule_findings(&report.findings, ORPHAN_MODULE_RULE).is_empty());
+    }
+
+    // A bare `use b::C;` next to `mod b;` inside an inline `mod a { .. }`
+    // references `a::b`.
+    #[test]
+    fn a_bare_use_inside_an_inline_mod_counts_as_a_reference() {
+        let dir = TempDir::new("module-graph-inline-bare-use");
+        write_single_crate_manifest(&dir, "fixture");
+        std::fs::create_dir_all(dir.join("src/a")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub mod a {\n    mod b;\n    pub use b::C;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/a/b.rs"), "pub struct C;\n").unwrap();
 
         let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
         let report = analyze_workspace(&workspace, true);

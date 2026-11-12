@@ -1222,10 +1222,12 @@ fn render_focused(
     label: &str,
     format: OutputFormat,
     workspace: &judge::ingest::Workspace,
-    mut findings: Vec<Finding>,
+    findings: Vec<Finding>,
     errors: Vec<String>,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
+    let (mut findings, _suppressed_inline) =
+        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
     judge::finding::sort_by_severity_desc(&mut findings);
     match format {
         OutputFormat::Json => write_json(
