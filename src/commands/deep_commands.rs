@@ -1,6 +1,40 @@
 //! Commands that optionally use judge's rust-analyzer-backed Deep Tier.
 
-use crate::*;
+#[cfg(feature = "deep")]
+use crate::BaselineArgs;
+#[cfg(feature = "deep")]
+use crate::BaselineInput;
+#[cfg(feature = "deep")]
+use crate::BaselineRequest;
+use crate::CliError;
+use crate::CommandOutcome;
+#[cfg(feature = "deep")]
+use crate::DEFAULT_BASELINE_DEAD_CODE;
+use crate::DeadCodeOptions;
+use crate::ExplainOptions;
+use crate::OutputFormat;
+#[cfg(feature = "deep")]
+use crate::analysis_errors;
+#[cfg(feature = "deep")]
+use crate::append_analysis_errors;
+#[cfg(feature = "deep")]
+use crate::load_judge_toml;
+#[cfg(feature = "deep")]
+use crate::severity_label;
+use crate::unsupported_format;
+#[cfg(feature = "deep")]
+use crate::write_json;
+#[cfg(feature = "deep")]
+use crate::write_sarif;
+#[cfg(feature = "deep")]
+use judge::finding::Finding;
+#[cfg(feature = "deep")]
+use judge::finding::Report;
+#[cfg(feature = "deep")]
+use judge::rules::duplication::DupeMode;
+use std::io::Write;
+#[cfg(feature = "deep")]
+use std::path::Path;
 
 #[cfg_attr(not(feature = "deep"), allow(unused_variables))]
 pub(crate) fn run_dead_code(
@@ -47,7 +81,12 @@ fn run_dead_code_deep(
     } = options;
     let workspace = judge::ingest::load(None)?;
 
-    let dead_code_report = judge::rules::dead_code::analyze_workspace(&workspace, include_tests)?;
+    // One rust-analyzer load serves every detector below that analyses the
+    // default feature set.
+    let ctx = judge::deep::DeepContext::load(&workspace.root)
+        .map_err(judge::rules::dead_code::DeadCodeError::Deep)?;
+    let dead_code_report =
+        judge::rules::dead_code::analyze_workspace_with(&ctx, &workspace, include_tests)?;
 
     // `feature-gated-dead-code` is opt-in via `judge.toml` `[feature_matrix]`
     // — with `combinations` absent or empty (the default), this performs no
@@ -59,7 +98,8 @@ fn run_dead_code_deep(
         include_tests,
     )?;
 
-    let dead_trait_impl_report = judge::rules::dead_trait_impl::analyze_workspace(&workspace)?;
+    let dead_trait_impl_report =
+        judge::rules::dead_trait_impl::analyze_workspace_with(&ctx, &workspace)?;
 
     // `duplicative-reinvention` needs clone-family membership — cheap,
     // Fast Tier, same defaults `cargo judge health`/`dupes` already use.
@@ -79,7 +119,8 @@ fn run_dead_code_deep(
     let complexity =
         judge::rules::complexity::analyze_workspace(monomorphization_source_files, false);
 
-    let structural_report = judge::rules::slop_structural_deep::analyze_workspace(
+    let structural_report = judge::rules::slop_structural_deep::analyze_workspace_with(
+        &ctx,
         &workspace,
         &dupes,
         include_tests,

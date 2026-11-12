@@ -4,9 +4,13 @@
 //! through `cargo judge --progress PATH`, while each phase owns only the
 //! findings and analysis errors it contributes.
 
-use crate::*;
-
 use super::combined;
+use crate::CliError;
+use crate::append_analysis_errors;
+use crate::parse_boundary_config;
+use judge::finding::Finding;
+use judge::rules::duplication::DupeMode;
+use std::path::PathBuf;
 
 pub(crate) struct CollectedFindings {
     pub(crate) findings: Vec<Finding>,

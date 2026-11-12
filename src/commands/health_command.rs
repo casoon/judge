@@ -1,6 +1,26 @@
 //! `cargo judge health`: health aggregation, score, and report selection.
 
-use crate::*;
+use crate::BaselineArgs;
+use crate::BaselineOptions;
+use crate::CliError;
+use crate::CommandOutcome;
+use crate::DEFAULT_BASELINE_HEALTH;
+use crate::HealthOptions;
+use crate::OutputFormat;
+use crate::analysis_errors;
+use crate::append_analysis_errors;
+use crate::compute_score_trend;
+use crate::handle_baseline_with_trend;
+use crate::load_judge_toml;
+use crate::print_score_trend;
+use crate::print_slop;
+use crate::require_score;
+use crate::unsupported_format;
+use crate::write_json;
+use crate::write_sarif;
+use judge::finding::Report;
+use std::io::Write;
+use std::path::Path;
 
 pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
     let HealthOptions {

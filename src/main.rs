@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, ValueEnum};
-use judge::AnalysisTier;
-use judge::baseline::Verdict;
 use judge::finding::{Finding, Report};
 use judge::rules::duplication::DupeMode;
 use serde::Serialize;
@@ -3426,6 +3424,32 @@ fn dup_two(x: i32) -> i32 {
         assert_eq!(file["production"]["functions"], 1);
         assert_eq!(file["tests"]["functions"], 1);
         assert_eq!(file["complexity_rank"], 1);
+    }
+
+    #[test]
+    fn init_writes_a_starter_config_once_and_never_overwrites() {
+        let dir = TempDir::new("init-starter-config");
+        write_fixture_crate(&dir);
+        let init = || Cli {
+            command: Some(Command::Init),
+            baseline_args: baseline_args(OutputFormat::Tty, false, None),
+            progress: None,
+            details: false,
+            color: ColorChoice::Auto,
+            output: None,
+        };
+
+        run_in_dir(&dir, init(), &mut Vec::new()).expect("first init writes the file");
+        let written = std::fs::read_to_string(dir.join("judge.toml")).unwrap();
+        let config: judge::rules::boundaries::BoundaryConfig = toml::from_str(&written).unwrap();
+        assert!(config.boundaries.is_empty());
+
+        let error = run_in_dir(&dir, init(), &mut Vec::new()).expect_err("second init refuses");
+        assert!(matches!(error, CliError::Config(_)));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("judge.toml")).unwrap(),
+            written
+        );
     }
 
     #[test]

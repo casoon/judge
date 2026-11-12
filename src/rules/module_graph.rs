@@ -322,6 +322,61 @@ fn resolve_mod_item_file(
     )
 }
 
+/// Source files that only exist under `#[cfg(test)]`: out-of-line `mod`
+/// targets declared by a `#[cfg(test)]` module (or nested in one), plus every
+/// file those files declare in turn. Files that cannot be read or parsed are
+/// skipped.
+pub(crate) fn cfg_test_module_files(root_files: &[PathBuf]) -> HashSet<PathBuf> {
+    fn walk(
+        file: &Path,
+        items: &[Item],
+        inline_dirs: &[String],
+        in_test: bool,
+        out: &mut Vec<PathBuf>,
+    ) {
+        for item in items {
+            let Item::Mod(item_mod) = item else { continue };
+            let is_test = in_test || crate::functions::attrs_have_cfg_test(&item_mod.attrs);
+            if let Some((_, content_items)) = &item_mod.content {
+                let mut nested = inline_dirs.to_vec();
+                nested.push(item_mod.ident.to_string());
+                walk(file, content_items, &nested, is_test, out);
+            } else if is_test
+                && let Some(child) = resolve_mod_item_file(file, inline_dirs, item_mod)
+            {
+                out.push(child);
+            }
+        }
+    }
+
+    let mut test_files: HashSet<PathBuf> = HashSet::new();
+    let mut pending: Vec<(PathBuf, bool)> = root_files.iter().map(|f| (f.clone(), false)).collect();
+    let mut visited: HashSet<(PathBuf, bool)> = HashSet::new();
+    while let Some((file, in_test)) = pending.pop() {
+        if !visited.insert((file.clone(), in_test)) {
+            continue;
+        }
+        let Ok((_, ast)) = crate::functions::read_and_parse_source(&file, |_| (), |_| ()) else {
+            continue;
+        };
+        let mut children = Vec::new();
+        walk(&file, &ast.items, &[], in_test, &mut children);
+        for child in children {
+            test_files.insert(child.clone());
+            pending.push((child, true));
+        }
+        if in_test {
+            let mut all = Vec::new();
+            collect_out_of_line_children(&file, &ast.items, &[], &mut all);
+            for child in all {
+                test_files.insert(child.clone());
+                pending.push((child, true));
+            }
+        }
+    }
+    test_files
+}
+
 /// Every out-of-line `mod` target declared in `items`, including those
 /// nested in inline `mod { .. }` blocks.
 fn collect_out_of_line_children(

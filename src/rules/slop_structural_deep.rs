@@ -499,9 +499,27 @@ pub fn analyze_workspace(
     complexity_functions: &[FunctionInfo],
 ) -> Result<DeepStructuralReport, SlopStructuralDeepError> {
     let ctx = DeepContext::load(&workspace.root).map_err(SlopStructuralDeepError::Deep)?;
+    analyze_workspace_with(
+        &ctx,
+        workspace,
+        duplication,
+        include_tests,
+        complexity_functions,
+    )
+}
+
+/// Same as [`analyze_workspace`], on an already loaded [`DeepContext`] so several
+/// detectors can share one rust-analyzer load.
+pub fn analyze_workspace_with(
+    ctx: &DeepContext,
+    workspace: &Workspace,
+    duplication: &WorkspaceDuplication,
+    include_tests: bool,
+    complexity_functions: &[FunctionInfo],
+) -> Result<DeepStructuralReport, SlopStructuralDeepError> {
     let analysis = ctx.analysis();
 
-    let (records, mut errors) = collect_function_fan_in(workspace, &ctx, &analysis, include_tests);
+    let (records, mut errors) = collect_function_fan_in(workspace, ctx, &analysis, include_tests);
     let checked = records.len();
 
     let mut findings = connectivity_drop_findings(&records);
@@ -515,7 +533,7 @@ pub fn analyze_workspace(
     // rule's score.
     if include_tests {
         let (production_records, production_errors) =
-            collect_function_fan_in(workspace, &ctx, &analysis, false);
+            collect_function_fan_in(workspace, ctx, &analysis, false);
         errors.extend(production_errors);
         findings.extend(monomorphization_load_findings(
             &production_records,

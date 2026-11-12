@@ -1120,7 +1120,9 @@ fn check_enum_variant(
         line,
         qualified_name,
         evidence,
-        None,
+        Some(vec![
+            "construction_inside_macro_invocations_not_scanned".to_string(),
+        ]),
     ));
 }
 
@@ -1644,11 +1646,21 @@ pub fn analyze_workspace(
     include_tests: bool,
 ) -> Result<WorkspaceDeadCode, DeadCodeError> {
     let ctx = DeepContext::load(&workspace.root).map_err(DeadCodeError::Deep)?;
+    analyze_workspace_with(&ctx, workspace, include_tests)
+}
+
+/// Same as [`analyze_workspace`], on an already loaded [`DeepContext`] so several
+/// detectors can share one rust-analyzer load.
+pub fn analyze_workspace_with(
+    ctx: &DeepContext,
+    workspace: &Workspace,
+    include_tests: bool,
+) -> Result<WorkspaceDeadCode, DeadCodeError> {
     let analysis = ctx.analysis();
 
-    let (crate_of_file, file_path_by_id, module_of_file) = build_file_maps(workspace, &ctx)?;
+    let (crate_of_file, file_path_by_id, module_of_file) = build_file_maps(workspace, ctx)?;
 
-    let (entry_keys_production, entry_keys_all) = compute_entry_key_sets(workspace, &ctx)?;
+    let (entry_keys_production, entry_keys_all) = compute_entry_key_sets(workspace, ctx)?;
     let entry_keys = if include_tests {
         &entry_keys_all
     } else {
@@ -1675,7 +1687,7 @@ pub fn analyze_workspace(
         load_proc_macro_and_publishable_sets(&workspace.root, &mut report);
 
     let mut private_check_keys = entry_keys.clone();
-    match crate::reachability::public_api_keys(workspace, &ctx, &publishable) {
+    match crate::reachability::public_api_keys(workspace, ctx, &publishable) {
         Ok(api_keys) => private_check_keys.extend(api_keys),
         Err(err) => report.errors.push(reachability_error(err)),
     }

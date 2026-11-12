@@ -1,8 +1,19 @@
 //! Rendering and baseline handling for the bare combined `cargo judge` run.
 
+use crate::BaselineInput;
+use crate::BaselineRequest;
+use crate::CliError;
+use crate::CommandOutcome;
+use crate::DEFAULT_BASELINE_ALL;
+use crate::OutputFormat;
+use crate::collect_findings_with_progress;
+use crate::write_json;
+use crate::write_sarif;
+use judge::finding::{Finding, Report};
 use serde::Serialize;
-
-use crate::*;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Schema version for `cargo judge --progress PATH` JSON Lines records.
 const PROGRESS_SCHEMA_VERSION: u32 = 1;

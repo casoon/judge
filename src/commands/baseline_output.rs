@@ -1,8 +1,17 @@
 //! Shared baseline persistence, comparison, and delta rendering.
 
+use crate::CliError;
+use crate::CommandOutcome;
+use crate::OutputFormat;
+use crate::load_judge_toml;
+use crate::severity_label;
+use crate::trend_json;
+use crate::unsupported_format;
+use judge::baseline::Verdict;
+use judge::finding::{Finding, Report};
 use serde::Serialize;
-
-use crate::*;
+use std::io::Write;
+use std::path::Path;
 
 /// The baseline-related portion of a command invocation. Keeping this
 /// separate from the individual command options lets ordinary report commands

@@ -1,7 +1,58 @@
 //! Command routing and arguments shared by baseline-aware subcommands.
 
-use crate::*;
+use crate::ApiSurfaceOptions;
+use crate::BoundariesOptions;
+use crate::CliError;
+use crate::CommandOutcome;
+use crate::CompareOptions;
+use crate::ComplexityOptions;
+use crate::CoverageOptions;
+use crate::DeadCodeOptions;
+use crate::DepsOptions;
+use crate::DupesOptions;
+use crate::ExplainOptions;
+use crate::ExplainPatternOptions;
+use crate::ExplainPrincipleOptions;
+use crate::ExplainRuleOptions;
+use crate::FixPreviewOptions;
+use crate::FocusedAnalysisOptions;
+use crate::HealthOptions;
+use crate::ImpactOptions;
+use crate::MapOptions;
+use crate::ModuleGraphOptions;
+use crate::OutputFormat;
+use crate::PatternsOptions;
+use crate::PrinciplesOptions;
+use crate::RefactorOptions;
+use crate::StructureOptions;
+use crate::run_api_surface;
+use crate::run_boundaries;
+use crate::run_complexity;
+use crate::run_coverage;
+use crate::run_dead_code;
+use crate::run_deps;
+use crate::run_dupes;
+use crate::run_errors;
+use crate::run_explain;
+use crate::run_explain_pattern;
+use crate::run_explain_principle;
+use crate::run_explain_rule;
+use crate::run_fix_preview;
+use crate::run_health;
+use crate::run_impact;
+use crate::run_inspect;
+use crate::run_map;
+use crate::run_module_graph;
+use crate::run_patterns;
+use crate::run_principles;
+use crate::run_refactor;
+use crate::run_slop;
+use crate::run_structure;
+use crate::run_tests;
+use crate::run_unsafe;
 use clap::{Args, Subcommand};
+use std::io::Write;
+use std::path::PathBuf;
 
 use super::combined;
 
@@ -157,10 +208,7 @@ impl Command {
                 combined::CombinedOptions::compare(options.format, options.baseline),
                 out,
             ),
-            Self::Init => {
-                writeln!(out, "judge init is not implemented yet")?;
-                Ok(CommandOutcome::Clean)
-            }
+            Self::Init => run_init(out),
             Self::Inspect => run_inspect(out),
             Self::Map(options) => run_map(options, out),
             Self::Structure(options) => run_structure(options, out),
@@ -183,4 +231,55 @@ impl Command {
             Self::ModuleGraph(options) => run_module_graph(options, out),
         }
     }
+}
+
+/// Starter `judge.toml`: every table is commented out, so a fresh file
+/// changes nothing until a rule is opted into.
+const JUDGE_TOML_TEMPLATE: &str = r#"# judge configuration. Everything below is opt-in: with no active table,
+# judge runs its defaults. Uncomment and adapt what you need.
+# Reference: https://casoon.github.io/judge/docs/
+
+# Crate-level architecture rules (`cargo judge boundaries`).
+# [[boundary]]
+# name = "domain-stays-pure"
+# from = ["my-domain"]
+# forbidden = ["my-infra"]
+# reach = "transitive"   # or "direct"
+
+# Module-level rules inside one crate.
+# [[module_boundary]]
+# name = "domain-no-db"
+# crate = "my-app"
+# from = "domain"
+# forbidden = ["db"]
+
+# Weigh findings of some crates differently in `health --score`.
+# [[crate_profile]]
+# name = "parsers"
+# crates = ["my-parser"]
+# deduction_multiplier = 0.5
+
+# Allow `anyhow` at public boundaries for `catch-all-error`.
+# [rules.catch-all-error]
+# allow-anyhow-at-boundary = true
+"#;
+
+/// `cargo judge init`: writes a commented starter `judge.toml` into the
+/// workspace root. Never overwrites an existing file.
+fn run_init(out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    let path = workspace.root.join("judge.toml");
+    if path.exists() {
+        return Err(CliError::Config(format!(
+            "{} already exists; judge init does not overwrite it",
+            path.display()
+        )));
+    }
+    std::fs::write(&path, JUDGE_TOML_TEMPLATE)?;
+    writeln!(out, "wrote {}", path.display())?;
+    writeln!(
+        out,
+        "Next: uncomment a table, then run `cargo judge boundaries`."
+    )?;
+    Ok(CommandOutcome::Clean)
 }

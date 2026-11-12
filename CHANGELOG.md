@@ -12,6 +12,8 @@ versions were published on crates.io.
   scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear
   as tool notifications and mark the invocation as unsuccessful.
 
+- **`init`:** `cargo judge init` writes a commented starter `judge.toml` and refuses to overwrite
+  an existing one. It used to print a notice only.
 - **`--progress`:** the event stream ends with a `run_completed` or `run_failed` record (phase
   `run`), so a consumer can tell a finished run from an aborted one.
 - **judge-mcp:** tools `review` (focused views such as `structure`, `slop`, `deps`), `compare`
@@ -20,6 +22,10 @@ versions were published on crates.io.
 ### Changed
 
 - **Pages:** the project site uses the current shared theme (0.12.12).
+- **`dead-code` (deep tier):** the command loads rust-analyzer once for `dead-code`,
+  `dead-trait-impl` and the structural checks instead of three times.
+- **Library API:** `dead_code`, `dead_trait_impl` and `slop_structural_deep` gain
+  `analyze_workspace_with`, which takes an already loaded `DeepContext`.
 - **judge-mcp:** `save_baseline` is its own tool, marked as writing; the analysis tools no
   longer take `save_baseline` and are read-only for real.
 - **Dependency cycles:** at most 1000 cycles are reported per graph, and the search skips
@@ -40,6 +46,10 @@ versions were published on crates.io.
 
 ### Fixed
 
+- **`dead-enum-variant` (deep tier):** findings state that construction sites inside macro
+  invocations are not scanned.
+- **`deps`:** a dependency used only from a file declared by `#[cfg(test)] mod x;` is a
+  dev-only usage, like one inside an inline `#[cfg(test)]` module.
 - **`coverage`:** a merged LCOV report that lists a file in several records adds the hit counts
   up instead of keeping only the last record.
 - **`health`:** the slop block lists `silent-default`, `context-free-propagation` and

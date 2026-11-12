@@ -541,12 +541,18 @@ fn collect_usage_sites(
     let mut sites = Vec::new();
     let mut errors = Vec::new();
 
+    let cfg_test_files = cfg_test_files_of(krate);
+
     for file in &krate.source_files {
         let relative = file
             .path
             .strip_prefix(&krate.root)
             .unwrap_or(file.path.as_path());
-        let domain = classify_domain(relative);
+        let domain = if cfg_test_files.contains(&file.path) {
+            UsageDomain::Dev
+        } else {
+            classify_domain(relative)
+        };
 
         match read_and_parse_source(
             &file.path,
@@ -1496,6 +1502,18 @@ impl<'ast> Visit<'ast> for DepItemCollector<'_> {
 /// Builds the `code_identifier -> domains observed` map for one crate, by
 /// classifying each source file's domain and parsing it for referenced path
 /// identifiers.
+/// Files reached only through `#[cfg(test)] mod x;` are test code even when
+/// their path says `src/`.
+fn cfg_test_files_of(krate: &CrateInfo) -> HashSet<PathBuf> {
+    crate::rules::module_graph::cfg_test_module_files(
+        &krate
+            .source_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn collect_crate_usage(
     krate: &CrateInfo,
 ) -> (
@@ -1507,12 +1525,17 @@ fn collect_crate_usage(
     let mut failed_domains = HashSet::new();
     let mut errors = Vec::new();
 
+    let cfg_test_files = cfg_test_files_of(krate);
     for file in &krate.source_files {
         let relative = file
             .path
             .strip_prefix(&krate.root)
             .unwrap_or(file.path.as_path());
-        let domain = classify_domain(relative);
+        let domain = if cfg_test_files.contains(&file.path) {
+            UsageDomain::Dev
+        } else {
+            classify_domain(relative)
+        };
 
         match collect_identifiers(&file.path) {
             Ok((idents, cfg_test_idents)) => {
@@ -1739,6 +1762,32 @@ repository = "https://example.com/{dep_crate_name}"
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.findings[0].location.item_path, "depcrate");
         assert!(report.feature_only_candidates.is_empty());
+    }
+
+    #[test]
+    fn a_normal_dependency_used_only_from_a_cfg_test_module_file_is_flagged_as_dev() {
+        let dir = TempDir::new("deps-dev-only-cfg-test-file");
+        let manifest = write_fixture(
+            &dir,
+            "[dependencies]",
+            "depcrate",
+            None,
+            &[],
+            &[
+                ("src/lib.rs", "#[cfg(test)]\nmod tests;\n"),
+                ("src/tests.rs", "#[test]\nfn t() { depcrate::noop(); }\n"),
+            ],
+        );
+
+        let workspace = crate::ingest::load(Some(&manifest)).unwrap();
+        let report = analyze_workspace(&workspace);
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.rule == MISPLACED_DEPENDENCY_KIND_RULE)
+        );
     }
 
     #[test]

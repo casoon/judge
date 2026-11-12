@@ -1,6 +1,21 @@
 //! Advisory pattern and design-principle commands and their focused rendering.
 
-use crate::*;
+use crate::CliError;
+use crate::CommandOutcome;
+use crate::DEFAULT_PATTERN_BASELINE;
+use crate::ExplainPatternOptions;
+use crate::ExplainPrincipleOptions;
+use crate::ExplainRuleOptions;
+use crate::FixPreviewOptions;
+use crate::OutputFormat;
+use crate::PatternsOptions;
+use crate::PrinciplesOptions;
+use crate::load_judge_toml;
+use crate::print_pattern_delta_tty;
+use crate::unsupported_format;
+use serde::Serialize;
+use std::io::Write;
+use std::path::Path;
 
 /// Rejects `sarif`/`markdown` up front; every advisory command in this
 /// module only supports `tty`/`json`. Shared so the supported-format list is

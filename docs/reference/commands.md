@@ -31,6 +31,7 @@ installed version.
 | `dupes --mode strict\|mild\|weak\|semantic` | Duplicated token spans grouped into clone families. Default `mild`, minimum 20 tokens; test code with `--include-tests`. |
 | `deps` | Dependency-kind hygiene and local name-collision checks. Opt-in: `--check-crates-io`, `--check-rustc-lints`, `--audit-json PATH`. `--why CRATE` explains one dependency instead. |
 | `api` | Focused public API surface analysis (`api-surface` remains available). |
+| `init` | Writes a commented starter `judge.toml` into the workspace root; never overwrites an existing one. |
 | `boundaries` | Crate boundaries from `judge.toml` plus dependency cycles. `--graph dot\|mermaid` prints the crate graph instead. |
 | `module-graph` | `unlinked-file` and `orphan-module` findings from each crate's real `mod` tree. |
 | `errors`, `tests`, `unsafe`, `slop` | Focused current-state views with concrete locations and stated Fast-Tier limits. |

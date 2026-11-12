@@ -294,11 +294,18 @@ fn finding_for(candidate: &ImplCandidate) -> Finding {
 }
 
 /// Runs the `dead-trait-impl` check over `workspace` (see the module docs).
-/// Loads its own [`DeepContext`] — the same accepted, documented extra cost
-/// every other Deep-Tier detector in this crate takes for the same reason
-/// (see e.g. `crate::rules::api_surface_deep::analyze_workspace`'s doc comment).
+/// Loads its own [`DeepContext`]; [`analyze_workspace_with`] reuses one.
 pub fn analyze_workspace(workspace: &Workspace) -> Result<DeadTraitImplReport, DeadCodeError> {
     let ctx = DeepContext::load(&workspace.root).map_err(DeadCodeError::Deep)?;
+    analyze_workspace_with(&ctx, workspace)
+}
+
+/// Same as [`analyze_workspace`], on an already loaded [`DeepContext`] so several
+/// detectors can share one rust-analyzer load.
+pub fn analyze_workspace_with(
+    ctx: &DeepContext,
+    workspace: &Workspace,
+) -> Result<DeadTraitImplReport, DeadCodeError> {
     let db = ctx.raw_database();
     let sema = Semantics::new(db);
 

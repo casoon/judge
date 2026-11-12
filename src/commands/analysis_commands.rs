@@ -1,7 +1,42 @@
 //! Fast-Tier report commands: source analysis, dependency hygiene, boundaries,
 //! ownership, provenance, coverage, module graph, and API surface.
 
-use crate::*;
+use crate::ApiSurfaceOptions;
+use crate::BaselineArgs;
+use crate::BaselineInput;
+use crate::BaselineOptions;
+use crate::BaselineRequest;
+use crate::BoundariesOptions;
+use crate::CliError;
+use crate::CommandOutcome;
+use crate::CoverageOptions;
+use crate::DEFAULT_BASELINE_API_SURFACE;
+use crate::DEFAULT_BASELINE_BOUNDARIES;
+use crate::DEFAULT_BASELINE_COVERAGE;
+use crate::DEFAULT_BASELINE_DEPS;
+use crate::DEFAULT_BASELINE_DUPES;
+use crate::DEFAULT_BASELINE_MODULE_GRAPH;
+use crate::DUPE_FAMILY_TTY_LIMIT;
+use crate::DepsOptions;
+use crate::DupeModeArg;
+use crate::DupesOptions;
+use crate::FocusedAnalysisOptions;
+use crate::GraphFormat;
+use crate::ModuleGraphOptions;
+use crate::OutputFormat;
+use crate::analysis_errors;
+use crate::append_analysis_errors;
+use crate::handle_baseline_with_trend;
+use crate::load_judge_toml;
+use crate::parse_boundary_config;
+use crate::severity_label;
+use crate::unsupported_format;
+use crate::write_json;
+use crate::write_sarif;
+use judge::finding::{Finding, Report};
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Every Fast-Tier analyzer takes a fresh iterator over the workspace's
 /// source files (each one is consumed once), so this one-liner is

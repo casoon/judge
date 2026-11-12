@@ -1,7 +1,22 @@
 //! Lightweight workspace projections: inspection, refactoring map, and impact.
 
-use crate::*;
+use crate::CliError;
+use crate::CommandOutcome;
+use crate::ComplexityOptions;
+use crate::ImpactOptions;
+use crate::MapOptions;
+use crate::OutputFormat;
+use crate::RefactorOptions;
+use crate::StructureOptions;
+use crate::severity_label;
+use crate::unsupported_format;
+use crate::write_json;
+use judge::AnalysisTier;
+use judge::finding::Finding;
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::path::PathBuf;
 
 /// Loads the workspace and runs the shared complexity/duplication pass,
 /// respecting `--include-tests`. Shared by `complexity` and `map`, whose
