@@ -77,6 +77,10 @@ pub struct DeclaredDependency {
     /// Used by `phantom-version` (see todo.md §14.2 G5) to check whether any
     /// published, non-yanked version on crates.io satisfies it.
     pub version_req: String,
+    /// Whether the dependency resolves to the crates.io registry. `false` for
+    /// path, git and alternate-registry dependencies, which a crates.io
+    /// lookup must never be asked about.
+    pub from_crates_io: bool,
 }
 
 /// Where a source file came from (see todo.md §3.A "Generated-Code-Policy").
@@ -289,10 +293,7 @@ pub fn load(manifest_path: Option<&Path>) -> Result<Workspace, IngestError> {
             .dependencies
             .iter()
             .map(|dep| {
-                let code_identifier = dep
-                    .rename
-                    .clone()
-                    .unwrap_or_else(|| dep.name.replace('-', "_"));
+                let code_identifier = dep.rename.as_deref().unwrap_or(&dep.name).replace('-', "_");
                 DeclaredDependency {
                     name: dep.name.clone(),
                     kind: DependencyKind::from_cargo_kind(dep.kind),
@@ -300,6 +301,10 @@ pub fn load(manifest_path: Option<&Path>) -> Result<Workspace, IngestError> {
                     target: dep.target.as_ref().map(ToString::to_string),
                     features: dep.features.clone(),
                     version_req: dep.req.to_string(),
+                    from_crates_io: dep
+                        .source
+                        .as_deref()
+                        .is_some_and(|source| source.contains("crates.io")),
                 }
             })
             .collect();

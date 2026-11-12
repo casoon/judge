@@ -437,7 +437,7 @@ pub(crate) fn run_fix_preview(
                 "migration": candidate.migration,
                 "related_findings": candidate.related_findings,
                 "patch": serde_json::Value::Null,
-                "note": "migration plan only — no patch is generated (see todo.md §16.5)",
+                "note": "migration plan only — no patch is generated",
             });
             to_json_string(&json)
         },

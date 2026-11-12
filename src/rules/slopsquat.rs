@@ -876,7 +876,10 @@ fn analyze_dependencies_via_lookup<T>(
     let mut connection_error_reported = false;
 
     for krate in &workspace.crates {
-        for dep in &krate.dependencies {
+        // Path, git and alternate-registry dependencies are not on crates.io:
+        // looking them up would report them as phantom crates and leak
+        // private crate names.
+        for dep in krate.dependencies.iter().filter(|dep| dep.from_crates_io) {
             match lookup(&dep.name) {
                 Ok(result) => on_ok(&mut report.findings, krate, dep, result),
                 Err(err) => record_lookup_error(

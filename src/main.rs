@@ -70,7 +70,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
     /// Output format (bare `cargo judge` only — a combined run across every
-    /// detector; see todo.md §4 "Decision Surface", §8).
+    /// detector).
     #[command(flatten)]
     baseline_args: BaselineArgs,
     /// Write versioned JSON Lines progress events for a bare combined run.
@@ -105,7 +105,7 @@ struct DupesOptions {
     min_tokens: usize,
     #[command(flatten)]
     baseline_args: BaselineArgs,
-    /// Analyze generated files too (see todo.md §3.A). Off by default —
+    /// Analyze generated files too Off by default —
     /// duplication in generated code isn't actionable the way it is in
     /// authored code.
     #[arg(long)]
@@ -126,7 +126,7 @@ struct HealthOptions {
     show_cascades: bool,
     #[command(flatten)]
     baseline_args: BaselineArgs,
-    /// Analyze generated files too (see todo.md §3.A).
+    /// Analyze generated files too.
     #[arg(long)]
     include_generated: bool,
 }
@@ -138,8 +138,7 @@ struct DepsOptions {
     /// Opt-in: also check declared dependencies against the real
     /// crates.io sparse index and REST API (`phantom-crate`,
     /// `phantom-version`, `fresh-low-reputation-dep`). Off by default —
-    /// judge makes no network calls unless explicitly asked to (see
-    /// todo.md §1 "kein SaaS, keine Telemetrie, lokal deterministisch").
+    /// judge makes no network calls unless explicitly asked to.
     /// `name-collision-risk` always runs; it's fully local.
     #[arg(long)]
     check_crates_io: bool,
@@ -181,7 +180,7 @@ struct BoundariesOptions {
     baseline_args: BaselineArgs,
     /// Print the workspace's crate dependency graph in this format instead
     /// of checking boundary rules, and exit — a pure projection of the
-    /// existing architecture graph (todo.md §H), not a new rule engine.
+    /// existing architecture graph, not a new rule engine.
     /// Ignores every other flag above; does not require `judge.toml`.
     #[arg(long, value_enum)]
     graph: Option<GraphFormat>,
@@ -198,8 +197,7 @@ enum GraphFormat {
 #[derive(Debug, Args)]
 struct DeadCodeOptions {
     /// Count a `#[test]`-only reference as usage. Off by default: a
-    /// `pub` item only reachable from tests is still dead in production
-    /// (see todo.md §3.A "Reachability-Modi").
+    /// `pub` item only reachable from tests is still dead in production.
     #[arg(long)]
     include_tests: bool,
     #[command(flatten)]
@@ -208,7 +206,7 @@ struct DeadCodeOptions {
 
 #[derive(Debug, Args)]
 struct CoverageOptions {
-    /// Path to a `cargo-llvm-cov` LCOV report (see todo.md §J). judge never
+    /// Path to a `cargo-llvm-cov` LCOV report. judge never
     /// measures coverage itself, only imports an already-generated snapshot.
     #[arg(long, value_name = "PATH")]
     lcov: PathBuf,
@@ -322,7 +320,7 @@ struct ExplainRuleOptions {
 struct ApiSurfaceOptions {
     #[command(flatten)]
     baseline_args: BaselineArgs,
-    /// Analyze generated files too (see todo.md §3.A). Off by default —
+    /// Analyze generated files too Off by default —
     /// documentation completeness on generated code isn't actionable the way
     /// it is on authored code.
     #[arg(long)]
@@ -333,7 +331,7 @@ struct ApiSurfaceOptions {
 struct ModuleGraphOptions {
     #[command(flatten)]
     baseline_args: BaselineArgs,
-    /// Analyze generated files too (see todo.md §3.A). Off by default — an
+    /// Analyze generated files too Off by default — an
     /// unlinked/orphaned generated file isn't actionable the way it is in
     /// authored code.
     #[arg(long)]
@@ -397,7 +395,7 @@ struct FocusedAnalysisOptions {
     include_generated: bool,
 }
 
-/// Output format shared by commands that emit findings (see todo.md §7).
+/// Output format shared by commands that emit findings.
 /// Not every command supports every format: SARIF exists for the
 /// report-producing commands; Markdown exists for the baseline delta
 /// and the bare `cargo judge` review report (the PR-comment use cases) —

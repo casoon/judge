@@ -135,6 +135,7 @@ impl Reach {
 /// bullet 1). A rule may name `forbidden` crates, `required` crates, or
 /// both.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BoundaryRule {
     pub name: String,
     pub from: Vec<String>,
@@ -156,6 +157,7 @@ pub struct BoundaryRule {
 /// prefix (not a list) and there is no `required`/`reach` choice — see the
 /// module docs for why.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModuleBoundaryRule {
     pub name: String,
     /// The workspace crate this rule scopes to. Validated to exist, same as
@@ -331,6 +333,9 @@ pub enum BoundaryConfigError {
     /// requests `reach = "transitive"` (see [`ModuleBoundaryRule::reach`],
     /// module docs "Module-level boundaries").
     InvalidModuleBoundary(String),
+    /// A `[[boundary]]` rule has neither `forbidden` nor `required` crates,
+    /// so it can never fire — almost always a misspelled key.
+    EmptyBoundaryRule(String),
 }
 
 impl std::fmt::Display for BoundaryConfigError {
@@ -345,6 +350,10 @@ impl std::fmt::Display for BoundaryConfigError {
             Self::InvalidModuleBoundary(message) => {
                 write!(f, "invalid [[module_boundary]] config: {message}")
             }
+            Self::EmptyBoundaryRule(rule) => write!(
+                f,
+                "boundary rule `{rule}` has neither `forbidden` nor `required` crates, so it can never fire"
+            ),
         }
     }
 }
@@ -353,9 +362,10 @@ impl std::error::Error for BoundaryConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Metadata(err) => Some(err),
-            Self::UnknownCrate { .. } | Self::InvalidLayers(_) | Self::InvalidModuleBoundary(_) => {
-                None
-            }
+            Self::UnknownCrate { .. }
+            | Self::InvalidLayers(_)
+            | Self::InvalidModuleBoundary(_)
+            | Self::EmptyBoundaryRule(_) => None,
         }
     }
 }
@@ -535,6 +545,9 @@ fn validate_config(
     crate_names: &HashSet<&str>,
 ) -> Result<(), BoundaryConfigError> {
     for rule in &config.boundaries {
+        if rule.forbidden.is_empty() && rule.required.is_empty() {
+            return Err(BoundaryConfigError::EmptyBoundaryRule(rule.name.clone()));
+        }
         if rule.allow_empty {
             continue;
         }
@@ -1706,6 +1719,27 @@ mod tests {
 
         assert!(evaluate(&workspace, &config).is_ok());
         assert!(validate_internal_crates(&workspace, &config).is_ok());
+    }
+
+    #[test]
+    fn a_misspelled_boundary_key_is_a_parse_error() {
+        let parsed = toml::from_str::<BoundaryConfig>(
+            "[[boundary]]\nname = \"x\"\nfrom = [\"ui\"]\nforbiden = [\"db\"]\nreach = \"direct\"\n",
+        );
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn a_boundary_rule_without_forbidden_or_required_is_rejected() {
+        let config = BoundaryConfig {
+            boundaries: vec![rule("never-fires", &["ui"], Reach::Direct)],
+            ..Default::default()
+        };
+        let crate_names = HashSet::from(["ui"]);
+        assert!(matches!(
+            validate_config(&config, &crate_names),
+            Err(BoundaryConfigError::EmptyBoundaryRule(name)) if name == "never-fires"
+        ));
     }
 
     #[test]

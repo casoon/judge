@@ -25,12 +25,22 @@ versions were published on crates.io.
 - **JSON header:** the assessment counts findings of `slop`, `errors`, `tests` and `unsafe`, and
   the `analysis_errors` of `map`, `structure`, `complexity` and `refactor`.
 - **`unreachable-from-entry` (deep tier):** no longer reports non-`pub` types, trait-impl methods,
-  test code outside `--include-tests`, proc-macro and build-script functions, or functions named
-  in a `const`/`static` of the same file. For a publishable library, its public API now counts as
-  entry points, so private helpers called from it are live.
-  Its findings now state that calls inside macro arguments may be unresolved.
+  tests, proc-macro or build-script functions and functions named in a same-file `const`/`static`;
+  a publishable library's public API counts as entry points. Findings state the macro limit.
 - **`connectivity-drop` (deep tier):** no longer reports `fn main`, test helpers, FFI exports and
   proc-macro entry points.
+- **`deps --check-crates-io`:** path, git and alternate-registry dependencies are no longer looked
+  up on crates.io, so internal crates are not reported as phantom crates and their names are not
+  sent out.
+- **Dependencies:** a renamed dependency (`package = ".."`) with a `-` in its alias is matched
+  against its `_` identifier in code.
+- **`deps --audit-json`:** a file that is not a `cargo audit --json` report is an error instead of
+  "no vulnerabilities".
+- **`judge.toml`:** a misspelled key in `[[boundary]]` or `[[module_boundary]]` is rejected, and a
+  `[[boundary]]` with neither `forbidden` nor `required` is an error instead of a rule that never
+  fires.
+- **CLI help and README:** removed remaining `todo.md` references and the outdated note that
+  module-level boundaries are missing.
 - **`module-graph`:** `mod x;` inside an inline `mod { .. }` resolves below it, and
   `pub use self::x::Y` counts as a reference to `x`.
 

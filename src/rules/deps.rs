@@ -2357,6 +2357,7 @@ edition = "2021"
             target: None,
             features: Vec::new(),
             version_req: "*".to_string(),
+            from_crates_io: true,
         };
         let used_items: HashSet<String> = HashSet::new();
         let finding = heavy_dependency_finding(&krate, &dep, 42, &used_items);
@@ -2396,6 +2397,7 @@ edition = "2021"
             target: None,
             features: Vec::new(),
             version_req: "*".to_string(),
+            from_crates_io: true,
         };
         let finding = dep_without_repo_finding(&krate, &dep);
 

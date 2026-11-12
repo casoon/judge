@@ -105,12 +105,21 @@ pub(crate) fn read_report_text<E>(
 #[derive(Debug)]
 pub enum AuditImportError {
     Io(PathBuf, std::io::Error),
+    /// The file is not a `cargo audit --json` report (invalid JSON, or no
+    /// `vulnerabilities` object). Importing it as "no vulnerabilities" would
+    /// silently hide a wrong or truncated file.
+    NotAnAuditReport(PathBuf),
 }
 
 impl std::fmt::Display for AuditImportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(path, err) => write!(f, "{}", describe_report_io_error(path, err)),
+            Self::NotAnAuditReport(path) => write!(
+                f,
+                "{}: not a `cargo audit --json` report (invalid JSON or no `vulnerabilities` object)",
+                path.display()
+            ),
         }
     }
 }
@@ -119,6 +128,7 @@ impl std::error::Error for AuditImportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(_, err) => report_io_error_source(err),
+            Self::NotAnAuditReport(_) => None,
         }
     }
 }
@@ -185,9 +195,15 @@ pub fn parse_audit_report(text: &str) -> Vec<AuditVulnerability> {
 }
 
 /// Reads and parses a `cargo audit --json` report from `path` (see
-/// [`parse_audit_report`]). Only the file read can fail; parsing never does.
+/// [`parse_audit_report`]). A file that is not a `cargo audit --json` report
+/// at all is an error; individual malformed entries are still skipped.
 pub fn read_audit_report(path: &Path) -> Result<Vec<AuditVulnerability>, AuditImportError> {
     let text = read_report_text(path, AuditImportError::Io)?;
+    let is_report = serde_json::from_str::<serde_json::Value>(&text)
+        .is_ok_and(|root| root.get("vulnerabilities").is_some_and(|v| v.is_object()));
+    if !is_report {
+        return Err(AuditImportError::NotAnAuditReport(path.to_path_buf()));
+    }
     Ok(parse_audit_report(&text))
 }
 
@@ -373,6 +389,22 @@ fn known_vulnerability_finding(
 mod tests {
     use super::*;
     use crate::test_util::TempDir;
+
+    #[test]
+    fn read_audit_report_rejects_a_file_that_is_not_an_audit_report() {
+        let dir = TempDir::new("audit-not-a-report");
+        let path = dir.join("audit.json");
+        for content in ["", "not json", "{\"unrelated\": true}"] {
+            std::fs::write(&path, content).unwrap();
+            assert!(
+                matches!(
+                    read_audit_report(&path),
+                    Err(AuditImportError::NotAnAuditReport(_))
+                ),
+                "{content:?} must be rejected"
+            );
+        }
+    }
 
     // -- parse_audit_report --
 

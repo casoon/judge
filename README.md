@@ -66,7 +66,7 @@ command description, and an assessment (`informational`, `review_recommended`,
 `analysis_incomplete`, or `blocking_findings`). The assessment is a triage
 hint, not an automatic refactoring instruction.
 
-Not yet implemented: module-level boundaries (only crate-level exists) and several planned maintainability and dependency-hygiene rules.
+Not yet implemented: `cargo judge init` (it only prints a notice) and several planned maintainability and dependency-hygiene rules.
 
 An MCP server adapter is available separately in [`judge-mcp/`](judge-mcp/) — a thin stdio adapter that shells out to an already-built `cargo-judge` binary and returns its `--format json` output as MCP tool calls; it computes nothing itself and is not a build or install requirement of judge.
 

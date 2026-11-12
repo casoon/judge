@@ -27,7 +27,7 @@ fn require_deep_tier(what: &str) -> Result<(), CliError> {
         return Ok(());
     }
     Err(CliError::Analyzer(format!(
-        "{what} needs the Deep Tier — rebuild with `cargo install --path . --features deep` (see todo.md §2.1)"
+        "{what} needs the Deep Tier — rebuild with `cargo install --path . --features deep`"
     )))
 }
 
