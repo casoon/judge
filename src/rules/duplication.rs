@@ -546,10 +546,34 @@ fn collect_function_tokens(
     Ok(functions)
 }
 
+/// Whether `path` lies under a `tests/` or `benches/` directory *of its own
+/// package*. Only the part below the nearest `Cargo.toml` directory counts, so
+/// a checkout that happens to live under `~/tests/` is not skipped wholesale.
 fn is_test_source_path(path: &Path) -> bool {
-    path.components().any(|component| {
+    let package_relative = path
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join("Cargo.toml").is_file())
+        .and_then(|dir| path.strip_prefix(dir).ok())
+        .unwrap_or(path);
+    package_relative.components().any(|component| {
         matches!(component, std::path::Component::Normal(name) if name == "tests" || name == "benches")
     })
+}
+
+/// Whether the source text between two byte ranges is identical. A range that
+/// is inverted or out of bounds (a doc comment's `#` and `[` tokens share
+/// spans oddly) never matches instead of panicking.
+fn same_source_gap(
+    a: &str,
+    a_range: std::ops::Range<usize>,
+    b: &str,
+    b_range: std::ops::Range<usize>,
+) -> bool {
+    match (a.get(a_range), b.get(b_range)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 /// Flattens a token stream into a linear sequence, unwrapping `{}`/`()`/`[]`
@@ -1233,7 +1257,7 @@ fn forward_step_matches(
             let prev_b = b.tokens[start_b + fwd - 1].byte_end;
             let next_a = a.tokens[start_a + fwd].byte_end;
             let next_b = b.tokens[start_b + fwd].byte_end;
-            a.source[prev_a..next_a] == b.source[prev_b..next_b]
+            same_source_gap(&a.source, prev_a..next_a, &b.source, prev_b..next_b)
         }
         DupeMode::Mild => a.tokens[start_a + fwd].mild_text == b.tokens[start_b + fwd].mild_text,
         DupeMode::Weak => a.tokens[start_a + fwd].weak_text == b.tokens[start_b + fwd].weak_text,
@@ -1260,7 +1284,7 @@ fn backward_step_matches(
             let new_b = b.tokens[start_b - back - 1].byte_start;
             let old_a = a.tokens[start_a - back].byte_start;
             let old_b = b.tokens[start_b - back].byte_start;
-            a.source[new_a..old_a] == b.source[new_b..old_b]
+            same_source_gap(&a.source, new_a..old_a, &b.source, new_b..old_b)
         }
         DupeMode::Mild => {
             a.tokens[start_a - back - 1].mild_text == b.tokens[start_b - back - 1].mild_text
@@ -1522,6 +1546,37 @@ mod tests {
 
         assert!(excluded.families.is_empty());
         assert_eq!(included.families.len(), 1);
+    }
+
+    /// Regression: a doc comment inside a duplicated body gives proc-macro2
+    /// inverted byte ranges for its `#`/`[` tokens; strict mode used to panic
+    /// slicing the gap between them.
+    #[test]
+    fn strict_mode_does_not_panic_on_doc_comments_inside_bodies() {
+        let dir = TempDir::new("dup-strict-doc-comment");
+        let body = "    let mut total = 0;\n    for x in v.iter() {\n        if *x > 3 { total += x * 2; } else { total += x + 1; }\n    }\n    /// note\n    let y = total + 1;\n    y\n";
+        let file_a = dir.join("a.rs");
+        let file_b = dir.join("b.rs");
+        std::fs::write(&file_a, format!("fn one(v: &[u32]) -> u32 {{\n{body}}}\n")).unwrap();
+        std::fs::write(&file_b, format!("fn two(v: &[u32]) -> u32 {{\n{body}}}\n")).unwrap();
+
+        let files = authored([file_a, file_b]);
+        let report = analyze_workspace(files.iter(), DupeMode::Strict, DEFAULT_MIN_TOKENS, false);
+
+        assert_eq!(report.families.len(), 1);
+    }
+
+    /// Regression: only `tests/`/`benches/` below the package's own
+    /// `Cargo.toml` count, not an enclosing checkout directory.
+    #[test]
+    fn test_path_check_ignores_directories_above_the_package() {
+        let dir = TempDir::new("dup-test-path");
+        std::fs::create_dir_all(dir.join("tests/proj/src")).unwrap();
+        std::fs::create_dir_all(dir.join("tests/proj/tests")).unwrap();
+        std::fs::write(dir.join("tests/proj/Cargo.toml"), "[package]\n").unwrap();
+
+        assert!(!is_test_source_path(&dir.join("tests/proj/src/lib.rs")));
+        assert!(is_test_source_path(&dir.join("tests/proj/tests/it.rs")));
     }
 
     #[test]

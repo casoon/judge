@@ -1453,6 +1453,7 @@ fn scan_file_for_dead_code(
     file_id: FileId,
     krate_name: &str,
     include_tests: bool,
+    private_check_keys: &std::collections::HashSet<(FileId, u32)>,
     rule_id: &str,
     severity: Severity,
     evidence_class: EvidenceClass,
@@ -1461,6 +1462,8 @@ fn scan_file_for_dead_code(
     module_edge_counts: &mut HashMap<(String, String), u32>,
     report: &mut WorkspaceDeadCode,
 ) {
+    let const_referenced = idents_used_in_const_initializers(ast);
+    let is_build_script = file.path.file_name().is_some_and(|name| name == "build.rs");
     walk_functions(ast, |site| {
         let (offset, line) = offset_and_line(site.ident_span);
         if let Some(syn::Visibility::Public(_)) = site.vis {
@@ -1494,10 +1497,27 @@ fn scan_file_for_dead_code(
         // comment) — ambiguous whether it belongs on the `pub` or
         // non-`pub` side of this split, so it's left unchecked by
         // both, same as today.
-        if let Some(syn::Visibility::Inherited | syn::Visibility::Restricted(_)) = site.vis {
+        // The call hierarchy only follows direct calls from function bodies,
+        // so a private function is judged only where that is the whole story:
+        // not a trait-impl method (dispatched through the trait), not test
+        // code outside `--include-tests`, not a proc-macro or build-script
+        // entry, not named in a `const`/`static` initializer of this file,
+        // and judged against the entry points plus, for a publishable
+        // library, its public API (see `reachability::public_api_keys`).
+        let last_ident = site.qualified_name.rsplit("::").next().unwrap_or_default();
+        let exempt = site.in_trait_impl
+            || (site.is_test_context && !include_tests)
+            || is_build_script
+            || ["proc_macro", "proc_macro_derive", "proc_macro_attribute"]
+                .iter()
+                .any(|attr| crate::reachability::has_attr_ending_in(site.attrs, attr))
+            || const_referenced.contains(last_ident);
+        if !exempt
+            && let Some(syn::Visibility::Inherited | syn::Visibility::Restricted(_)) = site.vis
+        {
             check_unreachable_from_entry(
                 analysis,
-                entry_keys,
+                private_check_keys,
                 proc_macro_exposed,
                 file,
                 file_id,
@@ -1537,21 +1557,10 @@ fn scan_file_for_dead_code(
                 module_edge_counts,
                 report,
             );
-            return;
         }
-        check_unreachable_from_entry(
-            analysis,
-            entry_keys,
-            proc_macro_exposed,
-            file,
-            file_id,
-            krate_name,
-            &site.qualified_name,
-            offset,
-            line,
-            include_tests,
-            report,
-        );
+        // A non-`pub` type, const or static is deliberately not checked for
+        // reachability: the call hierarchy only follows functions, so it
+        // would report every type used outside a function body as dead.
     });
 
     walk_enum_variants(ast, |site| {
@@ -1571,6 +1580,47 @@ fn scan_file_for_dead_code(
             report,
         );
     });
+}
+
+/// Names (last path segment) mentioned in the initializer of any `const` or
+/// `static` in `ast`. A function referenced there is live through a table or
+/// registry that the call hierarchy does not see.
+fn idents_used_in_const_initializers(ast: &syn::File) -> HashSet<String> {
+    struct Collector {
+        idents: HashSet<String>,
+        in_initializer: usize,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Collector {
+        fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+            self.in_initializer += 1;
+            syn::visit::visit_item_const(self, node);
+            self.in_initializer -= 1;
+        }
+        fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+            self.in_initializer += 1;
+            syn::visit::visit_item_static(self, node);
+            self.in_initializer -= 1;
+        }
+        fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+            self.in_initializer += 1;
+            syn::visit::visit_impl_item_const(self, node);
+            self.in_initializer -= 1;
+        }
+        fn visit_path(&mut self, node: &'ast syn::Path) {
+            if self.in_initializer > 0
+                && let Some(segment) = node.segments.last()
+            {
+                self.idents.insert(segment.ident.to_string());
+            }
+            syn::visit::visit_path(self, node);
+        }
+    }
+    let mut collector = Collector {
+        idents: HashSet::new(),
+        in_initializer: 0,
+    };
+    syn::visit::Visit::visit_file(&mut collector, ast);
+    collector.idents
 }
 
 /// Finds `pub` functions/methods referenced only from their own defining
@@ -1619,6 +1669,12 @@ pub fn analyze_workspace(
     let (proc_macro_exposed, publishable) =
         load_proc_macro_and_publishable_sets(&workspace.root, &mut report);
 
+    let mut private_check_keys = entry_keys.clone();
+    match crate::reachability::public_api_keys(workspace, &ctx, &publishable) {
+        Ok(api_keys) => private_check_keys.extend(api_keys),
+        Err(err) => report.errors.push(reachability_error(err)),
+    }
+
     for krate in &workspace.crates {
         let (rule_id, severity, evidence_class, reason) = if publishable.contains(&krate.name) {
             (
@@ -1664,6 +1720,7 @@ pub fn analyze_workspace(
                 file_id,
                 &krate.name,
                 include_tests,
+                &private_check_keys,
                 rule_id,
                 severity,
                 evidence_class,
@@ -2320,19 +2377,42 @@ pub static DEAD_STATIC: i32 = 2;
     }
 
     #[test]
-    fn a_private_struct_never_referenced_is_flagged_unreachable_from_entry() {
-        // `check_item` itself still never checks a non-`pub` type item (see
-        // `walk_type_items`'s `Public`-only branch above) — this is now
-        // `unreachable-from-entry`'s territory instead of "unchecked".
+    fn a_private_struct_is_not_judged_for_reachability() {
+        // The call hierarchy follows functions only, so a non-`pub` type is
+        // never reported: it would be dead whenever it is used outside a
+        // function body (field types, statics, trait impls).
         let dir = TempDir::new("dead-code-private-struct");
         let workspace = load_single_crate_workspace(&dir, "struct PrivateStruct;\n");
 
         let report = analyze_workspace(&workspace, true).unwrap();
 
-        assert_eq!(report.checked, 1);
-        assert_eq!(report.findings.len(), 1, "{:?}", report.findings);
-        assert_eq!(report.findings[0].rule, UNREACHABLE_FROM_ENTRY_RULE);
-        assert_eq!(report.findings[0].location.item_path, "PrivateStruct");
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_private_fn_named_in_a_static_table_is_not_flagged() {
+        let dir = TempDir::new("dead-code-static-table");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            "fn handler() {}\nstatic HANDLERS: &[fn()] = &[handler];\n",
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
+    }
+
+    #[test]
+    fn a_trait_impl_method_and_its_helper_are_not_flagged() {
+        let dir = TempDir::new("dead-code-trait-impl");
+        let workspace = load_single_crate_workspace(
+            &dir,
+            "struct S;\nimpl std::fmt::Display for S {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        write!(f, \"{}\", helper())\n    }\n}\nfn helper() -> u8 { 1 }\n",
+        );
+
+        let report = analyze_workspace(&workspace, true).unwrap();
+
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
     #[test]

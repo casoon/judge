@@ -696,7 +696,6 @@ pub(crate) fn run_coverage(
 
     let mut findings = judge::advisory::coverage::untested_hotspots(
         &complexity_report.functions,
-        &std::collections::HashMap::new(),
         &coverage,
         &workspace.root,
     );

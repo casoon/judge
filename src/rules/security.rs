@@ -179,8 +179,8 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, Expr, ExprCast, ExprIndex, ExprLit, ExprMacro, ExprMethodCall, ExprUnsafe,
-    ImplItemFn, ItemConst, ItemFn, ItemImpl, ItemMod, ItemStatic, Lit, Local, Pat, TraitItemFn,
-    Type, Visibility,
+    ImplItemFn, ItemConst, ItemFn, ItemImpl, ItemMod, ItemStatic, Lit, Local, Pat, StmtMacro,
+    TraitItemFn, Type, Visibility,
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
@@ -751,6 +751,15 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
             self.push_panic_finding(node.span(), "panic_macro");
         }
         visit::visit_expr_macro(self, node);
+    }
+
+    /// `panic!(..);` with a trailing semicolon is a statement macro in syn 2,
+    /// not an `ExprMacro`.
+    fn visit_stmt_macro(&mut self, node: &'ast StmtMacro) {
+        if node.mac.path.is_ident("panic") {
+            self.push_panic_finding(node.span(), "panic_macro");
+        }
+        visit::visit_stmt_macro(self, node);
     }
 
     fn visit_expr_index(&mut self, node: &'ast ExprIndex) {
@@ -1440,6 +1449,17 @@ mod tests {
         let findings = findings_for(
             "pub fn f() {\n    panic!(\"unreachable\")\n}\n",
             "security-panic-macro-pub",
+        );
+        let hits = rule_findings(&findings, PANIC_IN_LIB_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].evidence.as_ref().unwrap()["kind"], "panic_macro");
+    }
+
+    #[test]
+    fn panic_macro_statement_with_semicolon_is_flagged() {
+        let findings = findings_for(
+            "pub fn f(x: u32) {\n    if x > 1 {\n        panic!(\"too big\");\n    }\n}\n",
+            "security-panic-macro-stmt-pub",
         );
         let hits = rule_findings(&findings, PANIC_IN_LIB_RULE);
         assert_eq!(hits.len(), 1);

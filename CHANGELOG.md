@@ -9,7 +9,27 @@ versions were published on crates.io.
 ### Changed
 
 - **Pages:** the project site uses the current shared theme (0.12.12).
+- **`untested-hotspot`:** flags high-complexity, mostly uncovered functions without a churn
+  criterion (judge reads no Git history). Before, `cargo judge coverage` could never report it.
 
+### Fixed
+
+- **Baselines:** a finding that only moved because of an edit above it is no longer reported as
+  resolved plus introduced; `--baseline` matches the rest per rule and file.
+- **`dupes --mode strict`:** no longer panics on a doc comment inside a duplicated body.
+- **`dupes`:** a checkout below a `tests/` or `benches/` directory is no longer skipped; only
+  directories inside the package count.
+- **`panic-in-lib`:** detects `panic!(..);` written as a statement.
+- **JSON output:** `--format json --save-baseline` and `boundaries --format json` without a
+  `judge.toml` print their status line instead of failing with exit 2.
+- **JSON header:** the assessment counts findings of `slop`, `errors`, `tests` and `unsafe`, and
+  the `analysis_errors` of `map`, `structure`, `complexity` and `refactor`.
+- **`unreachable-from-entry` (deep tier):** no longer reports non-`pub` types, trait-impl methods,
+  test code outside `--include-tests`, proc-macro and build-script functions, or functions named
+  in a `const`/`static` of the same file. For a publishable library, its public API now counts as
+  entry points, so private helpers called from it are live.
+- **`module-graph`:** `mod x;` inside an inline `mod { .. }` resolves below it, and
+  `pub use self::x::Y` counts as a reference to `x`.
 
 ## [0.7.1] - 2026-10-31
 

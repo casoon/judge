@@ -326,6 +326,36 @@ pub(crate) fn entry_point_positions(
     Ok(entries)
 }
 
+/// Positions of the public API of every library crate in `publishable`:
+/// `pub` functions, trait-impl methods and trait default methods outside test
+/// code. Consumers outside the workspace may call them, so for a publishable
+/// library they count as roots when judging *private* functions.
+pub(crate) fn public_api_keys(
+    workspace: &Workspace,
+    ctx: &DeepContext,
+    publishable: &HashSet<String>,
+) -> Result<HashSet<(FileId, u32)>, ReachabilityError> {
+    let mut keys = HashSet::new();
+    for krate in &workspace.crates {
+        let is_lib = krate
+            .entry_points
+            .iter()
+            .any(|entry| entry.kind == EntryPointKind::Lib);
+        if !is_lib || !publishable.contains(&krate.name) {
+            continue;
+        }
+        walk_crate_functions(krate, ctx, |file_id, _path, site| {
+            let is_api =
+                site.in_trait_impl || matches!(site.vis, None | Some(syn::Visibility::Public(_)));
+            if is_api && !site.is_test_context {
+                let offset = site.ident_span.byte_range().start as u32;
+                keys.insert((file_id, offset));
+            }
+        })?;
+    }
+    Ok(keys)
+}
+
 /// Converts [`entry_point_positions`]' output into position keys ([`position_key`]),
 /// deduplicated via `HashSet` — the shared "materialize the deterministic-
 /// comparison form of the entry-point set" step every [`is_reachable_from_entry`]

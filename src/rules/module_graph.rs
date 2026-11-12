@@ -224,13 +224,14 @@ fn visit_mod_file(
             return;
         }
     };
-    visit_items(&ast.items, file, &module_path, tree, errors);
+    visit_items(&ast.items, file, &module_path, &[], tree, errors);
 }
 
 fn visit_items(
     items: &[Item],
     file: &Path,
     module_path: &str,
+    inline_dirs: &[String],
     tree: &mut CrateModuleTree,
     errors: &mut Vec<ModuleGraphError>,
 ) {
@@ -239,12 +240,22 @@ fn visit_items(
         let child_module_path = join_module_path(module_path, &item_mod.ident.to_string());
 
         if let Some((_, content_items)) = &item_mod.content {
-            // Inline module: same file, recurse directly — no new node.
-            visit_items(content_items, file, &child_module_path, tree, errors);
+            // Inline module: same file, recurse directly — no new node. Its
+            // out-of-line children resolve below a directory named after it.
+            let mut nested = inline_dirs.to_vec();
+            nested.push(item_mod.ident.to_string());
+            visit_items(
+                content_items,
+                file,
+                &child_module_path,
+                &nested,
+                tree,
+                errors,
+            );
             continue;
         }
 
-        let Some(child_file) = resolve_mod_item_file(file, item_mod) else {
+        let Some(child_file) = resolve_mod_item_file(file, inline_dirs, item_mod) else {
             continue; // unresolved mod target — undiscoverable, not an error
         };
         if tree.file_module_path.contains_key(&child_file) {
@@ -270,6 +281,7 @@ fn visit_items(
 /// existing file.
 fn resolve_mod_file(
     declaring_file: &Path,
+    inline_dirs: &[String],
     attrs: &[syn::Attribute],
     name: &str,
 ) -> Option<PathBuf> {
@@ -278,7 +290,11 @@ fn resolve_mod_file(
         let candidate = base.join(path_value);
         return candidate.is_file().then_some(candidate);
     }
-    let own_dir = module_own_dir(declaring_file);
+    let own_dir = inline_dirs
+        .iter()
+        .fold(module_own_dir(declaring_file), |dir, inline| {
+            dir.join(inline)
+        });
     let as_file = own_dir.join(format!("{name}.rs"));
     if as_file.is_file() {
         return Some(as_file);
@@ -293,8 +309,37 @@ fn resolve_mod_file(
 /// [`resolve_mod_file`] for an out-of-line `mod` item directly — shared by
 /// [`visit_items`] (building the tree) and [`unlinked_file_findings`]'s own
 /// second, causal-edge-only re-walk of an unreached file's `mod` items.
-fn resolve_mod_item_file(declaring_file: &Path, item_mod: &syn::ItemMod) -> Option<PathBuf> {
-    resolve_mod_file(declaring_file, &item_mod.attrs, &item_mod.ident.to_string())
+fn resolve_mod_item_file(
+    declaring_file: &Path,
+    inline_dirs: &[String],
+    item_mod: &syn::ItemMod,
+) -> Option<PathBuf> {
+    resolve_mod_file(
+        declaring_file,
+        inline_dirs,
+        &item_mod.attrs,
+        &item_mod.ident.to_string(),
+    )
+}
+
+/// Every out-of-line `mod` target declared in `items`, including those
+/// nested in inline `mod { .. }` blocks.
+fn collect_out_of_line_children(
+    file: &Path,
+    items: &[Item],
+    inline_dirs: &[String],
+    children: &mut Vec<PathBuf>,
+) {
+    for item in items {
+        let Item::Mod(item_mod) = item else { continue };
+        if let Some((_, content_items)) = &item_mod.content {
+            let mut nested = inline_dirs.to_vec();
+            nested.push(item_mod.ident.to_string());
+            collect_out_of_line_children(file, content_items, &nested, children);
+        } else if let Some(child) = resolve_mod_item_file(file, inline_dirs, item_mod) {
+            children.push(child);
+        }
+    }
 }
 
 /// Reads a `#[path = "..."]` attribute's string value, if present. Unlike
@@ -483,14 +528,9 @@ fn unlinked_file_findings(
             else {
                 continue;
             };
-            for item in &ast.items {
-                let Item::Mod(item_mod) = item else { continue };
-                if item_mod.content.is_some() {
-                    continue;
-                }
-                let Some(child_file) = resolve_mod_item_file(&file.path, item_mod) else {
-                    continue;
-                };
+            let mut children = Vec::new();
+            collect_out_of_line_children(&file.path, &ast.items, &[], &mut children);
+            for child_file in children {
                 if let Some(effect_id) = id_by_path.get(child_file.as_path())
                     && let Err(err) = graph.add_edge(&cause_id, effect_id)
                 {
@@ -574,6 +614,11 @@ impl ReferenceCollector<'_> {
             let mut parts = module_path_segments(self.current_module?);
             parts.pop()?;
             crate::rules::boundaries::pop_leading_supers(&mut parts, &mut segments)?;
+            parts.extend(segments);
+            return Some((self.own_crate.to_string(), parts.join("::")));
+        }
+        if head == "self" {
+            let mut parts = module_path_segments(self.current_module?);
             parts.extend(segments);
             return Some((self.own_crate.to_string(), parts.join("::")));
         }
@@ -785,6 +830,40 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert!(hits[0].location.file.ends_with("orphan.rs"));
         assert_eq!(hits[0].evidence_class, EvidenceClass::BoundedSemantic);
+    }
+
+    // `mod b;` inside an inline `mod a { .. }` lives in `a/b.rs`.
+    #[test]
+    fn an_out_of_line_mod_inside_an_inline_mod_resolves_below_it() {
+        let dir = TempDir::new("module-graph-inline-nesting");
+        write_single_crate_manifest(&dir, "fixture");
+        std::fs::create_dir_all(dir.join("src/a")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "mod a {\n    pub mod b;\n}\n").unwrap();
+        std::fs::write(dir.join("src/a/b.rs"), "pub fn hello() {}\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true);
+
+        assert!(rule_findings(&report.findings, UNLINKED_FILE_RULE).is_empty());
+    }
+
+    // `pub use self::foo::Bar;` references `foo` just like `foo::Bar` does.
+    #[test]
+    fn a_self_relative_use_counts_as_a_reference() {
+        let dir = TempDir::new("module-graph-self-use");
+        write_single_crate_manifest(&dir, "fixture");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "mod foo;\npub use self::foo::Bar;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/foo.rs"), "pub struct Bar;\n").unwrap();
+
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let report = analyze_workspace(&workspace, true);
+
+        assert!(rule_findings(&report.findings, ORPHAN_MODULE_RULE).is_empty());
     }
 
     /// The registry's curated `example.before` for this rule (see

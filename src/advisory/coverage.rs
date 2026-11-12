@@ -5,9 +5,8 @@
 //!
 //! Two things live here: a minimal LCOV line-coverage parser
 //! ([`parse_lcov`]/[`read_lcov`]), and `untested-hotspot`
-//! ([`untested_hotspots`]) — the intersection of high complexity, high
-//! churn, and mostly-uncovered lines that todo.md §J calls out as "die Zahl,
-//! die eine Priorisierung erlaubt".
+//! ([`untested_hotspots`]) — the intersection of high complexity and
+//! mostly-uncovered lines.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,15 +23,7 @@ use crate::rules::complexity::FunctionInfo;
 pub const UNTESTED_HOTSPOT_RULE: &str = "untested-hotspot";
 /// Bump when the untested-hotspot rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
-pub const UNTESTED_HOTSPOT_RULE_REVISION: u32 = 1;
-
-/// The churn window [`untested_hotspots`] expects its `churn` argument to
-/// have been computed with. Reuses `crate::rules::slop_structural`'s
-/// `churn-hotspot` window (and, internally, its threshold) so the two rules
-/// don't silently disagree on what "high churn" means for the same
-/// workspace (see todo.md §J, §3.G).
-pub const UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS: i64 =
-    crate::rules::slop_structural::CHURN_HOTSPOT_WINDOW_DAYS;
+pub const UNTESTED_HOTSPOT_RULE_REVISION: u32 = 2;
 
 /// Minimum cyclomatic complexity for a function to count as "high
 /// complexity" for `untested-hotspot` purposes — the conventional McCabe
@@ -263,41 +254,28 @@ fn finalize_file(lines: HashMap<usize, u64>) -> FileCoverage {
     }
 }
 
-/// Flags functions where high complexity, high recent file churn, and
-/// mostly uncovered lines all coincide — the intersection todo.md §J calls
-/// `untested-hotspot`: "hohe Komplexität, hoher Churn, niedrige Coverage".
-///
-/// `churn` must be computed over [`UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS`] (the
-/// same window `crate::rules::slop_structural::churn_hotspots` uses) — this
-/// function only reads it, it doesn't call `crate::git::churn` itself.
+/// Flags functions where high complexity and mostly uncovered lines
+/// coincide — `untested-hotspot`: high complexity, low coverage. judge reads
+/// no Git history, so there is deliberately no churn criterion.
 ///
 /// A function whose file has no coverage data at all is skipped, not
 /// treated as uncovered (todo.md §J: "keine Coverage-Daten" is its own
 /// state, not an unproven 0%-coverage claim).
 ///
 /// Evidence class: [`EvidenceClass::ExternalMeasurement`]. Complexity alone
-/// would be `derived_fact` and churn alone `heuristic`
-/// (see `crate::finding::evidence_class_for_rule`'s doc table), but coverage
-/// — an external snapshot judge can neither measure nor recompute itself —
-/// is the rarest and least locally-verifiable ingredient in the
-/// combination, so it sets the class for the combined claim (todo.md
-/// §17.3).
+/// would be `derived_fact`, but coverage — an external snapshot judge can
+/// neither measure nor recompute itself — is the least locally-verifiable
+/// ingredient in the combination, so it sets the class for the combined
+/// claim (todo.md §17.3).
 ///
-/// Known, undecidable time skew: `churn` and `coverage` are read as of two
-/// independent snapshots — `churn` from the workspace's current git history,
-/// `coverage` from whenever the LCOV report was generated (a CI run that can
-/// be days or weeks old). Both use the *current* function line ranges from
-/// `functions`. If a hotspot was reworked after the LCOV snapshot was taken,
-/// the reported `lines_covered_pct`/`uncovered_line_count` describe lines
-/// that may no longer exist in their current form — judge has no way to
-/// detect this from the LCOV file alone (it carries no commit/timestamp
-/// judge could compare against `AnalysisUniverse`'s commit). This is a
-/// structural limitation of importing an external snapshot, not a bug: it
-/// cannot be fixed by adjusting `UNTESTED_HOTSPOT_CHURN_WINDOW_DAYS` or any
-/// other local threshold.
+/// Known, undecidable time skew: `coverage` is read from whenever the LCOV
+/// report was generated (a CI run that can be days or weeks old), while
+/// `functions` use the *current* line ranges. If a hotspot was reworked after
+/// the LCOV snapshot, the reported coverage may describe lines that no longer
+/// exist in their current form — judge cannot detect this from the LCOV file
+/// alone. This is a structural limitation of importing an external snapshot.
 pub fn untested_hotspots(
     functions: &[FunctionInfo],
-    churn: &HashMap<PathBuf, u32>,
     coverage: &CoverageReport,
     workspace_root: &Path,
 ) -> Vec<Finding> {
@@ -305,11 +283,6 @@ pub fn untested_hotspots(
         .iter()
         .filter(|function| function.cyclomatic >= HIGH_COMPLEXITY_THRESHOLD)
         .filter_map(|function| {
-            let relative_file = function.file.strip_prefix(workspace_root).ok()?;
-            let file_churn = *churn.get(relative_file)?;
-            if file_churn < crate::rules::slop_structural::CHURN_HOTSPOT_THRESHOLD {
-                return None;
-            }
             let file_coverage = coverage.for_file(workspace_root, &function.file)?;
 
             let end_line = function.line + function.lines_of_code.saturating_sub(1);
@@ -341,7 +314,6 @@ pub fn untested_hotspots(
                 Origin::Code,
                 Some(json!({
                     "cyclomatic_complexity": function.cyclomatic,
-                    "file_churn": file_churn,
                     "lines_covered_pct": file_coverage.covered_pct(),
                     "uncovered_line_count": uncovered_in_function,
                 })),
@@ -647,23 +619,6 @@ end_of_record
         assert_eq!(missing, vec![uncovered]);
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let status = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=judge-test",
-                "-c",
-                "user.email=test@example.com",
-                "-c",
-                "commit.gpgsign=false",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .status()
-            .expect("failed to run git — required for these fixtures");
-        assert!(status.success(), "git {args:?} failed");
-    }
-
     fn function_info(
         file: PathBuf,
         line: usize,
@@ -690,28 +645,14 @@ end_of_record
         }
     }
 
-    /// End-to-end fixture in the style of `crate::git`'s `hotspots` test:
-    /// a real git repository whose one file is committed enough times to
-    /// clear the churn-hotspot threshold, combined with a hand-written LCOV
-    /// snippet leaving most of the flagged function's lines uncovered.
+    /// A high-complexity function whose lines are mostly uncovered in a
+    /// hand-written LCOV snippet is flagged.
     #[test]
-    fn untested_hotspot_fires_when_complexity_churn_and_uncovered_lines_all_coincide() {
+    fn untested_hotspot_fires_when_complexity_and_uncovered_lines_coincide() {
         let dir = TempDir::new("coverage-untested-hotspot");
-        git(&dir, &["init", "-q", "-b", "main"]);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/hot.rs"), "fn hot() {}\n").unwrap();
-        git(&dir, &["add", "."]);
-        git(&dir, &["commit", "-q", "-m", "initial"]);
 
-        // Five more commits touching the same file — clears
-        // `CHURN_HOTSPOT_THRESHOLD` (5) within the 14-day window.
-        for i in 0..5 {
-            std::fs::write(dir.join("src/hot.rs"), format!("fn hot() {{ {i} }}\n")).unwrap();
-            git(&dir, &["add", "."]);
-            git(&dir, &["commit", "-q", "-m", "rework"]);
-        }
-
-        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         // Lines 10..=20 belong to the function (11 lines, matching the DA
         // records below one-to-one); only 3 of them are covered.
         let functions = vec![function_info(dir.join("src/hot.rs"), 10, 12, 11)];
@@ -733,7 +674,7 @@ end_of_record
 ";
         let coverage = parse_lcov(lcov, &dir);
 
-        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+        let findings = untested_hotspots(&functions, &coverage, &dir);
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, UNTESTED_HOTSPOT_RULE);
@@ -745,7 +686,6 @@ end_of_record
             findings[0].evidence,
             Some(json!({
                 "cyclomatic_complexity": 12,
-                "file_churn": churn[&PathBuf::from("src/hot.rs")],
                 "lines_covered_pct": coverage.per_file[&PathBuf::from("src/hot.rs")].covered_pct(),
                 "uncovered_line_count": 8,
             }))
@@ -753,7 +693,7 @@ end_of_record
     }
 
     /// Same fixture as
-    /// `untested_hotspot_fires_when_complexity_churn_and_uncovered_lines_all_coincide`,
+    /// `untested_hotspot_fires_when_complexity_and_uncovered_lines_coincide`,
     /// but with a leading `./` in the LCOV `SF:` path — regression coverage
     /// for the `resolve_lcov_path` fix: before it, this LCOV entry was keyed
     /// under `./src/hot.rs` while `for_file` looked up `src/hot.rs`, so the
@@ -766,7 +706,6 @@ end_of_record
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/hot.rs"), "fn hot() {}\n").unwrap();
 
-        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         let functions = vec![function_info(dir.join("src/hot.rs"), 10, 12, 11)];
 
         let lcov = "\
@@ -786,7 +725,7 @@ end_of_record
 ";
         let coverage = parse_lcov(lcov, &dir);
 
-        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+        let findings = untested_hotspots(&functions, &coverage, &dir);
 
         assert_eq!(findings.len(), 1);
     }
@@ -809,7 +748,6 @@ end_of_record
     #[test]
     fn untested_hotspot_misses_a_real_hotspot_when_cfg_gated_lines_inflate_the_span() {
         let dir = TempDir::new("coverage-untested-hotspot-cfg-blind-loc");
-        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         // `lines_of_code` (14) spans lines 1..=14 as `syn` sees them
         // (cfg-blind); only lines 1..=4 are actually compiled and
         // instrumented — lines 5..=14 belong to an inactive
@@ -825,7 +763,7 @@ end_of_record
             },
         );
 
-        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+        let findings = untested_hotspots(&functions, &coverage, &dir);
 
         assert!(
             findings.is_empty(),
@@ -837,7 +775,6 @@ end_of_record
     #[test]
     fn untested_hotspot_does_not_fire_for_low_complexity() {
         let dir = TempDir::new("coverage-untested-hotspot-low-complexity");
-        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         let functions = vec![function_info(dir.join("src/hot.rs"), 1, 3, 20)];
         let mut coverage = CoverageReport::default();
         coverage.per_file.insert(
@@ -849,33 +786,13 @@ end_of_record
             },
         );
 
-        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn untested_hotspot_does_not_fire_for_low_churn() {
-        let dir = TempDir::new("coverage-untested-hotspot-low-churn");
-        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 1u32)]);
-        let functions = vec![function_info(dir.join("src/hot.rs"), 1, 12, 20)];
-        let mut coverage = CoverageReport::default();
-        coverage.per_file.insert(
-            PathBuf::from("src/hot.rs"),
-            FileCoverage {
-                lines_total: 20,
-                lines_covered: 0,
-                uncovered_lines: (1..=20).collect(),
-            },
-        );
-
-        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+        let findings = untested_hotspots(&functions, &coverage, &dir);
         assert!(findings.is_empty());
     }
 
     #[test]
     fn untested_hotspot_does_not_fire_for_high_coverage() {
         let dir = TempDir::new("coverage-untested-hotspot-high-coverage");
-        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         let functions = vec![function_info(dir.join("src/hot.rs"), 1, 12, 20)];
         let mut coverage = CoverageReport::default();
         coverage.per_file.insert(
@@ -887,18 +804,17 @@ end_of_record
             },
         );
 
-        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+        let findings = untested_hotspots(&functions, &coverage, &dir);
         assert!(findings.is_empty());
     }
 
     #[test]
     fn untested_hotspot_skips_a_function_whose_file_has_no_coverage_data() {
         let dir = TempDir::new("coverage-untested-hotspot-no-data");
-        let churn = HashMap::from([(PathBuf::from("src/hot.rs"), 10u32)]);
         let functions = vec![function_info(dir.join("src/hot.rs"), 1, 12, 20)];
         let coverage = CoverageReport::default();
 
-        let findings = untested_hotspots(&functions, &churn, &coverage, &dir);
+        let findings = untested_hotspots(&functions, &coverage, &dir);
         assert!(
             findings.is_empty(),
             "no coverage data must not be treated as 0% coverage"

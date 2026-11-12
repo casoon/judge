@@ -723,9 +723,22 @@ fn run_with_artifact_output(cli: Cli, out: &mut dyn Write) -> Result<CommandOutc
         return run(cli, out);
     };
 
+    let saving_baseline = cli.command.is_none() && cli.baseline_args.save_baseline;
     let mut rendered = Vec::new();
     let result = run(cli, &mut rendered);
     if !rendered.is_empty() {
+        // A run that only reports a plain status line (`baseline saved: ...`,
+        // "no judge.toml found") produced no report to wrap: print it as is
+        // instead of failing to parse it as an artifact.
+        let is_status_text = match format {
+            OutputFormat::Json => !rendered.starts_with(b"{"),
+            OutputFormat::Markdown => saving_baseline,
+            OutputFormat::Tty | OutputFormat::Sarif => false,
+        };
+        if is_status_text {
+            out.write_all(&rendered)?;
+            return result;
+        }
         match format {
             OutputFormat::Json => {
                 let artifact = add_json_header(&rendered, &path, command, &result)?;
@@ -810,19 +823,20 @@ fn add_json_header(
         ));
     };
 
-    let findings = root
-        .get("findings")
-        .and_then(serde_json::Value::as_array)
-        .map_or(0, Vec::len);
-    let candidates = ["candidates", "heuristics"]
-        .into_iter()
-        .filter_map(|key| root.get(key).and_then(serde_json::Value::as_array))
-        .map(Vec::len)
-        .sum::<usize>();
-    let errors = root
-        .get("errors")
-        .and_then(serde_json::Value::as_array)
-        .map_or(0, Vec::len);
+    // Focused commands (`slop`, `errors`, `tests`, `unsafe`) nest their
+    // payload under `report`; the others keep it at the root.
+    let body = root
+        .get("report")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or(root);
+    let array_len = |key: &str| {
+        body.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    let findings = array_len("findings");
+    let candidates = array_len("candidates") + array_len("heuristics");
+    let errors = array_len("errors") + array_len("analysis_errors");
     let blocking = matches!(result, Ok(CommandOutcome::FindingsFound));
     let (assessment, action_required, summary) = if errors > 0 {
         (
@@ -1231,6 +1245,35 @@ fn severity_label(severity: judge::finding::Severity) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn json_header_counts_findings_nested_under_report() {
+        let payload = br#"{"report":{"findings":[{}],"errors":[]},"schema_version":2}"#;
+        let artifact = add_json_header(
+            payload,
+            Path::new(".judge/slop.json"),
+            "slop",
+            &Ok(CommandOutcome::Clean),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        assert_eq!(value["header"]["assessment"]["kind"], "review_recommended");
+        assert_eq!(value["header"]["assessment"]["findings"], 1);
+    }
+
+    #[test]
+    fn json_header_reports_analysis_errors_key() {
+        let payload = br#"{"analysis_errors":["boom"],"files":[]}"#;
+        let artifact = add_json_header(
+            payload,
+            Path::new(".judge/map.json"),
+            "map",
+            &Ok(CommandOutcome::Clean),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&artifact).unwrap();
+        assert_eq!(value["header"]["assessment"]["kind"], "analysis_incomplete");
+    }
     use super::*;
 
     /// A temp directory unique to one test, removed when it goes out of

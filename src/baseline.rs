@@ -400,6 +400,9 @@ pub fn diff(
     let mut introduced = Vec::new();
     let mut severity_changed = Vec::new();
     let mut unchanged_count = 0;
+    // Findings whose id (which embeds line/column for syntax-anchored rules)
+    // no longer matches: an unrelated edit above them shifts the position.
+    let mut unmatched_current = Vec::new();
 
     for finding in current {
         match known.get(finding.id.as_str()) {
@@ -408,15 +411,45 @@ pub fn diff(
                 before: (*previous).clone(),
                 after: finding.clone(),
             }),
-            None => introduced.push(finding.clone()),
+            None => unmatched_current.push(finding),
         }
     }
 
     let current_ids: HashSet<&str> = current.iter().map(|f| f.id.as_str()).collect();
-    let resolved = baseline
+    let mut unmatched_baseline: HashMap<(&str, &Path), Vec<&BaselineFinding>> = HashMap::new();
+    for finding in baseline
         .findings
         .iter()
         .filter(|finding| !current_ids.contains(finding.id.as_str()))
+    {
+        unmatched_baseline
+            .entry((finding.rule.as_str(), finding.file.as_path()))
+            .or_default()
+            .push(finding);
+    }
+
+    // Pair the leftovers per (rule, file), position-insensitively: as many
+    // current findings as the baseline still holds for that rule and file
+    // count as unchanged (moved); only the surplus is new.
+    for finding in unmatched_current {
+        let key = (finding.rule.as_str(), finding.location.file.as_path());
+        match unmatched_baseline.get_mut(&key).and_then(Vec::pop) {
+            Some(previous) if previous.severity == finding.severity => unchanged_count += 1,
+            Some(previous) => severity_changed.push(SeverityChange {
+                before: previous.clone(),
+                after: finding.clone(),
+            }),
+            None => introduced.push(finding.clone()),
+        }
+    }
+    let resolved: Vec<BaselineFinding> = baseline
+        .findings
+        .iter()
+        .filter(|finding| {
+            unmatched_baseline
+                .get(&(finding.rule.as_str(), finding.file.as_path()))
+                .is_some_and(|left| left.iter().any(|candidate| candidate.id == finding.id))
+        })
         .cloned()
         .collect();
 
@@ -536,6 +569,34 @@ mod tests {
 
     fn current_revisions() -> HashMap<String, u32> {
         HashMap::from([("duplicate-code".to_string(), 1)])
+    }
+
+    /// Regression: an edit above a finding shifts the line/column embedded in
+    /// its id; the finding is still the same one, not resolved plus introduced.
+    #[test]
+    fn a_finding_that_only_moved_is_unchanged() {
+        let baseline = baseline_with(&[finding("swallowed-result:src/a.rs:3:5", "src/a.rs")]);
+        let moved = finding("swallowed-result:src/a.rs:4:5", "src/a.rs");
+
+        let delta = diff(&[moved], &baseline, &HashSet::new(), &current_revisions());
+
+        assert!(delta.introduced.is_empty());
+        assert!(delta.resolved.is_empty());
+        assert_eq!(delta.unchanged_count, 1);
+    }
+
+    #[test]
+    fn an_additional_finding_next_to_a_moved_one_is_introduced() {
+        let baseline = baseline_with(&[finding("swallowed-result:src/a.rs:3:5", "src/a.rs")]);
+        let current = [
+            finding("swallowed-result:src/a.rs:4:5", "src/a.rs"),
+            finding("swallowed-result:src/a.rs:9:5", "src/a.rs"),
+        ];
+
+        let delta = diff(&current, &baseline, &HashSet::new(), &current_revisions());
+
+        assert_eq!(delta.introduced.len(), 1);
+        assert_eq!(delta.unchanged_count, 1);
     }
 
     #[test]
