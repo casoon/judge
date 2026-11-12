@@ -20,7 +20,7 @@
 //! `ignored-test-accumulation` already use (see that module's docs): emit
 //! what exists today, unconditionally, with a `Finding.id` stable across
 //! runs (embeds file + qualified name), and the existing baseline/delta
-//! system turns a genuinely new occurrence into `code_introduced` on its
+//! system turns a genuinely new occurrence into an introduced finding on its
 //! own.
 //!
 //! **Two function shapes are excluded from both rules' candidate sets

@@ -163,14 +163,22 @@ pub fn read_lcov(path: &Path, workspace_root: &Path) -> Result<CoverageReport, L
 /// checked for existence and recorded in [`CoverageReport::missing_files`] if
 /// it isn't found — see todo.md §J point 2.
 pub fn parse_lcov(text: &str, workspace_root: &Path) -> CoverageReport {
-    let mut per_file: HashMap<PathBuf, FileCoverage> = HashMap::new();
+    // A merged report may list a file in several records (one per test
+    // run); their hit counts add up.
+    let mut merged: HashMap<PathBuf, HashMap<usize, u64>> = HashMap::new();
     let mut current: Option<(PathBuf, HashMap<usize, u64>)> = None;
+    let mut commit = |path: PathBuf, lines: HashMap<usize, u64>| {
+        let total = merged.entry(path).or_default();
+        for (line_no, hits) in lines {
+            *total.entry(line_no).or_insert(0) += hits;
+        }
+    };
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if let Some(raw_path) = line.strip_prefix("SF:") {
             if let Some((path, lines)) = current.take() {
-                per_file.insert(path, finalize_file(lines));
+                commit(path, lines);
             }
             let resolved = resolve_lcov_path(raw_path.trim(), workspace_root);
             current = Some((resolved, HashMap::new()));
@@ -183,15 +191,19 @@ pub fn parse_lcov(text: &str, workspace_root: &Path) -> CoverageReport {
         } else if line == "end_of_record"
             && let Some((path, lines)) = current.take()
         {
-            per_file.insert(path, finalize_file(lines));
+            commit(path, lines);
         }
     }
     // A file section without a trailing `end_of_record` still counts — LCOV
     // requires it, but a truncated/malformed report shouldn't lose the last
     // file's data.
     if let Some((path, lines)) = current.take() {
-        per_file.insert(path, finalize_file(lines));
+        commit(path, lines);
     }
+    let per_file: HashMap<PathBuf, FileCoverage> = merged
+        .into_iter()
+        .map(|(path, lines)| (path, finalize_file(lines)))
+        .collect();
 
     let mut missing_files: Vec<PathBuf> = per_file
         .keys()
@@ -485,6 +497,20 @@ end_of_record
         assert_eq!(coverage.lines_covered, 2);
         assert_eq!(coverage.uncovered_lines, vec![2, 3]);
         assert!(report.missing_files.is_empty());
+    }
+
+    #[test]
+    fn parse_lcov_merges_repeated_records_of_one_file() {
+        let dir = TempDir::new("coverage-parse-merge");
+        std::fs::write(dir.join("lib.rs"), "fn a() {}\n").unwrap();
+
+        let lcov =
+            "SF:lib.rs\nDA:1,1\nDA:2,0\nend_of_record\nSF:lib.rs\nDA:1,0\nDA:2,4\nend_of_record\n";
+        let report = parse_lcov(lcov, &dir);
+
+        let coverage = report.per_file.get(&PathBuf::from("lib.rs")).unwrap();
+        assert_eq!(coverage.lines_total, 2);
+        assert_eq!(coverage.lines_covered, 2);
     }
 
     #[test]

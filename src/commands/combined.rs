@@ -12,6 +12,10 @@ const PROGRESS_SCHEMA_VERSION: u32 = 1;
 pub(crate) enum ProgressEvent {
     Started(&'static str),
     Completed(&'static str),
+    /// The whole run ended with a verdict or report.
+    RunCompleted,
+    /// The whole run ended with an error.
+    RunFailed,
 }
 
 impl ProgressEvent {
@@ -26,6 +30,7 @@ impl ProgressEvent {
     fn phase(self) -> &'static str {
         match self {
             Self::Started(phase) | Self::Completed(phase) => phase,
+            Self::RunCompleted | Self::RunFailed => "run",
         }
     }
 
@@ -33,6 +38,8 @@ impl ProgressEvent {
         match self {
             Self::Started(_) => "phase_started",
             Self::Completed(_) => "phase_completed",
+            Self::RunCompleted => "run_completed",
+            Self::RunFailed => "run_failed",
         }
     }
 }
@@ -128,8 +135,33 @@ pub(crate) fn run(
         .map(ProgressWriter::create)
         .transpose()?;
 
-    let mut collected = collect_findings_with_progress(&workspace, &mut |event| {
-        if let Some(progress) = &mut progress {
+    let result = run_collected(
+        &workspace,
+        (format, save_baseline, baseline, details, color),
+        &mut progress,
+        out,
+    );
+    if let Some(progress) = &mut progress {
+        let closing = if result.is_ok() {
+            ProgressEvent::RunCompleted
+        } else {
+            ProgressEvent::RunFailed
+        };
+        progress.emit(closing)?;
+    }
+    result
+}
+
+type RenderChoices = (OutputFormat, bool, Option<PathBuf>, bool, bool);
+
+fn run_collected(
+    workspace: &judge::ingest::Workspace,
+    (format, save_baseline, baseline, details, color): RenderChoices,
+    progress: &mut Option<ProgressWriter>,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let mut collected = collect_findings_with_progress(workspace, &mut |event| {
+        if let Some(progress) = progress.as_mut() {
             progress.emit(event)?;
         }
         Ok(())
@@ -144,7 +176,7 @@ pub(crate) fn run(
             analysis_errors: &collected.analysis_errors,
             rule_revisions: collected.rule_revisions,
             default_save_path: Path::new(DEFAULT_BASELINE_ALL),
-            total_loc: judge::health_score::total_authored_loc(&workspace),
+            total_loc: judge::health_score::total_authored_loc(workspace),
         },
         out,
     ) {
@@ -156,7 +188,7 @@ pub(crate) fn run(
             // Bare `cargo judge` analyzes with the generated-code default
             // (excluded — see `collect_findings`), so the universe says so.
             let report = Report::with_errors(collected.findings, collected.analysis_errors)
-                .with_universe(judge::finding::AnalysisUniverse::fast(&workspace, false))
+                .with_universe(judge::finding::AnalysisUniverse::fast(workspace, false))
                 .with_suppressed_inline(collected.suppressed_inline);
             write_json(out, &report)?;
         }
@@ -166,7 +198,7 @@ pub(crate) fn run(
                 &workspace.root,
                 collected.findings,
                 collected.analysis_errors,
-                Some(judge::finding::AnalysisUniverse::fast(&workspace, false)),
+                Some(judge::finding::AnalysisUniverse::fast(workspace, false)),
             )?;
         }
         OutputFormat::Markdown => {

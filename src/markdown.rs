@@ -120,8 +120,6 @@ mod tests {
     fn render_delta_uses_the_two_state_verdict_and_skips_empty_tables() {
         let delta = Delta {
             introduced: Vec::new(),
-            code_introduced: Vec::new(),
-            rule_introduced: Vec::new(),
             resolved: Vec::new(),
             severity_changed: Vec::new(),
             unchanged_count: 2,
@@ -154,8 +152,6 @@ unchanged: 2 — resolved: 0 — severity changed: 0
                 3,
                 "foo",
             )],
-            code_introduced: Vec::new(),
-            rule_introduced: Vec::new(),
             resolved: Vec::new(),
             severity_changed: Vec::new(),
             unchanged_count: 0,

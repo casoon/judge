@@ -25,6 +25,8 @@ for you.
   to `cargo-judge`, i.e. it must be on `PATH` (e.g. after
   `cargo install --path .` in the judge repo, or a `--features deep` build
   for `dead_code`/`inspect_symbol`).
+- `JUDGE_TIMEOUT_MS` (optional): longest a single run may take before it is
+  killed and reported as a tool error. Defaults to 600000 (10 minutes).
 
 If the binary cannot be started (e.g. `ENOENT`), the affected tool call
 returns a clear MCP tool error explaining how to fix it — the server itself
@@ -65,9 +67,13 @@ The server speaks MCP over stdio.
 | `explain_finding` | `cargo-judge explain-rule <rule-id> --format json` |
 | `inspect_symbol` | `cargo-judge explain <item-path> --why-live --format json` (needs a `--features deep` build) |
 | `fix_preview` | `cargo-judge fix-preview <pattern-id> --format json` |
+| `review` | `cargo-judge <structure\|complexity\|refactor\|api\|api-surface\|errors\|tests\|unsafe\|slop\|deps\|boundaries\|module-graph\|map> --format json` |
+| `compare` | `cargo-judge compare --baseline <path> --format json` |
+| `save_baseline` | `cargo-judge [health\|dupes\|dead-code] --save-baseline --format json` |
 
-All tools are read-only (`readOnlyHint: true`, `destructiveHint: false`) —
-`cargo-judge` never modifies code.
+Every tool is read-only (`readOnlyHint: true`) except `save_baseline`, which
+writes a baseline file under `.judge/` in the analyzed workspace and is marked
+accordingly. `cargo-judge` never modifies source code.
 
 ### Naming deviation: `explain_finding`
 

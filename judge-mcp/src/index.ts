@@ -4,11 +4,9 @@
  *
  * It computes no findings of its own. Every tool below shells out to the
  * already-built `cargo-judge` binary and returns its `--format json` output
- * structured for an MCP client. See todo.md §1 / §7 in the judge repo:
- * "MCP, Editor-Plugins und Agent-Skills sind optionale Adapter auf dieselbe
- * stabile CLI-/JSON-Schnittstelle, nicht Teil der fachlichen Berechnung." /
- * "Er berechnet keine eigenen Befunde und ist weder Installations- noch
- * Laufzeitvoraussetzung."
+ * structured for an MCP client. It is an optional adapter on the stable
+ * CLI/JSON interface, not part of the analysis, and neither an install nor a
+ * runtime requirement of judge.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -24,9 +22,10 @@ const server = new McpServer(
   },
   {
     instructions:
-      "Thin, read-only adapter over the cargo-judge CLI. Computes no findings itself; " +
+      "Thin adapter over the cargo-judge CLI. Computes no findings itself; " +
       "every tool call runs cargo-judge as a subprocess and returns its --format json " +
-      "output. cargo-judge's exit code convention: 0 = clean, 1 = findings present " +
+      "output. All tools are read-only except save_baseline, which writes a baseline " +
+      "file into the analyzed workspace. cargo-judge's exit code convention: 0 = clean, 1 = findings present " +
       "(a normal result, not an error), 2 = real analyzer/config error (surfaced as a " +
       "tool error). judge-mcp is optional: it is neither an install nor a runtime " +
       "requirement of judge itself.",
@@ -69,10 +68,6 @@ async function callJudge(args: string[], cwd: string | undefined): Promise<CallT
 // ---------------------------------------------------------------------------
 const AnalyzeInputSchema = {
   workspace_root: workspaceRootField,
-  save_baseline: z
-    .boolean()
-    .optional()
-    .describe("Save the combined findings as the baseline (--save-baseline)."),
   baseline: z
     .string()
     .optional()
@@ -85,15 +80,14 @@ server.registerTool(
     title: "Full judge analysis",
     description:
       "Runs bare `cargo-judge` (--format json): the combined decision surface across " +
-      "hotspots, duplication, dependency hygiene, ownership and (if judge.toml exists) " +
-      "boundaries, merged and worst-first sorted. Read-only; computes nothing itself, " +
+      "complexity, slop, duplication, structure, security, dependency hygiene and (if " +
+      "judge.toml exists) boundaries, merged and worst-first sorted. Read-only; computes nothing itself, " +
       "only forwards judge's own JSON report.",
     inputSchema: AnalyzeInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false },
   },
-  async ({ workspace_root, save_baseline, baseline }) => {
+  async ({ workspace_root, baseline }) => {
     const args: string[] = [];
-    if (save_baseline) args.push("--save-baseline");
     if (baseline) args.push("--baseline", baseline);
     args.push("--format", "json");
     return callJudge(args, workspace_root);
@@ -110,7 +104,6 @@ const HealthInputSchema = {
     .boolean()
     .optional()
     .describe("Show findings caused by another finding, not just root findings (--show-cascades)."),
-  save_baseline: z.boolean().optional().describe("Save the current findings as the baseline."),
   baseline: z.string().optional().describe("Path to a saved baseline to compare against."),
   include_generated: z.boolean().optional().describe("Analyze generated files too."),
 };
@@ -120,18 +113,17 @@ server.registerTool(
   {
     title: "judge health summary",
     description:
-      "Runs `cargo-judge health --format json`: complexity, git hotspots, and " +
+      "Runs `cargo-judge health --format json`: complexity and " +
       "maintainability/slop findings, optionally with the 0-100 health score " +
       "(--score). Read-only; computes nothing itself, only forwards judge's own " +
       "JSON report.",
     inputSchema: HealthInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false },
   },
-  async ({ workspace_root, score, show_cascades, save_baseline, baseline, include_generated }) => {
+  async ({ workspace_root, score, show_cascades, baseline, include_generated }) => {
     const args: string[] = ["health"];
     if (score) args.push("--score");
     if (show_cascades) args.push("--show-cascades");
-    if (save_baseline) args.push("--save-baseline");
     if (baseline) args.push("--baseline", baseline);
     if (include_generated) args.push("--include-generated");
     args.push("--format", "json");
@@ -154,7 +146,6 @@ const DupesInputSchema = {
     .positive()
     .optional()
     .describe("Minimum span length in tokens for a clone family (--min-tokens)."),
-  save_baseline: z.boolean().optional().describe("Save the current findings as the baseline."),
   baseline: z.string().optional().describe("Path to a saved baseline to compare against."),
   include_generated: z.boolean().optional().describe("Analyze generated files too."),
 };
@@ -169,11 +160,10 @@ server.registerTool(
     inputSchema: DupesInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false },
   },
-  async ({ workspace_root, mode, min_tokens, save_baseline, baseline, include_generated }) => {
+  async ({ workspace_root, mode, min_tokens, baseline, include_generated }) => {
     const args: string[] = ["dupes"];
     if (mode) args.push("--mode", mode);
     if (min_tokens !== undefined) args.push("--min-tokens", String(min_tokens));
-    if (save_baseline) args.push("--save-baseline");
     if (baseline) args.push("--baseline", baseline);
     if (include_generated) args.push("--include-generated");
     args.push("--format", "json");
@@ -190,7 +180,6 @@ const DeadCodeInputSchema = {
     .boolean()
     .optional()
     .describe("Count a #[test]-only reference as usage (--include-tests)."),
-  save_baseline: z.boolean().optional().describe("Save the current findings as the baseline."),
   baseline: z.string().optional().describe("Path to a saved baseline to compare against."),
 };
 
@@ -208,10 +197,9 @@ server.registerTool(
     inputSchema: DeadCodeInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false },
   },
-  async ({ workspace_root, include_tests, save_baseline, baseline }) => {
+  async ({ workspace_root, include_tests, baseline }) => {
     const args: string[] = ["dead-code"];
     if (include_tests) args.push("--include-tests");
-    if (save_baseline) args.push("--save-baseline");
     if (baseline) args.push("--baseline", baseline);
     args.push("--format", "json");
     return callJudge(args, workspace_root);
@@ -221,7 +209,7 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 // explain_finding -> `cargo-judge explain-rule <rule-id> --format json`
 //
-// Deviation from todo.md §7's naming: judge's CLI has no
+// judge's CLI has no
 // `explain <finding-id>` command that explains one specific finding
 // instance. The closest real capability is `explain-rule <rule-id>`, which
 // explains the RULE behind a finding (evidence class, preconditions,
@@ -243,10 +231,9 @@ server.registerTool(
   {
     title: "judge explain-rule (rule behind a finding)",
     description:
-      "Runs `cargo-judge explain-rule <rule_id> --format json`. NOTE: this deviates from " +
-      "the `explain_finding` naming in todo.md §7 — judge's CLI has no command that " +
-      "explains one specific finding instance (no `explain <finding-id>`). This tool " +
-      "maps onto `explain-rule`, the closest real capability: it explains the RULE " +
+      "Runs `cargo-judge explain-rule <rule_id> --format json`. NOTE: judge's CLI has " +
+      "no command that explains one specific finding instance (no `explain <finding-id>`). " +
+      "This tool maps onto `explain-rule`, the closest real capability: it explains the RULE " +
       "behind a finding (evidence class, preconditions, exclusions, allowed wording, " +
       "verdict effect) via judge's static rule registry, not the individual finding " +
       "occurrence. A pure documentation lookup; never runs analysis, never affects any " +
@@ -329,6 +316,89 @@ server.registerTool(
   },
   async ({ workspace_root, pattern_id }) => {
     const args = ["fix-preview", pattern_id, "--format", "json"];
+    return callJudge(args, workspace_root);
+  },
+);
+
+// ---------------------------------------------------------------------------
+// review -> `cargo-judge <command> --format json` for the focused read-only views
+// ---------------------------------------------------------------------------
+const REVIEW_COMMANDS = [
+  "structure",
+  "complexity",
+  "refactor",
+  "api",
+  "api-surface",
+  "errors",
+  "tests",
+  "unsafe",
+  "slop",
+  "deps",
+  "boundaries",
+  "module-graph",
+  "map",
+] as const;
+
+server.registerTool(
+  "review",
+  {
+    title: "judge focused review",
+    description:
+      "Runs one focused, read-only judge view as `cargo-judge <command> --format json`: " +
+      REVIEW_COMMANDS.join(", ") +
+      ". `boundaries` does nothing without a judge.toml. Computes nothing itself, only " +
+      "forwards judge's own JSON report.",
+    inputSchema: {
+      workspace_root: workspaceRootField,
+      command: z.enum(REVIEW_COMMANDS).describe("Which focused view to run."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  },
+  async ({ workspace_root, command }) => callJudge([command, "--format", "json"], workspace_root),
+);
+
+// ---------------------------------------------------------------------------
+// compare -> `cargo-judge compare --baseline <path> --format json`
+// ---------------------------------------------------------------------------
+server.registerTool(
+  "compare",
+  {
+    title: "judge compare with baseline",
+    description:
+      "Runs `cargo-judge compare --baseline <path> --format json`: compares the current " +
+      "project state with a saved baseline artifact and reports introduced, resolved and " +
+      "unchanged findings plus the verdict. Read-only.",
+    inputSchema: {
+      workspace_root: workspaceRootField,
+      baseline: z.string().describe("Path to a saved baseline artifact."),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  },
+  async ({ workspace_root, baseline }) =>
+    callJudge(["compare", "--baseline", baseline, "--format", "json"], workspace_root),
+);
+
+// ---------------------------------------------------------------------------
+// save_baseline -> the only tool that writes into the analyzed workspace
+// ---------------------------------------------------------------------------
+server.registerTool(
+  "save_baseline",
+  {
+    title: "judge save baseline",
+    description:
+      "Saves the current findings as the baseline (`--save-baseline`). WRITES a baseline " +
+      "file under `.judge/` in the analyzed workspace, replacing an earlier baseline of " +
+      "the same scope. `scope` picks the baseline: `all` (bare run), `health`, `dupes` or " +
+      "`dead-code`.",
+    inputSchema: {
+      workspace_root: workspaceRootField,
+      scope: z.enum(["all", "health", "dupes", "dead-code"]).describe("Which baseline to save."),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  },
+  async ({ workspace_root, scope }) => {
+    const args: string[] = scope === "all" ? [] : [scope];
+    args.push("--save-baseline", "--format", "json");
     return callJudge(args, workspace_root);
   },
 );

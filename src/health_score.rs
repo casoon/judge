@@ -880,7 +880,6 @@ mod tests {
         ];
         let baseline = Baseline::new(
             &findings,
-            "abc123".to_string(),
             std::collections::HashMap::new(),
             1000,
             ScoreContext::from_profiles(&profiles),
@@ -899,7 +898,6 @@ mod tests {
         let findings = vec![finding(Severity::Fail, "/repo/src/lib.rs")];
         let baseline = Baseline::new(
             &findings,
-            "abc123".to_string(),
             std::collections::HashMap::new(),
             1000,
             ScoreContext::from_profiles(&[]),
@@ -935,7 +933,6 @@ mod tests {
         let findings = vec![finding(Severity::Warn, "/repo/src/lib.rs"), heuristic];
         let baseline = Baseline::new(
             &findings,
-            "abc123".to_string(),
             std::collections::HashMap::new(),
             1000,
             ScoreContext::from_profiles(&[]),
@@ -954,7 +951,6 @@ mod tests {
         let findings = vec![finding(Severity::Warn, "/repo/src/lib.rs")];
         let mut baseline = Baseline::new(
             &findings,
-            "abc123".to_string(),
             std::collections::HashMap::new(),
             1000,
             ScoreContext::from_profiles(&[]),
@@ -981,7 +977,6 @@ mod tests {
         let findings = vec![finding(Severity::Warn, "/repo/src/lib.rs")];
         let mut baseline = Baseline::new(
             &findings,
-            "abc123".to_string(),
             std::collections::HashMap::new(),
             1000,
             ScoreContext::from_profiles(&[]),

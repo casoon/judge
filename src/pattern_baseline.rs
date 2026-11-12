@@ -9,15 +9,8 @@
 //! "which pattern candidates are new since last time, and which disappeared"
 //! — advisory information, never a pass/fail outcome.
 //!
-//! Unlike [`crate::baseline::Delta`], there is no `code_introduced` /
-//! `rule_introduced` split here. That split exists for `Finding` baselines
-//! because a rule-logic change silently reclassifying old code as a new
-//! finding could otherwise fail a delta verdict for a change the diff never
-//! touched (todo.md §5 "Regelversions-Schutz") — the stakes are a false CI
-//! failure. Pattern candidates never gate anything, so a detector-logic
-//! change relabeling a candidate as "new" has no CI-breaking consequence: at
-//! worst it's a heuristic suggestion resurfacing. A flat new/resolved/
-//! unchanged split is honest and sufficient here.
+//! Pattern candidates never gate anything, so a flat new/resolved/unchanged split is
+//! sufficient here.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -134,8 +127,7 @@ pub fn load(path: &Path) -> Result<PatternBaseline, PatternBaselineError> {
 }
 
 /// The result of comparing a fresh set of pattern candidates against a
-/// [`PatternBaseline`] — a flat three-way split (see this module's docs for
-/// why there is no `code_introduced`/`rule_introduced` distinction here).
+/// [`PatternBaseline`] — a flat three-way split.
 #[derive(Debug, Clone, Serialize)]
 pub struct PatternDelta {
     /// Candidates not present in the baseline.

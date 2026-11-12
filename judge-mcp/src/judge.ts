@@ -7,6 +7,9 @@ import { join } from "node:path";
 /** Path to the `cargo-judge` binary. judge-mcp never installs or builds it. */
 const JUDGE_BINARY = process.env.JUDGE_BINARY ?? "cargo-judge";
 
+/** Longest a single cargo-judge run may take, in milliseconds. */
+const JUDGE_TIMEOUT_MS = Number(process.env.JUDGE_TIMEOUT_MS) || 10 * 60 * 1000;
+
 export interface JudgeRunOptions {
   /** CLI arguments after the binary name, e.g. ["health", "--format", "json"]. */
   args: string[];
@@ -32,6 +35,12 @@ function runJudgeProcess({ args, cwd }: JudgeRunOptions): Promise<JudgeRunResult
       stdio: ["ignore", "pipe", "pipe"],
     });
 
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, JUDGE_TIMEOUT_MS);
+
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => {
@@ -42,6 +51,7 @@ function runJudgeProcess({ args, cwd }: JudgeRunOptions): Promise<JudgeRunResult
     });
 
     child.on("error", (err: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
       if (err.code === "ENOENT") {
         reject(
           new JudgeExecutionError(
@@ -57,6 +67,16 @@ function runJudgeProcess({ args, cwd }: JudgeRunOptions): Promise<JudgeRunResult
     });
 
     child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(
+          new JudgeExecutionError(
+            `'${JUDGE_BINARY}' did not finish within ${JUDGE_TIMEOUT_MS} ms and was killed. ` +
+              `Raise JUDGE_TIMEOUT_MS for larger workspaces.`,
+          ),
+        );
+        return;
+      }
       if (signal) {
         reject(new JudgeExecutionError(`'${JUDGE_BINARY}' was terminated by signal ${signal}`));
         return;

@@ -190,7 +190,6 @@ pub(crate) fn handle_baseline_with_trend(
         let config = load_judge_toml(workspace_root)?;
         let mut baseline = judge::baseline::Baseline::new(
             &findings,
-            String::new(),
             rule_revisions,
             total_loc,
             judge::health_score::ScoreContext::from_profiles(&config.crate_profiles),
@@ -215,12 +214,7 @@ pub(crate) fn handle_baseline_with_trend(
     };
     let mut baseline = judge::baseline::load(path)?;
     baseline.relativize_paths(workspace_root);
-    let delta = judge::baseline::diff(
-        &findings,
-        &baseline,
-        &std::collections::HashSet::new(),
-        &rule_revisions,
-    );
+    let delta = judge::baseline::diff(&findings, &baseline);
     let verdict = delta.verdict();
     match format {
         OutputFormat::Json => {
@@ -323,8 +317,7 @@ fn print_delta(
 /// TTY rendering of a [`judge::pattern_baseline::PatternDelta`] — the
 /// pattern-candidate analog of [`print_delta`], but without a verdict line
 /// (pattern candidates never gate — see `judge::pattern_baseline`'s module
-/// docs) and without the `code_introduced`/`rule_introduced` split (patterns
-/// use a flat new/resolved/unchanged classification instead).
+/// docs); patterns use a flat new/resolved/unchanged classification.
 pub(crate) fn print_pattern_delta_tty(
     out: &mut dyn Write,
     delta: &judge::pattern_baseline::PatternDelta,

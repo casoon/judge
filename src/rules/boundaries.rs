@@ -1329,42 +1329,81 @@ fn module_boundary_finding(
     }
 }
 
-/// Finds every simple cycle in the whole `graph` (not scoped to any one rule).
-/// Each DFS is rooted at the lexicographically smallest node permitted in that
-/// traversal, so rotations of the same directed cycle are produced once.
+/// Upper bound on the cycles [`find_cycles`] returns. The number of simple
+/// cycles can grow exponentially with graph density; real crate and feature
+/// graphs stay far below this, and a graph above it is already reported as
+/// cyclic many times over.
+const MAX_REPORTED_CYCLES: usize = 1000;
+
+/// Finds every simple cycle in the whole `graph` (not scoped to any one rule),
+/// up to [`MAX_REPORTED_CYCLES`]. Each DFS is rooted at the lexicographically
+/// smallest node permitted in that traversal, so rotations of the same
+/// directed cycle are produced once. The DFS only enters nodes that can still
+/// reach the root, so dead-end branches are never explored.
 pub fn find_cycles(graph: &CrateGraph) -> Vec<Vec<String>> {
     let mut node_names: Vec<String> = graph.edges.keys().cloned().collect();
     node_names.sort();
 
-    fn visit_from(
-        start: &str,
-        current: &str,
-        graph: &CrateGraph,
-        visited: &mut HashSet<String>,
-        path: &mut Vec<String>,
-        cycles: &mut HashSet<Vec<String>>,
-    ) {
-        if let Some(neighbors) = graph.edges.get(current) {
-            for neighbor in neighbors {
-                if neighbor == start {
-                    let mut cycle = path.clone();
-                    cycle.push(start.to_string());
-                    cycles.insert(cycle);
-                } else if neighbor.as_str() >= start && visited.insert(neighbor.clone()) {
-                    path.push(neighbor.clone());
-                    visit_from(start, neighbor, graph, visited, path, cycles);
-                    path.pop();
-                    visited.remove(neighbor);
-                }
+    let mut reverse: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (from, targets) in &graph.edges {
+        for to in targets {
+            reverse.entry(to.as_str()).or_default().push(from.as_str());
+        }
+    }
+
+    struct Search<'a> {
+        graph: &'a CrateGraph,
+        start: &'a str,
+        reaches_start: HashSet<&'a str>,
+        visited: HashSet<String>,
+        path: Vec<String>,
+        cycles: &'a mut HashSet<Vec<String>>,
+    }
+
+    fn visit(search: &mut Search<'_>, current: &str) {
+        let Some(neighbors) = search.graph.edges.get(current) else {
+            return;
+        };
+        for neighbor in neighbors {
+            if search.cycles.len() >= MAX_REPORTED_CYCLES {
+                return;
+            }
+            if neighbor == search.start {
+                let mut cycle = search.path.clone();
+                cycle.push(search.start.to_string());
+                search.cycles.insert(cycle);
+            } else if search.reaches_start.contains(neighbor.as_str())
+                && search.visited.insert(neighbor.clone())
+            {
+                search.path.push(neighbor.clone());
+                visit(search, neighbor);
+                search.path.pop();
+                search.visited.remove(neighbor);
             }
         }
     }
 
     let mut found = HashSet::new();
     for start in &node_names {
-        let mut visited = HashSet::from([start.clone()]);
-        let mut path = vec![start.clone()];
-        visit_from(start, start, graph, &mut visited, &mut path, &mut found);
+        // Nodes (>= start) from which `start` is reachable.
+        let mut reaches_start: HashSet<&str> = HashSet::new();
+        let mut queue = vec![start.as_str()];
+        while let Some(node) = queue.pop() {
+            for &pred in reverse.get(node).map_or(&[][..], Vec::as_slice) {
+                if pred >= start.as_str() && reaches_start.insert(pred) {
+                    queue.push(pred);
+                }
+            }
+        }
+        let mut search = Search {
+            graph,
+            start,
+            reaches_start,
+            visited: HashSet::from([start.clone()]),
+            path: vec![start.clone()],
+            cycles: &mut found,
+        };
+        visit(&mut search, start);
     }
 
     let mut cycles: Vec<Vec<String>> = found.into_iter().collect();
@@ -1847,6 +1886,22 @@ mod tests {
                 "a".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn find_cycles_stops_at_the_cap_on_a_dense_graph() {
+        let names: Vec<String> = (0..14).map(|i| format!("n{i:02}")).collect();
+        let edges = names
+            .iter()
+            .map(|from| {
+                let targets = names.iter().filter(|to| *to != from).cloned().collect();
+                (from.clone(), targets)
+            })
+            .collect();
+
+        let cycles = find_cycles(&CrateGraph { edges });
+
+        assert_eq!(cycles.len(), MAX_REPORTED_CYCLES);
     }
 
     #[test]

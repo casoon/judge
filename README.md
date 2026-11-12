@@ -150,7 +150,8 @@ cargo judge dead-code          # Deep Tier — binary must be built with --featu
 writes a flushed JSON Lines event stream to `PATH`; JSON reports are written
 to `.judge/judge.json` by default (or `--output PATH`), while TTY/SARIF stay
 on stdout. Each record has `schema_version`, `sequence`,
-`event` (`phase_started`/`phase_completed`), and `phase`; it reports analysis
+`event` (`phase_started`/`phase_completed`, and a final `run_completed` or `run_failed` with
+phase `run`), and `phase`; it reports analysis
 lifecycle only, never provisional findings.
 
 The normal `cargo judge` terminal view is deliberately compact: it groups

@@ -66,7 +66,6 @@ pub struct Baseline {
 impl Baseline {
     pub fn new(
         findings: &[Finding],
-        _legacy_commit: String,
         rule_revisions: HashMap<String, u32>,
         total_loc: usize,
         score_context: ScoreContext,
@@ -345,13 +344,6 @@ pub struct Delta {
     pub severity_changed: Vec<SeverityChange>,
     /// Findings present in both the baseline and the current run.
     pub unchanged_count: usize,
-    /// Backwards-compatible in-memory aliases for callers that have not yet
-    /// moved from commit terminology. They are intentionally absent from the
-    /// artifact schema and contain no Git-derived classification.
-    #[serde(skip)]
-    pub code_introduced: Vec<Finding>,
-    #[serde(skip)]
-    pub rule_introduced: Vec<Finding>,
 }
 
 /// One stable finding whose severity changed between two analysed states.
@@ -382,15 +374,9 @@ where
         .partition(|finding| finding.is_gating())
 }
 
-/// Compares `current` findings against a recorded project state. The legacy
-/// arguments are retained temporarily for source compatibility but are
-/// deliberately ignored: comparison is wholly artifact-based.
-pub fn diff(
-    current: &[Finding],
-    baseline: &Baseline,
-    _touched_files: &HashSet<PathBuf>,
-    _current_rule_revisions: &HashMap<String, u32>,
-) -> Delta {
+/// Compares `current` findings against a recorded project state; the
+/// comparison is wholly artifact-based.
+pub fn diff(current: &[Finding], baseline: &Baseline) -> Delta {
     let known = baseline
         .findings
         .iter()
@@ -454,8 +440,6 @@ pub fn diff(
         .collect();
 
     Delta {
-        code_introduced: introduced.clone(),
-        rule_introduced: Vec::new(),
         introduced,
         resolved,
         severity_changed,
@@ -482,18 +466,6 @@ impl Verdict {
     }
 }
 
-/// A three-way verdict distinguishing `Warn` from `Fail` among
-/// `code_introduced` findings, instead of collapsing both into `Fail` like
-/// [`Delta::verdict`] does. It is retained for API consumers that need to
-/// distinguish warning-only deltas from failing deltas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TriVerdict {
-    Pass,
-    Warn,
-    Fail,
-}
-
 impl Delta {
     /// Only actionable (`Warn`/`Fail`) *gating* introduced findings can
     /// fail the verdict. `Info` findings remain visible in the delta but are
@@ -510,25 +482,6 @@ impl Delta {
             Verdict::Pass
         } else {
             Verdict::Fail
-        }
-    }
-
-    /// Like [`Delta::verdict`], but keeps `Warn` and `Fail` distinct instead
-    /// of collapsing both into `Fail` (see [`TriVerdict`]). Applies the same
-    /// advisory carve-out: heuristic findings never force `Warn`/`Fail`.
-    pub fn tri_verdict(&self) -> TriVerdict {
-        let mut has_warn = false;
-        for finding in self.introduced.iter().filter(|f| f.is_gating()) {
-            match finding.severity {
-                crate::finding::Severity::Fail => return TriVerdict::Fail,
-                crate::finding::Severity::Warn => has_warn = true,
-                crate::finding::Severity::Info => {}
-            }
-        }
-        if has_warn {
-            TriVerdict::Warn
-        } else {
-            TriVerdict::Pass
         }
     }
 }
@@ -560,15 +513,10 @@ mod tests {
     fn baseline_with(findings: &[Finding]) -> Baseline {
         Baseline::new(
             findings,
-            "abc123".to_string(),
             HashMap::from([("duplicate-code".to_string(), 1)]),
             1000,
             ScoreContext::from_profiles(&[]),
         )
-    }
-
-    fn current_revisions() -> HashMap<String, u32> {
-        HashMap::from([("duplicate-code".to_string(), 1)])
     }
 
     /// Regression: an edit above a finding shifts the line/column embedded in
@@ -578,7 +526,7 @@ mod tests {
         let baseline = baseline_with(&[finding("swallowed-result:src/a.rs:3:5", "src/a.rs")]);
         let moved = finding("swallowed-result:src/a.rs:4:5", "src/a.rs");
 
-        let delta = diff(&[moved], &baseline, &HashSet::new(), &current_revisions());
+        let delta = diff(&[moved], &baseline);
 
         assert!(delta.introduced.is_empty());
         assert!(delta.resolved.is_empty());
@@ -593,7 +541,7 @@ mod tests {
             finding("swallowed-result:src/a.rs:9:5", "src/a.rs"),
         ];
 
-        let delta = diff(&current, &baseline, &HashSet::new(), &current_revisions());
+        let delta = diff(&current, &baseline);
 
         assert_eq!(delta.introduced.len(), 1);
         assert_eq!(delta.unchanged_count, 1);
@@ -796,25 +744,10 @@ mod tests {
         let baseline = baseline_with(&[finding("a", "src/a.rs")]);
         let current = [finding("a", "src/a.rs")];
 
-        let delta = diff(&current, &baseline, &HashSet::new(), &current_revisions());
+        let delta = diff(&current, &baseline);
 
         assert_eq!(delta.unchanged_count, 1);
-        assert!(delta.code_introduced.is_empty());
-        assert!(delta.rule_introduced.is_empty());
         assert_eq!(delta.verdict(), Verdict::Pass);
-    }
-
-    #[test]
-    fn new_finding_in_a_touched_file_is_code_introduced() {
-        let baseline = baseline_with(&[]);
-        let current = [finding("new", "src/a.rs")];
-        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
-
-        let delta = diff(&current, &baseline, &touched, &current_revisions());
-
-        assert_eq!(delta.code_introduced.len(), 1);
-        assert!(delta.rule_introduced.is_empty());
-        assert_eq!(delta.verdict(), Verdict::Fail);
     }
 
     #[test]
@@ -822,12 +755,9 @@ mod tests {
         let baseline = baseline_with(&[]);
         let current = [finding("new", "src/a.rs")];
 
-        let mut revised = current_revisions();
-        revised.insert("duplicate-code".to_string(), 2);
-        let delta = diff(&current, &baseline, &HashSet::new(), &revised);
+        let delta = diff(&current, &baseline);
 
         assert_eq!(delta.introduced.len(), 1);
-        assert!(delta.rule_introduced.is_empty());
         assert_eq!(delta.verdict(), Verdict::Fail);
     }
 
@@ -835,90 +765,38 @@ mod tests {
     fn finding_missing_from_the_current_run_is_resolved() {
         let baseline = baseline_with(&[finding("gone", "src/a.rs")]);
 
-        let delta = diff(&[], &baseline, &HashSet::new(), &current_revisions());
+        let delta = diff(&[], &baseline);
 
         assert_eq!(delta.resolved.len(), 1);
         assert_eq!(delta.resolved[0].id, "gone");
     }
 
     #[test]
-    fn new_finding_without_a_rule_change_fails_even_in_an_untouched_file() {
-        let baseline = baseline_with(&[]);
-        let current = [finding("new", "src/a.rs")];
-
-        let delta = diff(&current, &baseline, &HashSet::new(), &current_revisions());
-
-        assert_eq!(delta.code_introduced.len(), 1);
-        assert!(delta.rule_introduced.is_empty());
-        assert_eq!(delta.verdict(), Verdict::Fail);
-    }
-
-    #[test]
-    fn changed_rule_keeps_an_identical_finding_unchanged() {
-        let baseline = baseline_with(&[finding("known", "src/a.rs")]);
-        let current = [finding("known", "src/a.rs")];
-        let revised = HashMap::from([("duplicate-code".to_string(), 2)]);
-
-        let delta = diff(&current, &baseline, &HashSet::new(), &revised);
-
-        assert_eq!(delta.unchanged_count, 1);
-        assert!(delta.rule_introduced.is_empty());
-    }
-
-    #[test]
-    fn informational_code_finding_does_not_fail_the_verdict() {
+    fn informational_finding_does_not_fail_the_verdict() {
         let baseline = baseline_with(&[]);
         let mut info = finding("info", "src/a.rs");
         info.severity = Severity::Info;
-        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
 
-        let delta = diff(&[info], &baseline, &touched, &current_revisions());
+        let delta = diff(&[info], &baseline);
 
-        assert_eq!(delta.code_introduced.len(), 1);
+        assert_eq!(delta.introduced.len(), 1);
         assert_eq!(delta.verdict(), Verdict::Pass);
     }
 
     #[test]
-    fn tri_verdict_is_warn_for_warn_only_code_introduced_findings() {
-        let baseline = baseline_with(&[]);
-        let current = [finding("new", "src/a.rs")];
-        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
-
-        let delta = diff(&current, &baseline, &touched, &current_revisions());
-
-        assert_eq!(delta.tri_verdict(), TriVerdict::Warn);
-    }
-
-    #[test]
-    fn tri_verdict_is_fail_when_any_code_introduced_finding_fails() {
-        let baseline = baseline_with(&[]);
-        let mut fail = finding("fail", "src/a.rs");
-        fail.severity = Severity::Fail;
-        let warn = finding("warn", "src/a.rs");
-        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
-
-        let delta = diff(&[fail, warn], &baseline, &touched, &current_revisions());
-
-        assert_eq!(delta.tri_verdict(), TriVerdict::Fail);
-    }
-
-    #[test]
-    fn heuristic_code_introduced_findings_are_advisory_and_do_not_fail() {
-        // A new heuristic finding in a touched file still classifies as
-        // code-introduced (it stays visible in the delta), but it can't
+    fn heuristic_introduced_findings_are_advisory_and_do_not_fail() {
+        // A new heuristic finding stays visible in the delta, but it can't
         // gate: heuristics are advisory by default (todo.md §17.2, §17.5).
         let baseline = baseline_with(&[]);
         let mut heuristic_fail = finding("hotspot:src/a.rs", "src/a.rs");
         heuristic_fail.rule = "hotspot".into();
         heuristic_fail.severity = Severity::Fail;
         heuristic_fail.evidence_class = EvidenceClass::Heuristic;
-        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
 
-        let delta = diff(&[heuristic_fail], &baseline, &touched, &current_revisions());
+        let delta = diff(&[heuristic_fail], &baseline);
 
-        assert_eq!(delta.code_introduced.len(), 1);
+        assert_eq!(delta.introduced.len(), 1);
         assert_eq!(delta.verdict(), Verdict::Pass);
-        assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
     }
 
     #[test]
@@ -929,32 +807,9 @@ mod tests {
         let mut heuristic = finding("hotspot:src/a.rs", "src/a.rs");
         heuristic.rule = "hotspot".into();
         heuristic.evidence_class = EvidenceClass::Heuristic;
-        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
 
-        let delta = diff(
-            &[derived_fail, heuristic],
-            &baseline,
-            &touched,
-            &current_revisions(),
-        );
+        let delta = diff(&[derived_fail, heuristic], &baseline);
 
         assert_eq!(delta.verdict(), Verdict::Fail);
-        assert_eq!(delta.tri_verdict(), TriVerdict::Fail);
-    }
-
-    #[test]
-    fn tri_verdict_is_pass_for_empty_or_info_only_code_introduced_findings() {
-        let baseline = baseline_with(&[]);
-        assert_eq!(
-            diff(&[], &baseline, &HashSet::new(), &current_revisions()).tri_verdict(),
-            TriVerdict::Pass
-        );
-
-        let mut info = finding("info", "src/a.rs");
-        info.severity = Severity::Info;
-        let touched = HashSet::from([PathBuf::from("src/a.rs")]);
-        let delta = diff(&[info], &baseline, &touched, &current_revisions());
-
-        assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
     }
 }

@@ -4,8 +4,6 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, ValueEnum};
 use judge::AnalysisTier;
-#[cfg(test)]
-use judge::baseline::TriVerdict;
 use judge::baseline::Verdict;
 use judge::finding::{Finding, Report};
 use judge::rules::duplication::DupeMode;
@@ -1644,7 +1642,7 @@ mod tests {
 
     /// A pair of duplicated function bodies (well over
     /// `judge::rules::duplication::DEFAULT_MIN_TOKENS`), both in one new file — a
-    /// self-contained `code_introduced` duplication finding once that file
+    /// self-contained introduced duplication finding once that file
     /// is committed.
     const DUPE_FILE_CONTENT: &str = r#"
 fn dup_one(x: i32) -> i32 {
@@ -2882,7 +2880,6 @@ fn dup_two(x: i32) -> i32 {
         write_fixture_crate(&dir);
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "initial"]);
-        let base_commit = commit_sha(&dir, "HEAD");
 
         let manifest = dir.join("Cargo.toml");
         let workspace = judge::ingest::load(Some(&manifest)).unwrap();
@@ -2890,7 +2887,6 @@ fn dup_two(x: i32) -> i32 {
         assert!(baseline_collected.analysis_errors.is_empty());
         let baseline = judge::baseline::Baseline::new(
             &baseline_collected.findings,
-            base_commit.clone(),
             baseline_collected.rule_revisions,
             judge::health_score::total_authored_loc(&workspace),
             judge::health_score::ScoreContext::from_profiles(&[]),
@@ -2909,12 +2905,7 @@ fn dup_two(x: i32) -> i32 {
         assert!(collected.analysis_errors.is_empty());
         judge::finding::relativize_paths(&mut collected.findings, &workspace.root);
 
-        let delta = judge::baseline::diff(
-            &collected.findings,
-            &baseline,
-            &std::collections::HashSet::new(),
-            &collected.rule_revisions,
-        );
+        let delta = judge::baseline::diff(&collected.findings, &baseline);
 
         let dupe_introduced: Vec<_> = delta
             .introduced
@@ -2926,7 +2917,6 @@ fn dup_two(x: i32) -> i32 {
             assert_eq!(finding.location.file, PathBuf::from("src/dupe.rs"));
             assert_eq!(finding.severity, judge::finding::Severity::Warn);
         }
-        assert_eq!(delta.tri_verdict(), TriVerdict::Warn);
     }
 
     /// Artifact comparisons retain an identical finding even when the rule
@@ -2938,7 +2928,6 @@ fn dup_two(x: i32) -> i32 {
         write_fixture_crate(&dir);
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "initial"]);
-        let base_commit = commit_sha(&dir, "HEAD");
 
         // Second commit touches an unrelated file only — `src/lib.rs` (the
         // file the simulated pre-existing finding lives in) is untouched.
@@ -2961,7 +2950,6 @@ fn dup_two(x: i32) -> i32 {
         );
         let baseline = judge::baseline::Baseline::new(
             std::slice::from_ref(&pre_existing),
-            base_commit,
             std::collections::HashMap::from([(
                 judge::rules::duplication::DUPLICATE_RULE.to_string(),
                 1,
@@ -2969,22 +2957,10 @@ fn dup_two(x: i32) -> i32 {
             0,
             judge::health_score::ScoreContext::from_profiles(&[]),
         );
-        let bumped_revisions = std::collections::HashMap::from([(
-            judge::rules::duplication::DUPLICATE_RULE.to_string(),
-            2,
-        )]);
-
-        let delta = judge::baseline::diff(
-            &[pre_existing],
-            &baseline,
-            &std::collections::HashSet::new(),
-            &bumped_revisions,
-        );
+        let delta = judge::baseline::diff(&[pre_existing], &baseline);
 
         assert_eq!(delta.unchanged_count, 1);
         assert!(delta.introduced.is_empty());
-        assert!(delta.rule_introduced.is_empty());
-        assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
     }
 
     /// Tests todo.md §17.2/§17.5's advisory default at the wiring level: a
@@ -3000,7 +2976,6 @@ fn dup_two(x: i32) -> i32 {
         write_fixture_crate(&dir);
         git(&dir, &["add", "."]);
         git(&dir, &["commit", "-q", "-m", "initial"]);
-        let base_commit = commit_sha(&dir, "HEAD");
 
         let manifest = dir.join("Cargo.toml");
         let workspace = judge::ingest::load(Some(&manifest)).unwrap();
@@ -3008,7 +2983,6 @@ fn dup_two(x: i32) -> i32 {
         assert!(baseline_collected.analysis_errors.is_empty());
         let baseline = judge::baseline::Baseline::new(
             &baseline_collected.findings,
-            base_commit.clone(),
             baseline_collected.rule_revisions,
             judge::health_score::total_authored_loc(&workspace),
             judge::health_score::ScoreContext::from_profiles(&[]),
@@ -3058,14 +3032,8 @@ fn dup_two(x: i32) -> i32 {
 
         // (c) Newly introduced heuristic findings stay visible in the delta
         // but never break the verdict.
-        let delta = judge::baseline::diff(
-            &collected.findings,
-            &baseline,
-            &std::collections::HashSet::new(),
-            &collected.rule_revisions,
-        );
+        let delta = judge::baseline::diff(&collected.findings, &baseline);
         assert!(!delta.introduced.is_empty());
-        assert_eq!(delta.tri_verdict(), TriVerdict::Pass);
 
         // (a) The score takes no deductions from advisory findings, and the
         // report envelope records them as advisory.
@@ -3483,6 +3451,9 @@ fn dup_two(x: i32) -> i32 {
         assert_eq!(records[0]["schema_version"], 1);
         assert_eq!(records[0]["event"], "phase_started");
         assert!(records.iter().all(|record| record["phase"].is_string()));
+        let last = records.last().unwrap();
+        assert_eq!(last["event"], "run_completed");
+        assert_eq!(last["phase"], "run");
 
         let error = run(
             Cli {

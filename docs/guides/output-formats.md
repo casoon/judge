@@ -61,6 +61,7 @@ cargo judge --progress judge-progress.jsonl
 ```
 
 For the bare combined run, `--progress PATH` writes a flushed JSON Lines stream. Each record has
-`schema_version`, `sequence`, `event` (`phase_started` or `phase_completed`) and `phase`. It
+`schema_version`, `sequence`, `event` (`phase_started`, `phase_completed`, and a final `run_completed` or `run_failed` with phase
+`run`) and `phase`. It
 reports the analysis lifecycle only, never provisional findings, so an agent can follow a long
 run.
