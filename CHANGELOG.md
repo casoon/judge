@@ -21,7 +21,7 @@ versions were published on crates.io.
 
 ### Changed
 
-- **Pages:** the project site uses the current shared theme (0.12.12).
+- **Pages:** the project site uses the current shared theme (0.12.14).
 - **`dead-code` (deep tier):** the command loads rust-analyzer once for `dead-code`,
   `dead-trait-impl` and the structural checks instead of three times.
 - **Library API:** `dead_code`, `dead_trait_impl` and `slop_structural_deep` gain
