@@ -8,6 +8,7 @@ versions were published on crates.io.
 
 ### Added
 
+- **`--renderreport`:** the bare `cargo judge` run prints its review report as a request for [renderreport](https://github.com/casoon/renderreport) instead of text (`cargo judge --renderreport | renderreport render - -o judge.pdf`). Same sections as `--format markdown`; judge itself gets no new dependency.
 - **SARIF:** every result carries a position-independent `partialFingerprints` entry, so code
   scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear
   as tool notifications and mark the invocation as unsuccessful.

@@ -82,6 +82,11 @@ struct Cli {
     /// only on a terminal and honours `NO_COLOR`; use `always` to force it.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
     color: ColorChoice,
+    /// Print the bare combined report as a request for `renderreport render`
+    /// instead of text, to make a PDF: `cargo judge --renderreport |
+    /// renderreport render - -o judge.pdf`. Same content as `--format markdown`.
+    #[arg(long)]
+    renderreport: bool,
     /// Write the artifact to this path. With `--format json`, the default is
     /// `.judge/<command>.json`; with the bare `cargo judge --format
     /// markdown`, the default is `.judge/judge.md`. This option selects a
@@ -674,6 +679,11 @@ fn main() -> ExitCode {
 /// [`main`] translates the result into a process exit code.
 fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
     match cli.command {
+        None if cli.renderreport && !matches!(cli.baseline_args.format, OutputFormat::Tty) => {
+            Err(CliError::Config(
+                "--renderreport replaces --format; use it without --format".to_string(),
+            ))
+        }
         None => commands::combined::run(
             commands::combined::CombinedOptions {
                 format: cli.baseline_args.format,
@@ -682,6 +692,7 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
                 progress_path: cli.progress.as_deref(),
                 details: cli.details,
                 color: cli.color.is_enabled(),
+                renderreport: cli.renderreport,
             },
             out,
         ),
@@ -695,6 +706,12 @@ fn run(cli: Cli, out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
             if cli.details {
                 return Err(CliError::Config(
                     "--details is available only for the bare `cargo judge` combined run"
+                        .to_string(),
+                ));
+            }
+            if cli.renderreport {
+                return Err(CliError::Config(
+                    "--renderreport is available only for the bare `cargo judge` combined run"
                         .to_string(),
                 ));
             }
@@ -1713,6 +1730,7 @@ fn dup_two(x: i32) -> i32 {
             baseline_args: baseline_args(OutputFormat::Tty, false, None),
             progress: None,
             details: false,
+            renderreport: false,
             color: ColorChoice::Auto,
             output: None,
         }
@@ -1758,6 +1776,7 @@ fn dup_two(x: i32) -> i32 {
             baseline_args: baseline_args(OutputFormat::Tty, save_baseline, baseline),
             progress: None,
             details: false,
+            renderreport: false,
             color: ColorChoice::Auto,
             output: None,
         }
@@ -3435,6 +3454,7 @@ fn dup_two(x: i32) -> i32 {
             baseline_args: baseline_args(OutputFormat::Tty, false, None),
             progress: None,
             details: false,
+            renderreport: false,
             color: ColorChoice::Auto,
             output: None,
         };
@@ -3485,6 +3505,7 @@ fn dup_two(x: i32) -> i32 {
                 baseline_args: baseline_args(OutputFormat::Tty, false, None),
                 progress: Some(PathBuf::from("not-allowed.jsonl")),
                 details: false,
+                renderreport: false,
                 color: ColorChoice::Auto,
                 output: None,
             },

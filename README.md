@@ -127,6 +127,7 @@ cargo judge                    # compact, structured combined triage report
 cargo judge --color always     # force terminal colors (even with NO_COLOR set)
 cargo judge --details          # every combined finding and source location
 cargo judge --format markdown  # review report, written to .judge/judge.md
+cargo judge --renderreport | renderreport render - -o judge.pdf  # the same report as a PDF (needs renderreport)
 cargo judge inspect            # crates, entry points, detected tiers
 cargo judge structure          # current workspace architecture
 cargo judge complexity         # measured complexity concentrations

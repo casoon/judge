@@ -240,6 +240,89 @@ impl<'a> Report<'a> {
     }
 }
 
+impl Report<'_> {
+    /// Renders the shared model as a request for `renderreport render`
+    /// (a PDF): the same sections and the same per-rule grouping as
+    /// [`Report::write_markdown`], as components.
+    pub fn write_renderreport(&self, workspace_root: &Path) -> String {
+        use serde_json::json;
+        let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let list = |title: String, items: Vec<String>| {
+            let items: Vec<_> = items.into_iter().map(|c| json!({ "content": c })).collect();
+            json!({ "type": "list", "data": { "title": title, "items": items } })
+        };
+        let (title, status) = self
+            .status_lines
+            .split_first()
+            .map_or(("judge", &[][..]), |(first, rest)| (first.as_str(), rest));
+        let mut components = Vec::new();
+        if !status.is_empty() {
+            components
+                .push(json!({ "type": "section", "data": { "title": "Status", "level": 1 } }));
+            components.push(list(
+                "Result".to_owned(),
+                status.iter().map(|line| collapse(line)).collect(),
+            ));
+        }
+        for note in &self.scope_notes {
+            components.push(list(
+                note.heading.clone(),
+                note.items.iter().map(|item| item.to_string()).collect(),
+            ));
+        }
+        for group in self.groups.iter().filter(|g| !g.findings.is_empty()) {
+            let groups = rule_groups(&group.findings);
+            let rows: Vec<_> = groups
+                .iter()
+                .take(RULE_SUMMARY_LIMIT)
+                .map(|(rule, count, example)| {
+                    json!([
+                        rule.to_string(),
+                        count.to_string(),
+                        format!(
+                            "{}:{} ({})",
+                            display_workspace_path(workspace_root, &example.location.file),
+                            example.location.line,
+                            display_item_path(workspace_root, &example.location.item_path)
+                        )
+                    ])
+                })
+                .collect();
+            components.push(json!({ "type": "section", "data": {
+                "title": format!("{}: {}", group.heading, group.findings.len()), "level": 1 } }));
+            components.push(json!({ "type": "audit-table", "data": {
+                "columns": [
+                    { "header": "Rule" },
+                    { "header": "Count", "align": "right" },
+                    { "header": "Representative location" } ],
+                "rows": rows } }));
+            if groups.len() > RULE_SUMMARY_LIMIT {
+                components.push(json!({ "type": "callout", "data": {
+                    "variant": "info",
+                    "content": format!("… {} more rule families{}", groups.len() - RULE_SUMMARY_LIMIT,
+                        if group.advisory { " (advisory)" } else { "" }) } }));
+            }
+        }
+        if !self.next_steps.is_empty() {
+            components
+                .push(json!({ "type": "section", "data": { "title": "Next steps", "level": 1 } }));
+            components.push(list(
+                "Next steps".to_owned(),
+                self.next_steps.iter().map(|step| collapse(step)).collect(),
+            ));
+        }
+        let mut out = serde_json::to_string_pretty(&json!({
+            "template_id": "default",
+            "title": title,
+            "metadata": { "author": "judge", "lang": "en" },
+            "components": components,
+        }))
+        .expect("serialisable");
+        out.push('\n');
+        out
+    }
+}
+
 /// Renders a focused, current-state command with Runemark's standard terminal
 /// conventions. JSON and SARIF remain the exhaustive machine contracts; this
 /// is the shared concise human view for commands that return only findings.
@@ -556,6 +639,34 @@ mod tests {
             markdown.contains("## Next steps")
                 && markdown.contains("- cargo judge --details every finding and location"),
             "next steps must render as a concise, collapsed bullet list: {markdown}"
+        );
+    }
+
+    #[test]
+    fn renderreport_carries_the_markdown_sections_as_components() {
+        let a = finding("rule-a", "src/a.rs", 1);
+        let report = Report::new(vec![
+            "Judge summary".to_string(),
+            "  1 evidence-backed findings".to_string(),
+        ])
+        .with_group("Evidence-backed findings", vec![&a], false)
+        .with_next_steps(vec!["cargo judge --details   every finding".to_string()]);
+
+        let request: serde_json::Value =
+            serde_json::from_str(&report.write_renderreport(Path::new("/work"))).unwrap();
+
+        assert_eq!(request["title"], "Judge summary");
+        let components = request["components"].as_array().unwrap();
+        let table = components
+            .iter()
+            .find(|c| c["type"] == "audit-table")
+            .expect("a table per finding group");
+        assert_eq!(table["data"]["rows"][0][0], "rule-a");
+        assert_eq!(table["data"]["rows"][0][1], "1");
+        assert!(
+            request
+                .to_string()
+                .contains("cargo judge --details every finding")
         );
     }
 

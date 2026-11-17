@@ -101,6 +101,7 @@ pub(crate) struct CombinedOptions<'a> {
     pub(crate) progress_path: Option<&'a Path>,
     pub(crate) details: bool,
     pub(crate) color: bool,
+    pub(crate) renderreport: bool,
 }
 
 impl CombinedOptions<'_> {
@@ -114,6 +115,7 @@ impl CombinedOptions<'_> {
             progress_path: None,
             details: false,
             color: false,
+            renderreport: false,
         }
     }
 }
@@ -132,6 +134,7 @@ pub(crate) fn run(
         progress_path,
         details,
         color,
+        renderreport,
     } = options;
     let workspace = judge::ingest::load(None)?;
     let progress_path = progress_path.map(|path| {
@@ -148,7 +151,14 @@ pub(crate) fn run(
 
     let result = run_collected(
         &workspace,
-        (format, save_baseline, baseline, details, color),
+        (
+            format,
+            save_baseline,
+            baseline,
+            details,
+            color,
+            renderreport,
+        ),
         &mut progress,
         out,
     );
@@ -163,11 +173,11 @@ pub(crate) fn run(
     result
 }
 
-type RenderChoices = (OutputFormat, bool, Option<PathBuf>, bool, bool);
+type RenderChoices = (OutputFormat, bool, Option<PathBuf>, bool, bool, bool);
 
 fn run_collected(
     workspace: &judge::ingest::Workspace,
-    (format, save_baseline, baseline, details, color): RenderChoices,
+    (format, save_baseline, baseline, details, color, renderreport): RenderChoices,
     progress: &mut Option<ProgressWriter>,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
@@ -225,6 +235,20 @@ fn run_collected(
             )
             .write_markdown(&workspace.root);
             write!(out, "{markdown}")?;
+        }
+        OutputFormat::Tty if renderreport => {
+            let (gating, advisory) = judge::baseline::partition_gating(&collected.findings);
+            let request = build_report(
+                &gating,
+                &advisory,
+                &collected.analysis_errors,
+                collected.boundary_rules_checked,
+                collected.boundaries_config_path.exists(),
+                collected.suppressed_inline,
+                &workspace.root,
+            )
+            .write_renderreport(&workspace.root);
+            write!(out, "{request}")?;
         }
         OutputFormat::Tty => {
             let (gating, advisory) = judge::baseline::partition_gating(&collected.findings);
