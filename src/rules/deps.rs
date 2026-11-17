@@ -1213,13 +1213,14 @@ pub fn analyze_rustc_unused_dependencies(workspace: &Workspace) -> RustcLintDeps
         .map(|package| (package.name.as_str(), package.id.clone()))
         .collect();
 
-    let messages = match run_cargo_check_with_unused_crate_dependencies_lint(&manifest_path) {
-        Ok(messages) => messages,
-        Err(err) => {
-            errors.push(err);
-            return RustcLintDeps { findings, errors };
-        }
-    };
+    let (messages, stderr) =
+        match run_cargo_check_with_unused_crate_dependencies_lint(&manifest_path) {
+            Ok(output) => output,
+            Err(err) => {
+                errors.push(err);
+                return RustcLintDeps { findings, errors };
+            }
+        };
 
     // Per package, every distinct target compiled (see `target_identity`) —
     // the universe the intersection below runs over.
@@ -1266,6 +1267,20 @@ pub fn analyze_rustc_unused_dependencies(workspace: &Workspace) -> RustcLintDeps
                     .insert(dep_identifier);
             }
             _ => {}
+        }
+    }
+
+    // cargo's own lint is per manifest, so a dependency it reports is unused in
+    // every target of that package: record it for each target seen.
+    for (package, name) in parse_cargo_unused_dependencies(&stderr) {
+        let Some(package_id) = name_to_id.get(package.as_str()) else {
+            continue;
+        };
+        for target in targets_seen.get(package_id).into_iter().flatten() {
+            unused_per_target
+                .entry((package_id.clone(), target.clone()))
+                .or_default()
+                .insert(name.replace('-', "_"));
         }
     }
 
@@ -1355,7 +1370,7 @@ fn extract_unused_crate_name(message: &str) -> Option<String> {
 /// `unused_crate_dependencies` lint".
 fn run_cargo_check_with_unused_crate_dependencies_lint(
     manifest_path: &Path,
-) -> Result<Vec<cargo_metadata::Message>, DepsError> {
+) -> Result<(Vec<cargo_metadata::Message>, String), DepsError> {
     let mut rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     if !rustflags.is_empty() {
         rustflags.push(' ');
@@ -1370,6 +1385,7 @@ fn run_cargo_check_with_unused_crate_dependencies_lint(
         .arg("--manifest-path")
         .arg(manifest_path)
         .env("RUSTFLAGS", rustflags)
+        .env("CARGO_TERM_COLOR", "never")
         .output()
         .map_err(|err| DepsError::RustcCheck(format!("failed to run `cargo check`: {err}")))?;
 
@@ -1381,11 +1397,52 @@ fn run_cargo_check_with_unused_crate_dependencies_lint(
         )));
     }
 
-    Ok(
+    Ok((
         cargo_metadata::Message::parse_stream(output.stdout.as_slice())
             .filter_map(Result::ok)
             .collect(),
-    )
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+/// The `unused dependency` warnings of cargo's own `cargo::unused_dependencies`
+/// lint (cargo 1.100), read from `cargo check`'s stderr. Since that release
+/// cargo reports unused dependencies itself, per manifest, and rustc's
+/// `unused_crate_dependencies` lint no longer appears in the JSON message
+/// stream. Each entry is the package and the dependency name as written in
+/// the manifest. The warning's own `-->` path is relative to the package, so
+/// the package comes from the summary line cargo prints after the package's
+/// warnings: "warning: `pkg` (manifest) generated N warning(s)". A warning
+/// that suggests moving the dependency to `dev-dependencies` means a test or
+/// example still uses it; it is not "never referenced anywhere" and is
+/// skipped, as rustc's per-target lint plus the intersection skipped it.
+fn parse_cargo_unused_dependencies(stderr: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut pending: Vec<(String, bool)> = Vec::new();
+    for line in stderr.lines() {
+        if let Some(name) = line
+            .strip_prefix("warning: unused dependency `")
+            .and_then(|rest| rest.strip_suffix('`'))
+        {
+            pending.push((name.to_string(), false));
+        } else if line.starts_with("help: to still use for development builds") {
+            if let Some(last) = pending.last_mut() {
+                last.1 = true;
+            }
+        } else if let Some(package) = line
+            .strip_prefix("warning: `")
+            .and_then(|rest| rest.split_once("` (manifest) generated"))
+            .map(|(package, _)| package)
+        {
+            found.extend(
+                pending
+                    .drain(..)
+                    .filter(|(_, used_in_development)| !used_in_development)
+                    .map(|(name, _)| (package.to_string(), name)),
+            );
+        }
+    }
+    found
 }
 
 /// Renders an `unused-dependency` finding — rustc's own
@@ -2536,6 +2593,28 @@ repository = "https://example.com/hasrepo"
             Some("depcrate".to_string())
         );
         assert_eq!(extract_unused_crate_name("some unrelated warning"), None);
+    }
+
+    #[test]
+    fn cargo_unused_dependency_warnings_are_read_from_stderr() {
+        let stderr = "\
+warning: unused dependency `my-dep`
+ --> Cargo.toml:7:1
+  |
+7 | my-dep = { path = \"../dep_crate\" }
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+warning: unused variable: `x`
+ --> src/lib.rs:1:5
+warning: unused dependency `test-only`
+ --> Cargo.toml:8:1
+help: to still use for development builds, move to `dev-dependencies`
+warning: `fixture` (manifest) generated 2 warnings
+";
+        assert_eq!(
+            parse_cargo_unused_dependencies(stderr),
+            vec![("fixture".to_string(), "my-dep".to_string())]
+        );
+        assert!(parse_cargo_unused_dependencies("warning: unused dependency `x`").is_empty());
     }
 
     #[test]

@@ -47,6 +47,7 @@ versions were published on crates.io.
 
 ### Fixed
 
+- **`deps --check-rustc-lints`:** `unused-dependency` finds nothing on cargo 1.100 and newer, where cargo reports unused dependencies itself (`cargo::unused_dependencies`) and rustc's lint no longer appears in the JSON messages. The rule now also reads cargo's warning from its stderr; a dependency that only tests or examples use is still not reported.
 - **`dead-enum-variant` (deep tier):** findings state that construction sites inside macro
   invocations are not scanned.
 - **`deps`:** a dependency used only from a file declared by `#[cfg(test)] mod x;` is a
