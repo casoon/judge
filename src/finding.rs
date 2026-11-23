@@ -437,6 +437,16 @@ impl Finding {
         self.evidence_class.is_gating()
     }
 
+    /// The `#[cfg(..)]` condition this finding's location is compiled under,
+    /// as written (evidence key `cfg`, see [`crate::cfg`]). `None` for
+    /// unconditional code.
+    pub fn cfg(&self) -> Option<&str> {
+        self.evidence
+            .as_ref()?
+            .get(crate::cfg::EVIDENCE_KEY)?
+            .as_str()
+    }
+
     /// Findings that caused this one (read-only; derived from
     /// [`FindingGraph`]'s edge set on export).
     pub fn caused_by(&self) -> &[FindingId] {

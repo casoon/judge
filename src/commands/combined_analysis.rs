@@ -465,7 +465,8 @@ fn collect_suppression(
     workspace: &judge::ingest::Workspace,
     findings: Vec<Finding>,
 ) -> Result<(Vec<Finding>, usize), CliError> {
-    let (findings, suppressed_inline) =
+    let (mut findings, suppressed_inline) =
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, workspace);
     Ok((findings, suppressed_inline))
 }

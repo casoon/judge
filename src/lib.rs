@@ -2,6 +2,7 @@
 
 pub mod advisory;
 pub mod baseline;
+pub mod cfg;
 #[cfg(feature = "deep")]
 pub mod deep;
 pub mod finding;

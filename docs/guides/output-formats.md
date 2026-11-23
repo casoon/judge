@@ -32,7 +32,9 @@ or `blocking_findings`. The assessment is a triage hint, not a refactoring instr
 
 The combined report's payload carries `schema_version`, `analysis_universe` (judge version,
 tier, targets, features, whether tests or generated code were included), `counts`, `errors` and
-the complete `findings`.
+the complete `findings`. A finding in code gated by `#[cfg(..)]` carries the condition as written
+in its evidence, for example `"cfg": "target_os = \"linux\""`; the terminal, Markdown and SARIF
+(`properties.cfg`) views show it too.
 
 `analysis_universe.unparsed_files` lists the source files that syntax-based rules could not
 analyze, sorted by path. The field is omitted when every file was parsed. Each entry has `path`

@@ -326,10 +326,11 @@ impl Report<'_> {
                         rule.to_string(),
                         count.to_string(),
                         format!(
-                            "{}:{} ({})",
+                            "{}:{} ({}){}",
                             display_workspace_path(workspace_root, &example.location.file),
                             example.location.line,
-                            display_item_path(workspace_root, &example.location.item_path)
+                            display_item_path(workspace_root, &example.location.item_path),
+                            crate::cfg::display_suffix(example)
                         )
                     ])
                 })
@@ -434,9 +435,10 @@ fn write_markdown_group(out: &mut String, workspace_root: &Path, group: &Finding
         let path = display_workspace_path(workspace_root, &example.location.file);
         let _ = writeln!(
             out,
-            "| {rule} | {count} | {path}:{} ({}) |",
+            "| {rule} | {count} | {path}:{} ({}){} |",
             example.location.line,
-            display_item_path(workspace_root, &example.location.item_path)
+            display_item_path(workspace_root, &example.location.item_path),
+            crate::cfg::display_suffix(example)
         );
     }
     if groups.len() > RULE_SUMMARY_LIMIT {
@@ -473,13 +475,20 @@ fn terminal_finding(workspace_root: &Path, finding: &Finding) -> TerminalFinding
         Path::new(&display_workspace_path(workspace_root, &finding.location.file).to_string())
             .to_path_buf();
 
-    TerminalFinding::new(tone, format!("{} in {item_path}", finding.rule))
-        .with_rule_id(finding.rule.to_string())
-        .with_location(TerminalLocation::file_line(
-            file,
-            finding.location.line.get(),
-        ))
-        .with_confidence(confidence)
+    TerminalFinding::new(
+        tone,
+        format!(
+            "{} in {item_path}{}",
+            finding.rule,
+            crate::cfg::display_suffix(finding)
+        ),
+    )
+    .with_rule_id(finding.rule.to_string())
+    .with_location(TerminalLocation::file_line(
+        file,
+        finding.location.line.get(),
+    ))
+    .with_confidence(confidence)
 }
 
 /// Renders `path` relative to the workspace root, matching the standardized
@@ -555,6 +564,33 @@ mod tests {
 
         assert!(text.contains("rule-a in src/a.rs::item"), "{text}");
         assert!(text.contains("Next steps"), "{text}");
+    }
+
+    #[test]
+    fn details_and_markdown_show_the_cfg_condition() {
+        let mut gated = finding("rule-a", "src/a.rs", 1);
+        gated.evidence = Some(serde_json::json!({ "cfg": "target_os = \"linux\"" }));
+        let report = Report::new(vec!["Judge summary".to_string()]).with_group(
+            "Evidence-backed findings",
+            vec![&gated],
+            false,
+        );
+
+        let mut out = Vec::new();
+        report
+            .write_tty(&mut out, Path::new("/work"), true)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("rule-a in src/a.rs::item [cfg(target_os = \"linux\")]"),
+            "{text}"
+        );
+
+        let markdown = report.write_markdown(Path::new("/work"));
+        assert!(
+            markdown.contains("src/a.rs:1 (src/a.rs::item) [cfg(target_os = \"linux\")]"),
+            "{markdown}"
+        );
     }
 
     #[test]

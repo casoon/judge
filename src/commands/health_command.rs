@@ -72,8 +72,9 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     // Inline `judge-ignore` suppression (todo.md §5): applied after every
     // detector above has merged its findings in, so a suppressed finding
     // never reaches score, baseline diff, or verdict below.
-    let (findings, suppressed_inline) =
+    let (mut findings, suppressed_inline) =
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, &workspace);
 
     let excluded_generated =
         report.excluded_generated + slop.excluded_generated + security_excluded_generated;

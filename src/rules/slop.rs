@@ -232,7 +232,7 @@ pub fn analyze_file(
         visitor_trait_impl_stack: Vec::new(),
         drop_impl_stack: Vec::new(),
         in_drop_drop_body: false,
-        documented_lines: documented_lines(&source),
+        documented_lines: documented_lines(source),
     };
     visitor.visit_file(ast);
     let mut findings = visitor.findings;

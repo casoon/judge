@@ -45,13 +45,14 @@ fn push_delta_body(out: &mut String, delta: &Delta) {
             let (rule, before, after) = change.transition();
             writeln!(
                 out,
-                "| {} | {} | {} | {}:{} | {} |",
+                "| {} | {} | {} | {}:{} | {}{} |",
                 rule,
                 severity_label(before),
                 severity_label(after),
                 crate::sarif::artifact_uri(&change.after.location.file),
                 change.after.location.line,
-                change.after.location.item_path
+                change.after.location.item_path,
+                crate::cfg::display_suffix(&change.after)
             )
             .unwrap();
         }
@@ -67,12 +68,13 @@ fn push_section(out: &mut String, title: &str, findings: &[&Finding]) {
     for finding in findings {
         writeln!(
             out,
-            "| {} | {} | {}:{} | {} |",
+            "| {} | {} | {}:{} | {}{} |",
             finding.rule,
             severity_label(finding.severity),
             crate::sarif::artifact_uri(&finding.location.file),
             finding.location.line,
-            finding.location.item_path
+            finding.location.item_path,
+            crate::cfg::display_suffix(finding)
         )
         .unwrap();
     }
@@ -138,6 +140,31 @@ unchanged: 2 — resolved: 0 — severity changed: 0
 
 ### introduced advisory (heuristic — no verdict effect): 0
 "
+        );
+    }
+
+    #[test]
+    fn table_rows_show_the_cfg_condition() {
+        let mut gated = finding(
+            "duplicate-code",
+            Severity::Warn,
+            EvidenceClass::DerivedFact,
+            "src/a.rs",
+            3,
+            "foo",
+        );
+        gated.evidence = Some(serde_json::json!({ "cfg": "windows" }));
+        let delta = Delta {
+            introduced: vec![gated],
+            resolved: Vec::new(),
+            severity_changed: Vec::new(),
+            unchanged_count: 0,
+        };
+
+        let text = render_delta(&delta, Verdict::Fail);
+        assert!(
+            text.contains("| src/a.rs:3 | foo [cfg(windows)] |"),
+            "text: {text}"
         );
     }
 

@@ -41,6 +41,25 @@ unrelated code. For a deliberately scoped range of several items:
 Use these sparingly. They document an exception; they do not replace extracting a shared
 abstraction.
 
+## Conditional compilation
+
+Two copies whose `#[cfg(..)]` conditions can never hold in the same build are not duplicates.
+The usual case is one implementation per platform:
+
+```rust
+#[cfg(unix)]
+fn config_dir() -> PathBuf { /* … */ }
+
+#[cfg(windows)]
+fn config_dir() -> PathBuf { /* … */ }
+```
+
+judge treats different values of `target_os`, `target_arch` and `target_pointer_width`, `unix`
+and `windows`, and `X` and `not(X)` as exclusive. A condition on a `mod foo;` declaration
+applies to the whole module file. Everything else, such as `feature = "a"` and `feature = "b"`,
+or a gated and an unconditional copy, is still reported, and each member in gated code names its
+condition. Only item-level `#[cfg(..)]` counts; `cfg!()` and `#[cfg_attr]` do not.
+
 ## Declarative macros
 
 A brace-delimited macro call with named fields, such as `candidate! { evidence: ..., migration:

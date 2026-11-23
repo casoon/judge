@@ -787,6 +787,7 @@ resolver = "2"
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let member_b = CloneMember {
             qualified_name: "clone_two".to_string(),
@@ -799,6 +800,7 @@ resolver = "2"
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let duplication = WorkspaceDuplication {
             families: vec![CloneFamily {
@@ -861,6 +863,7 @@ fn clone_two() -> i32 {
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let member_b = CloneMember {
             qualified_name: "clone_two".to_string(),
@@ -873,6 +876,7 @@ fn clone_two() -> i32 {
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let duplication = WorkspaceDuplication {
             families: vec![CloneFamily {
@@ -933,6 +937,7 @@ resolver = "2"
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let member_b = CloneMember {
             qualified_name: "clone_test_two".to_string(),
@@ -945,6 +950,7 @@ resolver = "2"
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let duplication = WorkspaceDuplication {
             families: vec![CloneFamily {
@@ -1318,6 +1324,7 @@ macros = { path = "../macros" }
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let member_b = CloneMember {
             qualified_name: "calculate_discount_v2".to_string(),
@@ -1330,6 +1337,7 @@ macros = { path = "../macros" }
             mode: DupeMode::Strict,
             identifier_mapping: Vec::new(),
             normalized_literal_kinds: Vec::new(),
+            cfg: None,
         };
         let duplication = WorkspaceDuplication {
             families: vec![CloneFamily {

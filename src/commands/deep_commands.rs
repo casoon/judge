@@ -140,8 +140,9 @@ fn run_dead_code_deep(
     append_analysis_errors(&mut analysis_errors, &structural_report.errors);
 
     // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
+    let (mut findings, suppressed_inline) =
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, &workspace);
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
     if baseline_request.is_requested() {
