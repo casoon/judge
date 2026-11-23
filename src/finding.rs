@@ -138,6 +138,7 @@ pub enum Severity {
 /// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::rules::duplication::CloneMember::to_finding`]) |
 /// | `duplicate-crate-versions`, `msrv-drift`, `workspace-dep-drift` | `derived_fact` (manifest/resolve-graph facts read directly from `cargo_metadata`) |
 /// | `dep-without-repo` | `derived_fact` (a manifest fact — the dependency's own `repository` field — read directly from a full `cargo_metadata` resolve, same class as `duplicate-crate-versions`/`msrv-drift`/`workspace-dep-drift`) |
+/// | `release-profile-hazard`, `panic-strategy-conflict` | `derived_fact` (a `[profile.release]` value read from the workspace root `Cargo.toml`/`.cargo/config.toml`, plus — for `panic-strategy-conflict` — `std::panic::catch_unwind` references in non-test source; see `crate::rules::release_profile`) |
 /// | `unsafe-surface` | `derived_fact` (a syntax-fact pairing: an `unsafe { .. }` block's span plus the absence of an adjacent `// SAFETY:` comment, both read directly from the parsed source — see `crate::rules::security`) |
 /// | `panic-in-lib` | `derived_fact` (a `.unwrap()`/`.expect(..)`/`panic!(..)`/indexing construct's span, plus the enclosing function's `pub` visibility, both read directly from the parsed source — same class as `unsafe-surface`, not a claim that it panics at runtime — see `crate::rules::security`) |
 /// | `unused-feature-flag` | `derived_fact` (the feature is declared in the manifest, and zero usage of the dependency was found anywhere in the examined view — both read directly from the declared inputs, see [`crate::rules::deps`] module docs "Feature-only evidence") |
@@ -230,7 +231,9 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "workspace-dep-drift"
         | "dep-without-repo"
         | "unsafe-surface"
-        | "panic-in-lib" => EvidenceClass::DerivedFact,
+        | "panic-in-lib"
+        | "release-profile-hazard"
+        | "panic-strategy-conflict" => EvidenceClass::DerivedFact,
         "unused-feature-flag" => EvidenceClass::DerivedFact,
         "default-features-unused" => EvidenceClass::DerivedFact,
         "unused-feature" => EvidenceClass::DerivedFact,

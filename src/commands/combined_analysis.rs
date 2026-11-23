@@ -107,6 +107,14 @@ fn default_rule_revisions() -> std::collections::HashMap<String, u32> {
         judge::rules::complexity::MAINTAINABILITY_INDEX_RULE.to_string(),
         judge::rules::complexity::MAINTAINABILITY_INDEX_RULE_REVISION,
     );
+    revisions.insert(
+        judge::rules::release_profile::RELEASE_PROFILE_HAZARD_RULE.to_string(),
+        judge::rules::release_profile::RELEASE_PROFILE_HAZARD_RULE_REVISION,
+    );
+    revisions.insert(
+        judge::rules::release_profile::PANIC_STRATEGY_CONFLICT_RULE.to_string(),
+        judge::rules::release_profile::PANIC_STRATEGY_CONFLICT_RULE_REVISION,
+    );
     revisions
 }
 
@@ -394,6 +402,10 @@ fn collect_dependencies(
     // need real crates.io network access and are opt-in only via
     // `cargo judge deps --check-crates-io` (see `run_deps`).
     findings.extend(judge::rules::slopsquat::analyze_name_collision(workspace));
+
+    let release_profile = judge::rules::release_profile::analyze_workspace(workspace);
+    append_analysis_errors(analysis_errors, &release_profile.errors);
+    findings.extend(release_profile.findings);
 }
 
 fn collect_boundaries(

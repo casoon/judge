@@ -391,6 +391,31 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
             why_it_matters: "When workspace members pin different version requirements for the same dependency, cargo can end up resolving two separate copies of it, and the two crates silently drift out of sync with each other over time.",
         }),
     },
+    // -- release_profile.rs -------------------------------------------------
+    RuleMetadata {
+        id: "release-profile-hazard",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge` and `audit`) for workspaces with at least one `bin` target.",
+        exclusions: "Reads only the workspace root `Cargo.toml` and the workspace root `.cargo/config.toml` (a config value overrides the manifest value for the same key); the user's home config, config files above the workspace root and `CARGO_PROFILE_*` environment variables are deliberately ignored so the result is the same on every machine. Only `opt-level = 0` and `debug-assertions = true` written in the effective release profile count — Cargo's built-in defaults never trigger it. `[profile.release.package.*]` overrides are listed by `inspect` but not judged. lto, codegen-units, strip and binary size are trade-offs, not hazards, and are out of scope.",
+        allowed_wording: DERIVED_FACT_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+        example: Some(RuleExample {
+            before: "# Cargo.toml\n[profile.release]\nopt-level = 0\n",
+            why_it_matters: "A release build with optimizations turned off ships a binary that is often many times slower than the code needs to be — usually a leftover from a debugging session rather than a deliberate choice.",
+        }),
+    },
+    RuleMetadata {
+        id: "panic-strategy-conflict",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge` and `audit`) for workspaces with at least one `bin` target whose effective release profile declares `panic = \"abort\"`.",
+        exclusions: "Resolves the release profile exactly like `release-profile-hazard` (workspace root `Cargo.toml` plus `.cargo/config.toml`; home config and `CARGO_PROFILE_*` ignored). Counts `std::panic::catch_unwind`/`panic::catch_unwind` paths and `use std::panic::catch_unwind` imports in each crate's normal source files; code under `#[cfg(test)]`, `#[test]` functions, files reached only through a `#[cfg(test)] mod`, and `tests/`, `examples/`, `benches/` and `build.rs` do not count (tests and benches ignore the panic setting). A call through a re-export, a glob import or a macro body is not recognized. One finding per workspace at the `panic` line; the code sites are listed in its evidence.",
+        allowed_wording: DERIVED_FACT_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+        example: Some(RuleExample {
+            before: "# Cargo.toml\n[profile.release]\npanic = \"abort\"\n\n// src/main.rs\nfn main() {\n    let outcome = std::panic::catch_unwind(|| run_job());\n    if outcome.is_err() {\n        eprintln!(\"job failed, continuing\");\n    }\n}\n\nfn run_job() {}\n",
+            why_it_matters: "With `panic = \"abort\"` a panic ends the process immediately, so the recovery path built around `catch_unwind` never runs in the release binary — it only works in debug builds and tests.",
+        }),
+    },
     // -- deps.rs ------------------------------------------------------------
     RuleMetadata {
         id: "misplaced-dependency-kind",
@@ -1395,6 +1420,8 @@ mod tests {
             crate::rules::duplication::DUPLICATE_RULE,
             crate::rules::module_graph::UNLINKED_FILE_RULE,
             crate::rules::module_graph::ORPHAN_MODULE_RULE,
+            crate::rules::release_profile::RELEASE_PROFILE_HAZARD_RULE,
+            crate::rules::release_profile::PANIC_STRATEGY_CONFLICT_RULE,
             crate::advisory::mutants::MUTATION_SURVIVOR_RULE,
             crate::rules::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
             crate::rules::security::UNSAFE_SURFACE_RULE,

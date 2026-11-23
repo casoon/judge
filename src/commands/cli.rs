@@ -18,6 +18,7 @@ use crate::FixPreviewOptions;
 use crate::FocusedAnalysisOptions;
 use crate::HealthOptions;
 use crate::ImpactOptions;
+use crate::InspectOptions;
 use crate::MapOptions;
 use crate::ModuleGraphOptions;
 use crate::OutputFormat;
@@ -96,8 +97,9 @@ pub(crate) enum Command {
     Compare(CompareOptions),
     /// Initialize judge configuration in a workspace.
     Init,
-    /// Show detected entry points, tiers, and cache status.
-    Inspect,
+    /// Show detected entry points, the effective release profile, tiers,
+    /// and cache status.
+    Inspect(InspectOptions),
     /// Show a compact, deterministic map of refactoring-relevant workspace facts.
     Map(MapOptions),
     /// Diagnose the current workspace structure: crates, targets, dependency edges,
@@ -191,7 +193,8 @@ impl Command {
             Self::Errors(options) => Some((options.format, "errors")),
             Self::Tests(options) => Some((options.format, "tests")),
             Self::Slop(options) => Some((options.format, "slop")),
-            Self::Init | Self::Inspect => None,
+            Self::Inspect(options) => Some((options.format, "inspect")),
+            Self::Init => None,
         }
     }
 
@@ -209,7 +212,7 @@ impl Command {
                 out,
             ),
             Self::Init => run_init(out),
-            Self::Inspect => run_inspect(out),
+            Self::Inspect(options) => run_inspect(options, out),
             Self::Map(options) => run_map(options, out),
             Self::Structure(options) => run_structure(options, out),
             Self::Complexity(options) => run_complexity(options, out),

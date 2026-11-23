@@ -17,7 +17,7 @@ installed version.
 
 | Command | What it does |
 | --- | --- |
-| `inspect` | Crates, source files, entry points and available tiers, via `cargo metadata`. |
+| `inspect` | Crates, source files, entry points and available tiers, via `cargo metadata`. For workspaces with a `bin` target it also prints the effective release profile and custom profiles that inherit from it (see [Rules](../rules/#release-profile)). `--format json` gives the same data. |
 | `structure` | Crates, targets, internal dependency edges and measured structural concentration. |
 | `complexity` | Production and test complexity rankings from the checked-out tree. |
 | `map` | Compact facts for refactoring plans: files by aggregate cyclomatic complexity and the largest clone families. `--include-tests` adds test-only code. |

@@ -32,7 +32,7 @@ See [MIGRATION.md](MIGRATION.md) for breaking changes and CLI migration details.
 Early stage. The Fast Tier (no build required, `syn`-, Cargo-metadata-, and manifest-based) and a first slice of the Deep Tier (rust-analyzer-based, behind the `deep` Cargo feature) are implemented:
 
 - `cargo judge` — combined findings from every detector that does not require opt-in configuration; the default view is grouped for triage and `--details` lists every finding
-- `cargo judge inspect` — crates, source files, and entry points detected via `cargo metadata`
+- `cargo judge inspect` — crates, source files, and entry points detected via `cargo metadata`, plus the effective release profile of workspaces that build binaries
 - `cargo judge structure` — crates, targets, internal dependency edges, and measured structural concentration
 - `cargo judge complexity` — current production/test complexity rankings from the checked-out source tree
 - `cargo judge map` — compact workspace facts for refactoring plans: crates and
@@ -53,7 +53,7 @@ Early stage. The Fast Tier (no build required, `syn`-, Cargo-metadata-, and mani
 - `cargo judge module-graph` — `unlinked-file` and `orphan-module` findings from each crate's real `mod` tree
 - `cargo judge coverage` — imports an existing `cargo-llvm-cov` LCOV report and flags `untested-hotspot` functions; judge never measures coverage itself
 - `cargo judge patterns`, `principles` — advisory design-pattern and design-principle readings; they never affect the verdict or exit code. `explain-pattern`, `explain-principle` show one candidate's full evidence, and `fix-preview` its migration plan and affected call sites (deliberately no patch)
-- `cargo judge explain-rule ID` — documentation of one rule from the static rule registry (78 rules); a pure lookup that never runs an analysis
+- `cargo judge explain-rule ID` — documentation of one rule from the static rule registry (80 rules); a pure lookup that never runs an analysis
 - `cargo judge compare BASELINE` — compares the current project state with a saved findings artifact; works without Git
 - `cargo judge dead-code [--include-tests]` — Deep Tier, needs `--features deep` (see below)
 - `cargo judge explain <item-path> --why-live` — Deep Tier, needs `--features deep` (see below)

@@ -361,6 +361,13 @@ struct ImpactOptions {
 }
 
 #[derive(Debug, Args)]
+struct InspectOptions {
+    /// Output format.
+    #[arg(long, value_enum, default_value = "tty")]
+    format: OutputFormat,
+}
+
+#[derive(Debug, Args)]
 struct StructureOptions {
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
@@ -2846,6 +2853,57 @@ fn dup_two(x: i32) -> i32 {
         }
     }
 
+    /// `inspect` shows the effective release profile and a custom profile
+    /// that inherits from it, deterministically, in text and JSON; the JSON
+    /// keeps the fields the text output already had.
+    #[test]
+    fn inspect_shows_the_release_profile_and_inheriting_custom_profiles() {
+        let dir = TempDir::new("inspect-release-profile");
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[profile.release]\npanic = \"abort\"\n\n[profile.dist]\ninherits = \"release\"\nlto = true\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        let inspect = |format| {
+            let mut out = Vec::new();
+            run_in_dir(
+                &dir,
+                cli_with(Command::Inspect(InspectOptions { format })),
+                &mut out,
+            )
+            .expect("inspect must succeed");
+            String::from_utf8(out).unwrap()
+        };
+
+        let text = inspect(OutputFormat::Tty);
+        assert_eq!(text, inspect(OutputFormat::Tty), "inspect is deterministic");
+        assert!(text.contains("  release\n"));
+        assert!(text.contains("    panic             abort      Cargo.toml:7 [profile.release]\n"));
+        assert!(text.contains("  dist (inherits release)\n"));
+        assert!(text.contains("    lto               true       Cargo.toml:11 [profile.dist]\n"));
+        assert!(text.contains("    opt-level         3          default\n"));
+
+        let json_text = inspect(OutputFormat::Json);
+        assert_eq!(json_text, inspect(OutputFormat::Json));
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        for key in ["workspace_root", "crates", "tiers", "cache"] {
+            assert!(!json[key].is_null(), "inspect JSON keeps `{key}`");
+        }
+        let custom = &json["release_profile"]["custom"][0];
+        assert_eq!(custom["name"], "dist");
+        assert_eq!(custom["inherits"], serde_json::json!(["release"]));
+        let panic = custom["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|setting| setting["key"] == "panic")
+            .unwrap();
+        assert_eq!(panic["value"], "abort");
+        assert_eq!(panic["source"]["profile"], "release");
+    }
+
     /// Broken pipe: the render aborts with `CliError::Io(BrokenPipe)`, which
     /// [`exit_code`] maps to a silent exit 0 — before the refactor this was
     /// a `println!` panic (exit 101).
@@ -2854,7 +2912,13 @@ fn dup_two(x: i32) -> i32 {
         let dir = TempDir::new("run-broken-pipe");
         write_fixture_crate(&dir);
 
-        let result = run_in_dir(&dir, cli_with(Command::Inspect), &mut BrokenPipeWriter);
+        let result = run_in_dir(
+            &dir,
+            cli_with(Command::Inspect(InspectOptions {
+                format: OutputFormat::Tty,
+            })),
+            &mut BrokenPipeWriter,
+        );
         let err = result.expect_err("writes to a broken pipe must surface as an error");
         match &err {
             CliError::Io(io_err) => {

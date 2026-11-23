@@ -8,6 +8,14 @@ versions were published on crates.io.
 
 ### Added
 
+- **release-profile-hazard:** reports `opt-level = 0` or `debug-assertions = true` in the
+  effective release profile of a workspace that builds binaries, at the manifest or
+  `.cargo/config.toml` line. Details:
+  [Release profile](https://casoon.github.io/judge/docs/reference/rules/#release-profile).
+- **panic-strategy-conflict:** reports `panic = "abort"` in the release profile when non-test
+  code calls `std::panic::catch_unwind`.
+- **`inspect`:** prints the effective release profile and the custom profiles that inherit from
+  it, and gains `--format json`.
 - **`--renderreport`:** the bare `cargo judge` run prints its review report as a request for [renderreport](https://github.com/casoon/renderreport) instead of text (`cargo judge --renderreport | renderreport render - -o judge.pdf`). Same sections as `--format markdown`; judge itself gets no new dependency.
 - **SARIF:** every result carries a position-independent `partialFingerprints` entry, so code
   scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear
