@@ -288,6 +288,7 @@ fn finding_for(candidate: &ImplCandidate) -> Finding {
         origin: Origin::Code,
         evidence: Some(evidence),
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

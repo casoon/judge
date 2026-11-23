@@ -156,7 +156,7 @@ pub(crate) fn run_dupes(
         include_tests,
     } = options;
     let format = baseline_args.format;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let source_files = workspace_source_files(&workspace);
     let report = judge::rules::duplication::analyze_workspace_with_options(
@@ -494,7 +494,7 @@ fn run_deps_why(
         return Err(unsupported_format("`deps --why`", format, "tty, json"));
     }
 
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let report = judge::rules::deps::why(&workspace, dependency_name);
 
     match format {
@@ -609,7 +609,7 @@ pub(crate) fn run_deps(
         return run_deps_why(&dependency_name, format, out);
     }
 
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let report = judge::rules::deps::analyze_workspace(&workspace);
     let mut analysis_errors = analysis_errors(&report.errors);
@@ -714,7 +714,7 @@ pub(crate) fn run_coverage(
         baseline_args,
     } = options;
     let format = baseline_args.format;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let coverage = judge::advisory::coverage::read_lcov(&lcov, &workspace.root)?;
 
@@ -961,7 +961,7 @@ pub(crate) fn run_boundaries(
         return Ok(CommandOutcome::Clean);
     }
 
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let config_path = config_path.unwrap_or_else(|| workspace.root.join("judge.toml"));
     if !config_path.exists() {
@@ -1053,7 +1053,7 @@ pub(crate) fn run_module_graph(
         include_generated,
     } = options;
     let format = baseline_args.format;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let report = judge::rules::module_graph::analyze_workspace(&workspace, include_generated);
     let analysis_errors = analysis_errors(&report.errors);
@@ -1149,7 +1149,7 @@ pub(crate) fn run_unsafe(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let source_files = workspace_source_files(&workspace);
     let report = judge::rules::security::analyze_workspace(source_files, options.include_generated);
     let findings = findings_matching(
@@ -1175,7 +1175,7 @@ pub(crate) fn run_errors(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let report = analyze_slop_workspace(&workspace, options.include_generated)?;
     let findings = findings_matching(
         report.findings,
@@ -1203,7 +1203,7 @@ pub(crate) fn run_tests(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let source_files = workspace_source_files(&workspace);
     let report =
         judge::rules::slop::analyze_workspace(source_files, options.include_generated, false);
@@ -1231,7 +1231,7 @@ pub(crate) fn run_slop(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let report = analyze_slop_workspace(&workspace, options.include_generated)?;
     render_focused(
         "slop",
@@ -1262,8 +1262,9 @@ fn render_focused(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let (mut findings, _suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
     judge::finding::sort_by_severity_desc(&mut findings);
+    let rule_levels = load_judge_toml(&workspace.root)?.rules.levels;
     match format {
         OutputFormat::Json => write_json(
             out,
@@ -1274,7 +1275,8 @@ fn render_focused(
                     "tier": "fast",
                     "claim": "Findings are current-state syntax and workspace facts. Absence of a finding is not proof of absence in unanalysed generated or semantic code."
                 },
-                "report": Report::with_errors(findings, errors),
+                "report": Report::with_errors(findings, errors)
+                    .with_rule_overrides(rule_levels.overrides()),
             }),
         )?,
         OutputFormat::Sarif => write_sarif(out, &workspace.root, findings, errors, None)?,
@@ -1282,6 +1284,7 @@ fn render_focused(
             out,
             &workspace.root,
             format!("Judge {label}"),
+            rule_levels.summary_line(),
             &findings,
             &errors,
         )?,
@@ -1355,7 +1358,7 @@ pub(crate) fn run_api_surface(
             },
         include_generated,
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let boundary_config = load_judge_toml(&workspace.root)?;
     judge::rules::boundaries::validate_internal_crates(&workspace, &boundary_config)?;
 
@@ -1372,7 +1375,7 @@ pub(crate) fn run_api_surface(
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
 
     // API-surface-size trend against a saved baseline (see todo.md §I
     // "API-Surface-Größe pro Crate, Trend gegen Baseline") — computed before
@@ -1579,7 +1582,7 @@ fn suppress_and_baseline(
     out: &mut dyn Write,
 ) -> Result<std::ops::ControlFlow<CommandOutcome, (Vec<Finding>, usize)>, CliError> {
     let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
 
     let baseline_request = BaselineRequest::new(
         baseline_args.save_baseline,

@@ -17,6 +17,10 @@ versions were published on crates.io.
   an existing one. It used to print a notice only.
 - **`--progress`:** the event stream ends with a `run_completed` or `run_failed` record (phase
   `run`), so a consumer can tell a finished run from an aborted one.
+- **judge.toml:** `[rules.<id>] level = "off" | "advisory" | "gating"` switches any rule off or
+  changes whether it gates the verdict. Every report lists the active overrides, `compare` shows
+  findings of an `off` rule as not evaluated, and an unknown rule id or level exits with 2 before
+  any analysis. Details: [Rule levels](https://casoon.github.io/judge/docs/reference/rules/#rule-levels).
 - **judge-mcp:** tools `review` (focused views such as `structure`, `slop`, `deps`), `compare`
   and `save_baseline`; `JUDGE_TIMEOUT_MS` kills a run that hangs.
 

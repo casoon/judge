@@ -44,6 +44,27 @@ severity. Heuristic (advisory) findings never fail it.
 | `1` | Verdict fails on introduced gating findings. |
 | `2` | Error: unreadable or unsupported baseline, broken `judge.toml`, analyzer failure. No verdict is given on incomplete analysis. |
 
+## Rule levels
+
+`judge.toml` can switch a rule off, or change whether it gates the verdict:
+
+```toml
+[rules.generic-naming]
+level = "off"        # findings dropped, rule not evaluated
+
+[rules.silent-default]
+level = "gating"     # an advisory rule that now fails the verdict
+
+[rules.merged-stub]
+level = "advisory"   # a gating rule that no longer does
+```
+
+The compare report names the active overrides in its header (`rule overrides: …` in TTY and
+Markdown, `rule_overrides` in JSON). When a rule is `off` in the current run, the findings the
+baseline still holds for it are listed as **not evaluated** (`not_evaluated` in JSON), not as
+resolved: the run never looked for them. An unknown rule id or level exits with 2 before any
+analysis. See [Rules](../../reference/rules/) for the full table.
+
 ## In CI
 
 Commit the baseline (or restore it as a CI artifact) and let a job compare against it. A GitHub

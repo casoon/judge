@@ -465,7 +465,8 @@ fn write_sarif(
     universe: Option<judge::finding::AnalysisUniverse>,
 ) -> Result<(), CliError> {
     judge::finding::relativize_paths(&mut findings, workspace_root);
-    let mut report = Report::with_errors(findings, analysis_errors);
+    let mut report = Report::with_errors(findings, analysis_errors)
+        .with_rule_overrides(load_judge_toml(workspace_root)?.rules.levels.overrides());
     if let Some(universe) = universe {
         report = report.with_universe(universe);
     }
@@ -1040,6 +1041,29 @@ fn load_judge_toml(
         return Ok(judge::rules::boundaries::BoundaryConfig::default());
     }
     parse_boundary_config(&config_path)
+}
+
+/// Loads the workspace and validates its `judge.toml`, so a broken config
+/// (an unknown `[rules.<id>]`, an unknown level, …) fails with exit 2 before
+/// any analyzer runs.
+fn load_workspace() -> Result<judge::ingest::Workspace, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    load_judge_toml(&workspace.root)?;
+    Ok(workspace)
+}
+
+/// Applies `judge.toml`'s `[rules.<id>] level` overrides, then inline
+/// `judge-ignore` suppressions — in that order, so findings of an `off` rule
+/// are gone before they could count as suppressed.
+fn apply_rule_levels_and_suppressions(
+    findings: Vec<Finding>,
+    workspace_root: &Path,
+) -> Result<(Vec<Finding>, usize), CliError> {
+    let levels = load_judge_toml(workspace_root)?.rules.levels;
+    Ok(judge::suppression::apply_inline_suppressions(
+        levels.apply(findings),
+        workspace_root,
+    )?)
 }
 
 /// Reads and parses `judge.toml` at `config_path` into a
@@ -3516,5 +3540,323 @@ fn dup_two(x: i32) -> i32 {
             panic!("progress misuse must be a configuration error");
         };
         assert!(message.contains("bare `cargo judge` combined run"));
+    }
+
+    /// One gating rule (`swallowed-result`), one advisory rule
+    /// (`silent-default`), and a second gating rule (`merged-stub`) — the
+    /// fixture behind the `[rules.<id>] level` tests (GitHub issue #54).
+    const RULE_LEVEL_SOURCE: &str = "pub fn cleanup() {\n    let _ = std::fs::remove_file(\"x\");\n}\n\npub fn parse_retry_count(raw: Option<&str>) -> u32 {\n    raw.and_then(|s| s.parse().ok()).unwrap_or_default()\n}\n\npub fn later() -> u32 {\n    todo!()\n}\n";
+
+    /// Exercises all three levels at once: `off`, an advisory rule promoted
+    /// to `gating`, and a gating rule demoted to `advisory`.
+    const THREE_LEVELS_TOML: &str = "[rules.swallowed-result]\nlevel = \"off\"\n\n[rules.silent-default]\nlevel = \"gating\"\n\n[rules.merged-stub]\nlevel = \"advisory\"\n";
+
+    const THREE_LEVELS_LINE: &str =
+        "rule overrides: merged-stub=advisory, silent-default=gating, swallowed-result=off";
+
+    fn write_rule_level_fixture(dir: &Path, judge_toml: Option<&str>) {
+        write_fixture_crate(dir);
+        std::fs::write(dir.join("src/lib.rs"), RULE_LEVEL_SOURCE).unwrap();
+        match judge_toml {
+            Some(config) => std::fs::write(dir.join("judge.toml"), config).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(dir.join("judge.toml"));
+            }
+        }
+    }
+
+    fn combined_cli(format: OutputFormat) -> Cli {
+        Cli {
+            baseline_args: baseline_args(format, false, None),
+            ..all_cli(false, None)
+        }
+    }
+
+    fn slop_cli(format: OutputFormat) -> Cli {
+        cli_with(Command::Slop(FocusedAnalysisOptions {
+            format,
+            include_generated: false,
+        }))
+    }
+
+    fn run_to_string(dir: &Path, cli: Cli) -> String {
+        let mut out = Vec::new();
+        run_in_dir(dir, cli, &mut out).expect("command must run");
+        String::from_utf8(out).unwrap()
+    }
+
+    fn findings_of<'a>(report: &'a serde_json::Value, rule: &str) -> Vec<&'a serde_json::Value> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["rule"] == rule)
+            .collect()
+    }
+
+    /// Checks one JSON `Report` against [`THREE_LEVELS_TOML`]: the `off`
+    /// rule is gone (and left no suppression trace), the other two carry
+    /// their configured level, and the header lists all three overrides.
+    fn assert_three_levels_applied(report: &serde_json::Value) {
+        assert!(findings_of(report, "swallowed-result").is_empty());
+        assert!(findings_of(report, "suppression-debt").is_empty());
+        assert!(report.get("suppressed_inline").is_none(), "{report}");
+
+        let silent_default = findings_of(report, "silent-default");
+        assert_eq!(silent_default.len(), 1, "{report}");
+        assert_eq!(silent_default[0]["rule_level"], "gating");
+        assert_eq!(silent_default[0]["evidence_class"], "heuristic");
+        let merged_stub = findings_of(report, "merged-stub");
+        assert_eq!(merged_stub.len(), 1, "{report}");
+        assert_eq!(merged_stub[0]["rule_level"], "advisory");
+        assert_eq!(merged_stub[0]["evidence_class"], "derived_fact");
+
+        assert_eq!(
+            report["rule_overrides"],
+            serde_json::json!([
+                { "rule": "merged-stub", "level": "advisory", "default": "gating" },
+                { "rule": "silent-default", "level": "gating", "default": "advisory" },
+                { "rule": "swallowed-result", "level": "off", "default": "gating" },
+            ])
+        );
+    }
+
+    fn assert_sarif_lists_three_levels(sarif: &str) {
+        let sarif: serde_json::Value = serde_json::from_str(sarif).unwrap();
+        let overrides = &sarif["runs"][0]["invocations"][0]["ruleConfigurationOverrides"];
+        assert_eq!(overrides.as_array().unwrap().len(), 3, "{sarif}");
+        assert_eq!(overrides[2]["descriptor"]["id"], "swallowed-result");
+        assert_eq!(overrides[2]["configuration"]["enabled"], false);
+        assert_eq!(overrides[1]["configuration"]["enabled"], true);
+        assert_eq!(
+            overrides[1]["configuration"]["properties"]["level"],
+            "gating"
+        );
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert!(
+            results
+                .iter()
+                .all(|result| result["ruleId"] != "swallowed-result")
+        );
+        let silent_default = results
+            .iter()
+            .find(|result| result["ruleId"] == "silent-default")
+            .expect("silent-default result");
+        assert_eq!(silent_default["properties"]["gating"], true);
+    }
+
+    #[test]
+    fn rule_levels_apply_to_the_combined_run_in_every_format() {
+        let dir = TempDir::new("rule-levels-combined");
+        write_rule_level_fixture(&dir, Some(THREE_LEVELS_TOML));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&run_to_string(&dir, combined_cli(OutputFormat::Json))).unwrap();
+        assert_three_levels_applied(&json);
+
+        let tty = run_to_string(&dir, combined_cli(OutputFormat::Tty));
+        assert!(tty.contains(THREE_LEVELS_LINE), "{tty}");
+        assert!(!tty.contains("[swallowed-result]"), "{tty}");
+
+        let markdown = run_to_string(&dir, combined_cli(OutputFormat::Markdown));
+        assert!(
+            markdown.contains(&format!("- {THREE_LEVELS_LINE}")),
+            "{markdown}"
+        );
+
+        assert_sarif_lists_three_levels(&run_to_string(&dir, combined_cli(OutputFormat::Sarif)));
+    }
+
+    #[test]
+    fn rule_levels_apply_to_a_focused_command_in_every_format() {
+        let dir = TempDir::new("rule-levels-slop");
+        write_rule_level_fixture(&dir, Some(THREE_LEVELS_TOML));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&run_to_string(&dir, slop_cli(OutputFormat::Json))).unwrap();
+        assert_three_levels_applied(&json["report"]);
+
+        let tty = run_to_string(&dir, slop_cli(OutputFormat::Tty));
+        assert!(tty.contains(THREE_LEVELS_LINE), "{tty}");
+        assert!(!tty.contains("[swallowed-result]"), "{tty}");
+
+        assert_sarif_lists_three_levels(&run_to_string(&dir, slop_cli(OutputFormat::Sarif)));
+    }
+
+    /// Without a `judge.toml` the same fixture reports every rule at its
+    /// default level and no override header.
+    #[test]
+    fn without_rule_levels_the_fixture_keeps_default_levels() {
+        let dir = TempDir::new("rule-levels-default");
+        write_rule_level_fixture(&dir, None);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&run_to_string(&dir, slop_cli(OutputFormat::Json))).unwrap();
+        let report = &json["report"];
+        assert_eq!(findings_of(report, "swallowed-result").len(), 1);
+        assert!(
+            findings_of(report, "silent-default")[0]
+                .get("rule_level")
+                .is_none()
+        );
+        assert!(report.get("rule_overrides").is_none(), "{report}");
+        let tty = run_to_string(&dir, slop_cli(OutputFormat::Tty));
+        assert!(!tty.contains("rule overrides"), "{tty}");
+    }
+
+    /// The exit-code half of the acceptance criteria: a gating rule set to
+    /// `advisory` no longer fails a baseline comparison, an advisory rule
+    /// set to `gating` does, and `off` removes a rule from the verdict.
+    #[test]
+    fn rule_levels_change_the_baseline_verdict() {
+        let dir = TempDir::new("rule-levels-verdict");
+        write_fixture_crate(&dir);
+        let mut out = Vec::new();
+        run_in_dir(&dir, all_cli(true, None), &mut out).expect("baseline must save");
+        let outcome = |config: Option<&str>| {
+            write_rule_level_fixture(&dir, config);
+            let mut out = Vec::new();
+            let outcome = run_in_dir(
+                &dir,
+                all_cli(false, Some(PathBuf::from(DEFAULT_BASELINE_ALL))),
+                &mut out,
+            )
+            .expect("compare must run");
+            (outcome, String::from_utf8(out).unwrap())
+        };
+
+        // Defaults: `swallowed-result`/`merged-stub` gate, `silent-default` does not.
+        let (default, text) = outcome(None);
+        assert_eq!(default, CommandOutcome::FindingsFound, "{text}");
+
+        let demoted = "[rules.swallowed-result]\nlevel = \"advisory\"\n\n[rules.merged-stub]\nlevel = \"advisory\"\n";
+        let (relaxed, text) = outcome(Some(demoted));
+        assert_eq!(relaxed, CommandOutcome::Clean, "{text}");
+        assert!(text.contains("verdict: pass"), "{text}");
+        assert!(
+            text.contains("rule overrides: merged-stub=advisory, swallowed-result=advisory"),
+            "{text}"
+        );
+
+        let promoted = format!("{demoted}\n[rules.silent-default]\nlevel = \"gating\"\n");
+        let (stricter, text) = outcome(Some(&promoted));
+        assert_eq!(stricter, CommandOutcome::FindingsFound, "{text}");
+
+        let gating_off =
+            "[rules.swallowed-result]\nlevel = \"off\"\n\n[rules.merged-stub]\nlevel = \"off\"\n";
+        let (off, text) = outcome(Some(gating_off));
+        assert_eq!(off, CommandOutcome::Clean, "{text}");
+        assert!(!text.contains("swallowed-result  "), "{text}");
+    }
+
+    /// A baseline saved while a rule was on must not report that rule's
+    /// findings as resolved once the rule is switched off.
+    #[test]
+    fn compare_reports_findings_of_an_off_rule_as_not_evaluated() {
+        let dir = TempDir::new("rule-levels-not-evaluated");
+        write_rule_level_fixture(&dir, None);
+        let mut out = Vec::new();
+        run_in_dir(&dir, all_cli(true, None), &mut out).expect("baseline must save");
+
+        std::fs::write(
+            dir.join("judge.toml"),
+            "[rules.swallowed-result]\nlevel = \"off\"\n",
+        )
+        .unwrap();
+        let compare = |format| {
+            cli_with(Command::Compare(CompareOptions {
+                baseline: dir.join(DEFAULT_BASELINE_ALL),
+                format,
+            }))
+        };
+        let mut out = Vec::new();
+        let outcome =
+            run_in_dir(&dir, compare(OutputFormat::Json), &mut out).expect("compare must run");
+        assert_eq!(outcome, CommandOutcome::Clean);
+        let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(json["delta"]["resolved"], serde_json::json!([]), "{json}");
+        let not_evaluated = json["delta"]["not_evaluated"].as_array().unwrap();
+        assert_eq!(not_evaluated.len(), 1, "{json}");
+        assert_eq!(not_evaluated[0]["rule"], "swallowed-result");
+        assert_eq!(json["rule_overrides"][0]["rule"], "swallowed-result");
+
+        let tty = run_to_string(&dir, compare(OutputFormat::Tty));
+        assert!(tty.contains("resolved: 0"), "{tty}");
+        assert!(
+            tty.contains("not evaluated (rule off in judge.toml): 1"),
+            "{tty}"
+        );
+        assert!(
+            tty.contains("rule overrides: swallowed-result=off"),
+            "{tty}"
+        );
+
+        let markdown = run_to_string(&dir, compare(OutputFormat::Markdown));
+        assert!(
+            markdown.contains("rule overrides: swallowed-result=off"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("not evaluated (rule off in judge.toml): 1"),
+            "{markdown}"
+        );
+    }
+
+    /// An unknown rule id is a config error (exit 2) raised before the
+    /// first analysis phase: the progress channel is never even opened.
+    #[test]
+    fn an_unknown_rule_id_fails_before_any_analyzer_runs() {
+        let dir = TempDir::new("rule-levels-unknown-id");
+        write_rule_level_fixture(&dir, Some("[rules.no-such-rule]\nlevel = \"off\"\n"));
+
+        let mut cli = all_cli(false, None);
+        cli.progress = Some(PathBuf::from("judge-progress.jsonl"));
+        let err = run_in_dir(&dir, cli, &mut Vec::new()).expect_err("unknown rule id must fail");
+        let CliError::Config(message) = &err else {
+            panic!("expected CliError::Config, got {err:?}");
+        };
+        assert!(message.contains("no-such-rule"), "{message}");
+        assert_eq!(exit_code(&Err(err)), 2);
+        assert!(!dir.join("judge-progress.jsonl").exists());
+
+        let err = run_in_dir(&dir, slop_cli(OutputFormat::Tty), &mut Vec::new())
+            .expect_err("focused commands validate judge.toml too");
+        assert!(matches!(err, CliError::Config(message) if message.contains("no-such-rule")));
+
+        std::fs::write(
+            dir.join("judge.toml"),
+            "[rules.swallowed-result]\nlevel = \"strict\"\n",
+        )
+        .unwrap();
+        let err = run_in_dir(&dir, slop_cli(OutputFormat::Tty), &mut Vec::new())
+            .expect_err("unknown level must fail");
+        assert!(matches!(err, CliError::Config(message) if message.contains("strict")));
+    }
+
+    #[test]
+    fn explain_rule_shows_the_effective_level_from_judge_toml() {
+        let dir = TempDir::new("rule-levels-explain");
+        write_rule_level_fixture(&dir, Some(THREE_LEVELS_TOML));
+        let explain = |id: &str, format| {
+            cli_with(Command::ExplainRule(ExplainRuleOptions {
+                id: id.to_string(),
+                format,
+            }))
+        };
+
+        let tty = run_to_string(&dir, explain("silent-default", OutputFormat::Tty));
+        assert!(
+            tty.contains("effective level: gating (judge.toml [rules.silent-default])"),
+            "{tty}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&run_to_string(
+            &dir,
+            explain("swallowed-result", OutputFormat::Json),
+        ))
+        .unwrap();
+        assert_eq!(json["effective_level"], "off");
+
+        let tty = run_to_string(&dir, explain("duplicate-code", OutputFormat::Tty));
+        assert!(!tty.contains("effective level"), "{tty}");
     }
 }

@@ -13,7 +13,11 @@
 //! `crate::finding::evidence_class_for_rule`'s fallback for any rule id it
 //! doesn't recognize.
 
-use crate::finding::EvidenceClass;
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+use crate::finding::{EvidenceClass, Finding};
 
 /// Whether a rule can affect a verdict/exit code or the health score.
 /// Documentation-only mirror of [`EvidenceClass::is_gating`] — see the
@@ -1292,6 +1296,122 @@ pub fn lookup(rule_id: &str) -> Option<&'static RuleMetadata> {
     RULE_REGISTRY.iter().find(|entry| entry.id == rule_id)
 }
 
+/// A rule's configured effect from `judge.toml` `[rules.<id>] level` (GitHub
+/// issue #54): `off` drops the rule's findings before any verdict,
+/// `advisory`/`gating` replace the verdict effect its evidence class would
+/// otherwise give it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleLevel {
+    Off,
+    Advisory,
+    Gating,
+}
+
+impl RuleLevel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Advisory => "advisory",
+            Self::Gating => "gating",
+        }
+    }
+
+    /// Parses a `level` value; `None` for anything but the three labels.
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::Off, Self::Advisory, Self::Gating]
+            .into_iter()
+            .find(|level| level.label() == value)
+    }
+
+    /// The level a rule has without any `judge.toml` override.
+    pub const fn default_for(effect: VerdictEffect) -> Self {
+        match effect {
+            VerdictEffect::Gating => Self::Gating,
+            VerdictEffect::AdvisoryOnly => Self::Advisory,
+        }
+    }
+}
+
+/// One active `[rules.<id>] level` entry, as every report header lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuleOverride {
+    pub rule: String,
+    pub level: RuleLevel,
+    /// The level the rule has without this override.
+    pub default: RuleLevel,
+}
+
+/// Every `[rules.<id>] level` configured in `judge.toml`, keyed by a rule id
+/// that is known to exist in [`RULE_REGISTRY`] (validated when the config is
+/// parsed — see `crate::rules::boundaries::RulesConfig`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleLevels(BTreeMap<String, RuleLevel>);
+
+impl RuleLevels {
+    pub fn insert(&mut self, rule: impl Into<String>, level: RuleLevel) {
+        self.0.insert(rule.into(), level);
+    }
+
+    /// The configured level for `rule`, if `judge.toml` sets one.
+    pub fn get(&self, rule: &str) -> Option<RuleLevel> {
+        self.0.get(rule).copied()
+    }
+
+    pub fn is_off(&self, rule: &str) -> bool {
+        self.get(rule) == Some(RuleLevel::Off)
+    }
+
+    /// The active overrides in rule-id order, for report headers.
+    pub fn overrides(&self) -> Vec<RuleOverride> {
+        self.0
+            .iter()
+            .map(|(rule, &level)| RuleOverride {
+                rule: rule.clone(),
+                level,
+                default: lookup(rule).map_or(RuleLevel::Advisory, |entry| {
+                    RuleLevel::default_for(entry.verdict_effect)
+                }),
+            })
+            .collect()
+    }
+
+    /// The one-line TTY/Markdown header form, e.g.
+    /// `rule overrides: duplicate-code=off, generic-naming=gating`; `None`
+    /// when nothing is overridden.
+    pub fn summary_line(&self) -> Option<String> {
+        (!self.0.is_empty()).then(|| {
+            let entries = self
+                .0
+                .iter()
+                .map(|(rule, level)| format!("{rule}={}", level.label()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("rule overrides: {entries}")
+        })
+    }
+
+    /// Drops the findings of every `off` rule and records the configured
+    /// verdict effect on the findings of every `advisory`/`gating` rule.
+    /// Id, evidence class, location and evidence stay untouched.
+    pub fn apply(&self, findings: Vec<Finding>) -> Vec<Finding> {
+        if self.0.is_empty() {
+            return findings;
+        }
+        findings
+            .into_iter()
+            .filter_map(|mut finding| match self.get(finding.rule.as_str()) {
+                Some(RuleLevel::Off) => None,
+                Some(level) => {
+                    finding.rule_level = Some(level);
+                    Some(finding)
+                }
+                None => Some(finding),
+            })
+            .collect()
+    }
+}
+
 /// Rule ids with no curated `example` yet, and why — every entry in
 /// [`RULE_REGISTRY`] must either set `example: Some(_)` or be listed here
 /// with a documented reason (see the completeness test below). This is what
@@ -1344,6 +1464,64 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::finding::{Location, OneBasedLine, Origin, Severity};
+
+    fn finding(rule: &str, evidence_class: EvidenceClass) -> Finding {
+        Finding::new(
+            format!("{rule}:src/lib.rs:1:1"),
+            rule,
+            Severity::Warn,
+            Location {
+                file: "src/lib.rs".into(),
+                line: OneBasedLine::FIRST,
+                item_path: "f".to_string(),
+            },
+            evidence_class,
+            Origin::Code,
+            None,
+        )
+    }
+
+    #[test]
+    fn rule_levels_drop_off_rules_and_override_the_verdict_effect() {
+        let mut levels = RuleLevels::default();
+        levels.insert("swallowed-result", RuleLevel::Off);
+        levels.insert("silent-default", RuleLevel::Gating);
+        levels.insert("merged-stub", RuleLevel::Advisory);
+        let findings = vec![
+            finding("swallowed-result", EvidenceClass::DerivedFact),
+            finding("silent-default", EvidenceClass::Heuristic),
+            finding("merged-stub", EvidenceClass::DerivedFact),
+            finding("empty-impl", EvidenceClass::DerivedFact),
+        ];
+
+        let applied = levels.apply(findings);
+
+        let rules: Vec<_> = applied.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["silent-default", "merged-stub", "empty-impl"]);
+        assert!(applied[0].is_gating());
+        assert_eq!(applied[0].evidence_class, EvidenceClass::Heuristic);
+        assert!(!applied[1].is_gating());
+        assert_eq!(applied[1].evidence_class, EvidenceClass::DerivedFact);
+        assert!(applied[2].is_gating());
+        assert_eq!(applied[2].rule_level, None);
+    }
+
+    #[test]
+    fn rule_overrides_name_the_configured_and_the_default_level() {
+        let mut levels = RuleLevels::default();
+        assert_eq!(levels.summary_line(), None);
+        levels.insert("silent-default", RuleLevel::Gating);
+        levels.insert("duplicate-code", RuleLevel::Off);
+
+        assert_eq!(
+            levels.summary_line().as_deref(),
+            Some("rule overrides: duplicate-code=off, silent-default=gating")
+        );
+        let overrides = levels.overrides();
+        assert_eq!(overrides[0].default, RuleLevel::Gating);
+        assert_eq!(overrides[1].default, RuleLevel::Advisory);
+    }
 
     /// Every registry entry's `verdict_effect` must agree with
     /// `evidence_class.is_gating()` — the single place this policy actually

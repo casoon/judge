@@ -707,6 +707,7 @@ fn leak_type_finding(
             "site": site,
         })),
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

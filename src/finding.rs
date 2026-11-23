@@ -361,6 +361,12 @@ pub struct Finding {
     /// `None` where a detector has no such gap to disclose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limitations: Option<Vec<String>>,
+    /// The verdict effect `judge.toml` `[rules.<id>] level` assigns this
+    /// finding's rule (see [`crate::rule_registry::RuleLevels::apply`]),
+    /// overriding the one `evidence_class` implies. `None` when the rule
+    /// keeps its default. Additive in schema v2; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rule_level: Option<crate::rule_registry::RuleLevel>,
     /// Findings that caused this one to appear (the root-cause direction).
     /// Derived from [`FindingGraph`]'s edge set on export — `pub(crate)` so
     /// the public API cannot set it independently of `causes` (todo.md
@@ -393,6 +399,7 @@ impl Finding {
             origin,
             evidence,
             limitations: None,
+            rule_level: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -430,8 +437,13 @@ impl Finding {
 
     /// See [`EvidenceClass::is_gating`] — `false` means this finding is
     /// advisory: shown, but with no effect on verdicts or the health score.
+    /// A `judge.toml` `[rules.<id>] level` override takes precedence.
     pub fn is_gating(&self) -> bool {
-        self.evidence_class.is_gating()
+        match self.rule_level {
+            Some(crate::rule_registry::RuleLevel::Gating) => true,
+            Some(crate::rule_registry::RuleLevel::Advisory) => false,
+            Some(crate::rule_registry::RuleLevel::Off) | None => self.evidence_class.is_gating(),
+        }
     }
 
     /// Findings that caused this one (read-only; derived from
@@ -657,6 +669,11 @@ pub struct Report {
     /// every source file is available in `HEAD`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub history_unavailable: Vec<PathBuf>,
+    /// The active `judge.toml` `[rules.<id>] level` overrides (GitHub issue
+    /// #54), so a relaxed verdict is never silent. Additive in schema v2;
+    /// omitted when nothing is overridden.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rule_overrides: Vec<crate::rule_registry::RuleOverride>,
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -682,6 +699,7 @@ impl Report {
             suppressed_inline: 0,
             api_surface_size: None,
             history_unavailable: Vec::new(),
+            rule_overrides: Vec::new(),
         }
     }
 
@@ -715,6 +733,16 @@ impl Report {
     /// without turning that ordinary in-progress state into a report error.
     pub fn with_history_unavailable(mut self, files: Vec<PathBuf>) -> Self {
         self.history_unavailable = files;
+        self
+    }
+
+    /// Lists the active `[rules.<id>] level` overrides — builder-style like
+    /// [`with_universe`](Self::with_universe).
+    pub fn with_rule_overrides(
+        mut self,
+        overrides: Vec<crate::rule_registry::RuleOverride>,
+    ) -> Self {
+        self.rule_overrides = overrides;
         self
     }
 }

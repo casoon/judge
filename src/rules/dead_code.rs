@@ -805,6 +805,7 @@ fn dead_code_finding(
         origin: Origin::Code,
         evidence: Some(evidence),
         limitations,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1848,6 +1849,7 @@ fn coupling_finding(
         origin: Origin::Code,
         evidence: Some(evidence),
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

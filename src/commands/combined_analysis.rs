@@ -21,6 +21,9 @@ pub(crate) struct CollectedFindings {
     /// How many findings an inline `// judge-ignore: <rule> — <reason>`
     /// comment dropped (see [`judge::suppression::apply_inline_suppressions`]).
     pub(crate) suppressed_inline: usize,
+    /// `judge.toml`'s `[rules.<id>] level` overrides, already applied to
+    /// `findings` and listed in every report header.
+    pub(crate) rule_levels: judge::rule_registry::RuleLevels,
 }
 
 /// Runs every default current-state detector (complexity, duplication,
@@ -45,6 +48,8 @@ pub(crate) fn collect_findings_with_progress(
     workspace: &judge::ingest::Workspace,
     progress: &mut dyn FnMut(combined::ProgressEvent) -> Result<(), CliError>,
 ) -> Result<CollectedFindings, CliError> {
+    // Parsed first so a broken `[rules.*]` table fails before any analyzer.
+    let rule_levels = crate::load_judge_toml(&workspace.root)?.rules.levels;
     let mut findings = Vec::new();
     let mut analysis_errors = Vec::new();
     let mut rule_revisions = default_rule_revisions();
@@ -58,7 +63,9 @@ pub(crate) fn collect_findings_with_progress(
     progress(combined::ProgressEvent::completed("slop"))?;
 
     progress(combined::ProgressEvent::started("duplication"))?;
-    collect_duplication(workspace, &mut findings, &mut analysis_errors);
+    if !rule_levels.is_off(judge::rules::duplication::DUPLICATE_RULE) {
+        collect_duplication(workspace, &mut findings, &mut analysis_errors);
+    }
     progress(combined::ProgressEvent::completed("duplication"))?;
 
     progress(combined::ProgressEvent::started("structural"))?;
@@ -70,12 +77,13 @@ pub(crate) fn collect_findings_with_progress(
     progress(combined::ProgressEvent::completed("security"))?;
 
     progress(combined::ProgressEvent::started("dependencies"))?;
-    collect_dependencies(workspace, &mut findings, &mut analysis_errors);
+    collect_dependencies(workspace, &rule_levels, &mut findings, &mut analysis_errors);
     progress(combined::ProgressEvent::completed("dependencies"))?;
 
     progress(combined::ProgressEvent::started("boundaries"))?;
     let (boundaries_config_path, boundary_rules_checked) = collect_boundaries(
         workspace,
+        &rule_levels,
         &mut findings,
         &mut analysis_errors,
         &mut rule_revisions,
@@ -83,7 +91,8 @@ pub(crate) fn collect_findings_with_progress(
     progress(combined::ProgressEvent::completed("boundaries"))?;
 
     progress(combined::ProgressEvent::started("suppression"))?;
-    let (findings, suppressed_inline) = collect_suppression(workspace, findings)?;
+    let (findings, suppressed_inline) =
+        collect_suppression(workspace, rule_levels.apply(findings))?;
     progress(combined::ProgressEvent::completed("suppression"))?;
 
     Ok(CollectedFindings {
@@ -93,6 +102,7 @@ pub(crate) fn collect_findings_with_progress(
         boundary_rules_checked,
         boundaries_config_path,
         suppressed_inline,
+        rule_levels,
     })
 }
 
@@ -377,6 +387,7 @@ pub(crate) fn collect_security(
 
 fn collect_dependencies(
     workspace: &judge::ingest::Workspace,
+    rule_levels: &judge::rule_registry::RuleLevels,
     findings: &mut Vec<Finding>,
     analysis_errors: &mut Vec<String>,
 ) {
@@ -393,11 +404,14 @@ fn collect_dependencies(
     // rules (`phantom-crate`/`phantom-version`/`fresh-low-reputation-dep`)
     // need real crates.io network access and are opt-in only via
     // `cargo judge deps --check-crates-io` (see `run_deps`).
-    findings.extend(judge::rules::slopsquat::analyze_name_collision(workspace));
+    if !rule_levels.is_off(judge::rules::slopsquat::NAME_COLLISION_RISK_RULE) {
+        findings.extend(judge::rules::slopsquat::analyze_name_collision(workspace));
+    }
 }
 
 fn collect_boundaries(
     workspace: &judge::ingest::Workspace,
+    rule_levels: &judge::rule_registry::RuleLevels,
     findings: &mut Vec<Finding>,
     analysis_errors: &mut Vec<String>,
     rule_revisions: &mut std::collections::HashMap<String, u32>,
@@ -417,6 +431,9 @@ fn collect_boundaries(
     // "`feature-graph-cycle`" for why: a `[features]` table is either
     // cyclic or it isn't, a fact needing no project-intent config to
     // interpret.
+    if rule_levels.is_off(judge::rules::boundaries::FEATURE_GRAPH_CYCLE_RULE) {
+        return Ok((boundaries_config_path, boundary_rules_checked));
+    }
     let feature_graph_manifest = workspace.root.join("Cargo.toml");
     match judge::rules::boundaries::feature_graph_cycles(Some(&feature_graph_manifest)) {
         Ok(cycle_findings) => {

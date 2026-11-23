@@ -79,7 +79,7 @@ fn run_dead_code_deep(
                 baseline,
             },
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     // One rust-analyzer load serves every detector below that analyses the
     // default feature set.
@@ -141,7 +141,7 @@ fn run_dead_code_deep(
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
     if baseline_request.is_requested() {
@@ -365,7 +365,7 @@ fn run_explain_deep(
         include_tests,
         format,
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let result = judge::reachability::why_live(&workspace, &item_path, include_tests)?;
 

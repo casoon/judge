@@ -136,7 +136,7 @@ pub(crate) fn run(
         color,
         renderreport,
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let progress_path = progress_path.map(|path| {
         if path.is_absolute() {
             path.to_path_buf()
@@ -210,7 +210,8 @@ fn run_collected(
             // (excluded — see `collect_findings`), so the universe says so.
             let report = Report::with_errors(collected.findings, collected.analysis_errors)
                 .with_universe(judge::finding::AnalysisUniverse::fast(workspace, false))
-                .with_suppressed_inline(collected.suppressed_inline);
+                .with_suppressed_inline(collected.suppressed_inline)
+                .with_rule_overrides(collected.rule_levels.overrides());
             write_json(out, &report)?;
         }
         OutputFormat::Sarif => {
@@ -231,7 +232,7 @@ fn run_collected(
                 collected.boundary_rules_checked,
                 collected.boundaries_config_path.exists(),
                 collected.suppressed_inline,
-                &workspace.root,
+                &collected.rule_levels,
             )
             .write_markdown(&workspace.root);
             write!(out, "{markdown}")?;
@@ -245,7 +246,7 @@ fn run_collected(
                 collected.boundary_rules_checked,
                 collected.boundaries_config_path.exists(),
                 collected.suppressed_inline,
-                &workspace.root,
+                &collected.rule_levels,
             )
             .write_renderreport(&workspace.root);
             write!(out, "{request}")?;
@@ -259,7 +260,7 @@ fn run_collected(
                 collected.boundary_rules_checked,
                 collected.boundaries_config_path.exists(),
                 collected.suppressed_inline,
-                &workspace.root,
+                &collected.rule_levels,
             )
             .write_tty_colored(out, &workspace.root, details, color)?;
         }
@@ -279,7 +280,7 @@ fn build_report<'a>(
     boundary_rules_checked: usize,
     boundaries_config_exists: bool,
     suppressed_inline: usize,
-    _workspace_root: &Path,
+    rule_levels: &judge::rule_registry::RuleLevels,
 ) -> judge::report::Report<'a> {
     let mut status_lines = vec![
         "Judge summary".to_string(),
@@ -300,6 +301,9 @@ fn build_report<'a>(
     ];
     if suppressed_inline > 0 {
         status_lines.push(format!("  inline suppressions: {suppressed_inline}"));
+    }
+    if let Some(line) = rule_levels.summary_line() {
+        status_lines.push(format!("  {line}"));
     }
 
     let analysis_error_items = analysis_errors

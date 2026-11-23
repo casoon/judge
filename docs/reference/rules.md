@@ -35,6 +35,39 @@ Many rules only run under preconditions: some need `judge.toml` configuration, t
 (`--features deep`), a specific subcommand, an imported report or the `network` feature.
 `explain-rule` states the precondition of each rule.
 
+## Rule levels
+
+A workspace can change the effect of any rule in `judge.toml`, one table per rule id:
+
+```toml
+[rules.generic-naming]
+level = "off"
+
+[rules.silent-default]
+level = "gating"
+
+[rules.catch-all-error]
+level = "advisory"
+allow-anyhow-at-boundary = true
+```
+
+| Level | Effect |
+| --- | --- |
+| `off` | The rule's findings are dropped before the verdict. Where a rule runs on its own (for example `duplicate-code` in the combined run), it is not run at all. Dropped findings are not counted as suppressions. |
+| `advisory` | Findings are listed as advisory and never change the verdict, the exit code or the score. |
+| `gating` | Findings can fail a baseline verdict and count towards the score. |
+
+The finding itself (id, evidence class, location, evidence) stays the same; in JSON it gains a
+`rule_level` field. Rule-specific keys such as `allow-anyhow-at-boundary` live in the same table.
+An unknown rule id, an unknown level or an unknown key is a configuration error: judge exits with
+2 before any analysis runs.
+
+Every report names the active overrides, so a relaxed verdict is never silent: a
+`rule overrides: …` line in the TTY and Markdown header, `rule_overrides` in JSON, and
+`invocations[].ruleConfigurationOverrides` in SARIF. `cargo judge explain-rule <id>` shows the
+effective level when `judge.toml` changes it, and `cargo judge init` writes a commented example.
+Levels apply to the whole workspace; there are no per-path or per-crate levels.
+
 ## All rules
 
 | Rule | Evidence class | Verdict effect |

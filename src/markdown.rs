@@ -11,8 +11,13 @@ use crate::baseline::{Delta, Verdict, partition_gating};
 use crate::finding::{Finding, Severity};
 
 /// An artifact baseline comparison as a compact Markdown delta.
-pub fn render_delta(delta: &Delta, verdict: Verdict) -> String {
+/// `rule_overrides` is the `judge.toml` `[rules.<id>] level` header line
+/// (see [`crate::rule_registry::RuleLevels::summary_line`]).
+pub fn render_delta(delta: &Delta, verdict: Verdict, rule_overrides: Option<&str>) -> String {
     let mut out = format!("**verdict: {}**\n\n", verdict.label());
+    if let Some(line) = rule_overrides {
+        writeln!(out, "{line}\n").unwrap();
+    }
     push_delta_body(&mut out, delta);
     out
 }
@@ -26,6 +31,14 @@ fn push_delta_body(out: &mut String, delta: &Delta) {
         delta.severity_changed.len(),
     )
     .unwrap();
+    if !delta.not_evaluated.is_empty() {
+        writeln!(
+            out,
+            "\nnot evaluated (rule off in judge.toml): {}",
+            delta.not_evaluated.len()
+        )
+        .unwrap();
+    }
     let (gating, advisory) = partition_gating(&delta.introduced);
     push_section(out, "introduced", &gating);
     push_section(
@@ -123,9 +136,10 @@ mod tests {
             resolved: Vec::new(),
             severity_changed: Vec::new(),
             unchanged_count: 2,
+            not_evaluated: Vec::new(),
         };
 
-        let text = render_delta(&delta, Verdict::Pass);
+        let text = render_delta(&delta, Verdict::Pass, None);
 
         assert_eq!(
             text,
@@ -155,9 +169,10 @@ unchanged: 2 — resolved: 0 — severity changed: 0
             resolved: Vec::new(),
             severity_changed: Vec::new(),
             unchanged_count: 0,
+            not_evaluated: Vec::new(),
         };
 
-        let text = render_delta(&delta, Verdict::Fail);
+        let text = render_delta(&delta, Verdict::Fail, None);
         assert!(text.contains("| src/win/a.rs:3 |"), "text: {text}");
     }
 }

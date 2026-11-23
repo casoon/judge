@@ -108,7 +108,7 @@ pub(crate) fn run_patterns(
         pattern_baseline,
     } = options;
     reject_unsupported_advisory_format(format, "`patterns`")?;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let candidates = collect_pattern_candidates(&workspace, clippy_json.as_deref())?;
 
     if save_pattern_baseline {
@@ -194,7 +194,7 @@ pub(crate) fn run_principles(
 ) -> Result<CommandOutcome, CliError> {
     let PrinciplesOptions { format } = options;
     reject_unsupported_advisory_format(format, "`principles`")?;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let heuristics = collect_principle_heuristics(&workspace)?;
 
     render_advisory(
@@ -246,7 +246,7 @@ fn load_pattern_candidate(
     command_name: &str,
 ) -> Result<judge::rules::pattern::PatternCandidate, CliError> {
     reject_unsupported_advisory_format(format, command_name)?;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     find_pattern_candidate(&workspace, id)
 }
 
@@ -421,7 +421,7 @@ pub(crate) fn run_explain_principle(
 ) -> Result<CommandOutcome, CliError> {
     let ExplainPrincipleOptions { id, format } = options;
     reject_unsupported_advisory_format(format, "`explain-principle`")?;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let heuristic = find_principle_heuristic(&workspace, &id)?;
 
     render_advisory(
@@ -481,10 +481,11 @@ pub(crate) fn run_fix_preview(
 
 /// `cargo judge explain-rule <id>` (todo.md §17.5): a rule's fixed
 /// documentation from [`judge::rule_registry`] — evidence class,
-/// preconditions, exclusions, allowed wording, and verdict effect. A pure
-/// static lookup: unlike `explain-pattern`/`fix-preview` it never loads the
-/// workspace or runs analysis, so it never fails for an analyzer reason and
-/// never produces `CommandOutcome::FindingsFound`.
+/// preconditions, exclusions, allowed wording, and verdict effect. A static
+/// lookup that never runs analysis, so it never produces
+/// `CommandOutcome::FindingsFound`. Inside a workspace it also reads
+/// `judge.toml` to show the effective level when `[rules.<id>] level`
+/// changes it; outside one there is no override to show.
 pub(crate) fn run_explain_rule(
     options: ExplainRuleOptions,
     out: &mut dyn Write,
@@ -493,6 +494,10 @@ pub(crate) fn run_explain_rule(
     reject_unsupported_advisory_format(format, "`explain-rule`")?;
     let entry = judge::rule_registry::lookup(&id)
         .ok_or_else(|| CliError::Analyzer(format!("unknown rule id: {id}")))?;
+    let configured_level = match judge::ingest::load(None) {
+        Ok(workspace) => load_judge_toml(&workspace.root)?.rules.levels.get(entry.id),
+        Err(_) => None,
+    };
 
     render_advisory(
         out,
@@ -504,7 +509,7 @@ pub(crate) fn run_explain_rule(
                     "why_it_matters": example.why_it_matters,
                 })
             });
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "id": entry.id,
                 "evidence_class": entry.evidence_class,
                 "verdict_effect": entry.verdict_effect.label(),
@@ -513,6 +518,9 @@ pub(crate) fn run_explain_rule(
                 "allowed_wording": entry.allowed_wording,
                 "example": example,
             });
+            if let Some(level) = configured_level {
+                json["effective_level"] = serde_json::json!(level);
+            }
             to_json_string(&json)
         },
         |out| {
@@ -524,6 +532,14 @@ pub(crate) fn run_explain_rule(
                 evidence_class.as_str().unwrap_or_default()
             )?;
             writeln!(out, "  verdict effect: {}", entry.verdict_effect.label())?;
+            if let Some(level) = configured_level {
+                writeln!(
+                    out,
+                    "  effective level: {} (judge.toml [rules.{}])",
+                    level.label(),
+                    entry.id
+                )?;
+            }
             writeln!(out, "  preconditions: {}", entry.preconditions)?;
             writeln!(out, "  exclusions: {}", entry.exclusions)?;
             writeln!(out, "  allowed wording: {}", entry.allowed_wording)?;

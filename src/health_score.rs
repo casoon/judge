@@ -595,6 +595,7 @@ mod tests {
             origin: Origin::Code,
             evidence: None,
             limitations: None,
+            rule_level: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }

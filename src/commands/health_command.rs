@@ -34,7 +34,7 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
             },
         include_generated,
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let source_files = super::analysis_commands::workspace_source_files(&workspace);
     let report = judge::rules::complexity::analyze_workspace(source_files, include_generated);
@@ -73,7 +73,7 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     // detector above has merged its findings in, so a suppressed finding
     // never reaches score, baseline diff, or verdict below.
     let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
 
     let excluded_generated =
         report.excluded_generated + slop.excluded_generated + security_excluded_generated;
