@@ -2413,6 +2413,8 @@ fn dup_two(x: i32) -> i32 {
     /// (exit 2) in Fast and Deep Tier builds alike.
     #[test]
     fn explain_format_sarif_is_a_config_error() {
+        // `run` reads judge.toml from the cwd, which other tests change.
+        let _guard = lock_cwd();
         let mut out = Vec::new();
         let err = run(
             cli_with(Command::Explain(ExplainOptions {
@@ -2854,6 +2856,8 @@ fn dup_two(x: i32) -> i32 {
     /// (a) A known rule id resolves with every field rendered in TTY output.
     #[test]
     fn explain_rule_known_id_renders_all_fields_in_tty() {
+        // `run` reads judge.toml from the cwd, which other tests change.
+        let _guard = lock_cwd();
         let mut out = Vec::new();
         let outcome = run(
             cli_with(Command::ExplainRule(ExplainRuleOptions {
@@ -2878,6 +2882,8 @@ fn dup_two(x: i32) -> i32 {
     /// unambiguous shape.
     #[test]
     fn explain_rule_known_id_renders_all_fields_in_json() {
+        // `run` reads judge.toml from the cwd, which other tests change.
+        let _guard = lock_cwd();
         let mut out = Vec::new();
         let outcome = run(
             cli_with(Command::ExplainRule(ExplainRuleOptions {
@@ -2913,6 +2919,8 @@ fn dup_two(x: i32) -> i32 {
     /// section/field entirely rather than printing an empty placeholder.
     #[test]
     fn explain_rule_with_a_curated_example_renders_it_in_tty_and_json() {
+        // `run` reads judge.toml from the cwd, which other tests change.
+        let _guard = lock_cwd();
         let mut tty_out = Vec::new();
         run(
             cli_with(Command::ExplainRule(ExplainRuleOptions {
@@ -2967,6 +2975,8 @@ fn dup_two(x: i32) -> i32 {
     /// verdict — same convention as `explain-pattern`.
     #[test]
     fn explain_rule_unknown_id_is_an_analyzer_error() {
+        // `run` reads judge.toml from the cwd, which other tests change.
+        let _guard = lock_cwd();
         let mut out = Vec::new();
         let err = run(
             cli_with(Command::ExplainRule(ExplainRuleOptions {
