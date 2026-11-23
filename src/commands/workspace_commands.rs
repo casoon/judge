@@ -24,7 +24,7 @@ use std::path::PathBuf;
 /// data-loading preamble is otherwise byte-identical; neither command needs
 /// the `Workspace` itself afterwards, only the derived `RefactorMap`.
 fn load_complexity_map(include_tests: bool) -> Result<judge::refactor_map::RefactorMap, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     Ok(judge::refactor_map::analyze(&workspace, include_tests))
 }
 
@@ -78,7 +78,7 @@ pub(crate) fn run_structure(
     options: StructureOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let map = judge::refactor_map::analyze(&workspace, false);
     let graph =
         judge::rules::boundaries::build_crate_graph(Some(&workspace.root.join("Cargo.toml")))?;
@@ -267,7 +267,7 @@ pub(crate) fn run_refactor(
     options: RefactorOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let mut collected = super::combined_analysis::collect_findings(&workspace)?;
     judge::finding::sort_by_severity_desc(&mut collected.findings);
     judge::finding::relativize_paths(&mut collected.findings, &workspace.root);
@@ -428,7 +428,7 @@ pub(crate) fn run_inspect(
     options: InspectOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let profiles = judge::rules::release_profile::workspace_builds_binaries(&workspace)
         .then(|| judge::rules::release_profile::resolve(&workspace.root));
     let deep_available = AnalysisTier::Deep.is_available();
@@ -608,7 +608,7 @@ pub(crate) fn run_impact(
     options: ImpactOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let impact = judge::impact::analyze(&workspace, &options.target)
         .map_err(|err| CliError::Config(err.to_string()))?;
 

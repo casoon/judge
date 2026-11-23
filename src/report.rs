@@ -373,10 +373,13 @@ impl Report<'_> {
 /// Renders a focused, current-state command with Runemark's standard terminal
 /// conventions. JSON and SARIF remain the exhaustive machine contracts; this
 /// is the shared concise human view for commands that return only findings.
+/// `rule_overrides` is the `judge.toml` `[rules.<id>] level` header line
+/// (see [`crate::rule_registry::RuleLevels::summary_line`]).
 pub fn write_findings_tty(
     out: &mut dyn Write,
     workspace_root: &Path,
     title: impl Into<String>,
+    rule_overrides: Option<String>,
     findings: &[Finding],
     errors: &[String],
 ) -> std::io::Result<()> {
@@ -386,17 +389,21 @@ pub fn write_findings_tty(
         .iter()
         .map(|error| Cow::Borrowed(error.as_str()))
         .collect();
-    Report::new(vec![title.into()])
-        .with_scope_note(
-            format!("Analysis incomplete: {} error(s)", errors.len()),
-            error_items,
-        )
-        .with_group("Evidence-backed findings", gating, false)
-        .with_group("Advisory heuristics", advisory, true)
-        .with_next_steps(vec![
-            "cargo judge --format json      full machine-readable evidence".to_string(),
-        ])
-        .write_tty(out, workspace_root, false)
+    Report::new(
+        std::iter::once(title.into())
+            .chain(rule_overrides)
+            .collect(),
+    )
+    .with_scope_note(
+        format!("Analysis incomplete: {} error(s)", errors.len()),
+        error_items,
+    )
+    .with_group("Evidence-backed findings", gating, false)
+    .with_group("Advisory heuristics", advisory, true)
+    .with_next_steps(vec![
+        "cargo judge --format json      full machine-readable evidence".to_string(),
+    ])
+    .write_tty(out, workspace_root, false)
 }
 
 /// Groups `findings` by rule, worst-count first (ties broken

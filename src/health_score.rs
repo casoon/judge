@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::baseline::Baseline;
 use crate::finding::{Finding, Severity};
 use crate::ingest::{CrateInfo, SourceFile, Workspace};
+use crate::rule_registry::RuleLevels;
 use crate::rules::boundaries::CrateProfile;
 
 /// Fixed per-severity deduction weight (see module docs, point 2 — not
@@ -407,6 +408,11 @@ pub struct ScoreContext {
     /// `1.0` entries, which don't change the score — are omitted, so
     /// semantically identical configs compare equal.
     pub profile_multipliers: BTreeMap<String, DeductionMultiplier>,
+    /// The `judge.toml` `[rules.<id>] level` overrides active at save time:
+    /// they decide which findings are scored at all. Absent in baselines
+    /// saved before rule levels existed, which reads as "no overrides".
+    #[serde(default, skip_serializing_if = "RuleLevels::is_empty")]
+    pub rule_levels: RuleLevels,
 }
 
 impl ScoreContext {
@@ -423,7 +429,15 @@ impl ScoreContext {
         Self {
             formula_version: SCORE_FORMULA_VERSION,
             profile_multipliers,
+            rule_levels: RuleLevels::default(),
         }
+    }
+
+    /// Records the active `[rules.<id>] level` overrides — builder-style, so
+    /// a context without overrides keeps its previous shape.
+    pub fn with_rule_levels(mut self, rule_levels: RuleLevels) -> Self {
+        self.rule_levels = rule_levels;
+        self
     }
 }
 
@@ -437,6 +451,9 @@ pub enum NotComparableReason {
     FormulaVersionChanged,
     /// `judge.toml` crate profiles changed since the baseline was saved.
     ProfilesChanged,
+    /// `judge.toml` `[rules.<id>] level` overrides changed since the
+    /// baseline was saved, so a different set of findings is scored.
+    RuleLevelsChanged,
     /// The baseline recorded no authored LOC, so its historical score is
     /// unavailable (see [`ScoreReason::NoAuthoredLoc`]).
     BaselineLocUnavailable,
@@ -449,6 +466,7 @@ impl NotComparableReason {
             Self::MissingScoreContext => "missing_score_context",
             Self::FormulaVersionChanged => "formula_version_changed",
             Self::ProfilesChanged => "profiles_changed",
+            Self::RuleLevelsChanged => "rule_levels_changed",
             Self::BaselineLocUnavailable => "baseline_loc_unavailable",
         }
     }
@@ -465,6 +483,9 @@ impl std::fmt::Display for NotComparableReason {
             }
             Self::ProfilesChanged => {
                 "judge.toml crate profiles changed since the baseline was saved (re-save it with --save-baseline)"
+            }
+            Self::RuleLevelsChanged => {
+                "judge.toml rule levels changed since the baseline was saved (re-save it with --save-baseline)"
             }
             Self::BaselineLocUnavailable => {
                 "the baseline recorded no authored LOC, so its score is unavailable"
@@ -522,6 +543,7 @@ pub fn trend(
     baseline: &Baseline,
     workspace: &Workspace,
     crate_profiles: &[CrateProfile],
+    rule_levels: &RuleLevels,
 ) -> Trend {
     let Some(context) = &baseline.score_context else {
         return Trend::NotComparable {
@@ -535,10 +557,18 @@ pub fn trend(
             reason: NotComparableReason::FormulaVersionChanged,
         };
     }
-    if *context != ScoreContext::from_profiles(crate_profiles) {
+    if context.profile_multipliers
+        != ScoreContext::from_profiles(crate_profiles).profile_multipliers
+    {
         return Trend::NotComparable {
             current,
             reason: NotComparableReason::ProfilesChanged,
+        };
+    }
+    if context.rule_levels != *rule_levels {
+        return Trend::NotComparable {
+            current,
+            reason: NotComparableReason::RuleLevelsChanged,
         };
     }
     if baseline.total_loc == 0 {
@@ -554,7 +584,7 @@ pub fn trend(
         baseline
             .findings
             .iter()
-            .filter(|finding| finding.evidence_class.is_gating())
+            .filter(|finding| rule_levels.is_gating(finding.rule.as_str(), finding.evidence_class))
             .map(|finding| {
                 // Stored paths are workspace-relative (`join` is a no-op for
                 // older baselines that stored absolute paths).
@@ -595,6 +625,7 @@ mod tests {
             origin: Origin::Code,
             evidence: None,
             limitations: None,
+            rule_level: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -886,7 +917,13 @@ mod tests {
         );
 
         let current = available(compute(&findings, 1000, &workspace, &profiles));
-        let trend = trend(current, &baseline, &workspace, &profiles);
+        let trend = trend(
+            current,
+            &baseline,
+            &workspace,
+            &profiles,
+            &RuleLevels::default(),
+        );
 
         assert_eq!(trend.delta(), Some(0.0));
         assert!(matches!(trend, Trend::Comparable { .. }));
@@ -909,7 +946,13 @@ mod tests {
         }];
 
         let current = available(compute(&findings, 1000, &workspace, &profiles));
-        let trend = trend(current, &baseline, &workspace, &profiles);
+        let trend = trend(
+            current,
+            &baseline,
+            &workspace,
+            &profiles,
+            &RuleLevels::default(),
+        );
 
         assert_eq!(trend.delta(), None);
         assert!(matches!(
@@ -919,6 +962,53 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rule_level_change_makes_the_trend_not_comparable() {
+        let workspace = workspace_with_crate("/repo", "core");
+        let findings = vec![finding(Severity::Warn, "/repo/src/lib.rs")];
+        let baseline = Baseline::new(
+            &findings,
+            std::collections::HashMap::new(),
+            1000,
+            ScoreContext::from_profiles(&[]),
+        );
+        let mut levels = RuleLevels::default();
+        levels.insert("rule", crate::rule_registry::RuleLevel::Advisory);
+
+        let current = available(compute(&levels.apply(findings), 1000, &workspace, &[]));
+        let trend = trend(current, &baseline, &workspace, &[], &levels);
+
+        assert_eq!(trend.delta(), None);
+        assert!(matches!(
+            trend,
+            Trend::NotComparable {
+                reason: NotComparableReason::RuleLevelsChanged,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn trend_scores_the_baseline_under_the_same_rule_levels() {
+        let workspace = workspace_with_crate("/repo", "core");
+        let findings = vec![finding(Severity::Warn, "/repo/src/lib.rs")];
+        let mut levels = RuleLevels::default();
+        levels.insert("rule", crate::rule_registry::RuleLevel::Advisory);
+        let baseline = Baseline::new(
+            &findings,
+            std::collections::HashMap::new(),
+            1000,
+            ScoreContext::from_profiles(&[]).with_rule_levels(levels.clone()),
+        );
+
+        let current = available(compute(&levels.apply(findings), 1000, &workspace, &[]));
+        assert_eq!(current.warn_count, 0);
+        let trend = trend(current, &baseline, &workspace, &[], &levels);
+
+        assert!(matches!(trend, Trend::Comparable { .. }));
+        assert_eq!(trend.delta(), Some(0.0));
     }
 
     #[test]
@@ -940,7 +1030,7 @@ mod tests {
 
         let current = available(compute(&findings, 1000, &workspace, &[]));
         assert_eq!(current.warn_count, 1);
-        let trend = trend(current, &baseline, &workspace, &[]);
+        let trend = trend(current, &baseline, &workspace, &[], &RuleLevels::default());
 
         assert_eq!(trend.delta(), Some(0.0));
     }
@@ -960,7 +1050,7 @@ mod tests {
         baseline.score_context.as_mut().unwrap().formula_version = 1;
 
         let current = available(compute(&findings, 1000, &workspace, &[]));
-        let trend = trend(current, &baseline, &workspace, &[]);
+        let trend = trend(current, &baseline, &workspace, &[], &RuleLevels::default());
 
         assert!(matches!(
             trend,
@@ -984,7 +1074,7 @@ mod tests {
         baseline.score_context = None;
 
         let current = available(compute(&findings, 1000, &workspace, &[]));
-        let trend = trend(current, &baseline, &workspace, &[]);
+        let trend = trend(current, &baseline, &workspace, &[], &RuleLevels::default());
 
         assert!(matches!(
             trend,

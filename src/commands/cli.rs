@@ -262,9 +262,15 @@ const JUDGE_TOML_TEMPLATE: &str = r#"# judge configuration. Everything below is 
 # crates = ["my-parser"]
 # deduction_multiplier = 0.5
 
-# Allow `anyhow` at public boundaries for `catch-all-error`.
+# Per-rule settings: `level` is "off", "advisory", or "gating" and works for
+# every rule id (`cargo judge explain-rule <id>`). Every report lists the
+# active overrides. `catch-all-error` also accepts its own key.
 # [rules.catch-all-error]
+# level = "advisory"
 # allow-anyhow-at-boundary = true
+#
+# [rules.generic-naming]
+# level = "off"
 "#;
 
 /// `cargo judge init`: writes a commented starter `judge.toml` into the
@@ -285,4 +291,29 @@ fn run_init(out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
         "Next: uncomment a table, then run `cargo judge boundaries`."
     )?;
     Ok(CommandOutcome::Clean)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JUDGE_TOML_TEMPLATE;
+
+    /// The commented `[rules.*]` example must be a valid config once
+    /// uncommented, so `init` never teaches a table judge then rejects.
+    #[test]
+    fn the_init_template_rules_example_parses_once_uncommented() {
+        let example = JUDGE_TOML_TEMPLATE
+            .lines()
+            .skip_while(|line| !line.starts_with("# [rules."))
+            .map(|line| line.trim_start_matches('#').trim_start())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: judge::rules::boundaries::BoundaryConfig =
+            toml::from_str(&example).expect("uncommented [rules.*] example must parse");
+
+        assert!(config.rules.catch_all_error.allow_anyhow_at_boundary);
+        assert_eq!(
+            config.rules.levels.summary_line().as_deref(),
+            Some("rule overrides: catch-all-error=advisory, generic-naming=off")
+        );
+    }
 }

@@ -205,6 +205,7 @@ impl CloneMember {
             // diffed against a baseline and only the `Finding` survives.
             evidence: Some(evidence),
             limitations: None,
+            rule_level: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }

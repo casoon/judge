@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::finding::{Report, Severity};
+use crate::rule_registry::RuleLevel;
 
 /// The SARIF `level` for a finding severity: `Fail` → `error`,
 /// `Warn` → `warning`, `Info` → `note`.
@@ -58,7 +59,9 @@ fn fingerprints(report: &Report) -> Vec<String> {
 /// result per finding. `evidence_class` and the advisory/gating split are
 /// carried in each result's `properties` bag; the report's
 /// `analysis_universe` (when present) in the run's `properties` bag — SARIF
-/// has no native slot for either (todo.md §17.2, §17.5).
+/// has no native slot for either (todo.md §17.2, §17.5). Active
+/// `judge.toml` `[rules.<id>] level` overrides become the invocation's
+/// `ruleConfigurationOverrides`.
 pub fn render(report: &Report) -> serde_json::Value {
     let rules: Vec<serde_json::Value> = report
         .findings
@@ -133,6 +136,21 @@ pub fn render(report: &Report) -> serde_json::Value {
             "toolExecutionNotifications": notifications,
         }],
     });
+    if !report.rule_overrides.is_empty() {
+        run["invocations"][0]["ruleConfigurationOverrides"] = report
+            .rule_overrides
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "descriptor": { "id": entry.rule },
+                    "configuration": {
+                        "enabled": entry.level != RuleLevel::Off,
+                        "properties": { "level": entry.level, "default": entry.default },
+                    },
+                })
+            })
+            .collect();
+    }
     if let Some(universe) = &report.analysis_universe {
         run["properties"] = serde_json::json!({ "analysis_universe": universe });
     }
@@ -255,6 +273,32 @@ mod tests {
         assert_eq!(physical["region"]["startLine"], 42);
         assert_eq!(result["properties"]["evidence_class"], "derived_fact");
         assert_eq!(result["properties"]["gating"], true);
+    }
+
+    #[test]
+    fn rule_overrides_become_rule_configuration_overrides() {
+        let report =
+            Report::new(Vec::new()).with_rule_overrides(vec![crate::rule_registry::RuleOverride {
+                rule: "duplicate-code".to_string(),
+                level: RuleLevel::Off,
+                default: RuleLevel::Gating,
+            }]);
+
+        let sarif = render(&report);
+
+        let overrides = &sarif["runs"][0]["invocations"][0]["ruleConfigurationOverrides"];
+        assert_eq!(overrides[0]["descriptor"]["id"], "duplicate-code");
+        assert_eq!(overrides[0]["configuration"]["enabled"], false);
+        assert_eq!(overrides[0]["configuration"]["properties"]["level"], "off");
+        assert_eq!(
+            overrides[0]["configuration"]["properties"]["default"],
+            "gating"
+        );
+        assert!(
+            render(&Report::new(Vec::new()))["runs"][0]["invocations"][0]
+                .get("ruleConfigurationOverrides")
+                .is_none()
+        );
     }
 
     #[test]

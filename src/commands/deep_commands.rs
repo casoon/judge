@@ -79,7 +79,7 @@ fn run_dead_code_deep(
                 baseline,
             },
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     // One rust-analyzer load serves every detector below that analyses the
     // default feature set.
@@ -141,7 +141,7 @@ fn run_dead_code_deep(
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (mut findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
     judge::cfg::annotate_findings(&mut findings, &workspace);
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
@@ -218,7 +218,8 @@ fn run_dead_code_deep(
         OutputFormat::Json => {
             let report = Report::with_errors(findings, analysis_errors)
                 .with_universe(universe)
-                .with_suppressed_inline(suppressed_inline);
+                .with_suppressed_inline(suppressed_inline)
+                .with_rule_overrides(crate::rule_overrides(&workspace.root)?);
             write_json(out, &report)?;
         }
         OutputFormat::Sarif => {
@@ -238,6 +239,7 @@ fn run_dead_code_deep(
             ));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             print_universe_tty(out, &universe)?;
             writeln!(out, "pub items checked: {}", dead_code_report.checked)?;
             writeln!(
@@ -366,7 +368,7 @@ fn run_explain_deep(
         include_tests,
         format,
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let result = judge::reachability::why_live(&workspace, &item_path, include_tests)?;
 

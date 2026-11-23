@@ -497,6 +497,7 @@ pub(crate) fn build_finding(
         origin: Origin::Code,
         evidence,
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }

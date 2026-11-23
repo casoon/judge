@@ -691,6 +691,7 @@ fn unsafe_density_finding_for_file(path: &Path, ast: &syn::File, source: &str) -
             "unsafe_block_count": visitor.block_line_counts.len(),
         })),
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     })

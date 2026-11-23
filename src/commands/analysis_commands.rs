@@ -124,12 +124,14 @@ pub(crate) fn write_excluded_and_suppressed_lines(
 /// each embed their own extra JSON fields).
 pub(crate) fn write_json_with_suppressed(
     out: &mut dyn Write,
+    workspace_root: &Path,
     findings: Vec<Finding>,
     analysis_errors: Vec<String>,
     suppressed_inline: usize,
 ) -> Result<(), CliError> {
-    let report =
-        Report::with_errors(findings, analysis_errors).with_suppressed_inline(suppressed_inline);
+    let report = Report::with_errors(findings, analysis_errors)
+        .with_suppressed_inline(suppressed_inline)
+        .with_rule_overrides(crate::rule_overrides(workspace_root)?);
     write_json(out, &report)?;
     Ok(())
 }
@@ -156,7 +158,7 @@ pub(crate) fn run_dupes(
         include_tests,
     } = options;
     let format = baseline_args.format;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let source_files = workspace_source_files(&workspace);
     let report = judge::rules::duplication::analyze_workspace_with_options(
@@ -197,7 +199,8 @@ pub(crate) fn run_dupes(
     match format {
         OutputFormat::Json => {
             let report = Report::with_errors(findings, analysis_errors)
-                .with_suppressed_inline(suppressed_inline);
+                .with_suppressed_inline(suppressed_inline)
+                .with_rule_overrides(crate::rule_overrides(&workspace.root)?);
             let mut envelope = serde_json::to_value(&report)?;
             envelope["refactoring_summary"] = serde_json::to_value(refactoring_summary)?;
             write_json(out, &envelope)?;
@@ -209,6 +212,7 @@ pub(crate) fn run_dupes(
             return Err(unsupported_format("`dupes`", format, "tty, json, sarif"));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             writeln!(out, "mode: {}", dupe_mode_label(mode))?;
             writeln!(out, "min tokens: {min_tokens}")?;
             writeln!(out, "clone families: {}", report.families.len())?;
@@ -499,7 +503,7 @@ fn run_deps_why(
         return Err(unsupported_format("`deps --why`", format, "tty, json"));
     }
 
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let report = judge::rules::deps::why(&workspace, dependency_name);
 
     match format {
@@ -614,7 +618,7 @@ pub(crate) fn run_deps(
         return run_deps_why(&dependency_name, format, out);
     }
 
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let report = judge::rules::deps::analyze_workspace(&workspace);
     let mut analysis_errors = analysis_errors(&report.errors);
@@ -674,13 +678,14 @@ pub(crate) fn run_deps(
 
     match format {
         OutputFormat::Json => {
-            let envelope = serde_json::json!({
+            let mut envelope = serde_json::json!({
                 "schema_version": judge::finding::SCHEMA_VERSION,
                 "findings": findings,
                 "feature_only_candidates": report.feature_only_candidates,
                 "errors": analysis_errors,
                 "suppressed_inline": suppressed_inline,
             });
+            crate::insert_rule_overrides(&mut envelope, &workspace.root)?;
             write_json(out, &envelope)?;
         }
         OutputFormat::Sarif => {
@@ -690,6 +695,7 @@ pub(crate) fn run_deps(
             return Err(unsupported_format("`deps`", format, "tty, json, sarif"));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             writeln!(out, "dependency findings: {}", findings.len())?;
             write_error_list(out, "errors", &analysis_errors)?;
             write_suppressed_inline_line(out, suppressed_inline)?;
@@ -719,7 +725,7 @@ pub(crate) fn run_coverage(
         baseline_args,
     } = options;
     let format = baseline_args.format;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let coverage = judge::advisory::coverage::read_lcov(&lcov, &workspace.root)?;
 
@@ -777,8 +783,9 @@ pub(crate) fn run_coverage(
 
     match format {
         OutputFormat::Json => {
-            let value =
+            let mut value =
                 coverage_json_value(findings, analysis_errors, &no_coverage_data, &test_ratios)?;
+            crate::insert_rule_overrides(&mut value, &workspace.root)?;
             write_json(out, &value)?;
         }
         OutputFormat::Sarif => {
@@ -788,6 +795,7 @@ pub(crate) fn run_coverage(
             return Err(unsupported_format("`coverage`", format, "tty, json, sarif"));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             writeln!(out, "untested hotspots: {}", findings.len())?;
             write_error_list(out, "errors", &analysis_errors)?;
             for finding in &findings {
@@ -966,7 +974,7 @@ pub(crate) fn run_boundaries(
         return Ok(CommandOutcome::Clean);
     }
 
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let config_path = config_path.unwrap_or_else(|| workspace.root.join("judge.toml"));
     if !config_path.exists() {
@@ -1013,9 +1021,13 @@ pub(crate) fn run_boundaries(
     };
 
     match format {
-        OutputFormat::Json => {
-            write_json_with_suppressed(out, findings, analysis_errors, suppressed_inline)?
-        }
+        OutputFormat::Json => write_json_with_suppressed(
+            out,
+            &workspace.root,
+            findings,
+            analysis_errors,
+            suppressed_inline,
+        )?,
         OutputFormat::Sarif => {
             write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
         }
@@ -1027,6 +1039,7 @@ pub(crate) fn run_boundaries(
             ));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             writeln!(out, "boundary rules: {}", config.boundaries.len())?;
             writeln!(out, "findings: {}", findings.len())?;
             write_error_list(out, "analysis errors", &analysis_errors)?;
@@ -1058,7 +1071,7 @@ pub(crate) fn run_module_graph(
         include_generated,
     } = options;
     let format = baseline_args.format;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let report = judge::rules::module_graph::analyze_workspace(&workspace, include_generated);
     let analysis_errors = analysis_errors(&report.errors);
@@ -1087,9 +1100,13 @@ pub(crate) fn run_module_graph(
     };
 
     match format {
-        OutputFormat::Json => {
-            write_json_with_suppressed(out, findings, analysis_errors, suppressed_inline)?
-        }
+        OutputFormat::Json => write_json_with_suppressed(
+            out,
+            &workspace.root,
+            findings,
+            analysis_errors,
+            suppressed_inline,
+        )?,
         OutputFormat::Sarif => {
             write_sarif(out, &workspace.root, findings, analysis_errors, None)?;
         }
@@ -1100,13 +1117,16 @@ pub(crate) fn run_module_graph(
                 "tty, json, sarif",
             ));
         }
-        OutputFormat::Tty => write_module_graph_tty(
-            out,
-            &findings,
-            &analysis_errors,
-            excluded_generated,
-            suppressed_inline,
-        )?,
+        OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
+            write_module_graph_tty(
+                out,
+                &findings,
+                &analysis_errors,
+                excluded_generated,
+                suppressed_inline,
+            )?
+        }
     }
     Ok(CommandOutcome::Clean)
 }
@@ -1154,7 +1174,7 @@ pub(crate) fn run_unsafe(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let source_files = workspace_source_files(&workspace);
     let report = judge::rules::security::analyze_workspace(source_files, options.include_generated);
     let findings = findings_matching(
@@ -1180,7 +1200,7 @@ pub(crate) fn run_errors(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let report = analyze_slop_workspace(&workspace, options.include_generated)?;
     let findings = findings_matching(
         report.findings,
@@ -1208,7 +1228,7 @@ pub(crate) fn run_tests(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let source_files = workspace_source_files(&workspace);
     let report =
         judge::rules::slop::analyze_workspace(source_files, options.include_generated, false);
@@ -1236,7 +1256,7 @@ pub(crate) fn run_slop(
     options: FocusedAnalysisOptions,
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let report = analyze_slop_workspace(&workspace, options.include_generated)?;
     render_focused(
         "slop",
@@ -1267,9 +1287,10 @@ fn render_focused(
     out: &mut dyn Write,
 ) -> Result<CommandOutcome, CliError> {
     let (mut findings, _suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
     judge::cfg::annotate_findings(&mut findings, workspace);
     judge::finding::sort_by_severity_desc(&mut findings);
+    let rule_levels = load_judge_toml(&workspace.root)?.rules.levels;
     match format {
         OutputFormat::Json => write_json(
             out,
@@ -1280,7 +1301,8 @@ fn render_focused(
                     "tier": "fast",
                     "claim": "Findings are current-state syntax and workspace facts. Absence of a finding is not proof of absence in unanalysed generated or semantic code."
                 },
-                "report": Report::with_errors(findings, errors),
+                "report": Report::with_errors(findings, errors)
+                    .with_rule_overrides(rule_levels.overrides()),
             }),
         )?,
         OutputFormat::Sarif => write_sarif(out, &workspace.root, findings, errors, None)?,
@@ -1288,6 +1310,7 @@ fn render_focused(
             out,
             &workspace.root,
             format!("Judge {label}"),
+            rule_levels.summary_line(),
             &findings,
             &errors,
         )?,
@@ -1361,7 +1384,7 @@ pub(crate) fn run_api_surface(
             },
         include_generated,
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
     let boundary_config = load_judge_toml(&workspace.root)?;
     judge::rules::boundaries::validate_internal_crates(&workspace, &boundary_config)?;
 
@@ -1378,7 +1401,7 @@ pub(crate) fn run_api_surface(
 
     // Inline `judge-ignore` suppression (todo.md §5).
     let (mut findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
     judge::cfg::annotate_findings(&mut findings, &workspace);
 
     // API-surface-size trend against a saved baseline (see todo.md §I
@@ -1398,6 +1421,10 @@ pub(crate) fn run_api_surface(
     let size_trend =
         judge::rules::api_surface::size_trend(&report.api_surface_size, baseline_size.as_ref());
     if matches!(format, OutputFormat::Tty) {
+        // A baseline compare prints the overrides in its own delta header.
+        if !save_baseline && baseline.is_none() {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
+        }
         print_api_surface_size(out, &size_trend, baseline.is_some() && !save_baseline)?;
     }
 
@@ -1423,7 +1450,8 @@ pub(crate) fn run_api_surface(
                         .iter()
                         .map(|trend| (trend.crate_name.clone(), trend.item_count))
                         .collect(),
-                );
+                )
+                .with_rule_overrides(crate::rule_overrides(&workspace.root)?);
             write_json(out, &report)?;
         }
         OutputFormat::Sarif => {
@@ -1586,7 +1614,7 @@ fn suppress_and_baseline(
     out: &mut dyn Write,
 ) -> Result<std::ops::ControlFlow<CommandOutcome, (Vec<Finding>, usize)>, CliError> {
     let (mut findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
     judge::cfg::annotate_findings(&mut findings, workspace);
 
     let baseline_request = BaselineRequest::new(

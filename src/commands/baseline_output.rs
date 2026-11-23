@@ -201,7 +201,8 @@ pub(crate) fn handle_baseline_with_trend(
             &findings,
             rule_revisions,
             total_loc,
-            judge::health_score::ScoreContext::from_profiles(&config.crate_profiles),
+            judge::health_score::ScoreContext::from_profiles(&config.crate_profiles)
+                .with_rule_levels(config.rules.levels.clone()),
         );
         if let Some(size) = api_surface_size {
             baseline = baseline.with_api_surface_size(size.clone());
@@ -223,7 +224,9 @@ pub(crate) fn handle_baseline_with_trend(
     };
     let mut baseline = judge::baseline::load(path)?;
     baseline.relativize_paths(workspace_root);
-    let delta = judge::baseline::diff(&findings, &baseline);
+    let rule_levels = load_judge_toml(workspace_root)?.rules.levels;
+    let mut delta = judge::baseline::diff(&findings, &baseline);
+    delta.set_aside_off_rules(&rule_levels);
     let verdict = delta.verdict();
     match format {
         OutputFormat::Json => {
@@ -232,6 +235,10 @@ pub(crate) fn handle_baseline_with_trend(
                 "verdict": verdict,
                 "delta": delta,
             });
+            let rule_overrides = rule_levels.overrides();
+            if !rule_overrides.is_empty() {
+                envelope["rule_overrides"] = serde_json::to_value(rule_overrides)?;
+            }
             if let Some(trend) = score_trend {
                 envelope["score"] = serde_json::to_value(trend.current()).unwrap();
                 envelope["trend"] = trend_json(trend);
@@ -239,7 +246,15 @@ pub(crate) fn handle_baseline_with_trend(
             write_json(out, &envelope)?;
         }
         OutputFormat::Markdown => {
-            write!(out, "{}", judge::markdown::render_delta(&delta, verdict))?;
+            write!(
+                out,
+                "{}",
+                judge::markdown::render_delta(
+                    &delta,
+                    verdict,
+                    rule_levels.summary_line().as_deref()
+                )
+            )?;
         }
         OutputFormat::Sarif => {
             return Err(unsupported_format(
@@ -248,7 +263,9 @@ pub(crate) fn handle_baseline_with_trend(
                 "tty, json, markdown",
             ));
         }
-        OutputFormat::Tty => print_delta(out, &delta, verdict)?,
+        OutputFormat::Tty => {
+            print_delta(out, &delta, verdict, rule_levels.summary_line().as_deref())?
+        }
     }
 
     if verdict == Verdict::Fail {
@@ -285,11 +302,25 @@ fn print_delta(
     out: &mut dyn Write,
     delta: &judge::baseline::Delta,
     verdict: Verdict,
+    rule_overrides: Option<&str>,
 ) -> std::io::Result<()> {
     writeln!(out, "verdict: {}", verdict.label())?;
+    if let Some(line) = rule_overrides {
+        writeln!(out, "{line}")?;
+    }
     write_unchanged_resolved(out, delta.unchanged_count, delta.resolved.len())?;
     for finding in &delta.resolved {
         writeln!(out, "  {}  {}", finding.rule, finding.file.display())?;
+    }
+    if !delta.not_evaluated.is_empty() {
+        writeln!(
+            out,
+            "not evaluated (rule off in judge.toml): {}",
+            delta.not_evaluated.len()
+        )?;
+        for finding in &delta.not_evaluated {
+            writeln!(out, "  {}  {}", finding.rule, finding.file.display())?;
+        }
     }
 
     let (gating, advisory) = judge::baseline::partition_gating(&delta.introduced);
