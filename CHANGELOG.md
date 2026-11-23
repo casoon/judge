@@ -6,6 +6,8 @@ versions were published on crates.io.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-23
+
 ### Added
 
 - **release-profile-hazard:** reports `opt-level = 0` or `debug-assertions = true` in the
@@ -16,10 +18,8 @@ versions were published on crates.io.
   code calls `std::panic::catch_unwind`.
 - **`inspect`:** prints the effective release profile and the custom profiles that inherit from
   it, and gains `--format json`.
-- **Deep tier:** `--expand` on `dead-code` and `explain --why-live` (or `[deep] expand = true` in
-  `judge.toml`) expands proc macros and loads build-script outputs, so references from generated
-  code count and `--why-live` marks such edges `generated`. It runs build scripts; a failing one
-  is exit 2. Every output format states the load fidelity. Details:
+- **Deep tier:** `--expand` on `dead-code` and `explain --why-live` expands proc macros and
+  runs build scripts, so references from generated code count. Details:
   [Deep Tier](https://casoon.github.io/judge/docs/guides/deep-tier/#--expand).
 - **`--renderreport`:** the bare `cargo judge` run prints its review report as a request for [renderreport](https://github.com/casoon/renderreport) instead of text (`cargo judge --renderreport | renderreport render - -o judge.pdf`). Same sections as `--format markdown`; judge itself gets no new dependency.
 - **`cfg` conditions:** a finding in code gated by an item-level `#[cfg(..)]` (including a gated
@@ -40,9 +40,8 @@ versions were published on crates.io.
 - **`--progress`:** the event stream ends with a `run_completed` or `run_failed` record (phase
   `run`), so a consumer can tell a finished run from an aborted one.
 - **judge.toml:** `[rules.<id>] level = "off" | "advisory" | "gating"` switches any rule off or
-  changes whether it gates the verdict. Every report lists the active overrides, `compare` shows
-  findings of an `off` rule as not evaluated, a health-score trend across a level change is not
-  comparable, and an unknown rule id or level exits with 2 before any analysis. Details: [Rule levels](https://casoon.github.io/judge/docs/reference/rules/#rule-levels).
+  changes whether it gates the verdict; every report lists the active overrides. Details:
+  [Rule levels](https://casoon.github.io/judge/docs/reference/rules/#rule-levels).
 - **judge-mcp:** tools `review` (focused views such as `structure`, `slop`, `deps`), `compare`
   and `save_baseline`; `JUDGE_TIMEOUT_MS` kills a run that hangs.
 
