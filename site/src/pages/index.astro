@@ -6,17 +6,20 @@ import {
   Button,
   CallToAction,
   CodeBlock,
-  Facts,
+  Compare,
   Faq,
-  Features,
+  FlowPanel,
   Hero,
   Install,
-  Quickstart,
   ReleaseHighlights,
-  Spotlight,
+  SectionIntro,
+  Split,
+  StatBand,
+  UseCases,
 } from '@casoon/pages-theme/components';
 import Base from '@casoon/pages-theme/layouts/Base.astro';
 import config from 'virtual:casoon-pages/config';
+import { useCases } from 'virtual:casoon-pages/use-cases';
 import { parseChangelog } from '@casoon/pages-theme/lib/changelog';
 import { url } from '@casoon/pages-theme/url';
 // Animated SVGs built with castwright from site/captures/judge*.terminal.yaml: excerpts of
@@ -25,16 +28,15 @@ import { url } from '@casoon/pages-theme/url';
 import judgeNarrowSvg from '../../captures/judge-narrow.svg?url';
 import judgeSvg from '../../captures/judge.svg?url';
 import Diagram from '../components/Diagram.astro';
+import { fixture } from '../showcase';
 
-const usage = `cargo judge                    # triage report
-cargo judge --save-baseline    # accept this state
-cargo judge compare .judge/baseline.json`;
-
-const deepTierUsage = `cargo install cargo-judge --features deep
-cargo judge inspect                      # "deep: available"
-
-cargo judge dead-code
-cargo judge explain my_crate::parser::parse --why-live`;
+// Excerpts of real judge 0.7.0 runs on its own source tree (examples/, see examples/capture.sh),
+// cut by line so they stay what judge printed ("…" marks skipped lines).
+const lines = (file: string, from: number, to: number) =>
+  fixture(file).split('\n').slice(from - 1, to).join('\n');
+const cloneFamily = lines('dupes.txt', 24, 27);
+const hotspots = lines('health.txt', 3, 9);
+const ruleCard = `${lines('explain-rule.txt', 1, 3)}\n  …\n${lines('explain-rule.txt', 7, 10)}`;
 
 // Skip "Unreleased": it has no version to show as "New in v…" yet.
 const latestRelease = config.changelog
@@ -46,8 +48,8 @@ const latestRelease = config.changelog
 
 <Base>
   <Hero
-    title="Know what a refactoring left behind."
-    lead="The refactoring compiles and Clippy is quiet, yet something is off. judge reads your Rust workspace, reports what the change left behind with the evidence for every finding, and tells CI whether it made things worse."
+    title="Your refactoring compiles. What did it leave behind?"
+    lead="Moving code leaves residue the compiler never complains about: a function copied instead of moved, a public item nobody calls any more, one function that quietly took all the branches. judge reads your Rust workspace, shows each of these with its evidence, and tells CI whether the change made things worse."
   >
     <Install commands={[{ label: 'crates.io', command: 'cargo install cargo-judge' }]} />
     <Badges>
@@ -68,35 +70,107 @@ const latestRelease = config.changelog
     </picture>
   </Hero>
 
-  <Features
-    heading="Who it is for"
-    items={[
-      {
-        title: 'Rust teams after a big change',
-        body: 'You moved modules, split crates or reshaped the API. judge shows what the move left behind, beyond what the compiler and Clippy already report.',
-      },
-      {
-        title: 'Reviewers of generated code',
-        body: 'judge reads only the checked-out tree, no Git history or authorship. Code written by people and code written by agents get the same findings.',
-      },
-      {
-        title: 'CI that should not get worse',
-        body: 'Save the state you accept as a baseline. Every later run reports what was resolved and what is new, and fails only on new findings that are backed by evidence.',
-      },
-    ]}
-  />
-
-  <Facts
+  <StatBand
+    label="judge in numbers"
     items={[
       { value: '80', label: 'rules, each with a declared evidence class' },
-      { value: '51', label: 'of them can fail a verdict; 29 are advisory only' },
-      { value: '4', label: 'output formats: terminal, JSON, SARIF and Markdown' },
+      { value: '51', label: 'of them can fail a verdict; 29 only advise' },
+      { value: '4', label: 'output formats: terminal, JSON, SARIF, Markdown' },
       { value: '0', label: 'network calls by default; crates.io checks are opt-in' },
     ]}
   />
 
+  <SectionIntro
+    eyebrow="The problem"
+    title="The build checks that it works. Nobody checks what it turned into."
+    lead="rustc and Clippy look at one item, one crate at a time. A refactoring changes the shape of a whole workspace: code moves between files, crates split, APIs shrink. What it leaves behind spans files and crates, so no build fails and the diff review sees only the lines that changed, not the state they produce. That is true whether a person or a coding agent did the moving."
+  />
+
+  <Split
+    index="01"
+    eyebrow="Left behind"
+    title="Copied instead of moved."
+    lead="Under time pressure, a helper gets copied into the new module and the old one stays. Both compile, both get tests, and the next fix lands in only one of them. judge groups repeated token spans into clone families across files and crates, largest first."
+    note="Real output: judge on its own tree found one cfg(test) check written out three times in three modules. It is a single shared function today."
+    links={[
+      { label: 'Duplicate code guide', href: url('docs/guides/duplicate-code/') },
+      { label: 'All clone families', href: url('showcase/clone-families/') },
+    ]}
+  >
+    <CodeBlock code={cloneFamily} title="cargo judge dupes" copy={false} />
+  </Split>
+
+  <Split
+    index="02"
+    reverse
+    eyebrow="Left behind"
+    title="Still public, no longer used."
+    lead="Split a crate and some `pub` items lose their last caller. The compiler stays silent, because public items count as used. The Deep Tier loads the workspace into rust-analyzer and reports a `pub` item with no reference from another workspace crate and no route from an entry point."
+    points={[
+      '**Evidence, not a verdict:** “no reference found within the examined view”, never a bare “unused”.',
+      '**Why is this still live?** `explain --why-live` prints the shortest route from `main`, a test or an FFI boundary.',
+      '**Generated callers count** with `--expand`, which runs proc macros and build scripts.',
+    ]}
+    links={[{ label: 'Deep Tier guide', href: url('docs/guides/deep-tier/') }]}
+  >
+    <FlowPanel
+      start={{ title: 'A pub item in the workspace', body: 'after the crate split' }}
+      paths={[
+        { label: 'Referenced', title: 'From another crate', body: 'A reference from another workspace crate keeps it live.' },
+        { label: 'Reachable', title: 'From an entry point', body: 'main, a test or an FFI boundary reaches it; why-live shows the route.' },
+        { label: 'Neither', title: 'unused-pub-workspace', body: 'Reported with the evidence and the limits of the analysis.' },
+      ]}
+      result="Each edge of a route is classified as static, dynamic, macro, generated or unknown."
+    />
+  </Split>
+
+  <Split
+    index="03"
+    eyebrow="Left behind"
+    title="One function took all the branches."
+    lead="Spreading logic across modules often concentrates the hard part in one place: the dispatcher that now handles every case. judge measures cyclomatic and cognitive complexity per function, tracks the maintainability index per file, and ranks files by the evidence that points at them."
+    note="These are judge’s own hotspots. A ranking says where to look first; judge never writes the patch."
+    links={[
+      { label: 'Refactoring queue', href: url('showcase/refactor-queue/') },
+      { label: 'Health score', href: url('showcase/health-score/') },
+    ]}
+  >
+    <CodeBlock code={hotspots} title="cargo judge health" copy={false} />
+  </Split>
+
+  <Compare
+    title="What each tool sees"
+    lead="judge does not repeat what rustc and Clippy already report. It covers what only shows up across a whole workspace, and the question CI actually asks after a refactoring."
+    topicLabel="After a refactoring"
+    columns={[{ title: 'rustc' }, { title: 'Clippy' }, { title: 'judge', badge: 'this project' }]}
+    highlight={2}
+    rows={[
+      {
+        topic: 'Type, borrow and lifetime errors',
+        cells: ['Yes, it will not build', 'No', 'No, left to the compiler'],
+      },
+      {
+        topic: 'Lints on a single item',
+        cells: ['Some, as warnings', 'Yes, hundreds of lints', 'No, left to Clippy'],
+      },
+      {
+        topic: 'The same code in several files',
+        cells: ['No', 'No', 'Clone families across files and crates'],
+      },
+      {
+        topic: 'Public items no other crate uses',
+        cells: ['Not for a library’s `pub` items', 'No', '`unused-pub-workspace`, Deep Tier'],
+      },
+      {
+        topic: 'Did this change make it worse?',
+        cells: ['No', 'No', 'Baseline compare, exit code 1 on new evidence'],
+      },
+    ]}
+  />
+
   <section class="how" aria-labelledby="how-heading">
-    <h2 id="how-heading">How the CI verdict works</h2>
+    <p class="eyebrow">In CI</p>
+    <h2 id="how-heading">A verdict that only fails on what is new</h2>
     <div class="text">
       <p>
         Run judge once on a tree you accept and save its findings as a baseline. On every later
@@ -106,44 +180,45 @@ const latestRelease = config.changelog
       <p>
         Only introduced findings that are backed by evidence and carry warning or failure severity
         fail the verdict and the exit code. Heuristic findings are listed, but never block a
-        merge.
+        merge, so you can start on a codebase that is far from clean.
       </p>
     </div>
     <Diagram name="baseline-verdict" format="svg" narrow={{ width: 380, height: 700 }} />
     <div class="links">
       <Button href={url('docs/guides/baselines-and-ci/')} variant="secondary">Baselines and CI</Button>
-      <Button href={url('docs/reference/rules/')} variant="secondary">All 80 rules</Button>
-      <Button href={url('showcase/')} variant="quiet">Real output →</Button>
+      <Button href={url('showcase/baseline-compare/')} variant="quiet">A real compare run →</Button>
     </div>
   </section>
 
-  <Spotlight
-    eyebrow="Fast tier or deep tier"
-    title="One more build step, real reference data"
-    lead="**The default Fast Tier needs no build step and reads the tree as written.** Compiling in rust-analyzer itself, behind the `deep` Cargo feature, lets `dead-code` and `explain --why-live` work from real reference data instead of syntax-level guesses."
+  <Split
+    index="04"
+    reverse
+    eyebrow="Trust"
+    title="Every finding says how sure it is."
+    lead="A tool that reports guesses as facts gets switched off. Each of judge’s 80 rules declares an evidence class, and that class decides how its findings are worded and whether they can fail a verdict."
     points={[
-      '**Dead code, with evidence.** `dead-code` reports `unused-pub-workspace` — no reference from another workspace crate and no reachability from a recognised entry point, not proof.',
-      '**Why something is still live.** `explain --why-live` prints the shortest evidenced route from `fn main`, a test or an FFI boundary to the item, each edge classified as static, dynamic, macro, generated or unknown.',
-      'The build cost is upfront, not per run. Compiling the `ra_ap_*` crates takes noticeably longer once; `cargo judge inspect` confirms `deep: available` afterward.',
+      '**Derived facts and bounded results** can gate: a syntax or manifest fact, or a result within the examined view.',
+      '**Heuristics** are hints. They are listed separately and never change the exit code.',
+      '**Your call per rule:** `[rules.<id>] level` in `judge.toml` turns a rule off or changes its effect, and every report names the change.',
     ]}
     links={[
-      { label: 'Deep Tier guide', href: url('docs/guides/deep-tier/') },
       { label: 'All 80 rules', href: url('docs/reference/rules/') },
+      { label: 'Rule levels', href: url('docs/reference/rules/#rule-levels') },
     ]}
   >
-    <CodeBlock code={deepTierUsage} lang="sh" label="Deep Tier" />
-  </Spotlight>
+    <CodeBlock code={ruleCard} title="cargo judge explain-rule swallowed-result" copy={false} />
+  </Split>
 
-  <Quickstart
-    lead="Install it, run it in the workspace root, and turn the result into a baseline for CI. Crate boundaries in judge.toml, the output formats and the rust-analyzer deep tier are covered in the documentation."
-    steps={[
-      'Install <code>cargo-judge</code> from crates.io with the line above.',
-      'Run <code>cargo judge</code> in the workspace root for the grouped triage report.',
-      'Save a baseline and let CI run <code>cargo judge compare</code> against it.',
-    ]}
-  >
-    <CodeBlock code={usage} lang="sh" label="Three commands" />
-  </Quickstart>
+  <UseCases
+    title="What it gets used for"
+    link={{ label: 'All use cases', href: url('use-cases/') }}
+    items={useCases.map((item) => ({
+      title: item.title,
+      body: item.body,
+      tags: item.tags,
+      href: url(`use-cases/#${item.slug}`),
+    }))}
+  />
 
   {latestRelease && <ReleaseHighlights release={latestRelease} />}
 
@@ -158,8 +233,8 @@ const latestRelease = config.changelog
         a: 'No. It analyzes only the current source tree, workspace structure and dependency graph, never commit history, authorship or telemetry, so human-written and agent-refactored code get the same findings.',
       },
       {
-        q: 'How does the CI verdict work?',
-        a: 'Save a baseline from a tree you accept with --save-baseline, then run cargo judge compare against it in CI. Only new findings backed by evidence and warning or failure severity fail the verdict; heuristic findings are listed but never block a merge.',
+        q: 'Can I start on a codebase with hundreds of findings?',
+        a: 'Yes. Save a baseline from the current tree; cargo judge compare then fails only on new gating findings. Rules your team disagrees with can be switched off or demoted to advisory in judge.toml, and every report lists those overrides.',
       },
       {
         q: 'What is the Deep Tier, and do I need it?',
@@ -191,7 +266,15 @@ const latestRelease = config.changelog
   .how {
     max-width: var(--max);
     margin: 0 auto;
-    padding: 0 24px 96px;
+    padding: 0 24px var(--section-y);
+  }
+  .eyebrow {
+    margin: 0 0 16px;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
   }
   h2 {
     margin: 0 0 14px;
