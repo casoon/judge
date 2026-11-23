@@ -12,7 +12,6 @@ export default defineConfig({
       description:
         'Deterministic post-refactoring analysis for Rust workspaces: evidence-backed findings, baselines and CI verdicts.',
       tagline: 'Post-refactoring analysis for Rust',
-      website: 'https://judge.casoon.de',
       repo: 'casoon/judge',
       license: 'BUSL-1.1',
       packages: [
