@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use crate::finding::Finding;
 
-const MARKER: &str = "judge-ignore:";
+pub(crate) const MARKER: &str = "judge-ignore:";
 const SEPARATORS: [&str; 3] = ["—", "--", "-"];
 
 #[derive(Debug)]

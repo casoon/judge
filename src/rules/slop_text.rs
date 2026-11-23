@@ -246,13 +246,18 @@ pub(crate) const CONVERSATIONAL_TIER1: &[&str] = &[
 /// mid-sentence technical usage (e.g. "here is" showing up deep in an
 /// otherwise unremarkable explanation).
 pub(crate) const CONVERSATIONAL_TIER2: &[&str] = &[
-    "here is",
-    "here's",
     "note that this is a simplified",
     "in a real implementation",
     "in a production implementation",
     "for the purposes of this example",
 ];
+
+/// Tier-2 phrases that only count when they open the comment (word index
+/// 0): "Here is the updated function" is assistant framing, but mid-sentence
+/// "here" is an ordinary adverb ("a send failure here is expected"), which
+/// the 8-word window of [`CONVERSATIONAL_TIER2`] misread as leakage (GitHub
+/// issue #42).
+pub(crate) const CONVERSATIONAL_TIER2_OPENERS: &[&str] = &["here is", "here's"];
 
 /// The whitespace-separated word index at which `pos` (a byte offset into
 /// `text`) falls — i.e. how many whole words precede it.
@@ -358,6 +363,9 @@ fn conversational_artifact_findings(
         let hit = CONVERSATIONAL_TIER2.iter().any(|phrase| {
             phrase_at_word_boundary(&lower, phrase)
                 .is_some_and(|pos| word_index_at(&lower, pos) < 8)
+        }) || CONVERSATIONAL_TIER2_OPENERS.iter().any(|phrase| {
+            phrase_at_word_boundary(&lower, phrase)
+                .is_some_and(|pos| word_index_at(&lower, pos) == 0)
         });
         if hit {
             findings.push(build_finding(
