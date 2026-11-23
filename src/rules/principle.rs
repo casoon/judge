@@ -387,22 +387,21 @@ pub fn analyze_workspace(
 /// per-detector per-file logic. `text` is available for detectors that need
 /// the raw source alongside the AST (e.g. [`unsafe_containment_candidates`]'s
 /// comment scan); detectors that only need the AST simply ignore it. Files
-/// that fail to read or parse are silently skipped, the same accepted
-/// limitation every detector in this module already documents for its own
-/// scan.
+/// that fail to read or parse are skipped, the same accepted limitation every
+/// detector in this module already documents for its own scan; a
+/// [`crate::parse::with_parse_session`] scope records them.
 fn for_each_parsed_file<'a>(
     workspace: &'a Workspace,
     mut visit: impl FnMut(&'a CrateInfo, &'a Path, &str, &syn::File),
 ) {
     for krate in &workspace.crates {
         for source in &krate.source_files {
-            let Ok(text) = std::fs::read_to_string(&source.path) else {
+            let Ok(parsed) = crate::functions::read_and_parse_source(&source.path, |_| (), |_| ())
+            else {
                 continue;
             };
-            let Ok(ast) = syn::parse_file(&text) else {
-                continue;
-            };
-            visit(krate, &source.path, &text, &ast);
+            let (text, ast) = (&parsed.source, &parsed.ast);
+            visit(krate, &source.path, text, ast);
         }
     }
 }
@@ -736,18 +735,17 @@ fn collect_trait_declarations_and_impls(
     let mut traits = Vec::new();
     let mut impls = Vec::new();
     for source in &krate.source_files {
-        let Ok(text) = std::fs::read_to_string(&source.path) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&source.path, |_| (), |_| ())
+        else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&text) else {
-            continue;
-        };
+        let ast = &parsed.ast;
         let mut collector = Collector {
             file: source.path.clone(),
             traits: Vec::new(),
             impls: Vec::new(),
         };
-        collector.visit_file(&ast);
+        collector.visit_file(ast);
         traits.extend(collector.traits);
         impls.extend(collector.impls);
     }
@@ -1020,13 +1018,12 @@ fn leaked_signatures(
         if !module_path_under(&module_path, from_module) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&source.path) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&source.path, |_| (), |_| ())
+        else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&text) else {
-            continue;
-        };
-        walk_functions(&ast, |site| {
+        let ast = &parsed.ast;
+        walk_functions(ast, |site| {
             if !matches!(site.vis, Some(syn::Visibility::Public(_))) {
                 return;
             }
@@ -2678,13 +2675,12 @@ fn parse_dont_validate_candidates(workspace: &Workspace) -> Vec<PrincipleHeurist
 fn collect_guarded_params(krate: &CrateInfo) -> Vec<GuardedParam> {
     let mut guarded: Vec<GuardedParam> = Vec::new();
     for source in &krate.source_files {
-        let Ok(text) = std::fs::read_to_string(&source.path) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&source.path, |_| (), |_| ())
+        else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&text) else {
-            continue;
-        };
-        walk_functions(&ast, |site| {
+        let ast = &parsed.ast;
+        walk_functions(ast, |site| {
             for param_kind in parse_dont_validate_guard_kinds(site.sig, site.block) {
                 guarded.push(GuardedParam {
                     qualified_name: site.qualified_name.clone(),
@@ -2707,13 +2703,12 @@ fn parse_dont_validate_heuristics_for_crate(
 ) -> Vec<PrincipleHeuristic> {
     let mut heuristics = Vec::new();
     for source in &krate.source_files {
-        let Ok(text) = std::fs::read_to_string(&source.path) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&source.path, |_| (), |_| ())
+        else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&text) else {
-            continue;
-        };
-        walk_functions(&ast, |site| {
+        let ast = &parsed.ast;
+        walk_functions(ast, |site| {
             if !matches!(site.vis, Some(syn::Visibility::Public(_))) {
                 return;
             }
@@ -3010,13 +3005,12 @@ fn collect_crate_wide_pair<A, B>(
     let mut candidates = Vec::new();
     let mut sites = Vec::new();
     for source in &krate.source_files {
-        let Ok(text) = std::fs::read_to_string(&source.path) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&source.path, |_| (), |_| ())
+        else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&text) else {
-            continue;
-        };
-        let (file_candidates, file_sites) = collect(source.path.clone(), &ast);
+        let ast = &parsed.ast;
+        let (file_candidates, file_sites) = collect(source.path.clone(), ast);
         candidates.extend(file_candidates);
         sites.extend(file_sites);
     }

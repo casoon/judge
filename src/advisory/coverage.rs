@@ -400,10 +400,9 @@ impl<'ast> Visit<'ast> for CfgTestModSpanCollector {
 /// and `crate::health_score::total_authored_loc` silently skip unreadable
 /// files rather than failing outright.
 fn cfg_test_mod_line_spans(path: &Path) -> Option<Vec<(usize, usize)>> {
-    let source = std::fs::read_to_string(path).ok()?;
-    let ast = syn::parse_file(&source).ok()?;
+    let parsed = crate::functions::read_and_parse_source(path, |_| (), |_| ()).ok()?;
     let mut collector = CfgTestModSpanCollector::default();
-    collector.visit_file(&ast);
+    collector.visit_file(&parsed.ast);
     Some(collector.spans)
 }
 

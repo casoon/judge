@@ -534,6 +534,12 @@ pub struct AnalysisUniverse {
     /// Which tier produced this view: `"fast"` or `"deep"` (see
     /// `crate::AnalysisTier`).
     pub tier: String,
+    /// Source files the syntax-based rules could not read or parse, with the
+    /// reason (see [`crate::parse::with_parse_session`]). Additive; omitted
+    /// from JSON when empty, and filled only by runs that use the shared
+    /// parse step (the combined `cargo judge` run).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unparsed_files: Vec<crate::parse::UnparsedFile>,
 }
 
 impl AnalysisUniverse {
@@ -598,7 +604,15 @@ impl AnalysisUniverse {
             build_scripts: FidelityStatus::NotApplicable,
             judge_version: env!("CARGO_PKG_VERSION").to_string(),
             tier: "fast".to_string(),
+            unparsed_files: Vec::new(),
         }
+    }
+
+    /// Records the files the syntax-based rules could not analyze —
+    /// builder-style, so only runs with a shared parse step opt in.
+    pub fn with_unparsed_files(mut self, files: Vec<crate::parse::UnparsedFile>) -> Self {
+        self.unparsed_files = files;
+        self
     }
 }
 

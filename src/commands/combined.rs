@@ -204,12 +204,17 @@ fn run_collected(
         return result;
     }
 
+    let unparsed_files = collected.parse_summary.unparsed_files(&workspace.root);
+    let universe = || {
+        judge::finding::AnalysisUniverse::fast(workspace, false)
+            .with_unparsed_files(unparsed_files.clone())
+    };
     match format {
         OutputFormat::Json => {
             // Bare `cargo judge` analyzes with the generated-code default
             // (excluded — see `collect_findings`), so the universe says so.
             let report = Report::with_errors(collected.findings, collected.analysis_errors)
-                .with_universe(judge::finding::AnalysisUniverse::fast(workspace, false))
+                .with_universe(universe())
                 .with_suppressed_inline(collected.suppressed_inline);
             write_json(out, &report)?;
         }
@@ -219,7 +224,7 @@ fn run_collected(
                 &workspace.root,
                 collected.findings,
                 collected.analysis_errors,
-                Some(judge::finding::AnalysisUniverse::fast(workspace, false)),
+                Some(universe()),
             )?;
         }
         OutputFormat::Markdown => {
@@ -231,7 +236,7 @@ fn run_collected(
                 collected.boundary_rules_checked,
                 collected.boundaries_config_path.exists(),
                 collected.suppressed_inline,
-                &workspace.root,
+                &unparsed_files,
             )
             .write_markdown(&workspace.root);
             write!(out, "{markdown}")?;
@@ -245,7 +250,7 @@ fn run_collected(
                 collected.boundary_rules_checked,
                 collected.boundaries_config_path.exists(),
                 collected.suppressed_inline,
-                &workspace.root,
+                &unparsed_files,
             )
             .write_renderreport(&workspace.root);
             write!(out, "{request}")?;
@@ -259,7 +264,7 @@ fn run_collected(
                 collected.boundary_rules_checked,
                 collected.boundaries_config_path.exists(),
                 collected.suppressed_inline,
-                &workspace.root,
+                &unparsed_files,
             )
             .write_tty_colored(out, &workspace.root, details, color)?;
         }
@@ -279,7 +284,7 @@ fn build_report<'a>(
     boundary_rules_checked: usize,
     boundaries_config_exists: bool,
     suppressed_inline: usize,
-    _workspace_root: &Path,
+    unparsed_files: &'a [judge::parse::UnparsedFile],
 ) -> judge::report::Report<'a> {
     let mut status_lines = vec![
         "Judge summary".to_string(),
@@ -311,6 +316,7 @@ fn build_report<'a>(
             format!("Analysis incomplete: {} error(s)", analysis_errors.len()),
             analysis_error_items,
         )
+        .with_unparsed_files(unparsed_files)
         .with_group("Evidence-backed findings", gating.to_vec(), false)
         .with_group(
             "Advisory heuristics (no verdict or score effect)",

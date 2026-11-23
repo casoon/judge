@@ -15,6 +15,8 @@ use syn::{
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::{read_and_parse_source, walk_functions};
 use crate::ingest::SourceFile;
+use crate::parse::ParsedSource;
+use std::rc::Rc;
 
 /// Cyclomatic complexity and size of a single function or method.
 #[derive(Debug, Clone)]
@@ -106,22 +108,22 @@ impl std::error::Error for ComplexityError {
 /// both [`analyze_file`] (walks individual function bodies) and
 /// [`analyze_file_halstead`] (a second, independent parse of the whole file
 /// for its file-level metric).
-fn parse_complexity_file(path: &Path) -> Result<syn::File, ComplexityError> {
-    let (_, ast) = read_and_parse_source(
+fn parse_complexity_file(path: &Path) -> Result<Rc<ParsedSource>, ComplexityError> {
+    read_and_parse_source(
         path,
         |err| ComplexityError::Io(path.to_path_buf(), err),
         |err| ComplexityError::Parse(path.to_path_buf(), err),
-    )?;
-    Ok(ast)
+    )
 }
 
 /// Parses a single Rust source file and returns the complexity of every
 /// function, method, and default trait-method body it contains.
 pub fn analyze_file(path: &Path) -> Result<Vec<FunctionInfo>, ComplexityError> {
-    let ast = parse_complexity_file(path)?;
+    let parsed = parse_complexity_file(path)?;
+    let ast = &parsed.ast;
 
     let mut functions = Vec::new();
-    walk_functions(&ast, |site| {
+    walk_functions(ast, |site| {
         let mut complexity = ComplexityVisitor {
             complexity: 1,
             nesting_depth: 0,
@@ -821,10 +823,10 @@ struct FileHalstead {
 /// (which only walks individual function bodies), since Halstead Volume is a
 /// file-level metric with no natural per-function decomposition.
 fn analyze_file_halstead(path: &Path) -> Result<FileHalstead, ComplexityError> {
-    let ast = parse_complexity_file(path)?;
+    let parsed = parse_complexity_file(path)?;
 
     let mut visitor = HalsteadVisitor::default();
-    visitor.visit_file(&ast);
+    visitor.visit_file(&parsed.ast);
     Ok(FileHalstead {
         distinct_operators: visitor.operator_kinds.len() as u32,
         total_operators: visitor.total_operators,

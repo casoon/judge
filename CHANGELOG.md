@@ -13,6 +13,11 @@ versions were published on crates.io.
   scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear
   as tool notifications and mark the invocation as unsuccessful.
 
+- **Report:** the combined `cargo judge` run lists the source files that syntax-based rules could
+  not read or parse, with reason, line and column, in every format (JSON
+  `analysis_universe.unparsed_files`). Exit codes are unchanged. Details:
+  [Output formats](https://casoon.github.io/judge/docs/guides/output-formats/#json).
+
 - **`init`:** `cargo judge init` writes a commented starter `judge.toml` and refuses to overwrite
   an existing one. It used to print a notice only.
 - **`--progress`:** the event stream ends with a `run_completed` or `run_failed` record (phase
@@ -23,6 +28,10 @@ versions were published on crates.io.
 ### Changed
 
 - **Pages:** the project site uses the current shared theme (0.17.0).
+- **Combined run:** each source file is read and parsed once per run and shared by all
+  syntax-based rules, instead of once per rule.
+- **Library API:** `AnalysisUniverse` gains `unparsed_files` and `with_unparsed_files`; the new
+  `judge::parse` module exposes `with_parse_session`, `ParseSummary` and `UnparsedFile`.
 - **`dead-code` (deep tier):** the command loads rust-analyzer once for `dead-code`,
   `dead-trait-impl` and the structural checks instead of three times.
 - **Library API:** `dead_code`, `dead_trait_impl` and `slop_structural_deep` gain

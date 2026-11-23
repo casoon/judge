@@ -1268,16 +1268,16 @@ fn evaluate_module_boundary_rule(rule: &ModuleBoundaryRule, krate: &CrateInfo) -
         if !module_path_under(&module_path, &rule.from) {
             continue;
         }
-        let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
-        else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ()) else {
             continue;
         };
+        let ast = &parsed.ast;
         let mut collector = ModuleBoundaryCollector {
             current_module: &module_path,
             forbidden: &rule.forbidden,
             hits: Vec::new(),
         };
-        collector.visit_file(&ast);
+        collector.visit_file(ast);
         if let Some((line, forbidden)) = collector.hits.into_iter().min_by_key(|(line, _)| *line) {
             findings.push(module_boundary_finding(
                 rule,

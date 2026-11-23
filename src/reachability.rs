@@ -261,12 +261,13 @@ fn walk_crate_functions(
         let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? else {
             continue;
         };
-        let source = std::fs::read_to_string(&file.path)
-            .map_err(|err| ReachabilityError::Io(file.path.clone(), err))?;
-        let ast = syn::parse_file(&source)
-            .map_err(|err| ReachabilityError::Parse(file.path.clone(), err))?;
+        let parsed = crate::functions::read_and_parse_source(
+            &file.path,
+            |err| ReachabilityError::Io(file.path.clone(), err),
+            |err| ReachabilityError::Parse(file.path.clone(), err),
+        )?;
 
-        walk_functions(&ast, |site| on_site(file_id, &file.path, site));
+        walk_functions(&parsed.ast, |site| on_site(file_id, &file.path, site));
     }
     Ok(())
 }

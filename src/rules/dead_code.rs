@@ -692,10 +692,14 @@ pub(crate) fn offset_and_line(span: Span) -> (u32, usize) {
 /// re-parse of a referencing file, and (via [`for_each_parsed_file`])
 /// [`crate::rules::dead_trait_impl`]'s and [`crate::rules::feature_matrix`]'s own
 /// candidate-collection passes.
-pub(crate) fn read_and_parse_file(path: &Path) -> Result<syn::File, DeadCodeError> {
-    let source =
-        std::fs::read_to_string(path).map_err(|err| DeadCodeError::Io(path.to_path_buf(), err))?;
-    syn::parse_file(&source).map_err(|err| DeadCodeError::Parse(path.to_path_buf(), err))
+pub(crate) fn read_and_parse_file(
+    path: &Path,
+) -> Result<std::rc::Rc<crate::parse::ParsedSource>, DeadCodeError> {
+    crate::functions::read_and_parse_source(
+        path,
+        |err| DeadCodeError::Io(path.to_path_buf(), err),
+        |err| DeadCodeError::Parse(path.to_path_buf(), err),
+    )
 }
 
 /// [`read_and_parse_file`], pushing a failure onto `report.errors` and
@@ -704,7 +708,10 @@ pub(crate) fn read_and_parse_file(path: &Path) -> Result<syn::File, DeadCodeErro
 /// own per-file walk and [`check_enum_variant`]'s re-parse of a referencing
 /// file, both of which need to `continue` their own loop on failure rather
 /// than visit an `on_file` callback the way [`for_each_parsed_file`] does.
-fn parsed_file_or_report(report: &mut WorkspaceDeadCode, path: &Path) -> Option<syn::File> {
+fn parsed_file_or_report(
+    report: &mut WorkspaceDeadCode,
+    path: &Path,
+) -> Option<std::rc::Rc<crate::parse::ParsedSource>> {
     match read_and_parse_file(path) {
         Ok(ast) => Some(ast),
         Err(err) => {
@@ -733,7 +740,7 @@ pub(crate) fn for_each_parsed_file(
                 continue;
             }
             match read_and_parse_file(&file.path) {
-                Ok(ast) => on_file(file, &ast),
+                Ok(parsed) => on_file(file, &parsed.ast),
                 Err(err) => errors.push(err),
             }
         }
@@ -1094,10 +1101,11 @@ fn check_enum_variant(
         let Some(path) = file_path_by_id.get(referencing_file_id) else {
             continue;
         };
-        let Some(ast) = parsed_file_or_report(report, path) else {
+        let Some(parsed) = parsed_file_or_report(report, path) else {
             continue;
         };
-        if file_constructs_variant(&ast, variant_name) {
+        let ast = &parsed.ast;
+        if file_constructs_variant(ast, variant_name) {
             construction_found = true;
             break;
         }
@@ -1719,9 +1727,10 @@ pub fn analyze_workspace_with(
                 continue;
             };
 
-            let Some(ast) = parsed_file_or_report(&mut report, &file.path) else {
+            let Some(parsed) = parsed_file_or_report(&mut report, &file.path) else {
                 continue;
             };
+            let ast = &parsed.ast;
 
             scan_file_for_dead_code(
                 &analysis,
@@ -1732,7 +1741,7 @@ pub fn analyze_workspace_with(
                 &entry_keys_production,
                 &entry_keys_all,
                 &proc_macro_exposed,
-                &ast,
+                ast,
                 file,
                 file_id,
                 &krate.name,

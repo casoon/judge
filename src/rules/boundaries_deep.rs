@@ -126,12 +126,12 @@ pub fn analyze_workspace(
                 continue;
             };
 
-            let ast = match crate::functions::read_and_parse_source(
+            let parsed = match crate::functions::read_and_parse_source(
                 &file.path,
                 |err| BoundaryDeepError::Io(file.path.clone(), err),
                 |err| BoundaryDeepError::Parse(file.path.clone(), err),
             ) {
-                Ok((_, ast)) => ast,
+                Ok(parsed) => parsed,
                 Err(err) => {
                     report.errors.push(err);
                     continue;
@@ -139,7 +139,7 @@ pub fn analyze_workspace(
             };
 
             let mut deep_error = None;
-            walk_functions(&ast, |site| {
+            walk_functions(&parsed.ast, |site| {
                 if deep_error.is_some() {
                     return;
                 }

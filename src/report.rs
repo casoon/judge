@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::finding::{Finding, Severity};
+use crate::parse::UnparsedFile;
 use runemark::{
     ColorMode, Confidence, Console, DetailLevel, Finding as TerminalFinding,
     FindingGroup as TerminalFindingGroup, Location as TerminalLocation, Metric, NextStep,
@@ -27,6 +28,7 @@ pub struct Report<'a> {
     scope_notes: Vec<ScopeNote<'a>>,
     groups: Vec<FindingGroup<'a>>,
     next_steps: Vec<String>,
+    unparsed_files: &'a [UnparsedFile],
 }
 
 struct ScopeNote<'a> {
@@ -48,7 +50,30 @@ impl<'a> Report<'a> {
             scope_notes: Vec::new(),
             groups: Vec::new(),
             next_steps: Vec::new(),
+            unparsed_files: &[],
         }
+    }
+
+    /// Records the source files the syntax-based rules could not analyze:
+    /// a count in the TTY header (the list with `details`), a Markdown
+    /// section, and a list in the `renderreport` request. A no-op when empty.
+    pub fn with_unparsed_files(mut self, files: &'a [UnparsedFile]) -> Self {
+        self.unparsed_files = files;
+        self
+    }
+
+    fn unparsed_heading(&self) -> String {
+        format!(
+            "Not analyzed by syntax-based rules: {} unparsed file(s)",
+            self.unparsed_files.len()
+        )
+    }
+
+    fn unparsed_items(&self) -> Vec<String> {
+        self.unparsed_files
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     /// Adds a scope/completeness note (analysis errors, unavailable
@@ -168,6 +193,12 @@ impl<'a> Report<'a> {
                 }),
             )
             .add_metric(Metric::new("Advisory", advisory_count.to_string()).with_tone(Tone::Info));
+        if !self.unparsed_files.is_empty() {
+            report = report.add_metric(
+                Metric::new("Unparsed", self.unparsed_files.len().to_string())
+                    .with_tone(Tone::Warning),
+            );
+        }
 
         let context = self
             .status_lines
@@ -185,6 +216,12 @@ impl<'a> Report<'a> {
             report = report.add_scope_note(TerminalScopeNote::new(
                 note.heading.clone(),
                 note.items.iter().map(ToString::to_string).collect(),
+            ));
+        }
+        if details && !self.unparsed_files.is_empty() {
+            report = report.add_scope_note(TerminalScopeNote::new(
+                self.unparsed_heading(),
+                self.unparsed_items(),
             ));
         }
         for group in &self.groups {
@@ -221,6 +258,12 @@ impl<'a> Report<'a> {
         for note in &self.scope_notes {
             let _ = writeln!(out, "\n**{}**\n", note.heading);
             for item in &note.items {
+                let _ = writeln!(out, "- {item}");
+            }
+        }
+        if !self.unparsed_files.is_empty() {
+            let _ = writeln!(out, "\n## {}\n", self.unparsed_heading());
+            for item in self.unparsed_items() {
                 let _ = writeln!(out, "- {item}");
             }
         }
@@ -269,6 +312,9 @@ impl Report<'_> {
                 note.heading.clone(),
                 note.items.iter().map(|item| item.to_string()).collect(),
             ));
+        }
+        if !self.unparsed_files.is_empty() {
+            components.push(list(self.unparsed_heading(), self.unparsed_items()));
         }
         for group in self.groups.iter().filter(|g| !g.findings.is_empty()) {
             let groups = rule_groups(&group.findings);

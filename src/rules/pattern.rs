@@ -371,9 +371,10 @@ fn crate_for_file<'a>(workspace: &'a Workspace, file: &Path) -> Option<&'a Crate
         .find(|krate| krate.source_files.iter().any(|source| source.path == file))
 }
 
-/// Reads and parses every source file in `krate` with `syn`, calling `visit`
-/// with each file's path and parsed AST. A file that fails to read or parse
-/// is silently skipped rather than surfaced as an analyzer error — every
+/// Reads and parses every source file in `krate` through the shared parse
+/// step, calling `visit` with each file's path and parsed AST. A file that
+/// fails to read or parse is skipped rather than surfaced as an analyzer
+/// error (a [`crate::parse::with_parse_session`] scope still records it) — every
 /// rule in this module treats its `syn`-derived facts as best-effort
 /// corroborating evidence, not ground truth, so skipping an unreadable file
 /// just means one less place a signal could have come from. Shared by every
@@ -381,13 +382,12 @@ fn crate_for_file<'a>(workspace: &'a Workspace, file: &Path) -> Option<&'a Crate
 /// loop.
 fn for_each_parsed_source(krate: &CrateInfo, mut visit: impl FnMut(&Path, &syn::File)) {
     for source in &krate.source_files {
-        let Ok(text) = std::fs::read_to_string(&source.path) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&source.path, |_| (), |_| ())
+        else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&text) else {
-            continue;
-        };
-        visit(&source.path, &ast);
+        let ast = &parsed.ast;
+        visit(&source.path, ast);
     }
 }
 
