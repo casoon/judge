@@ -80,7 +80,7 @@ pub fn render(report: &Report) -> serde_json::Value {
         .iter()
         .zip(&fingerprints)
         .map(|(finding, fingerprint)| {
-            serde_json::json!({
+            let mut result = serde_json::json!({
                 "ruleId": finding.rule.as_str(),
                 "level": level(finding.severity),
                 "message": {
@@ -97,7 +97,11 @@ pub fn render(report: &Report) -> serde_json::Value {
                     "evidence_class": finding.evidence_class,
                     "gating": finding.is_gating(),
                 },
-            })
+            });
+            if let Some(cfg) = finding.cfg() {
+                result["properties"][crate::cfg::EVIDENCE_KEY] = cfg.into();
+            }
+            result
         })
         .collect();
 
@@ -152,6 +156,29 @@ mod tests {
             Origin::Code,
             None,
         )
+    }
+
+    #[test]
+    fn cfg_condition_is_an_additive_result_property() {
+        let plain = finding(
+            "duplicate-code",
+            Severity::Warn,
+            EvidenceClass::DerivedFact,
+            "src/a.rs",
+        );
+        let mut gated = finding(
+            "duplicate-code",
+            Severity::Warn,
+            EvidenceClass::DerivedFact,
+            "src/b.rs",
+        );
+        gated.evidence = Some(serde_json::json!({ "token_count": 20, "cfg": "unix" }));
+
+        let sarif = render(&Report::new(vec![plain, gated]));
+
+        let results = &sarif["runs"][0]["results"];
+        assert!(results[0]["properties"].get("cfg").is_none());
+        assert_eq!(results[1]["properties"]["cfg"], "unix");
     }
 
     #[test]

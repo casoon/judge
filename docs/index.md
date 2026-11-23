@@ -33,6 +33,19 @@ error handling, unsafe structure and mechanical code smells.
 - **Deep Tier** — loads the workspace into rust-analyzer. Compiled only with `--features deep`;
   it powers `dead-code` and `explain --why-live`. See [Deep Tier](guides/deep-tier/).
 
+### Fast Tier limits
+
+- Every `#[cfg(..)]` branch is read; judge evaluates no condition against the host or the
+  enabled features. A finding inside code gated by an item-level `#[cfg(..)]` carries that
+  condition as written (`"cfg": "<predicate>"` in its evidence), including a condition on a
+  `mod foo;` declaration, which applies to the whole module file. The output is the same on
+  every platform.
+- Duplicate-code detection skips pairs whose conditions can never hold in the same build:
+  different `target_os`, `target_arch` or `target_pointer_width` values, `unix` and `windows`,
+  or `X` and `not(X)`. Any other combination counts as compatible.
+- Expression-level `cfg!()`, `#[cfg_attr]`, statement- or expression-level `#[cfg]` and feature
+  resolution are not considered. Macros are not expanded.
+
 ## Status
 
 judge is early-stage software. Module-level boundaries exist only in a first form, and several

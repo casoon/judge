@@ -9,6 +9,10 @@ versions were published on crates.io.
 ### Added
 
 - **`--renderreport`:** the bare `cargo judge` run prints its review report as a request for [renderreport](https://github.com/casoon/renderreport) instead of text (`cargo judge --renderreport | renderreport render - -o judge.pdf`). Same sections as `--format markdown`; judge itself gets no new dependency.
+- **`cfg` conditions:** a finding in code gated by an item-level `#[cfg(..)]` (including a gated
+  `mod foo;` and everything in its file) carries the condition as written in its evidence
+  (`"cfg": "<predicate>"`); `--details`, Markdown and SARIF show it as well. Nothing is evaluated
+  against the host, so the output is the same on every platform.
 - **SARIF:** every result carries a position-independent `partialFingerprints` entry, so code
   scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear
   as tool notifications and mark the invocation as unsuccessful.
@@ -22,6 +26,9 @@ versions were published on crates.io.
 
 ### Changed
 
+- **`duplicate-code`:** copies whose `#[cfg(..)]` conditions exclude each other (such as
+  `cfg(unix)` and `cfg(windows)`, or `feature = "a"` and `not(feature = "a")`) no longer form a
+  clone family. Rule revision 3.
 - **Pages:** the project site uses the current shared theme (0.17.0).
 - **`dead-code` (deep tier):** the command loads rust-analyzer once for `dead-code`,
   `dead-trait-impl` and the structural checks instead of three times.

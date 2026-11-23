@@ -255,12 +255,17 @@ fn write_dupe_families_tty(
         for member in &family.members {
             writeln!(
                 out,
-                "  {:>4} tokens  {}:{}-{}  {}",
+                "  {:>4} tokens  {}:{}-{}  {}{}",
                 member.token_count,
                 member.file.display(),
                 member.start_line,
                 member.end_line,
-                member.qualified_name
+                member.qualified_name,
+                member
+                    .cfg
+                    .as_ref()
+                    .map(|cfg| format!(" [cfg({cfg})]"))
+                    .unwrap_or_default()
             )?;
         }
     }
@@ -1263,6 +1268,7 @@ fn render_focused(
 ) -> Result<CommandOutcome, CliError> {
     let (mut findings, _suppressed_inline) =
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, workspace);
     judge::finding::sort_by_severity_desc(&mut findings);
     match format {
         OutputFormat::Json => write_json(
@@ -1371,8 +1377,9 @@ pub(crate) fn run_api_surface(
     )?;
 
     // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
+    let (mut findings, suppressed_inline) =
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, &workspace);
 
     // API-surface-size trend against a saved baseline (see todo.md §I
     // "API-Surface-Größe pro Crate, Trend gegen Baseline") — computed before
@@ -1578,8 +1585,9 @@ fn suppress_and_baseline(
     default_save_path: &Path,
     out: &mut dyn Write,
 ) -> Result<std::ops::ControlFlow<CommandOutcome, (Vec<Finding>, usize)>, CliError> {
-    let (findings, suppressed_inline) =
+    let (mut findings, suppressed_inline) =
         judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, workspace);
 
     let baseline_request = BaselineRequest::new(
         baseline_args.save_baseline,

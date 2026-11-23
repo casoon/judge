@@ -2887,6 +2887,50 @@ fn dup_two(x: i32) -> i32 {
         );
     }
 
+    /// A `#[cfg(..)] mod foo;` condition reaches the findings in the module
+    /// file, as written and whatever host runs judge: the `windows` module
+    /// is annotated on every platform. Its copy of the `unix` module is not
+    /// a duplicate; both still pair with the unconditional copy.
+    #[test]
+    fn combined_run_carries_cfg_conditions_from_mod_declarations() {
+        let _guard = lock_cwd();
+        let dir = TempDir::new("cfg-mod-conditions");
+        write_fixture_crate(&dir);
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "#[cfg(unix)]\nmod nix;\n#[cfg(windows)]\nmod win;\nmod shared;\n",
+        )
+        .unwrap();
+        let body = "fn sum(x: i32) -> i32 {\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n";
+        for name in ["nix", "win", "shared"] {
+            std::fs::write(dir.join(format!("src/{name}.rs")), body).unwrap();
+        }
+
+        let workspace = judge::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+        let mut collected = collect_findings(&workspace).unwrap();
+        assert!(collected.analysis_errors.is_empty());
+        judge::finding::relativize_paths(&mut collected.findings, &workspace.root);
+
+        let mut duplicates: Vec<_> = collected
+            .findings
+            .iter()
+            .filter(|finding| finding.rule == judge::rules::duplication::DUPLICATE_RULE)
+            .map(|finding| (finding.location.file.clone(), finding.cfg()))
+            .collect();
+        duplicates.sort();
+        assert_eq!(
+            duplicates,
+            [
+                (PathBuf::from("src/nix.rs"), Some("unix")),
+                (PathBuf::from("src/shared.rs"), None),
+                (PathBuf::from("src/win.rs"), Some("windows")),
+            ]
+        );
+        let json =
+            serde_json::to_string(&Report::with_errors(collected.findings, Vec::new())).unwrap();
+        assert!(json.contains(r#""cfg":"windows""#), "{json}");
+    }
+
     /// Artifact comparison classifies newly added source findings without
     /// consulting repository history.
     #[test]

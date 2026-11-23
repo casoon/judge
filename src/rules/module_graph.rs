@@ -309,7 +309,7 @@ fn resolve_mod_file(
 /// [`resolve_mod_file`] for an out-of-line `mod` item directly — shared by
 /// [`visit_items`] (building the tree) and [`unlinked_file_findings`]'s own
 /// second, causal-edge-only re-walk of an unreached file's `mod` items.
-fn resolve_mod_item_file(
+pub(crate) fn resolve_mod_item_file(
     declaring_file: &Path,
     inline_dirs: &[String],
     item_mod: &syn::ItemMod,
