@@ -48,6 +48,8 @@ versions were published on crates.io.
 
 ### Changed
 
+- **Pages:** the start page opens with the problem judge solves (what a refactoring leaves
+  behind, what rustc and Clippy do not see) and links a new Use cases page.
 - **`--color auto`:** an empty `NO_COLOR` counts as unset, as no-color.org specifies, and
   `TERM=dumb` turns colour off. The terminal output uses runemark 0.10.
 - **`duplicate-code`:** copies whose `#[cfg(..)]` conditions exclude each other (such as
