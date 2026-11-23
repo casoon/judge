@@ -432,9 +432,17 @@ pub fn analyze_workspace<'a>(
     include_generated: bool,
 ) -> WorkspaceSecurity {
     let mut report = WorkspaceSecurity::default();
+    let source_files: Vec<&SourceFile> = source_files.into_iter().collect();
+    // A file reached only through a `#[cfg(test)] mod` is test code as a
+    // whole, just like a test-scoped item inside a file.
+    let paths: Vec<PathBuf> = source_files.iter().map(|file| file.path.clone()).collect();
+    let test_only = crate::rules::module_graph::cfg_test_module_files(&paths);
     for file in source_files {
         if !include_generated && !file.kind.is_locally_reportable() {
             report.excluded_generated += 1;
+            continue;
+        }
+        if test_only.contains(&file.path) {
             continue;
         }
         match analyze_file(&file.path) {
@@ -1277,6 +1285,33 @@ mod tests {
 
     fn rule_findings<'a>(findings: &'a [Finding], rule: &str) -> Vec<&'a Finding> {
         findings.iter().filter(|f| f.rule == rule).collect()
+    }
+
+    /// A file reached only through `#[cfg(test)] mod helpers;` is test code,
+    /// so its panicking helpers are not `panic-in-lib`.
+    #[test]
+    fn files_behind_a_cfg_test_mod_declaration_are_not_analyzed() {
+        let dir = TempDir::new("security-cfg-test-module-file");
+        let lib = dir.join("lib.rs");
+        let helpers = dir.join("helpers.rs");
+        std::fs::write(
+            &lib,
+            "#[cfg(test)]\nmod helpers;\n\npub fn f(x: Option<u8>) -> u8 {\n    x.unwrap()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &helpers,
+            "pub fn g(x: Option<u8>) -> u8 {\n    x.unwrap()\n}\n",
+        )
+        .unwrap();
+        let files = [&lib, &helpers].map(|path| SourceFile {
+            path: path.clone(),
+            kind: crate::ingest::SourceKind::Authored,
+        });
+        let report = analyze_workspace(&files, false);
+        let hits = rule_findings(&report.findings, PANIC_IN_LIB_RULE);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].location.file, lib);
     }
 
     #[test]

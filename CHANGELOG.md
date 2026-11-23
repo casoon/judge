@@ -82,6 +82,8 @@ versions were published on crates.io.
 
 ### Fixed
 
+- **`panic-in-lib`, `unsafe-surface`, `integer-cast-risk`:** files reached only through a
+  `#[cfg(test)] mod` declaration are test code and no longer analyzed as library code.
 - **`swallowed-result`:** a `let _ = ...;` with a comment on the same line or directly above
   it is no longer reported; the comment documents the discard as intentional.
 - **`conversational-artifact`:** "here is"/"here's" only counts when it opens the comment, so
