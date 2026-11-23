@@ -79,7 +79,7 @@ struct Cli {
     #[arg(long)]
     details: bool,
     /// Terminal color policy for the bare combined report. `auto` uses color
-    /// only on a terminal and honours `NO_COLOR`; use `always` to force it.
+    /// only on a terminal and honours `NO_COLOR` and `TERM=dumb`; use `always` to force it.
     #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
     color: ColorChoice,
     /// Print the bare combined report as a request for `renderreport render`
@@ -427,7 +427,7 @@ enum ColorChoice {
 impl ColorChoice {
     fn is_enabled(self) -> bool {
         match self {
-            Self::Auto => std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+            Self::Auto => runemark::ColorMode::Auto.enabled(std::io::stdout().is_terminal()),
             Self::Always => true,
             Self::Never => false,
         }

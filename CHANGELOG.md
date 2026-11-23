@@ -22,6 +22,8 @@ versions were published on crates.io.
 
 ### Changed
 
+- **`--color auto`:** an empty `NO_COLOR` counts as unset, as no-color.org specifies, and
+  `TERM=dumb` turns colour off. The terminal output uses runemark 0.10.
 - **Pages:** the project site uses the current shared theme (0.17.0).
 - **`dead-code` (deep tier):** the command loads rust-analyzer once for `dead-code`,
   `dead-trait-impl` and the structural checks instead of three times.
