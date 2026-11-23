@@ -83,7 +83,7 @@ use crate::rules::api_surface::{build_finding, has_doc_comment};
 pub const SWALLOWED_RESULT_RULE: &str = "swallowed-result";
 /// Bump when the swallowed-result rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
-pub const SWALLOWED_RESULT_RULE_REVISION: u32 = 1;
+pub const SWALLOWED_RESULT_RULE_REVISION: u32 = 2;
 
 /// Rule id for an empty `Err(_)`/`Err(..)` match arm, or an `if let Err(_) =
 /// ... { }` with no `else` (see todo.md §G1).
@@ -134,7 +134,7 @@ pub const IGNORED_TEST_ACCUMULATION_RULE_REVISION: u32 = 1;
 /// Rule id for a phrase leaking AI-assistant framing into a plain comment
 /// (see todo.md §G3). Implemented in `crate::rules::slop_text`.
 pub const CONVERSATIONAL_ARTIFACT_RULE: &str = "conversational-artifact";
-pub const CONVERSATIONAL_ARTIFACT_RULE_REVISION: u32 = 1;
+pub const CONVERSATIONAL_ARTIFACT_RULE_REVISION: u32 = 2;
 
 /// Rule id for a comment that only paraphrases the code line it precedes
 /// (see todo.md §G3). Implemented in `crate::rules::slop_text`.
@@ -231,6 +231,7 @@ pub fn analyze_file(
         visitor_trait_impl_stack: Vec::new(),
         drop_impl_stack: Vec::new(),
         in_drop_drop_body: false,
+        documented_lines: documented_lines(&source),
     };
     visitor.visit_file(&ast);
     let mut findings = visitor.findings;
@@ -240,6 +241,32 @@ pub fn analyze_file(
         path,
     ));
     Ok(findings)
+}
+
+/// Lines on which a `let _ = ...;` statement counts as documented for
+/// `swallowed-result` (GitHub issue #42): the line of any comment (a
+/// trailing `let _ = f(); // why`), and the line directly below a comment
+/// that stands on its own line(s) (`// why` above `let _ = f();`). The
+/// comment's content is not interpreted — an adjacent comment is taken as
+/// the author's documented intent to discard — except that a `judge-ignore`
+/// marker comment is left to [`crate::suppression`], which validates its
+/// reason.
+fn documented_lines(source: &str) -> std::collections::HashSet<usize> {
+    let source_lines: Vec<&str> = source.lines().collect();
+    let mut lines = std::collections::HashSet::new();
+    for comment in crate::rules::slop_text::extract_comments(source) {
+        if comment.text.contains(crate::suppression::MARKER) {
+            continue;
+        }
+        lines.insert(comment.start_line);
+        let own_line = source_lines
+            .get(comment.start_line - 1)
+            .is_some_and(|line| line.trim_start().starts_with('/'));
+        if own_line {
+            lines.insert(comment.end_line + 1);
+        }
+    }
+    lines
 }
 
 /// Runs [`analyze_file`] over every file in `source_files` and aggregates the
@@ -324,6 +351,9 @@ struct SlopVisitor<'a> {
     /// idiomatic `let _ = ...;` there (see todo.md §G1 `swallowed-result`:
     /// `drop` cannot return a `Result`, so discarding is the only option).
     in_drop_drop_body: bool,
+    /// Lines a `let _ = ...;` starting on them counts as documented for
+    /// `swallowed-result` (see [`documented_lines`]).
+    documented_lines: std::collections::HashSet<usize>,
 }
 
 impl SlopVisitor<'_> {
@@ -751,10 +781,12 @@ impl<'ast> Visit<'ast> for SlopVisitor<'_> {
     /// to `_` rather than a real name (see todo.md §G1 `swallowed-result`).
     /// Exempt inside `Drop::drop`'s own body (see [`Self::in_drop_drop_body`]):
     /// `drop` cannot return a `Result`, so `let _ = fallible();` is the only
-    /// correct idiom there, not a discarded error.
+    /// correct idiom there, not a discarded error. Also exempt when an
+    /// adjacent comment documents the discard (see [`documented_lines`]).
     fn visit_local(&mut self, node: &'ast Local) {
         if !self.in_drop_drop_body
             && matches!(node.pat, Pat::Wild(_))
+            && !self.documented_lines.contains(&node.span().start().line)
             && let Some(init) = &node.init
             && matches!(init.expr.as_ref(), Expr::Call(_) | Expr::MethodCall(_))
         {
@@ -1686,6 +1718,37 @@ mod tests {
         assert_eq!(hits.len(), 1);
     }
 
+    /// GitHub issue #42: an intentional discard documented by a comment on
+    /// the line(s) directly above is not flagged.
+    #[test]
+    fn let_underscore_with_explanatory_comment_above_is_not_flagged() {
+        let findings = findings_for(
+            "fn spawn(tx: std::sync::mpsc::Sender<i32>) {\n    // The receiver may already be dropped if another worker's\n    // result was accepted first; a send failure here is expected.\n    let _ = tx.send(1);\n}\n",
+            "slop-swallowed-result-comment-above",
+        );
+        assert!(rule_findings(&findings, SWALLOWED_RESULT_RULE).is_empty());
+    }
+
+    #[test]
+    fn let_underscore_with_trailing_comment_is_not_flagged() {
+        let findings = findings_for(
+            "fn join(handle: std::thread::JoinHandle<()>) {\n    let _ = handle.join(); // cleanup only, failure not actionable\n}\n",
+            "slop-swallowed-result-comment-trailing",
+        );
+        assert!(rule_findings(&findings, SWALLOWED_RESULT_RULE).is_empty());
+    }
+
+    /// A comment separated by a blank line, or one trailing a previous
+    /// statement, does not document the `let _ = ...;` below it.
+    #[test]
+    fn let_underscore_without_adjacent_own_line_comment_is_still_flagged() {
+        let findings = findings_for(
+            "fn f(tx: std::sync::mpsc::Sender<i32>) {\n    // unrelated note\n\n    let _ = tx.send(1);\n    let n = 2; // trailing note\n    let _ = tx.send(n);\n}\n",
+            "slop-swallowed-result-comment-not-adjacent",
+        );
+        assert_eq!(rule_findings(&findings, SWALLOWED_RESULT_RULE).len(), 2);
+    }
+
     #[test]
     fn bare_dot_ok_statement_is_flagged() {
         let findings = findings_for(
@@ -2373,6 +2436,28 @@ fn f(r: Result<i32, ()>) {
             "slop-conversational-artifact-tier2-word-boundary",
         );
         assert!(rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    /// GitHub issue #42: mid-sentence "here is" in a rationale comment is an
+    /// ordinary adverb, not assistant framing.
+    #[test]
+    fn conversational_artifact_mid_sentence_here_is_is_not_flagged() {
+        let findings = findings_for(
+            "fn f() {\n    // The receiver may already be dropped if `solve` returned after another worker's\n    // result was accepted first; a send failure here is expected, not an error.\n}\n",
+            "slop-conversational-artifact-here-is-mid-sentence",
+        );
+        assert!(rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE).is_empty());
+    }
+
+    #[test]
+    fn conversational_artifact_here_is_opening_the_comment_is_flagged() {
+        let findings = findings_for(
+            "fn f() {\n    // Here is the updated function with error handling.\n}\n",
+            "slop-conversational-artifact-here-is-opener",
+        );
+        let hits = rule_findings(&findings, CONVERSATIONAL_ARTIFACT_RULE);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Info);
     }
 
     #[test]

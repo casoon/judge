@@ -47,6 +47,13 @@ versions were published on crates.io.
 
 ### Fixed
 
+- **`swallowed-result`:** a `let _ = ...;` with a comment on the same line or directly above
+  it is no longer reported; the comment documents the discard as intentional.
+- **`conversational-artifact`:** "here is"/"here's" only counts when it opens the comment, so
+  rationale comments like "a send failure here is expected" are no longer reported.
+- **`panic-in-lib`:** `v[x % v.len()]` is no longer reported after an early-return guard
+  `if v.is_empty() { return ..; }` (or `v.len() == 0`) in the same function that leaves `v`
+  unchanged afterwards.
 - **`deps --check-rustc-lints`:** `unused-dependency` finds nothing on cargo 1.100 and newer, where cargo reports unused dependencies itself (`cargo::unused_dependencies`) and rustc's lint no longer appears in the JSON messages. The rule now also reads cargo's warning from its stderr; a dependency that only tests or examples use is still not reported.
 - **`dead-enum-variant` (deep tier):** findings state that construction sites inside macro
   invocations are not scanned.
