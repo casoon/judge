@@ -495,6 +495,12 @@ fn is_clamped_immediately(expr: &Expr) -> bool {
     )
 }
 
+/// Whether `index` is the full range `..`: `v[..]` reborrows the whole
+/// collection and cannot panic.
+fn is_full_range(index: &Expr) -> bool {
+    matches!(index, Expr::Range(range) if range.start.is_none() && range.end.is_none())
+}
+
 /// Classifies an indexing expression's `[..]` operand shape into one of
 /// three `panic-in-lib` `evidence.kind` values (see module doc
 /// "`panic-in-lib` scope") — syntax-only, no type resolution:
@@ -931,7 +937,7 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
     }
 
     fn visit_expr_index(&mut self, node: &'ast ExprIndex) {
-        if !self.is_guarded_modulo_index(node) {
+        if !is_full_range(&node.index) && !self.is_guarded_modulo_index(node) {
             self.push_panic_finding(node.span(), classify_index_kind(&node.index));
         }
         visit::visit_expr_index(self, node);
@@ -1665,6 +1671,16 @@ mod tests {
         let hits = rule_findings(&findings, PANIC_IN_LIB_RULE);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].evidence.as_ref().unwrap()["kind"], "range_slice");
+    }
+
+    /// `v[..]` reborrows the whole collection and cannot panic.
+    #[test]
+    fn full_range_indexing_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn f(v: &Vec<u8>) -> &[u8] {\n    &v[..]\n}\n",
+            "security-panic-indexing-full-range",
+        );
+        assert!(rule_findings(&findings, PANIC_IN_LIB_RULE).is_empty());
     }
 
     /// A string-literal index is almost always a `serde_json::Value`/
