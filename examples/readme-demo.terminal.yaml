@@ -1,0 +1,74 @@
+version: 1
+
+# Recorded with: castwright build examples/readme-demo.terminal.yaml --allow-exec --record
+# SVG export:    castwright build examples/readme-demo.terminal.yaml --format svg --loop-delay 9000 -o <dir>
+#                (the file <dir>/readme-demo.svg is .github/readme/cargo-judge.svg; a trailing wait: is dropped
+#                in SVG, the end frame holds for --loop-delay)
+
+terminal:
+  title: cargo judge
+  cols: 112
+  rows: 25
+  theme: catppuccin-mocha
+
+steps:
+  - run: cargo judge
+  - output:
+      raw: "\e[1;93m⚠\e[0m Judge summary
+
+        \  \e[1;93mAnalysis context: \e[0m\e[2mboundary rules: 0 not checked (no judge.toml)\e[0m
+
+
+        \  \e[2mEvidence: \e[0m\e[1;93m674\e[0m   \e[2mAdvisory: \e[0m\e[36m333\e[0m
+
+
+        \  \e[1;96mTop issue rules:\e[0m
+
+        \     635x  \e[2mduplicate-code\e[0m
+
+        \     243x  \e[2mcomplexity-inflation\e[0m
+
+        \      39x  \e[2minteger-cast-risk\e[0m
+
+        \      39x  \e[2mmaintainability-index\e[0m
+
+        \      22x  \e[2mpanic-in-lib\e[0m
+
+
+        ● \e[1;96mEvidence-backed findings\e[0m \e[2m(674)\e[0m
+
+        \  - \e[1;93mswallowed-result in write_cache\e[0m \e[2m[swallowed-result]\e[0m \e[2m(high confidence)\e[0m at \e]8;;file:///private/tmp/demo-judge/judge/src/rules/slopsquat.rs#356\e\\\\\e[2msrc/rules/slopsquat.rs:356\e[0m\e]8;;\e\\\\
+
+        \  - \e[1;93mswallowed-result in write_cache\e[0m \e[2m[swallowed-result]\e[0m \e[2m(high confidence)\e[0m at \e]8;;file:///private/tmp/demo-judge/judge/src/rules/slopsquat.rs#359\e\\\\\e[2msrc/rules/slopsquat.rs:359\e[0m\e]8;;\e\\\\
+
+        \  - \e[1;93mduplicate-code in build_functional_core_imperative_shell_heuristic\e[0m \e[2m[duplicate-code]\e[0m \e[2m(high confidence)\e[0m at \e]8;;file:///private/tmp/demo-judge/judge/src/rules/principle.rs#550\e\\\\\e[2msrc/rules/principle.rs:550\e[0m\e]8;;\e\\\\
+
+        \  \e[2m... 671 more finding(s) (use --details to view all)\e[0m
+
+
+        ● \e[1;96mAdvisory heuristics (no verdict or score effect)\e[0m \e[2m(333)\e[0m \e[36m[advisory]\e[0m
+
+        \  - \e[1;93mcomplexity-inflation in known_vulnerability_finding\e[0m \e[2m[complexity-inflation]\e[0m \e[2m(low confidence)\e[0m at \e]8;;file:///private/tmp/demo-judge/judge/src/advisory/advisories.rs#330\e\\\\\e[2msrc/advisory/advisories.rs:330\e[0m\e]8;;\e\\\\
+
+        \  - \e[1;93mcomplexity-inflation in tests::known_vulnerability_registry_example_still_triggers_the_rule\e[0m \e[2m[complexity-inflation]\e[0m \e[2m(low confidence)\e[0m at \e]8;;file:///private/tmp/demo-judge/judge/src/advisory/advisories.rs#540\e\\\\\e[2msrc/advisory/advisories.rs:540\e[0m\e]8;;\e\\\\
+
+        \  - \e[1;93mcomplexity-inflation in parse_lcov\e[0m \e[2m[complexity-inflation]\e[0m \e[2m(low confidence)\e[0m at \e]8;;file:///private/tmp/demo-judge/judge/src/advisory/coverage.rs#155\e\\\\\e[2msrc/advisory/coverage.rs:155\e[0m\e]8;;\e\\\\
+
+        \  \e[2m... 330 more finding(s) (use --details to view all)\e[0m
+
+
+        \e[1;96mNext steps:\e[0m
+
+        \  • clone families, grouped and prioritized
+
+        \    \e[36m$ cargo judge dupes\e[0m
+
+        \  • every finding and location
+
+        \    \e[36m$ cargo judge --details\e[0m
+
+        \  • full machine-readable report in .judge/judge.json
+
+        \    \e[36m$ cargo judge --format json\e[0m\n"
+    delay: 60
+  - wait: 9000
