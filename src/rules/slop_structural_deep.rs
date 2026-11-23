@@ -236,19 +236,19 @@ fn collect_file_fan_in(
         }
     };
 
-    let ast = match crate::functions::read_and_parse_source(
+    let parsed = match crate::functions::read_and_parse_source(
         &file.path,
         |err| SlopStructuralDeepError::Io(file.path.clone(), err),
         |err| SlopStructuralDeepError::Parse(file.path.clone(), err),
     ) {
-        Ok((_, ast)) => ast,
+        Ok(parsed) => parsed,
         Err(err) => {
             errors.push(err);
             return;
         }
     };
 
-    walk_functions(&ast, |site| {
+    walk_functions(&parsed.ast, |site| {
         if !is_reliably_checkable_for_fan_in(&site) {
             return;
         }

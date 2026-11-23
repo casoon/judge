@@ -214,11 +214,12 @@ pub fn analyze_file(
     path: &Path,
     allow_anyhow_at_boundary: bool,
 ) -> Result<Vec<Finding>, SlopError> {
-    let (source, ast) = read_and_parse_source(
+    let parsed = read_and_parse_source(
         path,
         |err| SlopError::Io(path.to_path_buf(), err),
         |err| SlopError::Parse(path.to_path_buf(), err),
     )?;
+    let (source, ast) = (&parsed.source, &parsed.ast);
 
     let mut visitor = SlopVisitor {
         file: path,
@@ -233,10 +234,10 @@ pub fn analyze_file(
         in_drop_drop_body: false,
         documented_lines: documented_lines(&source),
     };
-    visitor.visit_file(&ast);
+    visitor.visit_file(ast);
     let mut findings = visitor.findings;
     findings.extend(crate::rules::slop_text::scan_comments(
-        &source,
+        source,
         &visitor.item_spans,
         path,
     ));

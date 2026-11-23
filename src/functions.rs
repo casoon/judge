@@ -6,6 +6,7 @@
 //! detectors agree on what counts as "a function" without duplicating the
 //! traversal logic.
 
+use crate::parse::{ParseFailure, ParsedSource};
 use proc_macro2::Span;
 use std::path::Path;
 use syn::spanned::Spanned;
@@ -61,17 +62,19 @@ pub struct FunctionSite<'ast> {
     pub is_test_context: bool,
 }
 
-/// Reads and parses one Rust source file while leaving each analyzer in
-/// control of its own error type. The returned source is kept alongside the
-/// AST because several callers also inspect comments or source spans.
+/// Reads and parses one Rust source file through the shared parse step
+/// ([`crate::parse::read_and_parse`]) while leaving each analyzer in control
+/// of its own error type. The parsed file keeps its source alongside the AST
+/// because several callers also inspect comments or source spans.
 pub(crate) fn read_and_parse_source<E>(
     path: &Path,
     io_error: impl FnOnce(std::io::Error) -> E,
     parse_error: impl FnOnce(syn::Error) -> E,
-) -> Result<(String, syn::File), E> {
-    let source = std::fs::read_to_string(path).map_err(io_error)?;
-    let ast = syn::parse_file(&source).map_err(parse_error)?;
-    Ok((source, ast))
+) -> Result<std::rc::Rc<ParsedSource>, E> {
+    crate::parse::read_and_parse(path).map_err(|failure| match failure {
+        ParseFailure::Io(err) => io_error(err),
+        ParseFailure::Syntax(err) => parse_error(err),
+    })
 }
 
 /// Visits every `fn`, impl method, and default trait-method body in `file`,

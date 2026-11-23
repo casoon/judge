@@ -101,6 +101,19 @@ pub fn render(report: &Report) -> serde_json::Value {
         })
         .collect();
 
+    let mut notifications: Vec<serde_json::Value> = report
+        .errors
+        .iter()
+        .map(|error| serde_json::json!({ "level": "error", "message": { "text": error } }))
+        .collect();
+    notifications.extend(
+        report
+            .analysis_universe
+            .iter()
+            .flat_map(|universe| &universe.unparsed_files)
+            .map(unparsed_file_notification),
+    );
+
     let mut run = serde_json::json!({
         "tool": {
             "driver": {
@@ -113,11 +126,7 @@ pub fn render(report: &Report) -> serde_json::Value {
         "results": results,
         "invocations": [{
             "executionSuccessful": report.errors.is_empty(),
-            "toolExecutionNotifications": report
-                .errors
-                .iter()
-                .map(|error| serde_json::json!({ "level": "error", "message": { "text": error } }))
-                .collect::<Vec<_>>(),
+            "toolExecutionNotifications": notifications,
         }],
     });
     if let Some(universe) = &report.analysis_universe {
@@ -128,6 +137,29 @@ pub fn render(report: &Report) -> serde_json::Value {
         "version": "2.1.0",
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "runs": [run],
+    })
+}
+
+/// A file the syntax-based rules could not analyze, as a warning-level
+/// `toolExecutionNotification` pointing at the file (and, for a `syn` error,
+/// the line and column). A warning, not an error: whether the run counts as
+/// incomplete stays each rule's own policy, reported through `errors`.
+fn unparsed_file_notification(file: &crate::parse::UnparsedFile) -> serde_json::Value {
+    let mut physical_location = serde_json::json!({
+        "artifactLocation": { "uri": artifact_uri(&file.path) },
+    });
+    if let (Some(line), Some(column)) = (file.line, file.column) {
+        physical_location["region"] = serde_json::json!({
+            "startLine": line,
+            "startColumn": column,
+        });
+    }
+    serde_json::json!({
+        "level": "warning",
+        "message": {
+            "text": format!("not analyzed by syntax-based rules: {}", file.reason),
+        },
+        "locations": [{ "physicalLocation": physical_location }],
     })
 }
 

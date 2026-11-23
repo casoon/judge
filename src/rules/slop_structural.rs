@@ -401,27 +401,26 @@ fn abstraction_finding(
 /// struct-shape half of sub-check 3 are workspace-wide, since that's
 /// exactly the correlation they need (an impl can live in a different file
 /// than its trait; a builder's target struct is often defined elsewhere).
-/// Parses every [`SourceKind::Authored`] file in `source_files`, calling
-/// `visit` with each file and its parsed AST — silently skipping files that
-/// fail to read or parse (see the Generated-Code-Policy, todo.md §3.A).
-/// Shared by every structural pass below, which only cares about what it
-/// *can* see, not about surfacing read/parse failures as findings of their
-/// own (unlike, say, [`crate::rules::complexity::analyze_file`]).
+/// Parses every [`SourceKind::Authored`] file in `source_files` through the
+/// shared parse step, calling `visit` with each file and its parsed AST —
+/// skipping files that fail to read or parse (see the Generated-Code-Policy,
+/// todo.md §3.A). Shared by every structural pass below, which only cares
+/// about what it *can* see, not about surfacing read/parse failures as
+/// findings of their own (unlike, say, [`crate::rules::complexity::analyze_file`]);
+/// [`crate::parse::with_parse_session`] records the skipped files for the
+/// report.
 fn for_each_authored_file<'a>(
     source_files: impl IntoIterator<Item = &'a SourceFile>,
-    mut visit: impl FnMut(&'a SourceFile, syn::File),
+    mut visit: impl FnMut(&'a SourceFile, &syn::File),
 ) {
     for file in source_files {
         if file.kind != SourceKind::Authored {
             continue;
         }
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ()) else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&source) else {
-            continue;
-        };
-        visit(file, ast);
+        visit(file, &parsed.ast);
     }
 }
 
@@ -445,7 +444,7 @@ pub fn analyze_workspace_structural<'a>(
 
     for_each_authored_file(source_files, |file, ast| {
         let mut collector = FileCollector::default();
-        collector.visit_file(&ast);
+        collector.visit_file(ast);
 
         for (trait_name, self_type, line) in collector.trait_impls {
             trait_impls
@@ -739,7 +738,7 @@ pub fn fragile_substring_classification<'a>(
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     for_each_authored_file(source_files, |file, ast| {
-        walk_functions(&ast, |site| {
+        walk_functions(ast, |site| {
             let mut visitor = FragileSubstringVisitor::default();
             visitor.visit_block(site.block);
             for span in visitor.hits {

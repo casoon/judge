@@ -21,6 +21,10 @@ pub(crate) struct CollectedFindings {
     /// How many findings an inline `// judge-ignore: <rule> — <reason>`
     /// comment dropped (see [`judge::suppression::apply_inline_suppressions`]).
     pub(crate) suppressed_inline: usize,
+    /// The run's shared parse session: the files the syntax-based rules
+    /// could not read or parse, and how often each file was parsed (see
+    /// [`judge::parse::with_parse_session`]).
+    pub(crate) parse_summary: judge::parse::ParseSummary,
 }
 
 /// Runs every default current-state detector (complexity, duplication,
@@ -42,6 +46,19 @@ pub(crate) fn collect_findings(
 /// while the bare combined command can expose live progress separately from
 /// its final stdout report.
 pub(crate) fn collect_findings_with_progress(
+    workspace: &judge::ingest::Workspace,
+    progress: &mut dyn FnMut(combined::ProgressEvent) -> Result<(), CliError>,
+) -> Result<CollectedFindings, CliError> {
+    let (collected, parse_summary) =
+        judge::parse::with_parse_session(|| collect_all(workspace, progress));
+    let mut collected = collected?;
+    collected.parse_summary = parse_summary;
+    Ok(collected)
+}
+
+/// Every Fast-Tier phase, run inside [`collect_findings_with_progress`]'s
+/// shared parse session so each source file is read and parsed once.
+fn collect_all(
     workspace: &judge::ingest::Workspace,
     progress: &mut dyn FnMut(combined::ProgressEvent) -> Result<(), CliError>,
 ) -> Result<CollectedFindings, CliError> {
@@ -93,6 +110,7 @@ pub(crate) fn collect_findings_with_progress(
         boundary_rules_checked,
         boundaries_config_path,
         suppressed_inline,
+        parse_summary: judge::parse::ParseSummary::default(),
     })
 }
 

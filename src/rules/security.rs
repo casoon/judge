@@ -359,15 +359,16 @@ pub struct WorkspaceSecurity {
 /// `unsafe-density`/`integer-cast-risk`/`panic-in-lib`/`hardcoded-secret`
 /// finding in it.
 pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
-    let (source, ast) = read_and_parse_source(
+    let parsed = read_and_parse_source(
         path,
         |err| SecurityError::Io(path.to_path_buf(), err),
         |err| SecurityError::Parse(path.to_path_buf(), err),
     )?;
-    let comments = extract_comments(&source);
+    let (source, ast) = (&parsed.source, &parsed.ast);
+    let comments = extract_comments(source);
 
     let mut findings = Vec::new();
-    walk_functions(&ast, |site| {
+    walk_functions(ast, |site| {
         let mut unsafe_visitor = UnsafeVisitor {
             file: path,
             item_path: &site.qualified_name,
@@ -404,10 +405,10 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
         binding_name: None,
         findings: Vec::new(),
     };
-    secret_visitor.visit_file(&ast);
+    secret_visitor.visit_file(ast);
     findings.append(&mut secret_visitor.findings);
 
-    if let Some(finding) = unsafe_density_finding_for_file(path, &ast, &source) {
+    if let Some(finding) = unsafe_density_finding_for_file(path, ast, source) {
         findings.push(finding);
     }
 

@@ -559,14 +559,15 @@ fn collect_usage_sites(
             |err| DepsError::Io(file.path.clone(), err),
             |err| DepsError::Parse(file.path.clone(), err),
         ) {
-            Ok((_, ast)) => {
+            Ok(parsed) => {
+                let ast = &parsed.ast;
                 let mut collector = WhySiteCollector {
                     target,
                     file: &file.path,
                     domain,
                     sites: Vec::new(),
                 };
-                collector.visit_file(&ast);
+                collector.visit_file(ast);
                 sites.extend(collector.sites);
             }
             Err(err) => errors.push(err),
@@ -1480,23 +1481,23 @@ fn unused_dependency_finding(
 /// footprint, not where it is used. `use dep::{Foo, bar::Baz}` records `Foo`
 /// and `bar`; `dep::foo::bar()` records `foo`. An approximation of "how many
 /// distinct items of this dependency does the crate use", not exact item
-/// resolution. Files that fail to read or parse are silently skipped: this is
+/// resolution. Files that fail to read or parse are skipped: this is
 /// advisory (`heuristic`) evidence, not a completeness claim like
-/// `unused-dev-dependency`'s.
+/// `unused-dev-dependency`'s. The shared parse step
+/// ([`crate::parse::with_parse_session`]) records every such file, so the
+/// report still lists it.
 fn collect_used_items(krate: &CrateInfo, target: &str) -> HashSet<String> {
     let mut items = HashSet::new();
     for file in &krate.source_files {
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
+        let Ok(parsed) = read_and_parse_source(&file.path, |_| (), |_| ()) else {
             continue;
         };
-        let Ok(ast) = syn::parse_file(&source) else {
-            continue;
-        };
+        let ast = &parsed.ast;
         let mut collector = DepItemCollector {
             target,
             items: HashSet::new(),
         };
-        collector.visit_file(&ast);
+        collector.visit_file(ast);
         items.extend(collector.items);
     }
     items
@@ -1629,17 +1630,18 @@ fn collect_crate_usage(
 /// to identifiers referenced only inside `#[cfg(test)]`-attributed modules
 /// (see [`CfgTestIdentCollector`]).
 fn collect_identifiers(path: &Path) -> Result<(HashSet<String>, HashSet<String>), DepsError> {
-    let (_, ast) = read_and_parse_source(
+    let parsed = read_and_parse_source(
         path,
         |err| DepsError::Io(path.to_path_buf(), err),
         |err| DepsError::Parse(path.to_path_buf(), err),
     )?;
+    let ast = &parsed.ast;
 
     let mut collector = PathIdentCollector::default();
-    collector.visit_file(&ast);
+    collector.visit_file(ast);
 
     let mut cfg_test_collector = CfgTestIdentCollector::default();
-    cfg_test_collector.visit_file(&ast);
+    cfg_test_collector.visit_file(ast);
 
     Ok((collector.idents, cfg_test_collector.idents))
 }

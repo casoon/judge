@@ -166,11 +166,12 @@ pub struct WorkspaceApiSurface {
 fn analyze_file_inner(
     path: &Path,
 ) -> Result<(Vec<Finding>, usize, Vec<PubFnCandidate>), ApiSurfaceError> {
-    let (_, ast) = read_and_parse_source(
+    let parsed = read_and_parse_source(
         path,
         |err| ApiSurfaceError::Io(path.to_path_buf(), err),
         |err| ApiSurfaceError::Parse(path.to_path_buf(), err),
     )?;
+    let ast = &parsed.ast;
 
     let mut visitor = ApiSurfaceVisitor {
         file: path,
@@ -181,7 +182,7 @@ fn analyze_file_inner(
         item_count: 0,
         pub_fn_candidates: Vec::new(),
     };
-    visitor.visit_file(&ast);
+    visitor.visit_file(ast);
     Ok((
         visitor.findings,
         visitor.item_count,

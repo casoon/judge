@@ -3168,6 +3168,168 @@ fn dup_two(x: i32) -> i32 {
         assert!(hotspot_files.is_empty());
     }
 
+    /// Issue #57: the combined run reads and parses every source file once,
+    /// however many rules look at it — including the `judge.toml`-gated
+    /// module-boundary pass.
+    #[test]
+    fn collect_findings_parses_each_source_file_exactly_once() {
+        let _guard = lock_cwd();
+        let dir = TempDir::new("parse-once");
+        write_fixture_crate(&dir);
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub mod domain;\npub mod db;\npub fn hello() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/domain.rs"), DUPE_FILE_CONTENT).unwrap();
+        std::fs::write(dir.join("src/db.rs"), "pub fn connect() {}\n").unwrap();
+        std::fs::write(
+            dir.join("judge.toml"),
+            "[[module_boundary]]\nname = \"domain-no-db\"\ncrate = \"fixture\"\n\
+             from = \"domain\"\nforbidden = [\"db\"]\n",
+        )
+        .unwrap();
+
+        let manifest = dir.join("Cargo.toml");
+        let workspace = judge::ingest::load(Some(&manifest)).unwrap();
+        let collected = collect_findings(&workspace).unwrap();
+        assert!(collected.analysis_errors.is_empty());
+
+        let counts = collected.parse_summary.parse_counts();
+        let source_files: std::collections::BTreeSet<&Path> = workspace
+            .crates
+            .iter()
+            .flat_map(|krate| &krate.source_files)
+            .map(|file| file.path.as_path())
+            .collect();
+        assert_eq!(
+            counts.keys().map(PathBuf::as_path).collect::<Vec<_>>(),
+            source_files.into_iter().collect::<Vec<_>>(),
+            "every source file must go through the shared parse step"
+        );
+        assert!(
+            counts.values().all(|count| *count == 1),
+            "each file must be parsed exactly once: {counts:?}"
+        );
+        assert!(
+            collected
+                .parse_summary
+                .unparsed_files(&workspace.root)
+                .is_empty()
+        );
+    }
+
+    /// Writes the fixture for issue #57: a crate with one file `syn` cannot
+    /// parse (a leftover merge-conflict marker on line 2).
+    fn write_unparseable_fixture(dir: &Path) {
+        write_fixture_crate(dir);
+        std::fs::write(dir.join("src/lib.rs"), "mod broken;\npub fn hello() {}\n").unwrap();
+        std::fs::write(
+            dir.join("src/broken.rs"),
+            "pub fn ok() {}\n<<<<<<< HEAD\npub fn other() {}\n",
+        )
+        .unwrap();
+    }
+
+    /// Issue #57: the unparseable file shows up, with line and column, in
+    /// every output format of the combined run.
+    #[test]
+    fn combined_run_lists_an_unparseable_file_in_every_format() {
+        let dir = TempDir::new("unparsed-formats");
+        write_unparseable_fixture(&dir);
+
+        let mut tty = Vec::new();
+        let mut details_cli = all_cli(false, None);
+        details_cli.details = true;
+        run_in_dir(&dir, details_cli, &mut tty).unwrap();
+        let tty = String::from_utf8(tty).unwrap();
+        assert!(tty.contains("Unparsed: 1"), "{tty}");
+        assert!(tty.contains("src/broken.rs:2:1: expected"), "{tty}");
+
+        let mut compact = Vec::new();
+        run_in_dir(&dir, all_cli(false, None), &mut compact).unwrap();
+        let compact = String::from_utf8(compact).unwrap();
+        assert!(compact.contains("Unparsed: 1"), "{compact}");
+        assert!(!compact.contains("src/broken.rs:2:1"), "{compact}");
+
+        let mut json_cli = all_cli(false, None);
+        json_cli.baseline_args.format = OutputFormat::Json;
+        let mut json = Vec::new();
+        run_in_dir(&dir, json_cli, &mut json).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            json["analysis_universe"]["unparsed_files"],
+            serde_json::json!([{
+                "path": "src/broken.rs",
+                "reason": json["analysis_universe"]["unparsed_files"][0]["reason"],
+                "line": 2,
+                "column": 1,
+            }])
+        );
+        assert!(
+            json["analysis_universe"]["unparsed_files"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("expected"))
+        );
+
+        let mut markdown = Vec::new();
+        run_in_dir(&dir, all_cli_markdown(), &mut markdown).unwrap();
+        let markdown = String::from_utf8(markdown).unwrap();
+        assert!(
+            markdown.contains("## Not analyzed by syntax-based rules: 1 unparsed file(s)"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("- src/broken.rs:2:1: expected"),
+            "{markdown}"
+        );
+
+        let mut sarif_cli = all_cli(false, None);
+        sarif_cli.baseline_args.format = OutputFormat::Sarif;
+        let mut sarif = Vec::new();
+        run_in_dir(&dir, sarif_cli, &mut sarif).unwrap();
+        let sarif: serde_json::Value = serde_json::from_slice(&sarif).unwrap();
+        let notifications = sarif["runs"][0]["invocations"][0]["toolExecutionNotifications"]
+            .as_array()
+            .unwrap();
+        let unparsed = notifications
+            .iter()
+            .find(|notification| notification["level"] == "warning")
+            .expect("an unparsed-file notification");
+        let location = &unparsed["locations"][0]["physicalLocation"];
+        assert_eq!(location["artifactLocation"]["uri"], "src/broken.rs");
+        assert_eq!(location["region"]["startLine"], 2);
+        assert_eq!(location["region"]["startColumn"], 1);
+    }
+
+    /// Issue #57 pins the exit codes on the unparseable fixture to what they
+    /// were before unparsed files were reported: the bare run stays `0` in
+    /// every format, and a baseline save stays withheld (`2`) because the
+    /// complexity, slop, duplication, security and dependency rules still
+    /// report the parse failure as an analysis error.
+    #[test]
+    fn unparseable_fixture_keeps_its_exit_codes() {
+        let dir = TempDir::new("unparsed-exit-codes");
+        write_unparseable_fixture(&dir);
+
+        for format in [
+            OutputFormat::Tty,
+            OutputFormat::Json,
+            OutputFormat::Markdown,
+            OutputFormat::Sarif,
+        ] {
+            let mut cli = all_cli(false, None);
+            cli.baseline_args.format = format;
+            let result = run_in_dir(&dir, cli, &mut Vec::new());
+            assert_eq!(exit_code(&result), 0, "{format:?}");
+        }
+
+        let result = run_in_dir(&dir, all_cli(true, None), &mut Vec::new());
+        assert!(matches!(result, Err(CliError::AnalysisIncomplete { .. })));
+        assert_eq!(exit_code(&result), 2);
+        assert!(!dir.join(DEFAULT_BASELINE_ALL).exists());
+    }
+
     #[test]
     fn refactoring_commands_keep_their_cli_contracts() {
         let map = Cli::try_parse_from(["judge", "map", "--format", "json", "--include-tests"])

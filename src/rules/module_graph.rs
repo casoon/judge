@@ -213,18 +213,18 @@ fn visit_mod_file(
     tree: &mut CrateModuleTree,
     errors: &mut Vec<ModuleGraphError>,
 ) {
-    let ast = match crate::functions::read_and_parse_source(
+    let parsed = match crate::functions::read_and_parse_source(
         file,
         |err| ModuleGraphError::Io(file.to_path_buf(), err),
         |err| ModuleGraphError::Parse(file.to_path_buf(), err),
     ) {
-        Ok((_, ast)) => ast,
+        Ok(parsed) => parsed,
         Err(err) => {
             errors.push(err);
             return;
         }
     };
-    visit_items(&ast.items, file, &module_path, &[], tree, errors);
+    visit_items(&parsed.ast.items, file, &module_path, &[], tree, errors);
 }
 
 fn visit_items(
@@ -356,18 +356,18 @@ pub(crate) fn cfg_test_module_files(root_files: &[PathBuf]) -> HashSet<PathBuf> 
         if !visited.insert((file.clone(), in_test)) {
             continue;
         }
-        let Ok((_, ast)) = crate::functions::read_and_parse_source(&file, |_| (), |_| ()) else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&file, |_| (), |_| ()) else {
             continue;
         };
         let mut children = Vec::new();
-        walk(&file, &ast.items, &[], in_test, &mut children);
+        walk(&file, &parsed.ast.items, &[], in_test, &mut children);
         for child in children {
             test_files.insert(child.clone());
             pending.push((child, true));
         }
         if in_test {
             let mut all = Vec::new();
-            collect_out_of_line_children(&file, &ast.items, &[], &mut all);
+            collect_out_of_line_children(&file, &parsed.ast.items, &[], &mut all);
             for child in all {
                 test_files.insert(child.clone());
                 pending.push((child, true));
@@ -579,12 +579,12 @@ fn unlinked_file_findings(
             let Some(cause_id) = id_by_path.get(file.path.as_path()).cloned() else {
                 continue;
             };
-            let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
+            let Ok(parsed) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
             else {
                 continue;
             };
             let mut children = Vec::new();
-            collect_out_of_line_children(&file.path, &ast.items, &[], &mut children);
+            collect_out_of_line_children(&file.path, &parsed.ast.items, &[], &mut children);
             for child_file in children {
                 if let Some(effect_id) = id_by_path.get(child_file.as_path())
                     && let Err(err) = graph.add_edge(&cause_id, effect_id)
@@ -763,11 +763,11 @@ fn module_has_recognized_entry_point(krate: &CrateInfo, file_set: &HashSet<&Path
         .iter()
         .filter(|file| file_set.contains(file.path.as_path()))
         .any(|file| {
-            let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
+            let Ok(parsed) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
             else {
                 return false;
             };
-            file_has_recognized_entry_point(&ast)
+            file_has_recognized_entry_point(&parsed.ast)
         })
 }
 
@@ -812,10 +812,11 @@ fn orphan_module_findings(
     let mut files_scanned = 0usize;
     for (krate, tree) in crates_with_trees(workspace, trees) {
         for file in &krate.source_files {
-            let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
+            let Ok(parsed) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
             else {
                 continue;
             };
+            let ast = &parsed.ast;
             files_scanned += 1;
             let current_module = tree.file_module_path.get(&file.path).cloned();
             let mut local_mod_names: HashMap<Vec<String>, HashSet<String>> = HashMap::new();
@@ -828,7 +829,7 @@ fn orphan_module_findings(
                 inline_stack: Vec::new(),
                 hits: Vec::new(),
             };
-            collector.visit_file(&ast);
+            collector.visit_file(ast);
             for (owning_crate, module_path) in collector.hits {
                 hits.push(ReferenceHit {
                     referencing_file: file.path.clone(),

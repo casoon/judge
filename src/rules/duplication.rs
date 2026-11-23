@@ -501,17 +501,18 @@ fn collect_function_tokens(
     min_tokens: usize,
     include_tests: bool,
 ) -> Result<Vec<FuncTokens>, DuplicationError> {
-    let (source, ast) = read_and_parse_source(
+    let parsed = read_and_parse_source(
         path,
         |err| DuplicationError::Io(path.to_path_buf(), err),
         |err| DuplicationError::Parse(path.to_path_buf(), err),
     )?;
-    let suppressed = Rc::new(suppressed_ranges(path, &source)?);
-    let mut item_suppressions = item_suppression_lines(path, &source)?;
-    let source: Rc<str> = Rc::from(source.into_boxed_str());
+    let ast = &parsed.ast;
+    let suppressed = Rc::new(suppressed_ranges(path, &parsed.source)?);
+    let mut item_suppressions = item_suppression_lines(path, &parsed.source)?;
+    let source: Rc<str> = Rc::from(parsed.source.as_str());
 
     let mut functions = Vec::new();
-    walk_functions(&ast, |site| {
+    walk_functions(ast, |site| {
         let item_suppressed = item_suppressions.remove(&site.span.start().line).is_some();
         if !include_tests && site.is_test_context {
             return;
