@@ -12,11 +12,20 @@
 //! libraries — the API is undocumented for external use and version-pinned
 //! (`=0.0.342`) for exactly that reason (see todo.md §11 "ra_ap_*-Wartungslast").
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ra_ap_ide::{Analysis, AnalysisHost, FilePosition, FindAllRefsConfig, RaFixtureConfig};
+use ra_ap_hir::{MacroKind, ModuleDef, PathResolution, Semantics};
+use ra_ap_ide::{
+    Analysis, AnalysisHost, FilePosition, FileRange, FindAllRefsConfig, RaFixtureConfig,
+    RootDatabase,
+};
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice};
-use ra_ap_project_model::CargoConfig;
+use ra_ap_project_model::{
+    CargoConfig, ProjectManifest, ProjectWorkspace, ProjectWorkspaceKind, TargetDirectoryConfig,
+};
+use ra_ap_syntax::ast::{self, HasAttrs, HasName};
+use ra_ap_syntax::{AstNode, SyntaxNode};
 use ra_ap_vfs::{AbsPathBuf, Vfs, VfsPath};
 
 pub use ra_ap_ide::FileId;
@@ -44,6 +53,14 @@ pub enum DeepError {
     /// panicking `AbsPathBuf::assert_utf8` conversion used to make this a
     /// library panic (see todo.md §15.2); now it is a propagatable error.
     InvalidPath(PathBuf),
+    /// `--expand` only: the toolchain's proc-macro server could not be
+    /// found or did not start. Never a silent fallback to the unexpanded
+    /// load (issue #56).
+    ProcMacroServer(String),
+    /// `--expand` only: running the workspace's build scripts (`cargo
+    /// check`) failed. Carries cargo's own diagnostics, which name the
+    /// failing build script.
+    BuildScripts(String),
 }
 
 impl std::fmt::Display for DeepError {
@@ -72,6 +89,12 @@ impl std::fmt::Display for DeepError {
                 "path is not absolute UTF-8 and cannot be mapped into the analysis vfs: {}",
                 path.display()
             ),
+            Self::ProcMacroServer(msg) => {
+                write!(f, "--expand: proc-macro server failed to start: {msg}")
+            }
+            Self::BuildScripts(msg) => {
+                write!(f, "--expand: build script failed: {}", msg.trim_end())
+            }
         }
     }
 }
@@ -80,7 +103,11 @@ impl std::error::Error for DeepError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Load(err) => Some(err.as_ref()),
-            Self::Cancelled(_) | Self::UnresolvedSymbol(_) | Self::InvalidPath(_) => None,
+            Self::Cancelled(_)
+            | Self::UnresolvedSymbol(_)
+            | Self::InvalidPath(_)
+            | Self::ProcMacroServer(_)
+            | Self::BuildScripts(_) => None,
         }
     }
 }
@@ -92,6 +119,14 @@ impl std::error::Error for DeepError {
 pub struct DeepContext {
     host: AnalysisHost,
     vfs: Vfs,
+    expanded: bool,
+    /// Call edges that only exist in generated code — empty without
+    /// `--expand` (see [`GeneratedCalls`]).
+    generated_calls: GeneratedCalls,
+    /// Keeps the proc-macro server process alive for the lifetime of the
+    /// analysis — expansions run lazily during queries. `None` without
+    /// `--expand`.
+    _proc_macro_server: Option<Box<dyn std::any::Any>>,
 }
 
 impl DeepContext {
@@ -161,32 +196,139 @@ impl DeepContext {
         workspace_root: &Path,
         features: CargoFeatures,
     ) -> Result<Self, DeepError> {
-        let cargo_config = CargoConfig {
+        Self::load_with(workspace_root, features, false)
+    }
+
+    /// The general loader behind [`load`](Self::load) and
+    /// [`load_with_features`](Self::load_with_features). `expand: false` is
+    /// the default fidelity documented on `load`. `expand: true` is the
+    /// opt-in `--expand` mode (issue #56): it runs the workspace's build
+    /// scripts (`cargo check`, which executes workspace code) so `OUT_DIR`
+    /// code is visible, and starts the active toolchain's sysroot proc-macro
+    /// server so derive/attribute macro output is expanded. Either step
+    /// failing is an error ([`DeepError::BuildScripts`],
+    /// [`DeepError::ProcMacroServer`]), never a silent fallback to the
+    /// unexpanded load.
+    pub fn load_with(
+        workspace_root: &Path,
+        features: CargoFeatures,
+        expand: bool,
+    ) -> Result<Self, DeepError> {
+        let mut cargo_config = CargoConfig {
             sysroot: Some(ra_ap_project_model::RustLibSource::Discover),
             set_test: true,
             features,
             ..CargoConfig::default()
         };
+        if !expand {
+            let load_config = LoadCargoConfig {
+                load_out_dirs_from_check: false,
+                with_proc_macro_server: ProcMacroServerChoice::None,
+                prefill_caches: false,
+                num_worker_threads: 1,
+                proc_macro_processes: 0,
+            };
+
+            let (db, vfs, _proc_macro_server) = ra_ap_load_cargo::load_workspace_at(
+                workspace_root,
+                &cargo_config,
+                &load_config,
+                &|_progress| {},
+            )
+            .map_err(|err| DeepError::Load(err.into()))?;
+
+            return Ok(Self {
+                host: AnalysisHost::with_database(db),
+                vfs,
+                expanded: false,
+                generated_calls: GeneratedCalls::default(),
+                _proc_macro_server: None,
+            });
+        }
+
+        // Build into `<target-dir>/rust-analyzer`, like rust-analyzer
+        // itself, so the check does not invalidate the user's own build.
+        cargo_config.target_dir_config = TargetDirectoryConfig::UseSubdirectory;
+        let root = std::env::current_dir()
+            .map_err(|err| DeepError::Load(err.into()))?
+            .join(workspace_root);
+        let root = validated_utf8_abs(&root)?;
+        let manifest =
+            ProjectManifest::discover_single(&root).map_err(|err| DeepError::Load(err.into()))?;
+        let mut workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_progress| {})
+            .map_err(|err| DeepError::Load(err.into()))?;
+
+        let build_output_dir = match &workspace.kind {
+            ProjectWorkspaceKind::Cargo { cargo, .. } => {
+                Some(PathBuf::from(cargo.target_directory().as_str()))
+            }
+            _ => None,
+        };
+        let build_scripts = workspace
+            .run_build_scripts(&cargo_config, &|_progress| {})
+            .map_err(|err| DeepError::BuildScripts(format!("{err:#}")))?;
+        if let Some(error) = build_scripts.error() {
+            return Err(DeepError::BuildScripts(error.to_string()));
+        }
+        workspace.set_build_scripts(build_scripts);
+
+        let server_path = match workspace.find_sysroot_proc_macro_srv() {
+            Some(Ok(path)) => path,
+            Some(Err(err)) => return Err(DeepError::ProcMacroServer(format!("{err:#}"))),
+            None => {
+                return Err(DeepError::ProcMacroServer(
+                    "no sysroot found for the active toolchain".to_string(),
+                ));
+            }
+        };
         let load_config = LoadCargoConfig {
-            load_out_dirs_from_check: false,
-            with_proc_macro_server: ProcMacroServerChoice::None,
+            load_out_dirs_from_check: true,
+            with_proc_macro_server: ProcMacroServerChoice::Explicit(server_path.clone()),
             prefill_caches: false,
             num_worker_threads: 1,
-            proc_macro_processes: 0,
+            proc_macro_processes: 1,
+        };
+        let (db, vfs, proc_macro_server) =
+            ra_ap_load_cargo::load_workspace(workspace, &cargo_config.extra_env, &load_config)
+                .map_err(|err| DeepError::Load(err.into()))?;
+        let Some(proc_macro_server) = proc_macro_server else {
+            return Err(DeepError::ProcMacroServer(format!(
+                "could not spawn {server_path}"
+            )));
         };
 
-        let (db, vfs, _proc_macro_server) = ra_ap_load_cargo::load_workspace_at(
-            workspace_root,
-            &cargo_config,
-            &load_config,
-            &|_progress| {},
-        )
-        .map_err(|err| DeepError::Load(err.into()))?;
-
+        let host = AnalysisHost::with_database(db);
+        let generated_calls =
+            collect_generated_calls(host.raw_database(), &vfs, build_output_dir.as_deref());
         Ok(Self {
-            host: AnalysisHost::with_database(db),
+            host,
             vfs,
+            expanded: true,
+            generated_calls,
+            _proc_macro_server: Some(Box::new(proc_macro_server)),
         })
+    }
+
+    /// Call edges that only exist in generated code (see
+    /// [`GeneratedCalls`]); empty unless loaded with `expand: true`.
+    pub(crate) fn generated_calls(&self) -> &GeneratedCalls {
+        &self.generated_calls
+    }
+
+    /// Whether this context was loaded with `--expand` (proc macros
+    /// expanded, build-script outputs loaded).
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// The vfs path of `file_id`, for files the loader indexed that are not
+    /// workspace source files known to `crate::ingest` — build-script
+    /// output in `OUT_DIR`, say. `None` for a virtual (non-filesystem) path.
+    pub fn file_path(&self, file_id: FileId) -> Option<PathBuf> {
+        self.vfs
+            .file_path(file_id)
+            .as_path()
+            .map(|path| PathBuf::from(path.as_str()))
     }
 
     /// A read-only snapshot for running semantic queries against.
@@ -220,6 +362,337 @@ impl DeepContext {
             .file_id(&vfs_path)
             .map(|(file_id, _excluded)| file_id))
     }
+}
+
+/// One call edge the call hierarchy (`incoming_calls`) cannot see, found by
+/// walking generated code after an `--expand` load (issue #56).
+#[derive(Debug, Clone)]
+pub(crate) struct GeneratedCall {
+    /// The calling function's position — for a function that is itself
+    /// generated, the start of the source range its name maps back to.
+    pub(crate) caller: FilePosition,
+    pub(crate) caller_name: String,
+    /// The call site, mapped back to a real file.
+    pub(crate) site: FileRange,
+    /// The call site only exists in generated code (proc-macro output or a
+    /// build-script file), not in the authored text at `site`.
+    pub(crate) in_generated_code: bool,
+    pub(crate) caller_is_test: bool,
+}
+
+/// Call edges that only exist in generated code — proc-macro expansions
+/// (derive, attribute and function-like proc macros) and build-script output
+/// pulled in with `include!` — keyed by the callee's `(FileId, offset)`.
+/// rust-analyzer's reference search matches identifier text, so it misses a
+/// call whose name only appears after expansion (e.g. the path in
+/// `#[serde(default = "path")]`), and it cannot resolve callers inside an
+/// `include!`d `OUT_DIR` file. Also holds the reverse direction for
+/// generated free functions and inherent methods: authored calls *into*
+/// them. Empty without `--expand`.
+#[derive(Debug, Default)]
+pub(crate) struct GeneratedCalls {
+    callers: HashMap<(FileId, u32), Vec<GeneratedCall>>,
+    generated_functions: HashSet<(FileId, u32)>,
+}
+
+impl GeneratedCalls {
+    /// Generated-code callers of the function at `key`.
+    pub(crate) fn callers_of(&self, key: (FileId, u32)) -> &[GeneratedCall] {
+        self.callers.get(&key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether `key` names a function that only exists in generated code —
+    /// the call hierarchy has no position to start from for it.
+    pub(crate) fn is_generated_function(&self, key: (FileId, u32)) -> bool {
+        self.generated_functions.contains(&key)
+    }
+
+    fn push(&mut self, callee: (FileId, u32), call: GeneratedCall) {
+        self.callers.entry(callee).or_default().push(call);
+    }
+}
+
+/// A function that only exists in generated code and is not a trait-impl
+/// method: authored code may call it directly.
+type GeneratedFunction = (ra_ap_hir::Function, (FileId, u32), String);
+
+/// Walks every local crate's proc-macro expansions and `include!`d
+/// build-script output for calls into local functions (see
+/// [`GeneratedCalls`]).
+fn collect_generated_calls(
+    db: &RootDatabase,
+    vfs: &Vfs,
+    build_output_dir: Option<&Path>,
+) -> GeneratedCalls {
+    ra_ap_hir::attach_db(db, || {
+        let sema = Semantics::new(db);
+        let mut local_files = BTreeSet::new();
+        for krate in ra_ap_hir::Crate::all(db) {
+            if !krate.origin(db).is_local() {
+                continue;
+            }
+            for module in krate.modules(db) {
+                if let Some(file_id) = module.definition_source_file_id(db).file_id() {
+                    local_files.insert(file_id.file_id(db));
+                }
+            }
+        }
+
+        let is_build_output = |file_id: FileId| {
+            build_output_dir.is_some_and(|dir| {
+                vfs.file_path(file_id)
+                    .as_path()
+                    .is_some_and(|path| Path::new(path.as_str()).starts_with(dir))
+            })
+        };
+        // A node is generated when it maps back into a build-script output
+        // file, or onto source text that is not the node's own text (a
+        // string literal, a derive attribute, …).
+        let is_generated = |node: &SyntaxNode| -> (FileRange, bool) {
+            let range = sema.original_range(node);
+            let file_id = range.file_id.file_id(db);
+            let range = FileRange {
+                file_id,
+                range: range.range,
+            };
+            if is_build_output(file_id) {
+                return (range, true);
+            }
+            let source = sema.parse_guess_edition(file_id);
+            let text = source.syntax().text();
+            let authored = range.range.end() <= text.len()
+                && text.slice(range.range).to_string() == node.text().to_string();
+            (range, !authored)
+        };
+
+        let mut calls = GeneratedCalls::default();
+        let mut generated_named: Vec<GeneratedFunction> = Vec::new();
+        for &file_id in &local_files {
+            let source = sema.parse_guess_edition(file_id);
+            let mut roots: Vec<SyntaxNode> = Vec::new();
+            for node in source.syntax().descendants() {
+                roots.extend(expansions_at(&sema, db, &node));
+            }
+            // Macro calls inside an expansion (e.g. a proc macro emitting
+            // `include!`) are expanded too, to a fixed depth.
+            let mut depth = 0;
+            while !roots.is_empty() && depth < 4 {
+                let mut nested = Vec::new();
+                for root in &roots {
+                    for node in root.descendants() {
+                        if ast::MacroCall::can_cast(node.kind()) {
+                            nested.extend(expansions_at(&sema, db, &node));
+                        }
+                        record_generated_call(
+                            &sema,
+                            db,
+                            &node,
+                            &is_generated,
+                            &mut calls,
+                            &mut generated_named,
+                        );
+                    }
+                }
+                roots = nested;
+                depth += 1;
+            }
+        }
+
+        // Authored calls into generated free functions and inherent methods
+        // (e.g. `main` calling a function a build script wrote): the call
+        // hierarchy cannot resolve the generated definition's position, so
+        // search the authored text the same way it would.
+        for (function, callee_key, name) in generated_named {
+            for &file_id in &local_files {
+                let source = sema.parse_guess_edition(file_id);
+                let text = source.syntax().text().to_string();
+                for (offset, _) in text.match_indices(name.as_str()) {
+                    let Some(name_ref) = source
+                        .syntax()
+                        .token_at_offset((offset as u32).into())
+                        .find(|token| token.text() == name)
+                        .and_then(|token| token.parent())
+                        .and_then(ast::NameRef::cast)
+                    else {
+                        continue;
+                    };
+                    if resolve_function(&sema, &name_ref) != Some(function) {
+                        continue;
+                    }
+                    let Some(caller_fn) = name_ref.syntax().ancestors().find_map(ast::Fn::cast)
+                    else {
+                        continue;
+                    };
+                    let Some(caller_name) = caller_fn.name() else {
+                        continue;
+                    };
+                    calls.push(
+                        callee_key,
+                        GeneratedCall {
+                            caller: FilePosition {
+                                file_id,
+                                offset: caller_name.syntax().text_range().start(),
+                            },
+                            caller_name: caller_name.text().to_string(),
+                            site: FileRange {
+                                file_id,
+                                range: name_ref.syntax().text_range(),
+                            },
+                            in_generated_code: false,
+                            caller_is_test: sema
+                                .to_def(&caller_fn)
+                                .is_some_and(|def| def.is_test(db)),
+                        },
+                    );
+                }
+            }
+        }
+        calls
+    })
+}
+
+/// The proc-macro expansions (and `include!` expansions) rooted at `node`:
+/// a derive-annotated ADT's custom derives, an item's attribute proc macro,
+/// or a function-like proc macro / `include!` call. Built-in derives and
+/// attributes, and `macro_rules!` macros, are not generated code in the
+/// `--expand` sense and are skipped.
+fn expansions_at(
+    sema: &Semantics<'_, RootDatabase>,
+    db: &RootDatabase,
+    node: &SyntaxNode,
+) -> Vec<SyntaxNode> {
+    let mut roots = Vec::new();
+    if let Some(adt) = ast::Adt::cast(node.clone()) {
+        for meta in adt.attrs().filter_map(|attr| attr.meta()) {
+            if let Some(expansions) = sema.expand_derive_macro(&meta) {
+                roots.extend(expansions.into_iter().flatten().map(|it| it.value));
+            }
+        }
+    }
+    if let Some(item) = ast::Item::cast(node.clone())
+        && sema
+            .resolve_attr_macro_call(&item)
+            .is_some_and(|mac| mac.kind(db) == MacroKind::Attr)
+        && let Some(expansion) = sema.expand_attr_macro(&item)
+    {
+        roots.push(expansion.value.value);
+    }
+    if let Some(call) = ast::MacroCall::cast(node.clone())
+        && sema.resolve_macro_call(&call).is_some_and(|mac| {
+            mac.kind(db) == MacroKind::ProcMacro
+                || (mac.kind(db) == MacroKind::DeclarativeBuiltIn
+                    && mac.name(db).as_str() == "include")
+        })
+        && let Some(expansion) = sema.expand_macro_call(&call)
+    {
+        roots.push(expansion.value);
+    }
+    roots
+}
+
+/// The function a path expression or method call at `name_ref` resolves to.
+fn resolve_function(
+    sema: &Semantics<'_, RootDatabase>,
+    name_ref: &ast::NameRef,
+) -> Option<ra_ap_hir::Function> {
+    let parent = name_ref.syntax().parent()?;
+    if let Some(call) = ast::MethodCallExpr::cast(parent.clone()) {
+        return sema.resolve_method_call(&call);
+    }
+    let path = parent.ancestors().find_map(ast::Path::cast)?;
+    match sema.resolve_path(&path)? {
+        PathResolution::Def(ModuleDef::Function(function)) => Some(function),
+        _ => None,
+    }
+}
+
+/// The `(FileId, offset)` key of `function`'s name — the identifier start
+/// for an authored function, the start of the mapped-back range for a
+/// generated one.
+fn function_key(
+    sema: &Semantics<'_, RootDatabase>,
+    db: &RootDatabase,
+    function: ra_ap_hir::Function,
+) -> Option<(FileId, u32)> {
+    let source = sema.source(function)?;
+    let name = source.value.name()?;
+    let range = sema.original_range(name.syntax());
+    Some((range.file_id.file_id(db), u32::from(range.range.start())))
+}
+
+/// Records one call into a local function found at `node` (a path
+/// expression or method call inside generated code), when the call site
+/// really is generated.
+fn record_generated_call(
+    sema: &Semantics<'_, RootDatabase>,
+    db: &RootDatabase,
+    node: &SyntaxNode,
+    is_generated: &dyn Fn(&SyntaxNode) -> (FileRange, bool),
+    calls: &mut GeneratedCalls,
+    generated_named: &mut Vec<GeneratedFunction>,
+) {
+    let (callee, site_node) = if let Some(path_expr) = ast::PathExpr::cast(node.clone()) {
+        let Some(path) = path_expr.path() else { return };
+        match sema.resolve_path(&path) {
+            Some(PathResolution::Def(ModuleDef::Function(function))) => {
+                (function, path.syntax().clone())
+            }
+            _ => return,
+        }
+    } else if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+        let (Some(function), Some(name_ref)) = (sema.resolve_method_call(&call), call.name_ref())
+        else {
+            return;
+        };
+        (function, name_ref.syntax().clone())
+    } else {
+        return;
+    };
+    if !callee.module(db).krate(db).origin(db).is_local() {
+        return;
+    }
+    let (site, true) = is_generated(&site_node) else {
+        return;
+    };
+    let Some(callee_key) = function_key(sema, db, callee) else {
+        return;
+    };
+    let Some(caller_fn) = site_node.ancestors().find_map(ast::Fn::cast) else {
+        return;
+    };
+    let Some(caller_name) = caller_fn.name() else {
+        return;
+    };
+    let (caller_range, caller_generated) = is_generated(caller_name.syntax());
+    let caller_key = (caller_range.file_id, u32::from(caller_range.range.start()));
+    let caller_def = sema.to_def(&caller_fn);
+    if caller_generated && calls.generated_functions.insert(caller_key) {
+        let in_trait_impl = caller_fn
+            .syntax()
+            .parent()
+            .and_then(ast::AssocItemList::cast)
+            .and_then(|list| list.syntax().parent())
+            .and_then(ast::Impl::cast)
+            .is_some_and(|imp| imp.trait_().is_some());
+        if let Some(def) = caller_def
+            && !in_trait_impl
+        {
+            generated_named.push((def, caller_key, caller_name.text().to_string()));
+        }
+    }
+    calls.push(
+        callee_key,
+        GeneratedCall {
+            caller: FilePosition {
+                file_id: caller_range.file_id,
+                offset: caller_range.range.start(),
+            },
+            caller_name: caller_name.text().to_string(),
+            site,
+            in_generated_code: true,
+            caller_is_test: caller_def.is_some_and(|def| def.is_test(db)),
+        },
+    );
 }
 
 /// Fallibly converts `path` into the absolute UTF-8 form the analysis vfs
@@ -676,6 +1149,27 @@ mod tests {
         assert_eq!(
             without_tests, 0,
             "the same call must not count in production-only mode"
+        );
+    }
+
+    /// Issue #56: under `--expand` a failing build script is an error that
+    /// names the build script — never a silent fallback to the unexpanded
+    /// load. Without `--expand` the build script never runs.
+    #[test]
+    fn a_failing_build_script_is_an_expand_error_naming_it() {
+        let dir = TempDir::new("deep-failing-build-rs");
+        crate::test_util::write_failing_build_rs_fixture(&dir);
+
+        DeepContext::load_with(&dir, CargoFeatures::All, false)
+            .expect("without --expand the build script does not run");
+        let Err(err) = DeepContext::load_with(&dir, CargoFeatures::All, true) else {
+            panic!("a failing build script must fail the --expand load");
+        };
+        assert!(matches!(err, DeepError::BuildScripts(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("build script") && message.contains("failing-build"),
+            "the error must name the failing build script: {message}"
         );
     }
 

@@ -275,6 +275,17 @@ pub struct BoundaryConfig {
     pub rules: RulesConfig,
     #[serde(default)]
     pub feature_matrix: FeatureMatrixConfig,
+    #[serde(default)]
+    pub deep: DeepConfig,
+}
+
+/// The `judge.toml` `[deep]` table: Deep Tier load options.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DeepConfig {
+    /// Same as `--expand` on every Deep Tier command: expand proc macros
+    /// and load build-script outputs. Runs the workspace's build scripts.
+    #[serde(default)]
+    pub expand: bool,
 }
 
 /// The `judge.toml` `[feature_matrix]` table (see `crate::rules::feature_matrix`,

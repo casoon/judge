@@ -761,12 +761,12 @@ fn checked_position(
 /// "resolve referencing files, or give up on this item" step behind
 /// [`check_item`], [`check_enum_variant`], and [`check_test_only_pub`].
 fn referencing_files_or_bail(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     position: ra_ap_ide::FilePosition,
     include_tests: bool,
     report: &mut WorkspaceDeadCode,
 ) -> Option<HashSet<FileId>> {
-    match crate::deep::referencing_files(analysis, position, include_tests) {
+    match analysis.referencing_files(position, include_tests) {
         Ok(referencing) => Some(referencing),
         Err(err) => {
             report.errors.push(DeadCodeError::Deep(err));
@@ -867,7 +867,7 @@ fn accumulate_coupling_edges(
 /// should be read.
 #[allow(clippy::too_many_arguments)]
 fn check_item(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     crate_of_file: &HashMap<FileId, &str>,
     module_of_file: &HashMap<FileId, String>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
@@ -973,7 +973,7 @@ fn searched_crates_count(crate_of_file: &HashMap<FileId, &str>) -> usize {
 /// this exact dispatch, differing only in which rule/evidence they attach.
 #[allow(clippy::too_many_arguments)]
 fn push_finding_if_unreachable(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
     position: ra_ap_ide::FilePosition,
     include_tests: bool,
@@ -1071,7 +1071,7 @@ pub(crate) fn reachability_error(err: crate::reachability::ReachabilityError) ->
 /// counts as workspace-internal) applies here too, unmodified.
 #[allow(clippy::too_many_arguments)]
 fn check_enum_variant(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     file_path_by_id: &HashMap<FileId, PathBuf>,
     file: &SourceFile,
     file_id: FileId,
@@ -1132,7 +1132,7 @@ fn check_enum_variant(
 /// [`check_test_only_pub`]'s two reachability queries (production, then
 /// all), which otherwise repeated this exact match verbatim.
 fn reachable_or_bail(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
     position: ra_ap_ide::FilePosition,
     include_tests: bool,
@@ -1169,7 +1169,7 @@ fn reachable_or_bail(
 /// `publish`-field-aware narrowing either.
 #[allow(clippy::too_many_arguments)]
 fn check_test_only_pub(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     crate_of_file: &HashMap<FileId, &str>,
     entry_keys_production: &std::collections::HashSet<(FileId, u32)>,
     entry_keys_all: &std::collections::HashSet<(FileId, u32)>,
@@ -1251,7 +1251,7 @@ const UNREACHABLE_FROM_ENTRY_REASON: &str = "not reachable from any recognized e
 /// check clears.
 #[allow(clippy::too_many_arguments)]
 fn check_unreachable_from_entry(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
     proc_macro_exposed: &HashSet<String>,
     file: &SourceFile,
@@ -1383,7 +1383,7 @@ fn load_proc_macro_and_publishable_sets(
 /// otherwise repeated this exact call sequence verbatim.
 #[allow(clippy::too_many_arguments)]
 fn check_pub_site(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     crate_of_file: &HashMap<FileId, &str>,
     module_of_file: &HashMap<FileId, String>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
@@ -1447,7 +1447,7 @@ fn check_pub_site(
 /// and each non-`pub` function/type-item site to [`check_unreachable_from_entry`].
 #[allow(clippy::too_many_arguments)]
 fn scan_file_for_dead_code(
-    analysis: &ra_ap_ide::Analysis,
+    analysis: &crate::reachability::CallGraph<'_>,
     crate_of_file: &HashMap<FileId, &str>,
     module_of_file: &HashMap<FileId, String>,
     file_path_by_id: &HashMap<FileId, PathBuf>,
@@ -1657,6 +1657,7 @@ pub fn analyze_workspace_with(
     include_tests: bool,
 ) -> Result<WorkspaceDeadCode, DeadCodeError> {
     let analysis = ctx.analysis();
+    let graph = crate::reachability::CallGraph::new(&analysis, ctx);
 
     let (crate_of_file, file_path_by_id, module_of_file) = build_file_maps(workspace, ctx)?;
 
@@ -1683,8 +1684,13 @@ pub fn analyze_workspace_with(
     // the crate loop.
     let mut module_edge_counts: HashMap<(String, String), u32> = HashMap::new();
 
-    let (proc_macro_exposed, publishable) =
+    let (mut proc_macro_exposed, publishable) =
         load_proc_macro_and_publishable_sets(&workspace.root, &mut report);
+    // After an `--expand` load the proc-macro blind spot is closed, so no
+    // finding carries the `proc_macro_expansion_disabled` limitation.
+    if ctx.is_expanded() {
+        proc_macro_exposed.clear();
+    }
 
     let mut private_check_keys = entry_keys.clone();
     match crate::reachability::public_api_keys(workspace, ctx, &publishable) {
@@ -1724,7 +1730,7 @@ pub fn analyze_workspace_with(
             };
 
             scan_file_for_dead_code(
-                &analysis,
+                &graph,
                 &crate_of_file,
                 &module_of_file,
                 &file_path_by_id,
@@ -2600,6 +2606,7 @@ pub extern "C" fn exported_b() -> i32 {
 
         let ctx = DeepContext::load(&workspace.root).unwrap();
         let analysis = ctx.analysis();
+        let graph = crate::reachability::CallGraph::new(&analysis, &ctx);
         let krate = &workspace.crates[0];
         let file = krate
             .source_files
@@ -2619,7 +2626,7 @@ pub extern "C" fn exported_b() -> i32 {
         let mut edge_counts = HashMap::new();
         let mut module_edge_counts = HashMap::new();
         check_item(
-            &analysis,
+            &graph,
             &crate_of_file,
             &module_of_file,
             &entry_keys,
@@ -2772,6 +2779,64 @@ pub fn truly_dead() -> i32 {
              that proc-macro expansion was disabled instead of presenting `helper` as an \
              unqualified dead-code finding: {:?}",
             helper_finding.limitations
+        );
+    }
+
+    /// The names of `unused-pub-workspace` findings for `workspace`, loaded
+    /// with or without `--expand`.
+    fn unused_pub_workspace_names(workspace: &Workspace, expand: bool) -> HashSet<String> {
+        let ctx = DeepContext::load_with(&workspace.root, crate::deep::CargoFeatures::All, expand)
+            .unwrap_or_else(|err| panic!("load (expand: {expand}) failed: {err}"));
+        let report = analyze_workspace_with(&ctx, workspace, false).unwrap();
+        assert!(
+            report.errors.is_empty(),
+            "expand: {expand}: {:?}",
+            report.errors
+        );
+        report
+            .findings
+            .iter()
+            .filter(|f| f.rule == UNUSED_PUB_WORKSPACE_RULE)
+            .map(|f| f.location.item_path.clone())
+            .collect()
+    }
+
+    /// Issue #56: `default_port` is only named in `#[serde(default = "…")]`
+    /// in another crate. Without `--expand` that reference is invisible and
+    /// the finding is the documented limit; with `--expand` the serde
+    /// derive's expansion references it from `app`, so it is used.
+    #[test]
+    fn a_fn_named_only_in_a_serde_default_attribute_is_used_with_expand() {
+        let dir = TempDir::new("dead-code-serde-default");
+        crate::test_util::write_serde_default_fixture(&dir);
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        assert!(
+            unused_pub_workspace_names(&workspace, false).contains("default_port"),
+            "without --expand the serde-generated reference is invisible (documented limit)"
+        );
+        assert!(
+            !unused_pub_workspace_names(&workspace, true).contains("default_port"),
+            "with --expand the derive expansion in `app` references `default_port`"
+        );
+    }
+
+    /// Issue #56: `workspace_helper`'s only caller is a function a build
+    /// script writes to `OUT_DIR`, which `main` calls. With `--expand` it is
+    /// reachable from `main`; without, it is the documented false finding.
+    #[test]
+    fn a_fn_called_only_from_build_script_output_is_used_with_expand() {
+        let dir = TempDir::new("dead-code-build-rs-caller");
+        crate::test_util::write_build_rs_caller_fixture(&dir);
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        assert!(
+            unused_pub_workspace_names(&workspace, false).contains("workspace_helper"),
+            "without --expand the OUT_DIR caller is invisible (documented limit)"
+        );
+        assert!(
+            !unused_pub_workspace_names(&workspace, true).contains("workspace_helper"),
+            "with --expand `main -> generated_caller -> workspace_helper` is visible"
         );
     }
 

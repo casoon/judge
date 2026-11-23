@@ -59,8 +59,11 @@ installed version.
 
 | Command | What it does |
 | --- | --- |
-| `dead-code [--include-tests]` | `pub` items with no reference from another workspace crate and no reachability from an entry point of their own crate. |
-| `explain <item-path> --why-live` | The shortest evidenced call path from an entry point to the item. |
+| `dead-code [--include-tests] [--expand]` | `pub` items with no reference from another workspace crate and no reachability from an entry point of their own crate. |
+| `explain <item-path> --why-live [--expand]` | The shortest evidenced call path from an entry point to the item. |
+
+`--expand` (or `[deep] expand = true` in `judge.toml`) expands proc macros and loads build-script
+outputs. It runs the workspace's build scripts. See [Deep Tier](../../guides/deep-tier/).
 
 ## Global options
 

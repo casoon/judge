@@ -8,6 +8,11 @@ versions were published on crates.io.
 
 ### Added
 
+- **Deep tier:** `--expand` on `dead-code` and `explain --why-live` (or `[deep] expand = true` in
+  `judge.toml`) expands proc macros and loads build-script outputs, so references from generated
+  code count and `--why-live` marks such edges `generated`. It runs build scripts; a failing one
+  is exit 2. Every output format states the load fidelity. Details:
+  [Deep Tier](https://casoon.github.io/judge/docs/guides/deep-tier/#--expand).
 - **`--renderreport`:** the bare `cargo judge` run prints its review report as a request for [renderreport](https://github.com/casoon/renderreport) instead of text (`cargo judge --renderreport | renderreport render - -o judge.pdf`). Same sections as `--format markdown`; judge itself gets no new dependency.
 - **SARIF:** every result carries a position-independent `partialFingerprints` entry, so code
   scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear

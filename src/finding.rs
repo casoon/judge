@@ -529,11 +529,55 @@ pub struct AnalysisUniverse {
     /// as `proc_macro_expansion`: [`FidelityStatus::Disabled`] at the Deep
     /// Tier, [`FidelityStatus::NotApplicable`] at the Fast Tier.
     pub build_scripts: FidelityStatus,
+    /// Deep Tier only: the load fidelity in the words every output format
+    /// states it in (`proc_macros: expanded | not expanded`,
+    /// `build_scripts: loaded | not loaded`). `--expand` turns both on
+    /// (issue #56). Omitted at the Fast Tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_fidelity: Option<LoadFidelity>,
     /// The judge version that produced this report (`CARGO_PKG_VERSION`).
     pub judge_version: String,
     /// Which tier produced this view: `"fast"` or `"deep"` (see
     /// `crate::AnalysisTier`).
     pub tier: String,
+}
+
+/// How completely the Deep Tier loaded the workspace (see
+/// [`AnalysisUniverse::load_fidelity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LoadFidelity {
+    /// `"expanded"` or `"not expanded"`.
+    pub proc_macros: &'static str,
+    /// `"loaded"` or `"not loaded"`.
+    pub build_scripts: &'static str,
+}
+
+impl LoadFidelity {
+    /// `expanded`: the workspace was loaded with `--expand` (proc-macro
+    /// server running, build-script outputs loaded).
+    pub fn new(expanded: bool) -> Self {
+        if expanded {
+            Self {
+                proc_macros: "expanded",
+                build_scripts: "loaded",
+            }
+        } else {
+            Self {
+                proc_macros: "not expanded",
+                build_scripts: "not loaded",
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LoadFidelity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "proc_macros: {}; build_scripts: {}",
+            self.proc_macros, self.build_scripts
+        )
+    }
 }
 
 impl AnalysisUniverse {
@@ -560,8 +604,21 @@ impl AnalysisUniverse {
             include_tests,
             proc_macro_expansion: FidelityStatus::Disabled,
             build_scripts: FidelityStatus::Disabled,
+            load_fidelity: Some(LoadFidelity::new(false)),
             tier: "deep".to_string(),
             ..Self::base(workspace)
+        }
+    }
+
+    /// The Deep Tier view after an `--expand` load: proc macros expanded and
+    /// build-script outputs loaded (issue #56). Everything else as
+    /// [`deep`](Self::deep).
+    pub fn deep_expanded(workspace: &crate::ingest::Workspace, include_tests: bool) -> Self {
+        Self {
+            proc_macro_expansion: FidelityStatus::Enabled,
+            build_scripts: FidelityStatus::Enabled,
+            load_fidelity: Some(LoadFidelity::new(true)),
+            ..Self::deep(workspace, include_tests)
         }
     }
 
@@ -596,6 +653,7 @@ impl AnalysisUniverse {
             include_generated: false,
             proc_macro_expansion: FidelityStatus::NotApplicable,
             build_scripts: FidelityStatus::NotApplicable,
+            load_fidelity: None,
             judge_version: env!("CARGO_PKG_VERSION").to_string(),
             tier: "fast".to_string(),
         }
