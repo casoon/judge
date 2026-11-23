@@ -4,6 +4,7 @@ use crate::CliError;
 use crate::CommandOutcome;
 use crate::ComplexityOptions;
 use crate::ImpactOptions;
+use crate::InspectOptions;
 use crate::MapOptions;
 use crate::OutputFormat;
 use crate::RefactorOptions;
@@ -384,46 +385,153 @@ pub(crate) fn run_refactor(
     Ok(CommandOutcome::Clean)
 }
 
-pub(crate) fn run_inspect(out: &mut dyn Write) -> Result<CommandOutcome, CliError> {
-    let workspace = judge::ingest::load(None)?;
-
-    writeln!(out, "workspace root: {}", workspace.root.display())?;
-    writeln!(out, "crates: {}", workspace.crates.len())?;
-    for krate in &workspace.crates {
-        writeln!(out)?;
-        writeln!(out, "  {} {}", krate.name, krate.version)?;
-        writeln!(out, "    manifest: {}", krate.manifest_path.display())?;
-        writeln!(out, "    source files: {}", krate.source_files.len())?;
-        if krate.entry_points.is_empty() {
-            writeln!(out, "    entry points: none")?;
-        } else {
-            writeln!(out, "    entry points:")?;
-            for entry in &krate.entry_points {
+/// Prints one resolved profile's settings and package overrides for
+/// `inspect`'s text output.
+fn print_profile_tty(
+    out: &mut dyn Write,
+    profile: &judge::rules::release_profile::ResolvedProfile,
+) -> std::io::Result<()> {
+    for setting in &profile.settings {
+        let source = setting
+            .source
+            .as_ref()
+            .map_or_else(|| "default".to_string(), ToString::to_string);
+        writeln!(
+            out,
+            "    {:<17} {:<10} {source}",
+            setting.key,
+            judge::rules::release_profile::display_value(&setting.value)
+        )?;
+    }
+    if !profile.package_overrides.is_empty() {
+        writeln!(out, "    package overrides (listed, not judged):")?;
+        for package_override in &profile.package_overrides {
+            for setting in &package_override.settings {
+                let source = setting
+                    .source
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string);
                 writeln!(
                     out,
-                    "      [{}] {} — {}",
-                    entry.kind.label(),
-                    entry.name,
-                    entry.path.display()
+                    "      {}: {} = {}  {source}",
+                    package_override.package,
+                    setting.key,
+                    judge::rules::release_profile::display_value(&setting.value)
                 )?;
             }
         }
     }
+    Ok(())
+}
 
-    writeln!(out)?;
-    writeln!(out, "tiers:")?;
-    writeln!(out, "  fast: available")?;
-    writeln!(
-        out,
-        "  deep: {}",
-        if AnalysisTier::Deep.is_available() {
-            "available"
-        } else {
-            "not available (build with --features deep)"
+pub(crate) fn run_inspect(
+    options: InspectOptions,
+    out: &mut dyn Write,
+) -> Result<CommandOutcome, CliError> {
+    let workspace = judge::ingest::load(None)?;
+    let profiles = judge::rules::release_profile::workspace_builds_binaries(&workspace)
+        .then(|| judge::rules::release_profile::resolve(&workspace.root));
+    let deep_available = AnalysisTier::Deep.is_available();
+
+    match options.format {
+        OutputFormat::Json => {
+            let (release_profile, analysis_errors) = match &profiles {
+                None => (serde_json::Value::Null, Vec::new()),
+                Some(Ok(profiles)) => (serde_json::to_value(profiles)?, Vec::new()),
+                Some(Err(err)) => (serde_json::Value::Null, vec![err.to_string()]),
+            };
+            write_json(
+                out,
+                &serde_json::json!({
+                    "schema_version": 1,
+                    "workspace_root": workspace.root,
+                    "crates": workspace.crates.iter().map(|krate| serde_json::json!({
+                        "name": krate.name,
+                        "version": krate.version,
+                        "manifest": krate.manifest_path,
+                        "source_files": krate.source_files.len(),
+                        "entry_points": krate.entry_points.iter().map(|entry| serde_json::json!({
+                            "kind": entry.kind.label(),
+                            "name": entry.name,
+                            "path": entry.path,
+                        })).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                    "release_profile": release_profile,
+                    "tiers": {
+                        "fast": "available",
+                        "deep": if deep_available { "available" } else { "not_available" },
+                    },
+                    "cache": "not_implemented",
+                    "analysis_errors": analysis_errors,
+                }),
+            )?;
         }
-    )?;
-    writeln!(out)?;
-    writeln!(out, "cache: not implemented yet")?;
+        OutputFormat::Tty => {
+            writeln!(out, "workspace root: {}", workspace.root.display())?;
+            writeln!(out, "crates: {}", workspace.crates.len())?;
+            for krate in &workspace.crates {
+                writeln!(out)?;
+                writeln!(out, "  {} {}", krate.name, krate.version)?;
+                writeln!(out, "    manifest: {}", krate.manifest_path.display())?;
+                writeln!(out, "    source files: {}", krate.source_files.len())?;
+                if krate.entry_points.is_empty() {
+                    writeln!(out, "    entry points: none")?;
+                } else {
+                    writeln!(out, "    entry points:")?;
+                    for entry in &krate.entry_points {
+                        writeln!(
+                            out,
+                            "      [{}] {} — {}",
+                            entry.kind.label(),
+                            entry.name,
+                            entry.path.display()
+                        )?;
+                    }
+                }
+            }
+
+            writeln!(out)?;
+            match &profiles {
+                None => writeln!(out, "release profile: not shown (no bin target)")?,
+                Some(Err(err)) => writeln!(out, "release profile: could not be resolved: {err}")?,
+                Some(Ok(profiles)) => {
+                    writeln!(
+                        out,
+                        "release profile (workspace Cargo.toml and .cargo/config.toml only):"
+                    )?;
+                    writeln!(out, "  release")?;
+                    print_profile_tty(out, &profiles.release)?;
+                    for custom in &profiles.custom {
+                        writeln!(
+                            out,
+                            "  {} (inherits {})",
+                            custom.name,
+                            custom.inherits.join(" -> ")
+                        )?;
+                        print_profile_tty(out, custom)?;
+                    }
+                }
+            }
+
+            writeln!(out)?;
+            writeln!(out, "tiers:")?;
+            writeln!(out, "  fast: available")?;
+            writeln!(
+                out,
+                "  deep: {}",
+                if deep_available {
+                    "available"
+                } else {
+                    "not available (build with --features deep)"
+                }
+            )?;
+            writeln!(out)?;
+            writeln!(out, "cache: not implemented yet")?;
+        }
+        OutputFormat::Sarif | OutputFormat::Markdown => {
+            return Err(unsupported_workspace_format("`inspect`", options.format));
+        }
+    }
     Ok(CommandOutcome::Clean)
 }
 
