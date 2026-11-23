@@ -34,7 +34,7 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
             },
         include_generated,
     } = options;
-    let workspace = judge::ingest::load(None)?;
+    let workspace = crate::load_workspace()?;
 
     let source_files = super::analysis_commands::workspace_source_files(&workspace);
     let report = judge::rules::complexity::analyze_workspace(source_files, include_generated);
@@ -72,8 +72,9 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
     // Inline `judge-ignore` suppression (todo.md §5): applied after every
     // detector above has merged its findings in, so a suppressed finding
     // never reaches score, baseline diff, or verdict below.
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    let (mut findings, suppressed_inline) =
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, &workspace);
 
     let excluded_generated =
         report.excluded_generated + slop.excluded_generated + security_excluded_generated;
@@ -149,7 +150,8 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
                     &workspace,
                     include_generated,
                 ))
-                .with_suppressed_inline(suppressed_inline);
+                .with_suppressed_inline(suppressed_inline)
+                .with_rule_overrides(crate::rule_overrides(&workspace.root)?);
             let mut value = serde_json::to_value(&report).unwrap();
             if let Some(score) = score {
                 value["score"] = serde_json::to_value(&score).unwrap();
@@ -179,6 +181,7 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
             return Err(unsupported_format("`health`", format, "tty, json, sarif"));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             writeln!(out, "functions analyzed: {}", functions.len())?;
             super::analysis_commands::write_error_list(out, "analysis errors", &analysis_errors)?;
             super::analysis_commands::write_excluded_and_suppressed_lines(

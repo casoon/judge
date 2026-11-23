@@ -23,6 +23,7 @@ pub mod feature_matrix;
 pub mod module_graph;
 pub mod pattern;
 pub mod principle;
+pub mod release_profile;
 pub mod security;
 pub mod slop;
 pub mod slop_structural;

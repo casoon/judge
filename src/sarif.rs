@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use crate::finding::{Report, Severity};
+use crate::rule_registry::RuleLevel;
 
 /// The SARIF `level` for a finding severity: `Fail` → `error`,
 /// `Warn` → `warning`, `Info` → `note`.
@@ -58,7 +59,9 @@ fn fingerprints(report: &Report) -> Vec<String> {
 /// result per finding. `evidence_class` and the advisory/gating split are
 /// carried in each result's `properties` bag; the report's
 /// `analysis_universe` (when present) in the run's `properties` bag — SARIF
-/// has no native slot for either (todo.md §17.2, §17.5).
+/// has no native slot for either (todo.md §17.2, §17.5). Active
+/// `judge.toml` `[rules.<id>] level` overrides become the invocation's
+/// `ruleConfigurationOverrides`.
 pub fn render(report: &Report) -> serde_json::Value {
     let rules: Vec<serde_json::Value> = report
         .findings
@@ -80,7 +83,7 @@ pub fn render(report: &Report) -> serde_json::Value {
         .iter()
         .zip(&fingerprints)
         .map(|(finding, fingerprint)| {
-            serde_json::json!({
+            let mut result = serde_json::json!({
                 "ruleId": finding.rule.as_str(),
                 "level": level(finding.severity),
                 "message": {
@@ -97,9 +100,26 @@ pub fn render(report: &Report) -> serde_json::Value {
                     "evidence_class": finding.evidence_class,
                     "gating": finding.is_gating(),
                 },
-            })
+            });
+            if let Some(cfg) = finding.cfg() {
+                result["properties"][crate::cfg::EVIDENCE_KEY] = cfg.into();
+            }
+            result
         })
         .collect();
+
+    let mut notifications: Vec<serde_json::Value> = report
+        .errors
+        .iter()
+        .map(|error| serde_json::json!({ "level": "error", "message": { "text": error } }))
+        .collect();
+    notifications.extend(
+        report
+            .analysis_universe
+            .iter()
+            .flat_map(|universe| &universe.unparsed_files)
+            .map(unparsed_file_notification),
+    );
 
     let mut run = serde_json::json!({
         "tool": {
@@ -113,13 +133,24 @@ pub fn render(report: &Report) -> serde_json::Value {
         "results": results,
         "invocations": [{
             "executionSuccessful": report.errors.is_empty(),
-            "toolExecutionNotifications": report
-                .errors
-                .iter()
-                .map(|error| serde_json::json!({ "level": "error", "message": { "text": error } }))
-                .collect::<Vec<_>>(),
+            "toolExecutionNotifications": notifications,
         }],
     });
+    if !report.rule_overrides.is_empty() {
+        run["invocations"][0]["ruleConfigurationOverrides"] = report
+            .rule_overrides
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "descriptor": { "id": entry.rule },
+                    "configuration": {
+                        "enabled": entry.level != RuleLevel::Off,
+                        "properties": { "level": entry.level, "default": entry.default },
+                    },
+                })
+            })
+            .collect();
+    }
     if let Some(universe) = &report.analysis_universe {
         run["properties"] = serde_json::json!({ "analysis_universe": universe });
     }
@@ -128,6 +159,29 @@ pub fn render(report: &Report) -> serde_json::Value {
         "version": "2.1.0",
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "runs": [run],
+    })
+}
+
+/// A file the syntax-based rules could not analyze, as a warning-level
+/// `toolExecutionNotification` pointing at the file (and, for a `syn` error,
+/// the line and column). A warning, not an error: whether the run counts as
+/// incomplete stays each rule's own policy, reported through `errors`.
+fn unparsed_file_notification(file: &crate::parse::UnparsedFile) -> serde_json::Value {
+    let mut physical_location = serde_json::json!({
+        "artifactLocation": { "uri": artifact_uri(&file.path) },
+    });
+    if let (Some(line), Some(column)) = (file.line, file.column) {
+        physical_location["region"] = serde_json::json!({
+            "startLine": line,
+            "startColumn": column,
+        });
+    }
+    serde_json::json!({
+        "level": "warning",
+        "message": {
+            "text": format!("not analyzed by syntax-based rules: {}", file.reason),
+        },
+        "locations": [{ "physicalLocation": physical_location }],
     })
 }
 
@@ -152,6 +206,29 @@ mod tests {
             Origin::Code,
             None,
         )
+    }
+
+    #[test]
+    fn cfg_condition_is_an_additive_result_property() {
+        let plain = finding(
+            "duplicate-code",
+            Severity::Warn,
+            EvidenceClass::DerivedFact,
+            "src/a.rs",
+        );
+        let mut gated = finding(
+            "duplicate-code",
+            Severity::Warn,
+            EvidenceClass::DerivedFact,
+            "src/b.rs",
+        );
+        gated.evidence = Some(serde_json::json!({ "token_count": 20, "cfg": "unix" }));
+
+        let sarif = render(&Report::new(vec![plain, gated]));
+
+        let results = &sarif["runs"][0]["results"];
+        assert!(results[0]["properties"].get("cfg").is_none());
+        assert_eq!(results[1]["properties"]["cfg"], "unix");
     }
 
     #[test]
@@ -196,6 +273,32 @@ mod tests {
         assert_eq!(physical["region"]["startLine"], 42);
         assert_eq!(result["properties"]["evidence_class"], "derived_fact");
         assert_eq!(result["properties"]["gating"], true);
+    }
+
+    #[test]
+    fn rule_overrides_become_rule_configuration_overrides() {
+        let report =
+            Report::new(Vec::new()).with_rule_overrides(vec![crate::rule_registry::RuleOverride {
+                rule: "duplicate-code".to_string(),
+                level: RuleLevel::Off,
+                default: RuleLevel::Gating,
+            }]);
+
+        let sarif = render(&report);
+
+        let overrides = &sarif["runs"][0]["invocations"][0]["ruleConfigurationOverrides"];
+        assert_eq!(overrides[0]["descriptor"]["id"], "duplicate-code");
+        assert_eq!(overrides[0]["configuration"]["enabled"], false);
+        assert_eq!(overrides[0]["configuration"]["properties"]["level"], "off");
+        assert_eq!(
+            overrides[0]["configuration"]["properties"]["default"],
+            "gating"
+        );
+        assert!(
+            render(&Report::new(Vec::new()))["runs"][0]["invocations"][0]
+                .get("ruleConfigurationOverrides")
+                .is_none()
+        );
     }
 
     #[test]

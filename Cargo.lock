@@ -1882,9 +1882,12 @@ dependencies = [
 
 [[package]]
 name = "runemark"
-version = "0.1.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec1b987e9cf427794c2eed20ca30339f8b66b67bd477613788747115b02a29c6"
+checksum = "37e4025683273b00c14c1d37f0e6ca4b0cc66db8fd0ac09a62e6c236a2891cb3"
+dependencies = [
+ "unicode-width",
+]
 
 [[package]]
 name = "rustc-hash"
@@ -2440,6 +2443,12 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca718471876992059f251e33aafc334346ada08042b7661dd1fe313a9bced557"
 
 [[package]]
 name = "untrusted"

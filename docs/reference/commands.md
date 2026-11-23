@@ -17,7 +17,7 @@ installed version.
 
 | Command | What it does |
 | --- | --- |
-| `inspect` | Crates, source files, entry points and available tiers, via `cargo metadata`. |
+| `inspect` | Crates, source files, entry points and available tiers, via `cargo metadata`. For workspaces with a `bin` target it also prints the effective release profile and custom profiles that inherit from it (see [Rules](../rules/#release-profile)). `--format json` gives the same data. |
 | `structure` | Crates, targets, internal dependency edges and measured structural concentration. |
 | `complexity` | Production and test complexity rankings from the checked-out tree. |
 | `map` | Compact facts for refactoring plans: files by aggregate cyclomatic complexity and the largest clone families. `--include-tests` adds test-only code. |
@@ -59,8 +59,11 @@ installed version.
 
 | Command | What it does |
 | --- | --- |
-| `dead-code [--include-tests]` | `pub` items with no reference from another workspace crate and no reachability from an entry point of their own crate. |
-| `explain <item-path> --why-live` | The shortest evidenced call path from an entry point to the item. |
+| `dead-code [--include-tests] [--expand]` | `pub` items with no reference from another workspace crate and no reachability from an entry point of their own crate. |
+| `explain <item-path> --why-live [--expand]` | The shortest evidenced call path from an entry point to the item. |
+
+`--expand` (or `[deep] expand = true` in `judge.toml`) expands proc macros and loads build-script
+outputs. It runs the workspace's build scripts. See [Deep Tier](../../guides/deep-tier/).
 
 ## Global options
 

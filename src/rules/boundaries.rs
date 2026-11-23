@@ -71,7 +71,7 @@
 //! configuration. Without configured rules, judge reports no violations
 //! rather than inferring an intended architecture.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use cargo_metadata::MetadataCommand;
@@ -83,6 +83,7 @@ use syn::{ItemUse, UseTree};
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::health_score::DeductionMultiplier;
 use crate::ingest::{CrateInfo, Workspace};
+use crate::rule_registry::{RuleLevel, RuleLevels};
 use crate::rules::slopsquat::SlopsquatConfig;
 
 /// Rule id used for both forbidden-edge and missing-required violations (see
@@ -275,6 +276,17 @@ pub struct BoundaryConfig {
     pub rules: RulesConfig,
     #[serde(default)]
     pub feature_matrix: FeatureMatrixConfig,
+    #[serde(default)]
+    pub deep: DeepConfig,
+}
+
+/// The `judge.toml` `[deep]` table: Deep Tier load options.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DeepConfig {
+    /// Same as `--expand` on every Deep Tier command: expand proc macros
+    /// and load build-script outputs. Runs the workspace's build scripts.
+    #[serde(default)]
+    pub expand: bool,
 }
 
 /// The `judge.toml` `[feature_matrix]` table (see `crate::rules::feature_matrix`,
@@ -292,12 +304,51 @@ pub struct FeatureMatrixConfig {
 }
 
 /// The `judge.toml` `[rules.*]` tables — per-rule configuration, keyed by
-/// rule id (see GitHub issue #5). A precedent for future per-rule config
-/// beyond `catch-all-error`, not a one-off.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// rule id (see GitHub issues #5, #54). Every table accepts `level = "off" |
+/// "advisory" | "gating"`; `[rules.catch-all-error]` additionally keeps its
+/// rule-specific keys. An unknown rule id, an unknown level, or an unknown
+/// key in a table without rule-specific keys is a parse error, so a broken
+/// config fails (exit 2) before any analysis runs.
+#[derive(Debug, Clone, Default)]
 pub struct RulesConfig {
-    #[serde(rename = "catch-all-error", default)]
     pub catch_all_error: CatchAllErrorConfig,
+    pub levels: RuleLevels,
+}
+
+impl<'de> Deserialize<'de> for RulesConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        let tables = BTreeMap::<String, toml::Table>::deserialize(deserializer)?;
+        let mut config = Self::default();
+        for (rule, mut table) in tables {
+            if crate::rule_registry::lookup(&rule).is_none() {
+                return Err(D::Error::custom(format!(
+                    "unknown rule id `{rule}` in [rules.{rule}] (see `cargo judge explain-rule <id>`)"
+                )));
+            }
+            if let Some(value) = table.remove("level") {
+                let level = value
+                    .as_str()
+                    .and_then(RuleLevel::parse)
+                    .ok_or_else(|| {
+                        D::Error::custom(format!(
+                            "unknown level `{value}` in [rules.{rule}] level; expected \"off\", \"advisory\", or \"gating\""
+                        ))
+                    })?;
+                config.levels.insert(rule.clone(), level);
+            }
+            if rule == crate::rules::slop::CATCH_ALL_ERROR_RULE {
+                config.catch_all_error = CatchAllErrorConfig::deserialize(table)
+                    .map_err(|err| D::Error::custom(format!("[rules.{rule}]: {err}")))?;
+            } else if let Some(key) = table.keys().next() {
+                return Err(D::Error::custom(format!(
+                    "unknown key `{key}` in [rules.{rule}]; only `level` is supported for this rule"
+                )));
+            }
+        }
+        Ok(config)
+    }
 }
 
 /// `[rules.catch-all-error]`: opts a codebase following the "thiserror for
@@ -1020,6 +1071,7 @@ fn cycle_finding(cycle: &[String], cargo_toml: &Path) -> Finding {
         origin: Origin::Code,
         evidence: None,
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -1268,16 +1320,16 @@ fn evaluate_module_boundary_rule(rule: &ModuleBoundaryRule, krate: &CrateInfo) -
         if !module_path_under(&module_path, &rule.from) {
             continue;
         }
-        let Ok((_, ast)) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ())
-        else {
+        let Ok(parsed) = crate::functions::read_and_parse_source(&file.path, |_| (), |_| ()) else {
             continue;
         };
+        let ast = &parsed.ast;
         let mut collector = ModuleBoundaryCollector {
             current_module: &module_path,
             forbidden: &rule.forbidden,
             hits: Vec::new(),
         };
-        collector.visit_file(&ast);
+        collector.visit_file(ast);
         if let Some((line, forbidden)) = collector.hits.into_iter().min_by_key(|(line, _)| *line) {
             findings.push(module_boundary_finding(
                 rule,
@@ -1324,6 +1376,7 @@ fn module_boundary_finding(
             "module_path_resolution": "directory-convention heuristic, not module-graph resolution — e.g. #[path = \"...\"] attributes are not recognized"
         })),
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     }
@@ -2141,6 +2194,43 @@ allow-anyhow-at-boundary = true
         let config: BoundaryConfig = toml::from_str(source).unwrap();
 
         assert!(config.rules.catch_all_error.allow_anyhow_at_boundary);
+    }
+
+    #[test]
+    fn rules_tables_accept_a_level_for_any_registered_rule() {
+        let source = r#"
+[rules.catch-all-error]
+level = "advisory"
+allow-anyhow-at-boundary = true
+
+[rules.duplicate-code]
+level = "off"
+
+[rules.silent-default]
+level = "gating"
+"#;
+        let config: BoundaryConfig = toml::from_str(source).unwrap();
+
+        assert!(config.rules.catch_all_error.allow_anyhow_at_boundary);
+        let levels = &config.rules.levels;
+        assert_eq!(levels.get("catch-all-error"), Some(RuleLevel::Advisory));
+        assert_eq!(levels.get("duplicate-code"), Some(RuleLevel::Off));
+        assert_eq!(levels.get("silent-default"), Some(RuleLevel::Gating));
+        assert_eq!(levels.get("swallowed-result"), None);
+    }
+
+    #[test]
+    fn rules_tables_reject_unknown_ids_levels_and_keys() {
+        for (source, named) in [
+            ("[rules.no-such-rule]\nlevel = \"off\"\n", "no-such-rule"),
+            ("[rules.duplicate-code]\nlevel = \"strict\"\n", "strict"),
+            ("[rules.duplicate-code]\nlevle = \"off\"\n", "levle"),
+        ] {
+            let err = toml::from_str::<BoundaryConfig>(source)
+                .expect_err("an invalid [rules.*] table must not parse")
+                .to_string();
+            assert!(err.contains(named), "{named}: {err}");
+        }
     }
 
     #[test]

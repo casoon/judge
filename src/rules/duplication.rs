@@ -56,6 +56,7 @@ use serde::Serialize;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+use crate::cfg::{CfgExpr, CfgIndexBuilder, mutually_exclusive};
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
 use crate::functions::{read_and_parse_source, walk_functions};
 use crate::ingest::SourceFile;
@@ -64,7 +65,7 @@ use crate::ingest::SourceFile;
 pub const DUPLICATE_RULE: &str = "duplicate-code";
 /// Bump when the duplication rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz").
-pub const DUPLICATE_RULE_REVISION: u32 = 2;
+pub const DUPLICATE_RULE_REVISION: u32 = 3;
 
 /// How aggressively two token spans must match to count as duplicates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +136,10 @@ pub struct CloneMember {
     /// [`DupeMode::Weak`]/[`DupeMode::Semantic`] — empty for
     /// `Strict`/`Mild`.
     pub normalized_literal_kinds: Vec<String>,
+    /// The `#[cfg(..)]` condition of the enclosing function (see
+    /// [`crate::cfg`]); `None` for unconditional code. Two members whose
+    /// conditions are mutually exclusive are never paired.
+    pub cfg: Option<CfgExpr>,
 }
 
 impl CloneMember {
@@ -167,15 +172,22 @@ impl CloneMember {
                     .collect(),
             );
         }
+        let mut id = format!(
+            "{DUPLICATE_RULE}:{}:{}:{}-{}",
+            self.file.display(),
+            self.qualified_name,
+            self.start_token,
+            self.end_token
+        );
+        // Same-named `cfg` variants of one function (`#[cfg(unix)] fn f` /
+        // `#[cfg(windows)] fn f`) share file, name and token range; the
+        // condition keeps their ids distinct.
+        if let Some(cfg) = &self.cfg {
+            evidence[crate::cfg::EVIDENCE_KEY] = serde_json::Value::String(cfg.to_string());
+            id = format!("{id}:cfg({cfg})");
+        }
         Finding {
-            id: format!(
-                "{DUPLICATE_RULE}:{}:{}:{}-{}",
-                self.file.display(),
-                self.qualified_name,
-                self.start_token,
-                self.end_token
-            )
-            .into(),
+            id: id.into(),
             rule: DUPLICATE_RULE.into(),
             severity: Severity::Warn,
             location: Location {
@@ -193,6 +205,7 @@ impl CloneMember {
             // diffed against a baseline and only the `Finding` survives.
             evidence: Some(evidence),
             limitations: None,
+            rule_level: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -442,6 +455,10 @@ struct FuncTokens {
     tokens: Vec<TokenUnit>,
     suppressed: Rc<Vec<(usize, usize)>>,
     item_suppressed: bool,
+    /// First and last source line of the whole function item.
+    item_lines: (usize, usize),
+    /// Condition of the function, resolved once every file is read.
+    cfg: Option<CfgExpr>,
 }
 
 /// Runs duplication detection over `source_files` in the given `mode`,
@@ -473,6 +490,7 @@ pub fn analyze_workspace_with_options<'a>(
     let mut functions = Vec::new();
     let mut errors = Vec::new();
     let mut excluded_generated = 0;
+    let mut cfg_builder = CfgIndexBuilder::default();
 
     for file in source_files {
         if !include_generated && !file.kind.is_locally_reportable() {
@@ -482,10 +500,16 @@ pub fn analyze_workspace_with_options<'a>(
         if !include_tests && is_test_source_path(&file.path) {
             continue;
         }
-        match collect_function_tokens(&file.path, min_tokens, include_tests) {
+        match collect_function_tokens(&file.path, min_tokens, include_tests, &mut cfg_builder) {
             Ok(mut found) => functions.append(&mut found),
             Err(err) => errors.push(err),
         }
+    }
+
+    let cfg_index = cfg_builder.build();
+    for func in &mut functions {
+        let (start, end) = func.item_lines;
+        func.cfg = cfg_index.condition_for_lines(&func.file, start, end);
     }
 
     let families = find_clone_families(&functions, mode, min_tokens);
@@ -500,18 +524,21 @@ fn collect_function_tokens(
     path: &Path,
     min_tokens: usize,
     include_tests: bool,
+    cfg_builder: &mut CfgIndexBuilder,
 ) -> Result<Vec<FuncTokens>, DuplicationError> {
-    let (source, ast) = read_and_parse_source(
+    let parsed = read_and_parse_source(
         path,
         |err| DuplicationError::Io(path.to_path_buf(), err),
         |err| DuplicationError::Parse(path.to_path_buf(), err),
     )?;
-    let suppressed = Rc::new(suppressed_ranges(path, &source)?);
-    let mut item_suppressions = item_suppression_lines(path, &source)?;
-    let source: Rc<str> = Rc::from(source.into_boxed_str());
+    let ast = &parsed.ast;
+    let suppressed = Rc::new(suppressed_ranges(path, &parsed.source)?);
+    let mut item_suppressions = item_suppression_lines(path, &parsed.source)?;
+    let source: Rc<str> = Rc::from(parsed.source.as_str());
+    cfg_builder.add_file(path, ast);
 
     let mut functions = Vec::new();
-    walk_functions(&ast, |site| {
+    walk_functions(ast, |site| {
         let item_suppressed = item_suppressions.remove(&site.span.start().line).is_some();
         if !include_tests && site.is_test_context {
             return;
@@ -535,6 +562,8 @@ fn collect_function_tokens(
             tokens,
             suppressed: Rc::clone(&suppressed),
             item_suppressed,
+            item_lines: (site.span.start().line, site.span.end().line),
+            cfg: None,
         });
     });
     if let Some((&_, &directive_line)) = item_suppressions.iter().next() {
@@ -1101,6 +1130,7 @@ fn find_clone_families(
         }
     }
 
+    let mut exclusive_pairs: HashMap<(usize, usize), bool> = HashMap::new();
     let mut matches: HashSet<(usize, usize, usize, usize, usize, usize)> = HashSet::new();
     for occurrences in seeds.values() {
         if occurrences.len() < 2 {
@@ -1109,7 +1139,13 @@ fn find_clone_families(
         for i in 0..occurrences.len() {
             let (func_a, start_a) = occurrences[i];
             for &(func_b, start_b) in &occurrences[i + 1..] {
-                if func_a == func_b {
+                if func_a == func_b
+                    || *exclusive_pairs
+                        .entry((func_a.min(func_b), func_a.max(func_b)))
+                        .or_insert_with(|| {
+                            cfgs_exclusive(&functions[func_a].cfg, &functions[func_b].cfg)
+                        })
+                {
                     continue;
                 }
                 // Leftmost-seed filter: if this pair extends one token
@@ -1205,6 +1241,15 @@ fn find_clone_families(
     families.retain(|family| family.members.len() > 1);
     families.sort_by_key(|family| std::cmp::Reverse(family.members.len()));
     families
+}
+
+/// Whether two functions can never be compiled into the same build, so a
+/// shared span between them is not a duplicate (see [`crate::cfg`]).
+fn cfgs_exclusive(a: &Option<CfgExpr>, b: &Option<CfgExpr>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => mutually_exclusive(a, b),
+        _ => false,
+    }
 }
 
 /// Extends a `min_tokens`-long seed match at `(func_a, start_a)` /
@@ -1346,6 +1391,7 @@ fn member_from(func: &FuncTokens, start: usize, end: usize, mode: DupeMode) -> C
         mode,
         identifier_mapping,
         normalized_literal_kinds,
+        cfg: func.cfg.clone(),
     }
 }
 
@@ -1353,6 +1399,7 @@ fn push_unique(members: &mut Vec<CloneMember>, member: CloneMember) {
     let already_present = members.iter().any(|existing| {
         existing.file == member.file
             && existing.qualified_name == member.qualified_name
+            && existing.cfg == member.cfg
             && existing.start_token == member.start_token
             && existing.end_token == member.end_token
     });
@@ -1375,6 +1422,7 @@ fn dedupe_contained_spans(families: &mut [CloneFamily]) {
                 member_index,
                 member.file.clone(),
                 member.qualified_name.clone(),
+                &member.cfg,
                 member.start_token,
                 member.end_token,
             ));
@@ -1382,9 +1430,13 @@ fn dedupe_contained_spans(families: &mut [CloneFamily]) {
     }
 
     let mut drop: HashSet<(usize, usize)> = HashSet::new();
-    for (fi_a, mi_a, file_a, name_a, start_a, end_a) in &locations {
-        for (fi_b, mi_b, file_b, name_b, start_b, end_b) in &locations {
-            if (fi_a, mi_a) == (fi_b, mi_b) || file_a != file_b || name_a != name_b {
+    for (fi_a, mi_a, file_a, name_a, cfg_a, start_a, end_a) in &locations {
+        for (fi_b, mi_b, file_b, name_b, cfg_b, start_b, end_b) in &locations {
+            if (fi_a, mi_a) == (fi_b, mi_b)
+                || file_a != file_b
+                || name_a != name_b
+                || cfg_a != cfg_b
+            {
                 continue;
             }
             let contained = start_a >= start_b && end_a <= end_b;
@@ -2278,53 +2330,142 @@ fn calls_helper_two(x: i32) -> i32 {
         }
     }
 
-    /// Undecidable fixture (todo.md §17.5): one of two identical spans sits
-    /// behind an inactive `#[cfg(feature = "off")]` — a feature this crate
-    /// build never enables. `collect_function_tokens` runs `syn::parse_file`
-    /// on the raw source and [`crate::functions::walk_functions`] does no
-    /// `cfg` evaluation at all (attributes are only inspected for `#[test]`/
-    /// visibility elsewhere in the codebase, never for `cfg` gating), so the
-    /// cfg-gated function is parsed and tokenized exactly like a normal one.
-    /// Confirmed cfg-blind, matching every other Fast Tier rule's documented
-    /// limitation — not a bug to fix here (cfg evaluation needs a real
-    /// feature-resolution pass, out of scope for a token scanner).
+    /// The clone families of `source` (one file), as member names per family.
+    fn cfg_fixture_families(name: &str, source: &str) -> Vec<Vec<String>> {
+        let dir = TempDir::new(name);
+        let file = dir.join("cfg.rs");
+        std::fs::write(&file, source).unwrap();
+        let files = authored([file]);
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+        report
+            .families
+            .iter()
+            .map(|family| {
+                family
+                    .members
+                    .iter()
+                    .map(|member| member.qualified_name.clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Two copies of the same body, each preceded by `first`/`second`
+    /// (`#[cfg(..)]` lines, or empty for an unconditional function).
+    fn gated_pair(first: &str, second: &str) -> String {
+        let body = "(x: i32) -> i32 {\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n";
+        format!("{first}\nfn dup_first{body}\n{second}\nfn dup_second{body}")
+    }
+
     #[test]
-    fn duplicate_behind_an_inactive_cfg_is_still_reported() {
-        let dir = TempDir::new("dup-cfg-blind");
+    fn platform_variants_of_one_function_are_not_duplicates() {
+        let families = cfg_fixture_families(
+            "dup-cfg-platform",
+            r#"
+#[cfg(unix)]
+fn config_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(base).join(".config").join("judge")
+}
+
+#[cfg(windows)]
+fn config_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("HOME").unwrap_or_default();
+    std::path::PathBuf::from(base).join(".config").join("judge")
+}
+"#,
+        );
+        assert!(families.is_empty(), "{families:?}");
+    }
+
+    #[test]
+    fn mutually_exclusive_conditions_never_pair() {
+        for (first, second) in [
+            (
+                r#"#[cfg(target_os = "linux")]"#,
+                r#"#[cfg(target_os = "macos")]"#,
+            ),
+            (r#"#[cfg(feature = "a")]"#, r#"#[cfg(not(feature = "a"))]"#),
+            ("#[cfg(unix)]", r#"#[cfg(all(windows, feature = "x"))]"#),
+        ] {
+            let families = cfg_fixture_families("dup-cfg-exclusive", &gated_pair(first, second));
+            assert!(families.is_empty(), "{first} / {second}: {families:?}");
+        }
+    }
+
+    #[test]
+    fn compatible_conditions_are_still_duplicates() {
+        for (first, second) in [
+            ("#[cfg(unix)]", "#[cfg(unix)]"),
+            ("#[cfg(unix)]", ""),
+            (r#"#[cfg(feature = "a")]"#, r#"#[cfg(feature = "b")]"#),
+            ("#[cfg(unix)]", r#"#[cfg(target_os = "linux")]"#),
+        ] {
+            let families = cfg_fixture_families("dup-cfg-compatible", &gated_pair(first, second));
+            assert_eq!(
+                families,
+                [["dup_first", "dup_second"]],
+                "{first} / {second}"
+            );
+        }
+    }
+
+    /// An unconditional copy pairs with both platform variants, so the
+    /// family keeps all three members even though the variants never pair
+    /// with each other.
+    #[test]
+    fn exclusive_variants_stay_in_a_family_through_a_shared_partner() {
+        let body = "(x: i32) -> i32 {\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n";
+        let dir = TempDir::new("dup-cfg-partner");
         let file = dir.join("cfg.rs");
         std::fs::write(
             &file,
-            r#"
-fn dup_active(x: i32) -> i32 {
-    let mut total = 0;
-    for i in 0..x {
-        total += i;
-    }
-    total
-}
-
-#[cfg(feature = "off")]
-fn dup_inactive(x: i32) -> i32 {
-    let mut total = 0;
-    for i in 0..x {
-        total += i;
-    }
-    total
-}
-"#,
+            format!(
+                "#[cfg(unix)]\nfn sum{body}\n#[cfg(windows)]\nfn sum{body}\nfn portable_sum{body}"
+            ),
         )
         .unwrap();
-
         let files = authored([file]);
         let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
 
         assert_eq!(report.families.len(), 1, "{:?}", report.families);
-        let names: Vec<_> = report.families[0]
-            .members
+        let findings = report.to_findings();
+        let conditions: Vec<_> = findings.iter().map(Finding::cfg).collect();
+        assert_eq!(conditions, [Some("unix"), Some("windows"), None]);
+        let ids: BTreeSet<_> = findings.iter().map(|finding| finding.id.clone()).collect();
+        assert_eq!(ids.len(), 3, "same-named variants need distinct ids");
+    }
+
+    /// `#[cfg(..)] mod foo;` applies its condition to the module file.
+    #[test]
+    fn condition_on_a_mod_declaration_reaches_the_module_file() {
+        let body = "(x: i32) -> i32 {\n    let mut total = 0;\n    for i in 0..x {\n        total += i;\n    }\n    total\n}\n";
+        let dir = TempDir::new("dup-cfg-mod");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "#[cfg(unix)]\nmod unix_impl;\n#[cfg(windows)]\nmod windows_impl;\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/unix_impl.rs"), format!("fn sum{body}")).unwrap();
+        std::fs::write(dir.join("src/windows_impl.rs"), format!("fn sum{body}")).unwrap();
+        std::fs::write(dir.join("src/other.rs"), format!("fn other_sum{body}")).unwrap();
+
+        let files = authored(
+            ["lib.rs", "unix_impl.rs", "windows_impl.rs"].map(|name| dir.join("src").join(name)),
+        );
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+        assert!(report.families.is_empty(), "{:?}", report.families);
+
+        let files =
+            authored(["lib.rs", "unix_impl.rs", "other.rs"].map(|name| dir.join("src").join(name)));
+        let report = analyze_workspace(files.iter(), DupeMode::Mild, DEFAULT_MIN_TOKENS, false);
+        let conditions: Vec<_> = report
+            .to_findings()
             .iter()
-            .map(|m| m.qualified_name.as_str())
+            .map(|finding| finding.cfg().map(str::to_string))
             .collect();
-        assert_eq!(names, ["dup_active", "dup_inactive"]);
+        assert_eq!(conditions, [None, Some("unix".to_string())]);
     }
 
     /// Undecidable fixture (todo.md §17.5): two call sites of the same macro

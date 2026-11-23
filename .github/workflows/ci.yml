@@ -38,7 +38,8 @@ jobs:
         with:
           # rust-src: the deep tier discovers the sysroot; without std sources
           # rust-analyzer undercounts references (see src/deep.rs).
-          components: rustfmt, clippy, rust-src
+          # rust-analyzer: ships the sysroot proc-macro server the --expand tests start.
+          components: rustfmt, clippy, rust-src, rust-analyzer
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt
         run: cargo fmt --all -- --check

@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::finding::{Finding, Severity};
+use crate::parse::UnparsedFile;
 use runemark::{
     ColorMode, Confidence, Console, DetailLevel, Finding as TerminalFinding,
     FindingGroup as TerminalFindingGroup, Location as TerminalLocation, Metric, NextStep,
@@ -27,6 +28,7 @@ pub struct Report<'a> {
     scope_notes: Vec<ScopeNote<'a>>,
     groups: Vec<FindingGroup<'a>>,
     next_steps: Vec<String>,
+    unparsed_files: &'a [UnparsedFile],
 }
 
 struct ScopeNote<'a> {
@@ -48,7 +50,30 @@ impl<'a> Report<'a> {
             scope_notes: Vec::new(),
             groups: Vec::new(),
             next_steps: Vec::new(),
+            unparsed_files: &[],
         }
+    }
+
+    /// Records the source files the syntax-based rules could not analyze:
+    /// a count in the TTY header (the list with `details`), a Markdown
+    /// section, and a list in the `renderreport` request. A no-op when empty.
+    pub fn with_unparsed_files(mut self, files: &'a [UnparsedFile]) -> Self {
+        self.unparsed_files = files;
+        self
+    }
+
+    fn unparsed_heading(&self) -> String {
+        format!(
+            "Not analyzed by syntax-based rules: {} unparsed file(s)",
+            self.unparsed_files.len()
+        )
+    }
+
+    fn unparsed_items(&self) -> Vec<String> {
+        self.unparsed_files
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     /// Adds a scope/completeness note (analysis errors, unavailable
@@ -168,6 +193,12 @@ impl<'a> Report<'a> {
                 }),
             )
             .add_metric(Metric::new("Advisory", advisory_count.to_string()).with_tone(Tone::Info));
+        if !self.unparsed_files.is_empty() {
+            report = report.add_metric(
+                Metric::new("Unparsed", self.unparsed_files.len().to_string())
+                    .with_tone(Tone::Warning),
+            );
+        }
 
         let context = self
             .status_lines
@@ -185,6 +216,12 @@ impl<'a> Report<'a> {
             report = report.add_scope_note(TerminalScopeNote::new(
                 note.heading.clone(),
                 note.items.iter().map(ToString::to_string).collect(),
+            ));
+        }
+        if details && !self.unparsed_files.is_empty() {
+            report = report.add_scope_note(TerminalScopeNote::new(
+                self.unparsed_heading(),
+                self.unparsed_items(),
             ));
         }
         for group in &self.groups {
@@ -221,6 +258,12 @@ impl<'a> Report<'a> {
         for note in &self.scope_notes {
             let _ = writeln!(out, "\n**{}**\n", note.heading);
             for item in &note.items {
+                let _ = writeln!(out, "- {item}");
+            }
+        }
+        if !self.unparsed_files.is_empty() {
+            let _ = writeln!(out, "\n## {}\n", self.unparsed_heading());
+            for item in self.unparsed_items() {
                 let _ = writeln!(out, "- {item}");
             }
         }
@@ -270,6 +313,9 @@ impl Report<'_> {
                 note.items.iter().map(|item| item.to_string()).collect(),
             ));
         }
+        if !self.unparsed_files.is_empty() {
+            components.push(list(self.unparsed_heading(), self.unparsed_items()));
+        }
         for group in self.groups.iter().filter(|g| !g.findings.is_empty()) {
             let groups = rule_groups(&group.findings);
             let rows: Vec<_> = groups
@@ -280,10 +326,11 @@ impl Report<'_> {
                         rule.to_string(),
                         count.to_string(),
                         format!(
-                            "{}:{} ({})",
+                            "{}:{} ({}){}",
                             display_workspace_path(workspace_root, &example.location.file),
                             example.location.line,
-                            display_item_path(workspace_root, &example.location.item_path)
+                            display_item_path(workspace_root, &example.location.item_path),
+                            crate::cfg::display_suffix(example)
                         )
                     ])
                 })
@@ -326,10 +373,13 @@ impl Report<'_> {
 /// Renders a focused, current-state command with Runemark's standard terminal
 /// conventions. JSON and SARIF remain the exhaustive machine contracts; this
 /// is the shared concise human view for commands that return only findings.
+/// `rule_overrides` is the `judge.toml` `[rules.<id>] level` header line
+/// (see [`crate::rule_registry::RuleLevels::summary_line`]).
 pub fn write_findings_tty(
     out: &mut dyn Write,
     workspace_root: &Path,
     title: impl Into<String>,
+    rule_overrides: Option<String>,
     findings: &[Finding],
     errors: &[String],
 ) -> std::io::Result<()> {
@@ -339,17 +389,21 @@ pub fn write_findings_tty(
         .iter()
         .map(|error| Cow::Borrowed(error.as_str()))
         .collect();
-    Report::new(vec![title.into()])
-        .with_scope_note(
-            format!("Analysis incomplete: {} error(s)", errors.len()),
-            error_items,
-        )
-        .with_group("Evidence-backed findings", gating, false)
-        .with_group("Advisory heuristics", advisory, true)
-        .with_next_steps(vec![
-            "cargo judge --format json      full machine-readable evidence".to_string(),
-        ])
-        .write_tty(out, workspace_root, false)
+    Report::new(
+        std::iter::once(title.into())
+            .chain(rule_overrides)
+            .collect(),
+    )
+    .with_scope_note(
+        format!("Analysis incomplete: {} error(s)", errors.len()),
+        error_items,
+    )
+    .with_group("Evidence-backed findings", gating, false)
+    .with_group("Advisory heuristics", advisory, true)
+    .with_next_steps(vec![
+        "cargo judge --format json      full machine-readable evidence".to_string(),
+    ])
+    .write_tty(out, workspace_root, false)
 }
 
 /// Groups `findings` by rule, worst-count first (ties broken
@@ -388,9 +442,10 @@ fn write_markdown_group(out: &mut String, workspace_root: &Path, group: &Finding
         let path = display_workspace_path(workspace_root, &example.location.file);
         let _ = writeln!(
             out,
-            "| {rule} | {count} | {path}:{} ({}) |",
+            "| {rule} | {count} | {path}:{} ({}){} |",
             example.location.line,
-            display_item_path(workspace_root, &example.location.item_path)
+            display_item_path(workspace_root, &example.location.item_path),
+            crate::cfg::display_suffix(example)
         );
     }
     if groups.len() > RULE_SUMMARY_LIMIT {
@@ -427,13 +482,20 @@ fn terminal_finding(workspace_root: &Path, finding: &Finding) -> TerminalFinding
         Path::new(&display_workspace_path(workspace_root, &finding.location.file).to_string())
             .to_path_buf();
 
-    TerminalFinding::new(tone, format!("{} in {item_path}", finding.rule))
-        .with_rule_id(finding.rule.to_string())
-        .with_location(TerminalLocation::file_line(
-            file,
-            finding.location.line.get(),
-        ))
-        .with_confidence(confidence)
+    TerminalFinding::new(
+        tone,
+        format!(
+            "{} in {item_path}{}",
+            finding.rule,
+            crate::cfg::display_suffix(finding)
+        ),
+    )
+    .with_rule_id(finding.rule.to_string())
+    .with_location(TerminalLocation::file_line(
+        file,
+        finding.location.line.get(),
+    ))
+    .with_confidence(confidence)
 }
 
 /// Renders `path` relative to the workspace root, matching the standardized
@@ -509,6 +571,33 @@ mod tests {
 
         assert!(text.contains("rule-a in src/a.rs::item"), "{text}");
         assert!(text.contains("Next steps"), "{text}");
+    }
+
+    #[test]
+    fn details_and_markdown_show_the_cfg_condition() {
+        let mut gated = finding("rule-a", "src/a.rs", 1);
+        gated.evidence = Some(serde_json::json!({ "cfg": "target_os = \"linux\"" }));
+        let report = Report::new(vec!["Judge summary".to_string()]).with_group(
+            "Evidence-backed findings",
+            vec![&gated],
+            false,
+        );
+
+        let mut out = Vec::new();
+        report
+            .write_tty(&mut out, Path::new("/work"), true)
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("rule-a in src/a.rs::item [cfg(target_os = \"linux\")]"),
+            "{text}"
+        );
+
+        let markdown = report.write_markdown(Path::new("/work"));
+        assert!(
+            markdown.contains("src/a.rs:1 (src/a.rs::item) [cfg(target_os = \"linux\")]"),
+            "{markdown}"
+        );
     }
 
     #[test]

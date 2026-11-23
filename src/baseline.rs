@@ -14,6 +14,7 @@ use crate::finding::{
     EvidenceClass, Finding, FindingId, Origin, RuleId, Severity, evidence_class_for_rule,
 };
 use crate::health_score::ScoreContext;
+use crate::rule_registry::RuleLevels;
 
 /// v3 removes commit identity and the Git-derived code/rule introduction
 /// split. v2 introduced `evidence_class` in place of numeric `confidence`.
@@ -344,6 +345,12 @@ pub struct Delta {
     pub severity_changed: Vec<SeverityChange>,
     /// Findings present in both the baseline and the current run.
     pub unchanged_count: usize,
+    /// Baseline findings of a rule that is `off` in the current run's
+    /// `judge.toml` (see [`Delta::set_aside_off_rules`]): absent because the
+    /// rule was not evaluated, not because they were resolved. Additive;
+    /// omitted from JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub not_evaluated: Vec<BaselineFinding>,
 }
 
 /// One stable finding whose severity changed between two analysed states.
@@ -444,6 +451,7 @@ pub fn diff(current: &[Finding], baseline: &Baseline) -> Delta {
         resolved,
         severity_changed,
         unchanged_count,
+        not_evaluated: Vec::new(),
     }
 }
 
@@ -467,6 +475,17 @@ impl Verdict {
 }
 
 impl Delta {
+    /// Moves every resolved baseline finding whose rule is `off` in
+    /// `levels` to [`Delta::not_evaluated`]: the current run never looked
+    /// for it, so its absence says nothing about whether it was fixed.
+    pub fn set_aside_off_rules(&mut self, levels: &RuleLevels) {
+        let (not_evaluated, resolved) = std::mem::take(&mut self.resolved)
+            .into_iter()
+            .partition(|finding| levels.is_off(finding.rule.as_str()));
+        self.resolved = resolved;
+        self.not_evaluated = not_evaluated;
+    }
+
     /// Only actionable (`Warn`/`Fail`) *gating* introduced findings can
     /// fail the verdict. `Info` findings remain visible in the delta but are
     /// explicitly descriptive, not pass/fail judgements — and advisory
@@ -505,6 +524,7 @@ mod tests {
             origin: Origin::Code,
             evidence: None,
             limitations: None,
+            rule_level: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -545,6 +565,24 @@ mod tests {
 
         assert_eq!(delta.introduced.len(), 1);
         assert_eq!(delta.unchanged_count, 1);
+    }
+
+    #[test]
+    fn resolved_findings_of_an_off_rule_are_not_evaluated() {
+        let baseline = baseline_with(&[
+            finding("duplicate-code:src/a.rs:1", "src/a.rs"),
+            finding("duplicate-code:src/b.rs:1", "src/b.rs"),
+        ]);
+        let mut levels = RuleLevels::default();
+        levels.insert("duplicate-code", crate::rule_registry::RuleLevel::Off);
+
+        let mut delta = diff(&[], &baseline);
+        assert_eq!(delta.resolved.len(), 2);
+        delta.set_aside_off_rules(&levels);
+
+        assert!(delta.resolved.is_empty());
+        assert_eq!(delta.not_evaluated.len(), 2);
+        assert_eq!(delta.verdict(), Verdict::Pass);
     }
 
     #[test]

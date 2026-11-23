@@ -13,7 +13,11 @@
 //! `crate::finding::evidence_class_for_rule`'s fallback for any rule id it
 //! doesn't recognize.
 
-use crate::finding::EvidenceClass;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::finding::{EvidenceClass, Finding};
 
 /// Whether a rule can affect a verdict/exit code or the health score.
 /// Documentation-only mirror of [`EvidenceClass::is_gating`] — see the
@@ -389,6 +393,31 @@ pub const RULE_REGISTRY: &[RuleMetadata] = &[
         example: Some(RuleExample {
             before: "# api-gateway/Cargo.toml\ntokio = \"1.35\"\n\n# report-worker/Cargo.toml\ntokio = \"1.40\"\n",
             why_it_matters: "When workspace members pin different version requirements for the same dependency, cargo can end up resolving two separate copies of it, and the two crates silently drift out of sync with each other over time.",
+        }),
+    },
+    // -- release_profile.rs -------------------------------------------------
+    RuleMetadata {
+        id: "release-profile-hazard",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge` and `audit`) for workspaces with at least one `bin` target.",
+        exclusions: "Reads only the workspace root `Cargo.toml` and the workspace root `.cargo/config.toml` (a config value overrides the manifest value for the same key); the user's home config, config files above the workspace root and `CARGO_PROFILE_*` environment variables are deliberately ignored so the result is the same on every machine. Only `opt-level = 0` and `debug-assertions = true` written in the effective release profile count — Cargo's built-in defaults never trigger it. `[profile.release.package.*]` overrides are listed by `inspect` but not judged. lto, codegen-units, strip and binary size are trade-offs, not hazards, and are out of scope.",
+        allowed_wording: DERIVED_FACT_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+        example: Some(RuleExample {
+            before: "# Cargo.toml\n[profile.release]\nopt-level = 0\n",
+            why_it_matters: "A release build with optimizations turned off ships a binary that is often many times slower than the code needs to be — usually a leftover from a debugging session rather than a deliberate choice.",
+        }),
+    },
+    RuleMetadata {
+        id: "panic-strategy-conflict",
+        evidence_class: EvidenceClass::DerivedFact,
+        preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge` and `audit`) for workspaces with at least one `bin` target whose effective release profile declares `panic = \"abort\"`.",
+        exclusions: "Resolves the release profile exactly like `release-profile-hazard` (workspace root `Cargo.toml` plus `.cargo/config.toml`; home config and `CARGO_PROFILE_*` ignored). Counts `std::panic::catch_unwind`/`panic::catch_unwind` paths and `use std::panic::catch_unwind` imports in each crate's normal source files; code under `#[cfg(test)]`, `#[test]` functions, files reached only through a `#[cfg(test)] mod`, and `tests/`, `examples/`, `benches/` and `build.rs` do not count (tests and benches ignore the panic setting). A call through a re-export, a glob import or a macro body is not recognized. One finding per workspace at the `panic` line; the code sites are listed in its evidence.",
+        allowed_wording: DERIVED_FACT_WORDING,
+        verdict_effect: VerdictEffect::Gating,
+        example: Some(RuleExample {
+            before: "# Cargo.toml\n[profile.release]\npanic = \"abort\"\n\n// src/main.rs\nfn main() {\n    let outcome = std::panic::catch_unwind(|| run_job());\n    if outcome.is_err() {\n        eprintln!(\"job failed, continuing\");\n    }\n}\n\nfn run_job() {}\n",
+            why_it_matters: "With `panic = \"abort\"` a panic ends the process immediately, so the recovery path built around `catch_unwind` never runs in the release binary — it only works in debug builds and tests.",
         }),
     },
     // -- deps.rs ------------------------------------------------------------
@@ -888,7 +917,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "panic-in-lib",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`).",
-        exclusions: "Scoped to a function whose own written visibility is `pub` — item-level only, same simplification as `undocumented-public-item` (a `pub fn` inside a private `mod` is still checked as if reachable; a trait default method, with no visibility of its own, is never checked). `.unwrap()`/`.expect(..)`/indexing are name/operator matches, not resolved against a real `Option`/`Result`/`Index` type — a type defining its own non-panicking method or operator of the same name is not distinguished from the standard, panicking one (same accepted imprecision as `swallowed-result`'s `.ok()` match). Does not distinguish a `[lib]` target's public API from a `[[bin]]`-only crate's `pub` items, which are never actually reachable by another crate. `#[test]`-attributed functions are excluded directly; a `#[cfg(test)] mod tests {..}` block is not tracked, but its functions are almost never themselves `pub`. An indexing finding's `evidence.kind` further distinguishes the index operand's shape: a range (`expr[a..b]`) is `range_slice` (real bounds and, for a `str`, char-boundary risk), a string literal (`expr[\"key\"]`) is `string_key_indexing` (in practice almost always a non-panicking `serde_json::Value`/`toml::Value`-style accessor, though a `HashMap<String, _>` would still genuinely panic and cannot be told apart from this without type information), anything else stays plain `indexing` — added after a 2026-07-24 precision audit found ~100 of 116 findings in a real corpus were `serde_json::Value` string-key access, none a real panic risk, while the only real bug found was a range-slice (GitHub issue #10).",
+        exclusions: "Scoped to a function whose own written visibility is `pub` — item-level only, same simplification as `undocumented-public-item` (a `pub fn` inside a private `mod` is still checked as if reachable; a trait default method, with no visibility of its own, is never checked). `.unwrap()`/`.expect(..)`/indexing are name/operator matches, not resolved against a real `Option`/`Result`/`Index` type — a type defining its own non-panicking method or operator of the same name is not distinguished from the standard, panicking one (same accepted imprecision as `swallowed-result`'s `.ok()` match). Does not distinguish a `[lib]` target's public API from a `[[bin]]`-only crate's `pub` items, which are never actually reachable by another crate. `#[test]`-attributed functions are excluded directly; a `#[cfg(test)] mod tests {..}` block is not tracked, but its functions are almost never themselves `pub`. An indexing finding's `evidence.kind` further distinguishes the index operand's shape: a range (`expr[a..b]`) is `range_slice` (real bounds and, for a `str`, char-boundary risk), a string literal (`expr[\"key\"]`) is `string_key_indexing` (in practice almost always a non-panicking `serde_json::Value`/`toml::Value`-style accessor, though a `HashMap<String, _>` would still genuinely panic and cannot be told apart from this without type information), anything else stays plain `indexing` — added after a 2026-07-24 precision audit found ~100 of 116 findings in a real corpus were `serde_json::Value` string-key access, none a real panic risk, while the only real bug found was a range-slice (GitHub issue #10). `v[x % v.len()]` is not flagged when a top-level `if v.is_empty() { ..; return ..; }` (or `v.len() == 0`) with no `else` precedes it in the same function and `v` is never reassigned, rebound, mutably borrowed or shrunk (`clear`, `pop`, ...) after that guard — a syntactic shape match, not dataflow (GitHub issue #42).",
         allowed_wording: "State only that a panic-shaped construct (`.unwrap()`/`.expect(..)`/`panic!(..)`/indexing) exists on a `pub` path — never that it 'will panic', 'crashes', or 'is a bug'.",
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -918,7 +947,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "swallowed-result",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Syntax-only: only `let _ = fallible();` and a bare `.ok();` statement are matched; other ways of discarding a `Result` are not. Exempt inside `Drop::drop`'s own body (`impl Drop for _ { fn drop(&mut self) { .. } }`, matched by trait path's last segment): `drop` cannot return a `Result`, so `let _ = fallible();` is the only correct idiom there, not a discarded error.",
+        exclusions: "Syntax-only: only `let _ = fallible();` and a bare `.ok();` statement are matched; other ways of discarding a `Result` are not. Exempt inside `Drop::drop`'s own body (`impl Drop for _ { fn drop(&mut self) { .. } }`, matched by trait path's last segment): `drop` cannot return a `Result`, so `let _ = fallible();` is the only correct idiom there, not a discarded error. A `let _ = ...;` with a comment on the same line, or directly below a comment standing on its own line(s), is exempt: the comment documents the discard as intentional (its wording is not interpreted).",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         example: Some(RuleExample {
@@ -1026,7 +1055,7 @@ pub fn can_cancel(status: &OrderStatus, refund_issued: bool) -> bool {
         id: "conversational-artifact",
         evidence_class: EvidenceClass::DerivedFact,
         preconditions: "Always evaluated (Fast Tier; part of bare `cargo judge`, `audit`, and `health`'s slop block).",
-        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::rules::slop_text`, since `syn` discards non-doc comments entirely); `///`/`//!` doc comments are out of scope for this rule. A trigger phrase immediately enclosed by matching quote marks (`\"` or a backtick) is treated as quoted meta-discussion of the phrase, not a live disclaimer, and does not fire — which is why this very comment can quote \"as an AI\" below without self-triggering.",
+        exclusions: "Only plain `//`/`/* */` comments are scanned (raw source-text scan in `crate::rules::slop_text`, since `syn` discards non-doc comments entirely); `///`/`//!` doc comments are out of scope for this rule. A trigger phrase immediately enclosed by matching quote marks (`\"` or a backtick) is treated as quoted meta-discussion of the phrase, not a live disclaimer, and does not fire — which is why this very comment can quote \"as an AI\" below without self-triggering. Weaker phrases count only near the start of the comment; \"here is\"/\"here's\" only when they open it, since mid-sentence \"here\" is an ordinary adverb in rationale comments.",
         allowed_wording: DERIVED_FACT_WORDING,
         verdict_effect: VerdictEffect::Gating,
         // The trigger phrase ("as an AI") lives inside a Rust string literal
@@ -1292,6 +1321,139 @@ pub fn lookup(rule_id: &str) -> Option<&'static RuleMetadata> {
     RULE_REGISTRY.iter().find(|entry| entry.id == rule_id)
 }
 
+/// A rule's configured effect from `judge.toml` `[rules.<id>] level` (GitHub
+/// issue #54): `off` drops the rule's findings before any verdict,
+/// `advisory`/`gating` replace the verdict effect its evidence class would
+/// otherwise give it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleLevel {
+    Off,
+    Advisory,
+    Gating,
+}
+
+impl RuleLevel {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Advisory => "advisory",
+            Self::Gating => "gating",
+        }
+    }
+
+    /// Parses a `level` value; `None` for anything but the three labels.
+    pub fn parse(value: &str) -> Option<Self> {
+        [Self::Off, Self::Advisory, Self::Gating]
+            .into_iter()
+            .find(|level| level.label() == value)
+    }
+
+    /// The level a rule has without any `judge.toml` override.
+    pub const fn default_for(effect: VerdictEffect) -> Self {
+        match effect {
+            VerdictEffect::Gating => Self::Gating,
+            VerdictEffect::AdvisoryOnly => Self::Advisory,
+        }
+    }
+}
+
+/// One active `[rules.<id>] level` entry, as every report header lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RuleOverride {
+    pub rule: String,
+    pub level: RuleLevel,
+    /// The level the rule has without this override.
+    pub default: RuleLevel,
+}
+
+/// Every `[rules.<id>] level` configured in `judge.toml`, keyed by a rule id
+/// that is known to exist in [`RULE_REGISTRY`] (validated when the config is
+/// parsed — see `crate::rules::boundaries::RulesConfig`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RuleLevels(BTreeMap<String, RuleLevel>);
+
+impl RuleLevels {
+    pub fn insert(&mut self, rule: impl Into<String>, level: RuleLevel) {
+        self.0.insert(rule.into(), level);
+    }
+
+    /// The configured level for `rule`, if `judge.toml` sets one.
+    pub fn get(&self, rule: &str) -> Option<RuleLevel> {
+        self.0.get(rule).copied()
+    }
+
+    pub fn is_off(&self, rule: &str) -> bool {
+        self.get(rule) == Some(RuleLevel::Off)
+    }
+
+    /// Whether a finding of `rule` with `evidence_class` counts towards a
+    /// verdict or score under these levels — the same decision
+    /// [`Finding::is_gating`] makes, for records that only keep the rule id
+    /// and class (baseline findings). An `off` rule never counts.
+    pub fn is_gating(&self, rule: &str, evidence_class: EvidenceClass) -> bool {
+        match self.get(rule) {
+            Some(RuleLevel::Gating) => true,
+            Some(RuleLevel::Advisory | RuleLevel::Off) => false,
+            None => evidence_class.is_gating(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The active overrides in rule-id order, for report headers.
+    pub fn overrides(&self) -> Vec<RuleOverride> {
+        self.0
+            .iter()
+            .map(|(rule, &level)| RuleOverride {
+                rule: rule.clone(),
+                level,
+                default: lookup(rule).map_or(RuleLevel::Advisory, |entry| {
+                    RuleLevel::default_for(entry.verdict_effect)
+                }),
+            })
+            .collect()
+    }
+
+    /// The one-line TTY/Markdown header form, e.g.
+    /// `rule overrides: duplicate-code=off, generic-naming=gating`; `None`
+    /// when nothing is overridden.
+    pub fn summary_line(&self) -> Option<String> {
+        (!self.0.is_empty()).then(|| {
+            let entries = self
+                .0
+                .iter()
+                .map(|(rule, level)| format!("{rule}={}", level.label()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("rule overrides: {entries}")
+        })
+    }
+
+    /// Drops the findings of every `off` rule and records the configured
+    /// verdict effect on the findings of every `advisory`/`gating` rule.
+    /// Id, evidence class, location and evidence stay untouched.
+    pub fn apply(&self, findings: Vec<Finding>) -> Vec<Finding> {
+        if self.0.is_empty() {
+            return findings;
+        }
+        findings
+            .into_iter()
+            .filter_map(|mut finding| match self.get(finding.rule.as_str()) {
+                Some(RuleLevel::Off) => None,
+                Some(level) => {
+                    finding.rule_level = Some(level);
+                    Some(finding)
+                }
+                None => Some(finding),
+            })
+            .collect()
+    }
+}
+
 /// Rule ids with no curated `example` yet, and why — every entry in
 /// [`RULE_REGISTRY`] must either set `example: Some(_)` or be listed here
 /// with a documented reason (see the completeness test below). This is what
@@ -1344,6 +1506,64 @@ const NO_EXAMPLE_YET: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::finding::{Location, OneBasedLine, Origin, Severity};
+
+    fn finding(rule: &str, evidence_class: EvidenceClass) -> Finding {
+        Finding::new(
+            format!("{rule}:src/lib.rs:1:1"),
+            rule,
+            Severity::Warn,
+            Location {
+                file: "src/lib.rs".into(),
+                line: OneBasedLine::FIRST,
+                item_path: "f".to_string(),
+            },
+            evidence_class,
+            Origin::Code,
+            None,
+        )
+    }
+
+    #[test]
+    fn rule_levels_drop_off_rules_and_override_the_verdict_effect() {
+        let mut levels = RuleLevels::default();
+        levels.insert("swallowed-result", RuleLevel::Off);
+        levels.insert("silent-default", RuleLevel::Gating);
+        levels.insert("merged-stub", RuleLevel::Advisory);
+        let findings = vec![
+            finding("swallowed-result", EvidenceClass::DerivedFact),
+            finding("silent-default", EvidenceClass::Heuristic),
+            finding("merged-stub", EvidenceClass::DerivedFact),
+            finding("empty-impl", EvidenceClass::DerivedFact),
+        ];
+
+        let applied = levels.apply(findings);
+
+        let rules: Vec<_> = applied.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["silent-default", "merged-stub", "empty-impl"]);
+        assert!(applied[0].is_gating());
+        assert_eq!(applied[0].evidence_class, EvidenceClass::Heuristic);
+        assert!(!applied[1].is_gating());
+        assert_eq!(applied[1].evidence_class, EvidenceClass::DerivedFact);
+        assert!(applied[2].is_gating());
+        assert_eq!(applied[2].rule_level, None);
+    }
+
+    #[test]
+    fn rule_overrides_name_the_configured_and_the_default_level() {
+        let mut levels = RuleLevels::default();
+        assert_eq!(levels.summary_line(), None);
+        levels.insert("silent-default", RuleLevel::Gating);
+        levels.insert("duplicate-code", RuleLevel::Off);
+
+        assert_eq!(
+            levels.summary_line().as_deref(),
+            Some("rule overrides: duplicate-code=off, silent-default=gating")
+        );
+        let overrides = levels.overrides();
+        assert_eq!(overrides[0].default, RuleLevel::Gating);
+        assert_eq!(overrides[1].default, RuleLevel::Advisory);
+    }
 
     /// Every registry entry's `verdict_effect` must agree with
     /// `evidence_class.is_gating()` — the single place this policy actually
@@ -1395,6 +1615,8 @@ mod tests {
             crate::rules::duplication::DUPLICATE_RULE,
             crate::rules::module_graph::UNLINKED_FILE_RULE,
             crate::rules::module_graph::ORPHAN_MODULE_RULE,
+            crate::rules::release_profile::RELEASE_PROFILE_HAZARD_RULE,
+            crate::rules::release_profile::PANIC_STRATEGY_CONFLICT_RULE,
             crate::advisory::mutants::MUTATION_SURVIVOR_RULE,
             crate::rules::pattern::STRINGLY_ERROR_BOUNDARY_RULE,
             crate::rules::security::UNSAFE_SURFACE_RULE,

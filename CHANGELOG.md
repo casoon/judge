@@ -8,21 +8,56 @@ versions were published on crates.io.
 
 ### Added
 
+- **release-profile-hazard:** reports `opt-level = 0` or `debug-assertions = true` in the
+  effective release profile of a workspace that builds binaries, at the manifest or
+  `.cargo/config.toml` line. Details:
+  [Release profile](https://casoon.github.io/judge/docs/reference/rules/#release-profile).
+- **panic-strategy-conflict:** reports `panic = "abort"` in the release profile when non-test
+  code calls `std::panic::catch_unwind`.
+- **`inspect`:** prints the effective release profile and the custom profiles that inherit from
+  it, and gains `--format json`.
+- **Deep tier:** `--expand` on `dead-code` and `explain --why-live` (or `[deep] expand = true` in
+  `judge.toml`) expands proc macros and loads build-script outputs, so references from generated
+  code count and `--why-live` marks such edges `generated`. It runs build scripts; a failing one
+  is exit 2. Every output format states the load fidelity. Details:
+  [Deep Tier](https://casoon.github.io/judge/docs/guides/deep-tier/#--expand).
 - **`--renderreport`:** the bare `cargo judge` run prints its review report as a request for [renderreport](https://github.com/casoon/renderreport) instead of text (`cargo judge --renderreport | renderreport render - -o judge.pdf`). Same sections as `--format markdown`; judge itself gets no new dependency.
+- **`cfg` conditions:** a finding in code gated by an item-level `#[cfg(..)]` (including a gated
+  `mod foo;` and everything in its file) carries the condition as written in its evidence
+  (`"cfg": "<predicate>"`); `--details`, Markdown and SARIF show it as well. Nothing is evaluated
+  against the host, so the output is the same on every platform.
 - **SARIF:** every result carries a position-independent `partialFingerprints` entry, so code
   scanning keeps matching a finding after an edit above it moves its line. Analysis errors appear
   as tool notifications and mark the invocation as unsuccessful.
+
+- **Report:** the combined `cargo judge` run lists the source files that syntax-based rules could
+  not read or parse, with reason, line and column, in every format (JSON
+  `analysis_universe.unparsed_files`). Exit codes are unchanged. Details:
+  [Output formats](https://casoon.github.io/judge/docs/guides/output-formats/#json).
 
 - **`init`:** `cargo judge init` writes a commented starter `judge.toml` and refuses to overwrite
   an existing one. It used to print a notice only.
 - **`--progress`:** the event stream ends with a `run_completed` or `run_failed` record (phase
   `run`), so a consumer can tell a finished run from an aborted one.
+- **judge.toml:** `[rules.<id>] level = "off" | "advisory" | "gating"` switches any rule off or
+  changes whether it gates the verdict. Every report lists the active overrides, `compare` shows
+  findings of an `off` rule as not evaluated, a health-score trend across a level change is not
+  comparable, and an unknown rule id or level exits with 2 before any analysis. Details: [Rule levels](https://casoon.github.io/judge/docs/reference/rules/#rule-levels).
 - **judge-mcp:** tools `review` (focused views such as `structure`, `slop`, `deps`), `compare`
   and `save_baseline`; `JUDGE_TIMEOUT_MS` kills a run that hangs.
 
 ### Changed
 
+- **`--color auto`:** an empty `NO_COLOR` counts as unset, as no-color.org specifies, and
+  `TERM=dumb` turns colour off. The terminal output uses runemark 0.10.
+- **`duplicate-code`:** copies whose `#[cfg(..)]` conditions exclude each other (such as
+  `cfg(unix)` and `cfg(windows)`, or `feature = "a"` and `not(feature = "a")`) no longer form a
+  clone family. Rule revision 3.
 - **Pages:** the project site uses the current shared theme (0.17.0).
+- **Combined run:** each source file is read and parsed once per run and shared by all
+  syntax-based rules, instead of once per rule.
+- **Library API:** `AnalysisUniverse` gains `unparsed_files` and `with_unparsed_files`; the new
+  `judge::parse` module exposes `with_parse_session`, `ParseSummary` and `UnparsedFile`.
 - **`dead-code` (deep tier):** the command loads rust-analyzer once for `dead-code`,
   `dead-trait-impl` and the structural checks instead of three times.
 - **Library API:** `dead_code`, `dead_trait_impl` and `slop_structural_deep` gain
@@ -47,6 +82,16 @@ versions were published on crates.io.
 
 ### Fixed
 
+- **`panic-in-lib`:** a full-range reborrow `v[..]` is no longer reported; it cannot panic.
+- **`panic-in-lib`, `unsafe-surface`, `integer-cast-risk`:** files reached only through a
+  `#[cfg(test)] mod` declaration are test code and no longer analyzed as library code.
+- **`swallowed-result`:** a `let _ = ...;` with a comment on the same line or directly above
+  it is no longer reported; the comment documents the discard as intentional.
+- **`conversational-artifact`:** "here is"/"here's" only counts when it opens the comment, so
+  rationale comments like "a send failure here is expected" are no longer reported.
+- **`panic-in-lib`:** `v[x % v.len()]` is no longer reported after an early-return guard
+  `if v.is_empty() { return ..; }` (or `v.len() == 0`) in the same function that leaves `v`
+  unchanged afterwards.
 - **`deps --check-rustc-lints`:** `unused-dependency` finds nothing on cargo 1.100 and newer, where cargo reports unused dependencies itself (`cargo::unused_dependencies`) and rustc's lint no longer appears in the JSON messages. The rule now also reads cargo's warning from its stderr; a dependency that only tests or examples use is still not reported.
 - **`dead-enum-variant` (deep tier):** findings state that construction sites inside macro
   invocations are not scanned.

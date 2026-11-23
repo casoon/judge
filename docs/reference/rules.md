@@ -1,6 +1,6 @@
 ---
 title: Rules
-description: The 78 rules in judge's static rule registry, with their evidence class and whether they can gate a verdict.
+description: The 80 rules in judge's static rule registry, with their evidence class and whether they can gate a verdict.
 order: 2
 ---
 
@@ -29,11 +29,44 @@ analysis and never exits with 1.
 
 **Gating** rules can fail a baseline verdict (exit code 1) and count towards the health score.
 **Advisory only** rules are listed separately as advisory heuristics and never change the verdict,
-the exit code or the score. In 0.7.1, 49 rules are gating and 29 are advisory only.
+the exit code or the score. 51 rules are gating and 29 are advisory only.
 
 Many rules only run under preconditions: some need `judge.toml` configuration, the Deep Tier
 (`--features deep`), a specific subcommand, an imported report or the `network` feature.
 `explain-rule` states the precondition of each rule.
+
+## Rule levels
+
+A workspace can change the effect of any rule in `judge.toml`, one table per rule id:
+
+```toml
+[rules.generic-naming]
+level = "off"
+
+[rules.silent-default]
+level = "gating"
+
+[rules.catch-all-error]
+level = "advisory"
+allow-anyhow-at-boundary = true
+```
+
+| Level | Effect |
+| --- | --- |
+| `off` | The rule's findings are dropped before the verdict. Where a rule runs on its own (for example `duplicate-code` in the combined run), it is not run at all. Dropped findings are not counted as suppressions. |
+| `advisory` | Findings are listed as advisory and never change the verdict, the exit code or the score. |
+| `gating` | Findings can fail a baseline verdict and count towards the score. |
+
+The finding itself (id, evidence class, location, evidence) stays the same; in JSON it gains a
+`rule_level` field. Rule-specific keys such as `allow-anyhow-at-boundary` live in the same table.
+An unknown rule id, an unknown level or an unknown key is a configuration error: judge exits with
+2 before any analysis runs.
+
+Every report names the active overrides, so a relaxed verdict is never silent: a
+`rule overrides: …` line in the TTY and Markdown header, `rule_overrides` in JSON, and
+`invocations[].ruleConfigurationOverrides` in SARIF. `cargo judge explain-rule <id>` shows the
+effective level when `judge.toml` changes it, and `cargo judge init` writes a commented example.
+Levels apply to the whole workspace; there are no per-path or per-crate levels.
 
 ## All rules
 
@@ -64,6 +97,8 @@ Many rules only run under preconditions: some need `judge.toml` configuration, t
 | `duplicate-crate-versions` | derived fact | gating |
 | `msrv-drift` | derived fact | gating |
 | `workspace-dep-drift` | derived fact | gating |
+| `release-profile-hazard` | derived fact | gating |
+| `panic-strategy-conflict` | derived fact | gating |
 | `misplaced-dependency-kind` | heuristic | advisory only |
 | `unused-dev-dependency` | bounded semantic | gating |
 | `heavy-dependency` | heuristic | advisory only |
@@ -117,3 +152,23 @@ Many rules only run under preconditions: some need `judge.toml` configuration, t
 | `yanked-dependency` | external measurement | gating |
 | `dep-single-maintainer` | external measurement | gating |
 | `known-vulnerability` | external measurement | gating |
+
+## Release profile
+
+`release-profile-hazard` and `panic-strategy-conflict` read the effective release profile of
+workspaces with at least one `bin` target. `cargo judge inspect` prints the same resolution.
+
+- Sources: the workspace root `Cargo.toml` and the workspace root `.cargo/config.toml`. A value
+  in the config file overrides the manifest value for the same key, as in Cargo. A custom
+  profile follows its `inherits` chain.
+- Deliberately ignored: the user's home config (`~/.cargo/config.toml`), config files above the
+  workspace root and `CARGO_PROFILE_*` environment variables. The result is the same on every
+  machine, but a build that sets any of them can use a different profile than judge reports.
+- `release-profile-hazard` reports `opt-level = 0` and `debug-assertions = true`, at the manifest
+  or config line that sets them.
+- `panic-strategy-conflict` reports `panic = "abort"` when non-test code calls
+  `std::panic::catch_unwind`, by path or import. Code under `#[cfg(test)]`, `#[test]` functions
+  and `tests/`, `examples/`, `benches/` and `build.rs` do not count. The finding sits at the
+  `panic` line and lists the call sites in its evidence.
+- `[profile.release.package.*]` overrides are listed by `inspect`, not judged. lto,
+  codegen-units, strip and binary size are trade-offs, not hazards.

@@ -2,6 +2,7 @@
 
 pub mod advisory;
 pub mod baseline;
+pub mod cfg;
 #[cfg(feature = "deep")]
 pub mod deep;
 pub mod finding;
@@ -10,6 +11,7 @@ pub mod health_score;
 pub mod impact;
 pub mod ingest;
 pub mod markdown;
+pub mod parse;
 pub mod pattern_baseline;
 #[cfg(feature = "deep")]
 pub mod reachability;

@@ -138,6 +138,7 @@ pub enum Severity {
 /// | `duplicate-code` | `derived_fact` for `Strict`/`Mild` token equality; `heuristic` for `Weak`/`Semantic` normalization (see [`crate::rules::duplication::CloneMember::to_finding`]) |
 /// | `duplicate-crate-versions`, `msrv-drift`, `workspace-dep-drift` | `derived_fact` (manifest/resolve-graph facts read directly from `cargo_metadata`) |
 /// | `dep-without-repo` | `derived_fact` (a manifest fact — the dependency's own `repository` field — read directly from a full `cargo_metadata` resolve, same class as `duplicate-crate-versions`/`msrv-drift`/`workspace-dep-drift`) |
+/// | `release-profile-hazard`, `panic-strategy-conflict` | `derived_fact` (a `[profile.release]` value read from the workspace root `Cargo.toml`/`.cargo/config.toml`, plus — for `panic-strategy-conflict` — `std::panic::catch_unwind` references in non-test source; see `crate::rules::release_profile`) |
 /// | `unsafe-surface` | `derived_fact` (a syntax-fact pairing: an `unsafe { .. }` block's span plus the absence of an adjacent `// SAFETY:` comment, both read directly from the parsed source — see `crate::rules::security`) |
 /// | `panic-in-lib` | `derived_fact` (a `.unwrap()`/`.expect(..)`/`panic!(..)`/indexing construct's span, plus the enclosing function's `pub` visibility, both read directly from the parsed source — same class as `unsafe-surface`, not a claim that it panics at runtime — see `crate::rules::security`) |
 /// | `unused-feature-flag` | `derived_fact` (the feature is declared in the manifest, and zero usage of the dependency was found anywhere in the examined view — both read directly from the declared inputs, see [`crate::rules::deps`] module docs "Feature-only evidence") |
@@ -230,7 +231,9 @@ pub(crate) fn evidence_class_for_rule(rule: &RuleId) -> EvidenceClass {
         | "workspace-dep-drift"
         | "dep-without-repo"
         | "unsafe-surface"
-        | "panic-in-lib" => EvidenceClass::DerivedFact,
+        | "panic-in-lib"
+        | "release-profile-hazard"
+        | "panic-strategy-conflict" => EvidenceClass::DerivedFact,
         "unused-feature-flag" => EvidenceClass::DerivedFact,
         "default-features-unused" => EvidenceClass::DerivedFact,
         "unused-feature" => EvidenceClass::DerivedFact,
@@ -361,6 +364,12 @@ pub struct Finding {
     /// `None` where a detector has no such gap to disclose.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limitations: Option<Vec<String>>,
+    /// The verdict effect `judge.toml` `[rules.<id>] level` assigns this
+    /// finding's rule (see [`crate::rule_registry::RuleLevels::apply`]),
+    /// overriding the one `evidence_class` implies. `None` when the rule
+    /// keeps its default. Additive in schema v2; omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rule_level: Option<crate::rule_registry::RuleLevel>,
     /// Findings that caused this one to appear (the root-cause direction).
     /// Derived from [`FindingGraph`]'s edge set on export — `pub(crate)` so
     /// the public API cannot set it independently of `causes` (todo.md
@@ -393,6 +402,7 @@ impl Finding {
             origin,
             evidence,
             limitations: None,
+            rule_level: None,
             caused_by: Vec::new(),
             causes: Vec::new(),
         }
@@ -430,8 +440,23 @@ impl Finding {
 
     /// See [`EvidenceClass::is_gating`] — `false` means this finding is
     /// advisory: shown, but with no effect on verdicts or the health score.
+    /// A `judge.toml` `[rules.<id>] level` override takes precedence.
     pub fn is_gating(&self) -> bool {
-        self.evidence_class.is_gating()
+        match self.rule_level {
+            Some(crate::rule_registry::RuleLevel::Gating) => true,
+            Some(crate::rule_registry::RuleLevel::Advisory) => false,
+            Some(crate::rule_registry::RuleLevel::Off) | None => self.evidence_class.is_gating(),
+        }
+    }
+
+    /// The `#[cfg(..)]` condition this finding's location is compiled under,
+    /// as written (evidence key `cfg`, see [`crate::cfg`]). `None` for
+    /// unconditional code.
+    pub fn cfg(&self) -> Option<&str> {
+        self.evidence
+            .as_ref()?
+            .get(crate::cfg::EVIDENCE_KEY)?
+            .as_str()
     }
 
     /// Findings that caused this one (read-only; derived from
@@ -529,11 +554,61 @@ pub struct AnalysisUniverse {
     /// as `proc_macro_expansion`: [`FidelityStatus::Disabled`] at the Deep
     /// Tier, [`FidelityStatus::NotApplicable`] at the Fast Tier.
     pub build_scripts: FidelityStatus,
+    /// Deep Tier only: the load fidelity in the words every output format
+    /// states it in (`proc_macros: expanded | not expanded`,
+    /// `build_scripts: loaded | not loaded`). `--expand` turns both on
+    /// (issue #56). Omitted at the Fast Tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_fidelity: Option<LoadFidelity>,
     /// The judge version that produced this report (`CARGO_PKG_VERSION`).
     pub judge_version: String,
     /// Which tier produced this view: `"fast"` or `"deep"` (see
     /// `crate::AnalysisTier`).
     pub tier: String,
+    /// Source files the syntax-based rules could not read or parse, with the
+    /// reason (see [`crate::parse::with_parse_session`]). Additive; omitted
+    /// from JSON when empty, and filled only by runs that use the shared
+    /// parse step (the combined `cargo judge` run).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unparsed_files: Vec<crate::parse::UnparsedFile>,
+}
+
+/// How completely the Deep Tier loaded the workspace (see
+/// [`AnalysisUniverse::load_fidelity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LoadFidelity {
+    /// `"expanded"` or `"not expanded"`.
+    pub proc_macros: &'static str,
+    /// `"loaded"` or `"not loaded"`.
+    pub build_scripts: &'static str,
+}
+
+impl LoadFidelity {
+    /// `expanded`: the workspace was loaded with `--expand` (proc-macro
+    /// server running, build-script outputs loaded).
+    pub fn new(expanded: bool) -> Self {
+        if expanded {
+            Self {
+                proc_macros: "expanded",
+                build_scripts: "loaded",
+            }
+        } else {
+            Self {
+                proc_macros: "not expanded",
+                build_scripts: "not loaded",
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LoadFidelity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "proc_macros: {}; build_scripts: {}",
+            self.proc_macros, self.build_scripts
+        )
+    }
 }
 
 impl AnalysisUniverse {
@@ -560,8 +635,21 @@ impl AnalysisUniverse {
             include_tests,
             proc_macro_expansion: FidelityStatus::Disabled,
             build_scripts: FidelityStatus::Disabled,
+            load_fidelity: Some(LoadFidelity::new(false)),
             tier: "deep".to_string(),
             ..Self::base(workspace)
+        }
+    }
+
+    /// The Deep Tier view after an `--expand` load: proc macros expanded and
+    /// build-script outputs loaded (issue #56). Everything else as
+    /// [`deep`](Self::deep).
+    pub fn deep_expanded(workspace: &crate::ingest::Workspace, include_tests: bool) -> Self {
+        Self {
+            proc_macro_expansion: FidelityStatus::Enabled,
+            build_scripts: FidelityStatus::Enabled,
+            load_fidelity: Some(LoadFidelity::new(true)),
+            ..Self::deep(workspace, include_tests)
         }
     }
 
@@ -596,9 +684,18 @@ impl AnalysisUniverse {
             include_generated: false,
             proc_macro_expansion: FidelityStatus::NotApplicable,
             build_scripts: FidelityStatus::NotApplicable,
+            load_fidelity: None,
             judge_version: env!("CARGO_PKG_VERSION").to_string(),
             tier: "fast".to_string(),
+            unparsed_files: Vec::new(),
         }
+    }
+
+    /// Records the files the syntax-based rules could not analyze —
+    /// builder-style, so only runs with a shared parse step opt in.
+    pub fn with_unparsed_files(mut self, files: Vec<crate::parse::UnparsedFile>) -> Self {
+        self.unparsed_files = files;
+        self
     }
 }
 
@@ -657,6 +754,11 @@ pub struct Report {
     /// every source file is available in `HEAD`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub history_unavailable: Vec<PathBuf>,
+    /// The active `judge.toml` `[rules.<id>] level` overrides (GitHub issue
+    /// #54), so a relaxed verdict is never silent. Additive in schema v2;
+    /// omitted when nothing is overridden.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rule_overrides: Vec<crate::rule_registry::RuleOverride>,
 }
 
 fn is_zero(count: &usize) -> bool {
@@ -682,6 +784,7 @@ impl Report {
             suppressed_inline: 0,
             api_surface_size: None,
             history_unavailable: Vec::new(),
+            rule_overrides: Vec::new(),
         }
     }
 
@@ -715,6 +818,16 @@ impl Report {
     /// without turning that ordinary in-progress state into a report error.
     pub fn with_history_unavailable(mut self, files: Vec<PathBuf>) -> Self {
         self.history_unavailable = files;
+        self
+    }
+
+    /// Lists the active `[rules.<id>] level` overrides — builder-style like
+    /// [`with_universe`](Self::with_universe).
+    pub fn with_rule_overrides(
+        mut self,
+        overrides: Vec<crate::rule_registry::RuleOverride>,
+    ) -> Self {
+        self.rule_overrides = overrides;
         self
     }
 }

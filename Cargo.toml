@@ -38,7 +38,7 @@ cargo_metadata = "0.19"
 clap = { version = "4.6.2", features = ["derive"] }
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
-runemark = "0.1.1"
+runemark = "0.10"
 ra_ap_hir = { version = "=0.0.342", optional = true }
 ra_ap_ide = { version = "=0.0.342", optional = true }
 ra_ap_load-cargo = { version = "=0.0.342", optional = true }

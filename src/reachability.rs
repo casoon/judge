@@ -27,7 +27,7 @@ use ra_ap_ide::{
 };
 use ra_ap_syntax::{AstNode, TextRange, ast};
 
-use crate::deep::{DeepContext, DeepError, FileId};
+use crate::deep::{DeepContext, DeepError, FileId, GeneratedCalls};
 use crate::functions::walk_functions;
 use crate::ingest::{EntryPointKind, SourceKind, Workspace};
 
@@ -261,12 +261,13 @@ fn walk_crate_functions(
         let Some(file_id) = ctx.file_id(&file.path).map_err(ReachabilityError::Deep)? else {
             continue;
         };
-        let source = std::fs::read_to_string(&file.path)
-            .map_err(|err| ReachabilityError::Io(file.path.clone(), err))?;
-        let ast = syn::parse_file(&source)
-            .map_err(|err| ReachabilityError::Parse(file.path.clone(), err))?;
+        let parsed = crate::functions::read_and_parse_source(
+            &file.path,
+            |err| ReachabilityError::Io(file.path.clone(), err),
+            |err| ReachabilityError::Parse(file.path.clone(), err),
+        )?;
 
-        walk_functions(&ast, |site| on_site(file_id, &file.path, site));
+        walk_functions(&parsed.ast, |site| on_site(file_id, &file.path, site));
     }
     Ok(())
 }
@@ -434,6 +435,48 @@ pub(crate) fn position_key(position: FilePosition) -> (FileId, u32) {
     (position.file_id, position.offset.into())
 }
 
+/// The call graph a reachability search walks: rust-analyzer's call
+/// hierarchy plus, after an `--expand` load, the call edges that only exist
+/// in generated code (see [`GeneratedCalls`]; empty otherwise, so an
+/// unexpanded search is unchanged).
+#[derive(Clone, Copy)]
+pub(crate) struct CallGraph<'a> {
+    analysis: &'a Analysis,
+    generated: &'a GeneratedCalls,
+}
+
+impl<'a> CallGraph<'a> {
+    pub(crate) fn new(analysis: &'a Analysis, ctx: &'a DeepContext) -> Self {
+        Self {
+            analysis,
+            generated: ctx.generated_calls(),
+        }
+    }
+
+    /// [`crate::deep::referencing_files`], plus the files of generated call
+    /// sites into the item at `position`.
+    pub(crate) fn referencing_files(
+        &self,
+        position: FilePosition,
+        include_tests: bool,
+    ) -> Result<HashSet<FileId>, DeepError> {
+        let mut files = crate::deep::referencing_files(self.analysis, position, include_tests)?;
+        files.extend(
+            self.generated
+                .callers_of(position_key(position))
+                .iter()
+                .filter(|call| include_tests || !call.caller_is_test)
+                .map(|call| call.site.file_id),
+        );
+        Ok(files)
+    }
+}
+
+/// One caller found by [`deterministic_callers`]: its position, display
+/// name, the call-site ranges, and whether the call only exists in
+/// generated code.
+type Caller = (FilePosition, String, Vec<FileRange>, bool);
+
 /// Collects `position`'s callers via `incoming_calls`, resolved to a
 /// `FilePosition` at each caller's focus (or full) range, sorted by
 /// `(FileId, offset)` for a deterministic visitation order. Shared by
@@ -442,22 +485,33 @@ pub(crate) fn position_key(position: FilePosition) -> (FileId, u32) {
 /// classify the edge; `is_reachable_from_entry`'s boolean-only search
 /// ignores them.
 fn deterministic_callers(
-    analysis: &Analysis,
+    graph: &CallGraph<'_>,
     config: &CallHierarchyConfig<'_>,
     position: FilePosition,
-) -> Result<Vec<(FilePosition, String, Vec<FileRange>)>, ReachabilityError> {
-    // Three-state, not two: `None` means the position didn't resolve to a
-    // symbol the call hierarchy could start from — an analyzer error, not
-    // "no callers". Collapsing it to an empty caller set would let an
-    // unresolvable position turn into `NotReachable` (todo.md §15.1).
-    let callers = analysis
-        .incoming_calls(config, position)
-        .map_err(|err| ReachabilityError::Deep(DeepError::Cancelled(format!("{err:?}"))))?
-        .ok_or_else(|| {
-            ReachabilityError::Deep(DeepError::UnresolvedSymbol(crate::deep::describe_position(
-                position,
-            )))
-        })?;
+) -> Result<Vec<Caller>, ReachabilityError> {
+    // A function that only exists in generated code has no position the
+    // call hierarchy can start from; its callers come from the generated
+    // call index alone.
+    let callers = if graph
+        .generated
+        .is_generated_function(position_key(position))
+    {
+        Vec::new()
+    } else {
+        // Three-state, not two: `None` means the position didn't resolve to
+        // a symbol the call hierarchy could start from — an analyzer error,
+        // not "no callers". Collapsing it to an empty caller set would let
+        // an unresolvable position turn into `NotReachable` (todo.md §15.1).
+        graph
+            .analysis
+            .incoming_calls(config, position)
+            .map_err(|err| ReachabilityError::Deep(DeepError::Cancelled(format!("{err:?}"))))?
+            .ok_or_else(|| {
+                ReachabilityError::Deep(DeepError::UnresolvedSymbol(
+                    crate::deep::describe_position(position),
+                ))
+            })?
+    };
 
     let mut callers: Vec<_> = callers
         .into_iter()
@@ -476,10 +530,26 @@ fn deterministic_callers(
                 caller_position,
                 call_item.target.name.as_str().to_string(),
                 ranges,
+                false,
             )
         })
         .collect();
-    callers.sort_by_key(|(position, _, _)| position_key(*position));
+    callers.extend(
+        graph
+            .generated
+            .callers_of(position_key(position))
+            .iter()
+            .filter(|call| !(config.exclude_tests && call.caller_is_test))
+            .map(|call| {
+                (
+                    call.caller,
+                    call.caller_name.clone(),
+                    vec![call.site],
+                    call.in_generated_code,
+                )
+            }),
+    );
+    callers.sort_by_key(|(position, _, _, _)| position_key(*position));
     Ok(callers)
 }
 
@@ -491,7 +561,7 @@ fn deterministic_callers(
 /// caller and reused across every item, since it never changes within one
 /// analysis run.
 pub(crate) fn is_reachable_from_entry(
-    analysis: &Analysis,
+    graph: &CallGraph<'_>,
     entry_keys: &std::collections::HashSet<(FileId, u32)>,
     target: FilePosition,
     include_tests: bool,
@@ -509,7 +579,8 @@ pub(crate) fn is_reachable_from_entry(
     let mut queue = VecDeque::from([target]);
 
     while let Some(position) = queue.pop_front() {
-        for (caller_position, _name, _ranges) in deterministic_callers(analysis, &config, position)?
+        for (caller_position, _name, _ranges, _generated) in
+            deterministic_callers(graph, &config, position)?
         {
             let key = position_key(caller_position);
             if entry_keys.contains(&key) {
@@ -535,7 +606,20 @@ pub fn why_live(
     include_tests: bool,
 ) -> Result<WhyLive, ReachabilityError> {
     let ctx = DeepContext::load(&workspace.root).map_err(ReachabilityError::Deep)?;
+    why_live_in(&ctx, workspace, item_path, include_tests)
+}
+
+/// Same as [`why_live`], on an already loaded [`DeepContext`] — e.g. one
+/// loaded with `--expand` ([`DeepContext::load_with`]), where an edge that
+/// only exists in generated code is classified [`CallKind::Generated`].
+pub fn why_live_in(
+    ctx: &DeepContext,
+    workspace: &Workspace,
+    item_path: &str,
+    include_tests: bool,
+) -> Result<WhyLive, ReachabilityError> {
     let analysis = ctx.analysis();
+    let graph = CallGraph::new(&analysis, ctx);
     let db = ctx.raw_database();
     let sema = Semantics::new(db);
 
@@ -550,11 +634,11 @@ pub fn why_live(
         }
     }
 
-    let entries = entry_point_positions(workspace, &ctx, include_tests)?;
+    let entries = entry_point_positions(workspace, ctx, include_tests)?;
     let entry_keys = entry_keys_from(&entries);
 
-    let target = find_item_position(workspace, &ctx, item_path)?;
-    let (target_file, target_line) = describe_position(workspace, &ctx, target);
+    let target = find_item_position(workspace, ctx, item_path)?;
+    let (target_file, target_line) = describe_position(workspace, ctx, target);
 
     if entry_keys.contains(&position_key(target)) {
         return Ok(WhyLive::Path(vec![PathStep {
@@ -581,24 +665,25 @@ pub fn why_live(
         VecDeque::from([(target, initial_path)]);
 
     while let Some((position, path_so_far)) = queue.pop_front() {
-        let callers = deterministic_callers(&analysis, &config, position)?;
+        let callers = deterministic_callers(&graph, &config, position)?;
 
-        for (caller_position, caller_name, ranges) in callers {
+        for (caller_position, caller_name, ranges, in_generated_code) in callers {
             let key = position_key(caller_position);
             if !visited.insert(key) {
                 continue;
             }
 
-            let kind =
-                if file_source_kind.get(&caller_position.file_id) == Some(&SourceKind::Generated) {
-                    CallKind::Generated
-                } else if let Some(call_site) = ranges.first() {
-                    classify_call_kind(&sema, db, call_site.file_id, call_site.range)
-                } else {
-                    CallKind::Unknown
-                };
+            let kind = if in_generated_code
+                || file_source_kind.get(&caller_position.file_id) == Some(&SourceKind::Generated)
+            {
+                CallKind::Generated
+            } else if let Some(call_site) = ranges.first() {
+                classify_call_kind(&sema, db, call_site.file_id, call_site.range)
+            } else {
+                CallKind::Unknown
+            };
 
-            let (caller_file, caller_line) = describe_position(workspace, &ctx, caller_position);
+            let (caller_file, caller_line) = describe_position(workspace, ctx, caller_position);
             let mut new_path = path_so_far.clone();
             new_path.push(PathStep {
                 qualified_name: caller_name,
@@ -621,27 +706,37 @@ pub fn why_live(
 /// Best-effort mapping from a `FilePosition` back to the workspace source
 /// file it came from, and the 1-based line at its offset — for display
 /// purposes only, computed by re-reading the file rather than threading a
-/// semantic line index through the whole search.
+/// semantic line index through the whole search. A file outside the
+/// workspace sources (build-script output after `--expand`) is named by its
+/// loaded path.
 fn describe_position(
     workspace: &Workspace,
     ctx: &DeepContext,
     position: FilePosition,
 ) -> (PathBuf, usize) {
+    let line_of = |path: &Path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|source| {
+                let offset = usize::from(position.offset).min(source.len());
+                source[..offset].matches('\n').count() + 1
+            })
+            .unwrap_or(0)
+    };
     for krate in &workspace.crates {
         for file in &krate.source_files {
             match ctx.file_id(&file.path) {
                 Ok(Some(file_id)) if file_id == position.file_id => {}
                 _ => continue,
             }
-            let line = std::fs::read_to_string(&file.path)
-                .ok()
-                .map(|source| {
-                    let offset = usize::from(position.offset).min(source.len());
-                    source[..offset].matches('\n').count() + 1
-                })
-                .unwrap_or(0);
-            return (file.path.clone(), line);
+            return (file.path.clone(), line_of(&file.path));
         }
+    }
+    if ctx.is_expanded()
+        && let Some(path) = ctx.file_path(position.file_id)
+    {
+        let line = line_of(&path);
+        return (path, line);
     }
     (PathBuf::from("<unknown>"), 0)
 }
@@ -722,6 +817,47 @@ pub fn middle() -> i32 {
                 .all(|step| step.kind == Some(CallKind::Static)),
             "every call in this fixture is a direct static call: {:?}",
             path.iter().map(|s| s.kind).collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #56: with `--expand`, the path to `workspace_helper` runs
+    /// through `generated_caller`, a function a build script writes to
+    /// `OUT_DIR`. The edge from it only exists in generated code; the edge
+    /// from `main` into it is an ordinary static call. Without `--expand`
+    /// there is no path at all.
+    #[test]
+    fn a_path_through_build_script_output_has_a_generated_edge_with_expand() {
+        let dir = TempDir::new("why-live-build-rs");
+        crate::test_util::write_build_rs_caller_fixture(&dir);
+        let workspace = crate::ingest::load(Some(&dir.join("Cargo.toml"))).unwrap();
+
+        assert!(matches!(
+            why_live(&workspace, "workspace_helper", false).unwrap(),
+            WhyLive::NotReachable
+        ));
+
+        let ctx = DeepContext::load_with(&workspace.root, crate::deep::CargoFeatures::All, true)
+            .unwrap_or_else(|err| panic!("--expand load failed: {err}"));
+        let WhyLive::Path(path) = why_live_in(&ctx, &workspace, "workspace_helper", false).unwrap()
+        else {
+            panic!("expected a path with --expand, got NotReachable");
+        };
+        let steps: Vec<_> = path
+            .iter()
+            .map(|step| (step.qualified_name.as_str(), step.kind))
+            .collect();
+        assert_eq!(
+            steps,
+            vec![
+                ("workspace_helper", None),
+                ("generated_caller", Some(CallKind::Generated)),
+                ("main", Some(CallKind::Static)),
+            ]
+        );
+        assert!(
+            path[1].file.ends_with("generated.rs") && path[1].line == 1,
+            "the generated step names the build-script output file: {:?}",
+            path[1]
         );
     }
 

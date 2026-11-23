@@ -72,6 +72,7 @@ fn run_dead_code_deep(
 ) -> Result<CommandOutcome, CliError> {
     let DeadCodeOptions {
         include_tests,
+        expand,
         baseline_args:
             BaselineArgs {
                 format,
@@ -80,22 +81,28 @@ fn run_dead_code_deep(
             },
     } = options;
     let workspace = judge::ingest::load(None)?;
+    let judge_toml = load_judge_toml(&workspace.root)?;
+    let expand = expand || judge_toml.deep.expand;
 
     // One rust-analyzer load serves every detector below that analyses the
     // default feature set.
-    let ctx = judge::deep::DeepContext::load(&workspace.root)
-        .map_err(judge::rules::dead_code::DeadCodeError::Deep)?;
+    let ctx = judge::deep::DeepContext::load_with(
+        &workspace.root,
+        judge::deep::CargoFeatures::All,
+        expand,
+    )
+    .map_err(judge::rules::dead_code::DeadCodeError::Deep)?;
     let dead_code_report =
         judge::rules::dead_code::analyze_workspace_with(&ctx, &workspace, include_tests)?;
 
     // `feature-gated-dead-code` is opt-in via `judge.toml` `[feature_matrix]`
     // — with `combinations` absent or empty (the default), this performs no
     // analysis at all (see `judge::rules::feature_matrix` module docs).
-    let feature_matrix_config = load_judge_toml(&workspace.root)?.feature_matrix;
-    let feature_matrix_report = judge::rules::feature_matrix::analyze_workspace(
+    let feature_matrix_report = judge::rules::feature_matrix::analyze_workspace_with_expand(
         &workspace,
-        &feature_matrix_config.combinations,
+        &judge_toml.feature_matrix.combinations,
         include_tests,
+        expand,
     )?;
 
     let dead_trait_impl_report =
@@ -140,8 +147,9 @@ fn run_dead_code_deep(
     append_analysis_errors(&mut analysis_errors, &structural_report.errors);
 
     // Inline `judge-ignore` suppression (todo.md §5).
-    let (findings, suppressed_inline) =
-        judge::suppression::apply_inline_suppressions(findings, &workspace.root)?;
+    let (mut findings, suppressed_inline) =
+        crate::apply_rule_levels_and_suppressions(findings, &workspace.root)?;
+    judge::cfg::annotate_findings(&mut findings, &workspace);
 
     let baseline_request = BaselineRequest::new(save_baseline, baseline.as_deref(), format);
     if baseline_request.is_requested() {
@@ -212,12 +220,13 @@ fn run_dead_code_deep(
 
     // §0 demands the Deep Tier fully describes what its claims are
     // about — JSON carries the structured universe, TTY a compact echo.
-    let universe = judge::finding::AnalysisUniverse::deep(&workspace, include_tests);
+    let universe = deep_universe(&workspace, include_tests, expand);
     match format {
         OutputFormat::Json => {
             let report = Report::with_errors(findings, analysis_errors)
                 .with_universe(universe)
-                .with_suppressed_inline(suppressed_inline);
+                .with_suppressed_inline(suppressed_inline)
+                .with_rule_overrides(crate::rule_overrides(&workspace.root)?);
             write_json(out, &report)?;
         }
         OutputFormat::Sarif => {
@@ -237,6 +246,7 @@ fn run_dead_code_deep(
             ));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             print_universe_tty(out, &universe)?;
             writeln!(out, "pub items checked: {}", dead_code_report.checked)?;
             writeln!(
@@ -291,11 +301,6 @@ fn print_universe_tty(
     out: &mut dyn Write,
     universe: &judge::finding::AnalysisUniverse,
 ) -> std::io::Result<()> {
-    let fidelity = |status: judge::finding::FidelityStatus| match status {
-        judge::finding::FidelityStatus::Enabled => "enabled",
-        judge::finding::FidelityStatus::Disabled => "disabled",
-        judge::finding::FidelityStatus::NotApplicable => "not applicable",
-    };
     writeln!(
         out,
         "analysis universe: {} tier, judge {}, {}, commit {}",
@@ -316,12 +321,27 @@ fn print_universe_tty(
     )?;
     writeln!(
         out,
-        "  include tests: {}; include generated: {}; proc-macro expansion: {}; build scripts: {}",
+        "  include tests: {}; include generated: {}; {}",
         universe.include_tests,
         universe.include_generated,
-        fidelity(universe.proc_macro_expansion),
-        fidelity(universe.build_scripts)
+        universe
+            .load_fidelity
+            .expect("the deep universe always states its load fidelity")
     )
+}
+
+/// The deep analysis universe for an unexpanded or `--expand` load.
+#[cfg(feature = "deep")]
+fn deep_universe(
+    workspace: &judge::ingest::Workspace,
+    include_tests: bool,
+    expand: bool,
+) -> judge::finding::AnalysisUniverse {
+    if expand {
+        judge::finding::AnalysisUniverse::deep_expanded(workspace, include_tests)
+    } else {
+        judge::finding::AnalysisUniverse::deep(workspace, include_tests)
+    }
 }
 
 /// `judge explain <item-path> --why-live` (see todo.md §7, §14.2 P1).
@@ -363,18 +383,26 @@ fn run_explain_deep(
         item_path,
         why_live: _,
         include_tests,
+        expand,
         format,
     } = options;
     let workspace = judge::ingest::load(None)?;
+    let expand = expand || load_judge_toml(&workspace.root)?.deep.expand;
 
-    let result = judge::reachability::why_live(&workspace, &item_path, include_tests)?;
+    let ctx = judge::deep::DeepContext::load_with(
+        &workspace.root,
+        judge::deep::CargoFeatures::All,
+        expand,
+    )
+    .map_err(judge::reachability::ReachabilityError::Deep)?;
+    let result = judge::reachability::why_live_in(&ctx, &workspace, &item_path, include_tests)?;
+    let universe = deep_universe(&workspace, include_tests, expand);
 
     match format {
         OutputFormat::Json => {
             // Not a `Report` (no findings), but the same §0 obligation
             // applies: a Deep Tier answer states what it is a claim
             // about (see `judge::finding::AnalysisUniverse`).
-            let universe = judge::finding::AnalysisUniverse::deep(&workspace, include_tests);
             let json = match &result {
                 judge::reachability::WhyLive::Path(path) => serde_json::json!({
                     "item_path": item_path,
@@ -399,28 +427,32 @@ fn run_explain_deep(
         OutputFormat::Sarif | OutputFormat::Markdown => {
             unreachable!("rejected in run_explain before the Deep Tier runs")
         }
-        OutputFormat::Tty => match &result {
-            judge::reachability::WhyLive::Path(path) => {
-                writeln!(out, "{item_path} is live:")?;
-                for (index, step) in path.iter().enumerate() {
-                    let prefix = if index == 0 { "  " } else { "  called by " };
-                    let kind_suffix = step.kind.map_or(String::new(), |kind| format!(" [{kind}]"));
+        OutputFormat::Tty => {
+            writeln!(out, "{}", judge::finding::LoadFidelity::new(expand))?;
+            match &result {
+                judge::reachability::WhyLive::Path(path) => {
+                    writeln!(out, "{item_path} is live:")?;
+                    for (index, step) in path.iter().enumerate() {
+                        let prefix = if index == 0 { "  " } else { "  called by " };
+                        let kind_suffix =
+                            step.kind.map_or(String::new(), |kind| format!(" [{kind}]"));
+                        writeln!(
+                            out,
+                            "{prefix}{} ({}:{}){kind_suffix}",
+                            step.qualified_name,
+                            step.file.display(),
+                            step.line
+                        )?;
+                    }
+                }
+                judge::reachability::WhyLive::NotReachable => {
                     writeln!(
                         out,
-                        "{prefix}{} ({}:{}){kind_suffix}",
-                        step.qualified_name,
-                        step.file.display(),
-                        step.line
+                        "{item_path}: not reachable from any recognized entry point (`fn main` in a [[bin]]/[[example]] target, #[test]/#[bench] with --include-tests, or #[no_mangle]/#[export_name]/#[wasm_bindgen])"
                     )?;
                 }
             }
-            judge::reachability::WhyLive::NotReachable => {
-                writeln!(
-                    out,
-                    "{item_path}: not reachable from any recognized entry point (`fn main` in a [[bin]]/[[example]] target, #[test]/#[bench] with --include-tests, or #[no_mangle]/#[export_name]/#[wasm_bindgen])"
-                )?;
-            }
-        },
+        }
     }
     Ok(CommandOutcome::Clean)
 }

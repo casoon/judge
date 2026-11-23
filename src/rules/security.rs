@@ -119,6 +119,11 @@
 //! per-target source-file mapping to draw that line; see the module doc's
 //! `pub`-scoping note above for the same simplification applied elsewhere.
 //!
+//! One guarded index shape is exempt (GitHub issue #42): `v[x % v.len()]`
+//! after a top-level early-return emptiness guard on `v` that nothing later
+//! in the function undoes (see `nonempty_guards`) — always in bounds, and
+//! the modulo never divides by zero. A syntactic shape match, not dataflow.
+//!
 //! ## `hardcoded-secret` scope
 //!
 //! Two independent lanes, both reported under the same rule id
@@ -178,9 +183,9 @@ use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Expr, ExprCast, ExprIndex, ExprLit, ExprMacro, ExprMethodCall, ExprUnsafe,
-    ImplItemFn, ItemConst, ItemFn, ItemImpl, ItemMod, ItemStatic, Lit, Local, Pat, StmtMacro,
-    TraitItemFn, Type, Visibility,
+    Attribute, BinOp, Block, Expr, ExprAssign, ExprCast, ExprIndex, ExprLit, ExprMacro,
+    ExprMethodCall, ExprReference, ExprUnsafe, ImplItemFn, ItemConst, ItemFn, ItemImpl, ItemMod,
+    ItemStatic, Lit, Local, Pat, PatIdent, Stmt, StmtMacro, TraitItemFn, Type, Visibility,
 };
 
 use crate::finding::{EvidenceClass, Finding, Location, OneBasedLine, Origin, Severity};
@@ -241,8 +246,9 @@ pub const PANIC_IN_LIB_RULE: &str = "panic-in-lib";
 /// Bump when the panic-in-lib rule's logic changes (see todo.md §5
 /// "Regelversions-Schutz"). v2 (2026-07-24, GitHub issue #10): split
 /// indexing's `evidence.kind` by index-operand shape (see module doc and
-/// `classify_index_kind`).
-pub const PANIC_IN_LIB_RULE_REVISION: u32 = 2;
+/// `classify_index_kind`). v3 (GitHub issue #42): `v[x % v.len()]` after an
+/// early-return emptiness guard is exempt (see `nonempty_guards`).
+pub const PANIC_IN_LIB_RULE_REVISION: u32 = 3;
 
 /// Rule id for a string literal matching a known secret-provider pattern, or
 /// bound to a suspiciously-named `let`/`const`/`static` with high entropy
@@ -353,15 +359,16 @@ pub struct WorkspaceSecurity {
 /// `unsafe-density`/`integer-cast-risk`/`panic-in-lib`/`hardcoded-secret`
 /// finding in it.
 pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
-    let (source, ast) = read_and_parse_source(
+    let parsed = read_and_parse_source(
         path,
         |err| SecurityError::Io(path.to_path_buf(), err),
         |err| SecurityError::Parse(path.to_path_buf(), err),
     )?;
-    let comments = extract_comments(&source);
+    let (source, ast) = (&parsed.source, &parsed.ast);
+    let comments = extract_comments(source);
 
     let mut findings = Vec::new();
-    walk_functions(&ast, |site| {
+    walk_functions(ast, |site| {
         let mut unsafe_visitor = UnsafeVisitor {
             file: path,
             item_path: &site.qualified_name,
@@ -383,6 +390,7 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
             let mut panic_visitor = PanicVisitor {
                 file: path,
                 item_path: &site.qualified_name,
+                nonempty_guards: nonempty_guards(site.block),
                 findings: Vec::new(),
             };
             panic_visitor.visit_block(site.block);
@@ -397,10 +405,10 @@ pub fn analyze_file(path: &Path) -> Result<Vec<Finding>, SecurityError> {
         binding_name: None,
         findings: Vec::new(),
     };
-    secret_visitor.visit_file(&ast);
+    secret_visitor.visit_file(ast);
     findings.append(&mut secret_visitor.findings);
 
-    if let Some(finding) = unsafe_density_finding_for_file(path, &ast, &source) {
+    if let Some(finding) = unsafe_density_finding_for_file(path, ast, source) {
         findings.push(finding);
     }
 
@@ -424,9 +432,17 @@ pub fn analyze_workspace<'a>(
     include_generated: bool,
 ) -> WorkspaceSecurity {
     let mut report = WorkspaceSecurity::default();
+    let source_files: Vec<&SourceFile> = source_files.into_iter().collect();
+    // A file reached only through a `#[cfg(test)] mod` is test code as a
+    // whole, just like a test-scoped item inside a file.
+    let paths: Vec<PathBuf> = source_files.iter().map(|file| file.path.clone()).collect();
+    let test_only = crate::rules::module_graph::cfg_test_module_files(&paths);
     for file in source_files {
         if !include_generated && !file.kind.is_locally_reportable() {
             report.excluded_generated += 1;
+            continue;
+        }
+        if test_only.contains(&file.path) {
             continue;
         }
         match analyze_file(&file.path) {
@@ -477,6 +493,12 @@ fn is_clamped_immediately(expr: &Expr) -> bool {
         expr,
         Expr::MethodCall(call) if CLAMP_GUARD_METHODS.contains(&call.method.to_string().as_str())
     )
+}
+
+/// Whether `index` is the full range `..`: `v[..]` reborrows the whole
+/// collection and cannot panic.
+fn is_full_range(index: &Expr) -> bool {
+    matches!(index, Expr::Range(range) if range.start.is_none() && range.end.is_none())
 }
 
 /// Classifies an indexing expression's `[..]` operand shape into one of
@@ -683,6 +705,7 @@ fn unsafe_density_finding_for_file(path: &Path, ast: &syn::File, source: &str) -
             "unsafe_block_count": visitor.block_line_counts.len(),
         })),
         limitations: None,
+        rule_level: None,
         caused_by: Vec::new(),
         causes: Vec::new(),
     })
@@ -721,10 +744,160 @@ impl<'ast> Visit<'ast> for CastVisitor<'_> {
 struct PanicVisitor<'a> {
     file: &'a Path,
     item_path: &'a str,
+    /// See [`nonempty_guards`].
+    nonempty_guards: HashMap<String, usize>,
     findings: Vec<Finding>,
 }
 
+/// `expr` with any enclosing parentheses removed.
+fn unparen(mut expr: &Expr) -> &Expr {
+    while let Expr::Paren(inner) = expr {
+        expr = &inner.expr;
+    }
+    expr
+}
+
+/// The identifier `expr` names, if it is a bare single-segment path.
+fn plain_ident(expr: &Expr) -> Option<String> {
+    match unparen(expr) {
+        Expr::Path(path) if path.qself.is_none() => path.path.get_ident().map(ToString::to_string),
+        _ => None,
+    }
+}
+
+/// `v` for a `v.len()` call.
+fn len_call_receiver(expr: &Expr) -> Option<String> {
+    match unparen(expr) {
+        Expr::MethodCall(call) if call.method == "len" && call.args.is_empty() => {
+            plain_ident(&call.receiver)
+        }
+        _ => None,
+    }
+}
+
+/// `v` for an emptiness test `v.is_empty()`, `v.len() == 0` or `0 == v.len()`.
+fn emptiness_test_ident(cond: &Expr) -> Option<String> {
+    let is_zero = |expr: &Expr| matches!(unparen(expr), Expr::Lit(ExprLit { lit: Lit::Int(int), .. }) if int.base10_digits() == "0");
+    match unparen(cond) {
+        Expr::MethodCall(call) if call.method == "is_empty" && call.args.is_empty() => {
+            plain_ident(&call.receiver)
+        }
+        Expr::Binary(bin) if matches!(bin.op, BinOp::Eq(_)) => {
+            if is_zero(&bin.right) {
+                len_call_receiver(&bin.left)
+            } else if is_zero(&bin.left) {
+                len_call_receiver(&bin.right)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Methods that can empty a collection in place; calling one on a guarded
+/// identifier voids its guard (see [`nonempty_guards`]).
+const SHRINKING_METHODS: &[&str] = &[
+    "clear",
+    "truncate",
+    "drain",
+    "retain",
+    "retain_mut",
+    "pop",
+    "remove",
+    "swap_remove",
+    "split_off",
+];
+
+/// Finds any syntactic chance for `name` to change after its guard: an
+/// assignment to it, a rebinding pattern, a `&mut name` borrow, or a
+/// [`SHRINKING_METHODS`] call on it.
+struct MutationVisitor<'a> {
+    name: &'a str,
+    found: bool,
+}
+
+impl<'ast> Visit<'ast> for MutationVisitor<'_> {
+    fn visit_expr_assign(&mut self, node: &'ast ExprAssign) {
+        self.found |= plain_ident(&node.left).as_deref() == Some(self.name);
+        visit::visit_expr_assign(self, node);
+    }
+
+    fn visit_expr_reference(&mut self, node: &'ast ExprReference) {
+        self.found |=
+            node.mutability.is_some() && plain_ident(&node.expr).as_deref() == Some(self.name);
+        visit::visit_expr_reference(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
+        self.found |= SHRINKING_METHODS.contains(&node.method.to_string().as_str())
+            && plain_ident(&node.receiver).as_deref() == Some(self.name);
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_pat_ident(&mut self, node: &'ast PatIdent) {
+        self.found |= node.ident == self.name;
+        visit::visit_pat_ident(self, node);
+    }
+}
+
+/// Identifiers proven non-empty for the rest of a function body by a simple
+/// syntactic guard (GitHub issue #42), mapped to the guard's last line: a
+/// top-level statement `if v.is_empty() { ..; return ..; }` (or
+/// `v.len() == 0`), with no `else` and a `return` as its final statement,
+/// after which `v` is never reassigned, rebound, mutably borrowed, or
+/// shrunk (see [`MutationVisitor`]). Not dataflow: anything outside this
+/// exact shape is not a guard.
+fn nonempty_guards(block: &Block) -> HashMap<String, usize> {
+    let mut guards = HashMap::new();
+    for (i, stmt) in block.stmts.iter().enumerate() {
+        let Stmt::Expr(Expr::If(if_expr), _) = stmt else {
+            continue;
+        };
+        if if_expr.else_branch.is_some()
+            || !matches!(
+                if_expr.then_branch.stmts.last(),
+                Some(Stmt::Expr(Expr::Return(_), _))
+            )
+        {
+            continue;
+        }
+        let Some(name) = emptiness_test_ident(&if_expr.cond) else {
+            continue;
+        };
+        let mut mutation = MutationVisitor {
+            name: &name,
+            found: false,
+        };
+        for later in &block.stmts[i + 1..] {
+            mutation.visit_stmt(later);
+        }
+        if !mutation.found {
+            guards.insert(name, if_expr.span().end().line);
+        }
+    }
+    guards
+}
+
 impl PanicVisitor<'_> {
+    /// Whether `node` is `v[x % v.len()]` after a [`nonempty_guards`] guard
+    /// for `v`: the index is then always in bounds, and the modulo never
+    /// divides by zero.
+    fn is_guarded_modulo_index(&self, node: &ExprIndex) -> bool {
+        let Some(name) = plain_ident(&node.expr) else {
+            return false;
+        };
+        let Expr::Binary(bin) = unparen(&node.index) else {
+            return false;
+        };
+        matches!(bin.op, BinOp::Rem(_))
+            && len_call_receiver(&bin.right).as_deref() == Some(name.as_str())
+            && self
+                .nonempty_guards
+                .get(&name)
+                .is_some_and(|&guard_line| node.span().start().line > guard_line)
+    }
+
     /// Records a `panic-in-lib` finding at `span` — shared by every
     /// `visit_expr_*` method below, which differ only in how they classify
     /// `kind` and which expression they attach the finding to.
@@ -764,7 +937,9 @@ impl<'ast> Visit<'ast> for PanicVisitor<'_> {
     }
 
     fn visit_expr_index(&mut self, node: &'ast ExprIndex) {
-        self.push_panic_finding(node.span(), classify_index_kind(&node.index));
+        if !is_full_range(&node.index) && !self.is_guarded_modulo_index(node) {
+            self.push_panic_finding(node.span(), classify_index_kind(&node.index));
+        }
         visit::visit_expr_index(self, node);
     }
 
@@ -1116,6 +1291,33 @@ mod tests {
 
     fn rule_findings<'a>(findings: &'a [Finding], rule: &str) -> Vec<&'a Finding> {
         findings.iter().filter(|f| f.rule == rule).collect()
+    }
+
+    /// A file reached only through `#[cfg(test)] mod helpers;` is test code,
+    /// so its panicking helpers are not `panic-in-lib`.
+    #[test]
+    fn files_behind_a_cfg_test_mod_declaration_are_not_analyzed() {
+        let dir = TempDir::new("security-cfg-test-module-file");
+        let lib = dir.join("lib.rs");
+        let helpers = dir.join("helpers.rs");
+        std::fs::write(
+            &lib,
+            "#[cfg(test)]\nmod helpers;\n\npub fn f(x: Option<u8>) -> u8 {\n    x.unwrap()\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &helpers,
+            "pub fn g(x: Option<u8>) -> u8 {\n    x.unwrap()\n}\n",
+        )
+        .unwrap();
+        let files = [&lib, &helpers].map(|path| SourceFile {
+            path: path.clone(),
+            kind: crate::ingest::SourceKind::Authored,
+        });
+        let report = analyze_workspace(&files, false);
+        let hits = rule_findings(&report.findings, PANIC_IN_LIB_RULE);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].location.file, lib);
     }
 
     #[test]
@@ -1471,6 +1673,16 @@ mod tests {
         assert_eq!(hits[0].evidence.as_ref().unwrap()["kind"], "range_slice");
     }
 
+    /// `v[..]` reborrows the whole collection and cannot panic.
+    #[test]
+    fn full_range_indexing_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn f(v: &Vec<u8>) -> &[u8] {\n    &v[..]\n}\n",
+            "security-panic-indexing-full-range",
+        );
+        assert!(rule_findings(&findings, PANIC_IN_LIB_RULE).is_empty());
+    }
+
     /// A string-literal index is almost always a `serde_json::Value`/
     /// `toml::Value`-style non-panicking accessor in practice — reported
     /// under a separate, lower-signal `evidence.kind` instead of being
@@ -1487,6 +1699,55 @@ mod tests {
             hits[0].evidence.as_ref().unwrap()["kind"],
             "string_key_indexing"
         );
+    }
+
+    /// GitHub issue #42: `v[x % v.len()]` after an early-return emptiness
+    /// guard on `v` is always in bounds.
+    #[test]
+    fn modulo_len_indexing_after_is_empty_guard_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn f(step: u64, vars: Vec<u32>) -> u32 {\n    if vars.is_empty() {\n        // Nothing to pick from.\n        return 0;\n    }\n    let offset = (step as usize) % vars.len();\n    let mut sum = 0;\n    for i in 0..vars.len() {\n        sum += vars[(i + offset) % vars.len()];\n    }\n    sum\n}\n",
+            "security-panic-indexing-guarded-is-empty",
+        );
+        assert!(rule_findings(&findings, PANIC_IN_LIB_RULE).is_empty());
+    }
+
+    #[test]
+    fn modulo_len_indexing_after_len_eq_zero_guard_is_not_flagged() {
+        let findings = findings_for(
+            "pub fn f(i: usize, v: &[u32]) -> u32 {\n    if v.len() == 0 {\n        return 0;\n    }\n    v[i % v.len()]\n}\n",
+            "security-panic-indexing-guarded-len-zero",
+        );
+        assert!(rule_findings(&findings, PANIC_IN_LIB_RULE).is_empty());
+    }
+
+    /// Without a guard, or with the guarded identifier changed after the
+    /// guard, `v[x % v.len()]` is still flagged.
+    #[test]
+    fn modulo_len_indexing_unguarded_or_mutated_after_guard_is_flagged() {
+        let unguarded = findings_for(
+            "pub fn f(i: usize, v: &[u32]) -> u32 {\n    v[i % v.len()]\n}\n",
+            "security-panic-indexing-unguarded",
+        );
+        assert_eq!(rule_findings(&unguarded, PANIC_IN_LIB_RULE).len(), 1);
+
+        let mutated = findings_for(
+            "pub fn f(i: usize, mut v: Vec<u32>) -> u32 {\n    if v.is_empty() {\n        return 0;\n    }\n    v.clear();\n    v[i % v.len()]\n}\n",
+            "security-panic-indexing-guard-then-clear",
+        );
+        assert_eq!(rule_findings(&mutated, PANIC_IN_LIB_RULE).len(), 1);
+
+        let rebound = findings_for(
+            "pub fn f(i: usize, v: Vec<u32>) -> u32 {\n    if v.is_empty() {\n        return 0;\n    }\n    let v: Vec<u32> = Vec::new();\n    v[i % v.len()]\n}\n",
+            "security-panic-indexing-guard-then-rebind",
+        );
+        assert_eq!(rule_findings(&rebound, PANIC_IN_LIB_RULE).len(), 1);
+
+        let no_return = findings_for(
+            "pub fn f(i: usize, v: &[u32]) -> u32 {\n    if v.is_empty() {\n        eprintln!(\"empty\");\n    }\n    v[i % v.len()]\n}\n",
+            "security-panic-indexing-guard-without-return",
+        );
+        assert_eq!(rule_findings(&no_return, PANIC_IN_LIB_RULE).len(), 1);
     }
 
     #[test]
