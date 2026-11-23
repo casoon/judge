@@ -201,7 +201,8 @@ pub(crate) fn handle_baseline_with_trend(
             &findings,
             rule_revisions,
             total_loc,
-            judge::health_score::ScoreContext::from_profiles(&config.crate_profiles),
+            judge::health_score::ScoreContext::from_profiles(&config.crate_profiles)
+                .with_rule_levels(config.rules.levels.clone()),
         );
         if let Some(size) = api_surface_size {
             baseline = baseline.with_api_surface_size(size.clone());

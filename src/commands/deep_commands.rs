@@ -217,7 +217,8 @@ fn run_dead_code_deep(
         OutputFormat::Json => {
             let report = Report::with_errors(findings, analysis_errors)
                 .with_universe(universe)
-                .with_suppressed_inline(suppressed_inline);
+                .with_suppressed_inline(suppressed_inline)
+                .with_rule_overrides(crate::rule_overrides(&workspace.root)?);
             write_json(out, &report)?;
         }
         OutputFormat::Sarif => {
@@ -237,6 +238,7 @@ fn run_dead_code_deep(
             ));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             print_universe_tty(out, &universe)?;
             writeln!(out, "pub items checked: {}", dead_code_report.checked)?;
             writeln!(

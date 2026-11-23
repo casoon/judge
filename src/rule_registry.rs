@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::finding::{EvidenceClass, Finding};
 
@@ -1300,7 +1300,7 @@ pub fn lookup(rule_id: &str) -> Option<&'static RuleMetadata> {
 /// issue #54): `off` drops the rule's findings before any verdict,
 /// `advisory`/`gating` replace the verdict effect its evidence class would
 /// otherwise give it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleLevel {
     Off,
@@ -1345,7 +1345,8 @@ pub struct RuleOverride {
 /// Every `[rules.<id>] level` configured in `judge.toml`, keyed by a rule id
 /// that is known to exist in [`RULE_REGISTRY`] (validated when the config is
 /// parsed — see `crate::rules::boundaries::RulesConfig`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct RuleLevels(BTreeMap<String, RuleLevel>);
 
 impl RuleLevels {
@@ -1360,6 +1361,22 @@ impl RuleLevels {
 
     pub fn is_off(&self, rule: &str) -> bool {
         self.get(rule) == Some(RuleLevel::Off)
+    }
+
+    /// Whether a finding of `rule` with `evidence_class` counts towards a
+    /// verdict or score under these levels — the same decision
+    /// [`Finding::is_gating`] makes, for records that only keep the rule id
+    /// and class (baseline findings). An `off` rule never counts.
+    pub fn is_gating(&self, rule: &str, evidence_class: EvidenceClass) -> bool {
+        match self.get(rule) {
+            Some(RuleLevel::Gating) => true,
+            Some(RuleLevel::Advisory | RuleLevel::Off) => false,
+            None => evidence_class.is_gating(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// The active overrides in rule-id order, for report headers.

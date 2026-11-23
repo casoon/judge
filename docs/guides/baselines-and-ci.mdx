@@ -89,7 +89,8 @@ advisory findings are not scored.
 - The score is a configurable trend index, not an objective quality ranking. The delta against a
   baseline is the message, not the absolute number.
 - A trend is shown only with `--baseline PATH`, and only when the baseline used the same score
-  formula version and the same crate profiles. Anything else is reported as not comparable.
+  formula version, the same crate profiles and the same `[rules.<id>] level` overrides. Anything
+  else is reported as not comparable.
 - Without a basis for a score, for example no authored lines of code, the score is reported as
   unavailable and judge exits with 2 — never a fake perfect score.
 

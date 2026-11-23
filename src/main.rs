@@ -1066,6 +1066,36 @@ fn apply_rule_levels_and_suppressions(
     )?)
 }
 
+/// The active `judge.toml` `[rules.<id>] level` overrides, for a report's
+/// JSON `rule_overrides` field.
+fn rule_overrides(
+    workspace_root: &Path,
+) -> Result<Vec<judge::rule_registry::RuleOverride>, CliError> {
+    Ok(load_judge_toml(workspace_root)?.rules.levels.overrides())
+}
+
+/// Adds `rule_overrides` to a command's own JSON object when any rule level
+/// is overridden — additive, so reports without overrides keep their shape.
+fn insert_rule_overrides(
+    value: &mut serde_json::Value,
+    workspace_root: &Path,
+) -> Result<(), CliError> {
+    let overrides = rule_overrides(workspace_root)?;
+    if !overrides.is_empty() {
+        value["rule_overrides"] = serde_json::to_value(overrides)?;
+    }
+    Ok(())
+}
+
+/// Writes the `rule overrides: …` header line of a command's TTY report,
+/// or nothing when no rule level is overridden.
+fn write_rule_overrides_line(out: &mut dyn Write, workspace_root: &Path) -> Result<(), CliError> {
+    if let Some(line) = load_judge_toml(workspace_root)?.rules.levels.summary_line() {
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
 /// Reads and parses `judge.toml` at `config_path` into a
 /// [`judge::rules::boundaries::BoundaryConfig`] — the "read, then parse, name the
 /// file in either error" recipe shared by `load_judge_toml`'s
@@ -1118,6 +1148,7 @@ fn compute_score_trend(
         &baseline,
         workspace,
         &config.crate_profiles,
+        &config.rules.levels,
     ))
 }
 
@@ -3858,5 +3889,87 @@ fn dup_two(x: i32) -> i32 {
 
         let tty = run_to_string(&dir, explain("duplicate-code", OutputFormat::Tty));
         assert!(!tty.contains("effective level"), "{tty}");
+    }
+
+    fn health_cli(format: OutputFormat, score: bool, save: bool, baseline: Option<PathBuf>) -> Cli {
+        cli_with(Command::Health(HealthOptions {
+            score,
+            show_cascades: false,
+            baseline_args: baseline_args(format, save, baseline),
+            include_generated: false,
+        }))
+    }
+
+    #[test]
+    fn health_lists_rule_overrides_in_its_tty_and_json_header() {
+        let dir = TempDir::new("rule-levels-health");
+        write_rule_level_fixture(&dir, Some(THREE_LEVELS_TOML));
+
+        let tty = run_to_string(&dir, health_cli(OutputFormat::Tty, false, false, None));
+        assert_eq!(tty.lines().next(), Some(THREE_LEVELS_LINE), "{tty}");
+        assert_eq!(tty.matches("swallowed-result").count(), 1, "{tty}");
+
+        let json: serde_json::Value = serde_json::from_str(&run_to_string(
+            &dir,
+            health_cli(OutputFormat::Json, false, false, None),
+        ))
+        .unwrap();
+        assert_three_levels_applied(&json);
+
+        std::fs::remove_file(dir.join("judge.toml")).unwrap();
+        let tty = run_to_string(&dir, health_cli(OutputFormat::Tty, false, false, None));
+        assert!(!tty.contains("rule overrides"), "{tty}");
+        let json: serde_json::Value = serde_json::from_str(&run_to_string(
+            &dir,
+            health_cli(OutputFormat::Json, false, false, None),
+        ))
+        .unwrap();
+        assert!(json.get("rule_overrides").is_none(), "{json}");
+    }
+
+    /// A health score saved under one set of rule levels is not compared
+    /// with a score computed under another: different findings are scored.
+    #[test]
+    fn health_score_trend_is_not_comparable_across_a_rule_level_change() {
+        let dir = TempDir::new("rule-levels-health-trend");
+        write_rule_level_fixture(&dir, None);
+        let mut out = Vec::new();
+        run_in_dir(
+            &dir,
+            health_cli(OutputFormat::Tty, false, true, None),
+            &mut out,
+        )
+        .expect("baseline must save");
+        let compare = || {
+            health_cli(
+                OutputFormat::Tty,
+                true,
+                false,
+                Some(PathBuf::from(DEFAULT_BASELINE_HEALTH)),
+            )
+        };
+
+        let unchanged = run_to_string(&dir, compare());
+        assert!(
+            !unchanged.contains("not directly comparable"),
+            "{unchanged}"
+        );
+
+        std::fs::write(dir.join("judge.toml"), THREE_LEVELS_TOML).unwrap();
+        let changed = run_to_string(&dir, compare());
+        assert!(
+            changed.contains("baseline not directly comparable: judge.toml rule levels changed"),
+            "{changed}"
+        );
+
+        let mut out = Vec::new();
+        run_in_dir(
+            &dir,
+            health_cli(OutputFormat::Tty, false, true, None),
+            &mut out,
+        )
+        .expect("baseline must save under the new levels");
+        let resaved = run_to_string(&dir, compare());
+        assert!(!resaved.contains("not directly comparable"), "{resaved}");
     }
 }

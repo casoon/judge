@@ -19,8 +19,8 @@ versions were published on crates.io.
   `run`), so a consumer can tell a finished run from an aborted one.
 - **judge.toml:** `[rules.<id>] level = "off" | "advisory" | "gating"` switches any rule off or
   changes whether it gates the verdict. Every report lists the active overrides, `compare` shows
-  findings of an `off` rule as not evaluated, and an unknown rule id or level exits with 2 before
-  any analysis. Details: [Rule levels](https://casoon.github.io/judge/docs/reference/rules/#rule-levels).
+  findings of an `off` rule as not evaluated, a health-score trend across a level change is not
+  comparable, and an unknown rule id or level exits with 2 before any analysis. Details: [Rule levels](https://casoon.github.io/judge/docs/reference/rules/#rule-levels).
 - **judge-mcp:** tools `review` (focused views such as `structure`, `slop`, `deps`), `compare`
   and `save_baseline`; `JUDGE_TIMEOUT_MS` kills a run that hangs.
 

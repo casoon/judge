@@ -149,7 +149,8 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
                     &workspace,
                     include_generated,
                 ))
-                .with_suppressed_inline(suppressed_inline);
+                .with_suppressed_inline(suppressed_inline)
+                .with_rule_overrides(crate::rule_overrides(&workspace.root)?);
             let mut value = serde_json::to_value(&report).unwrap();
             if let Some(score) = score {
                 value["score"] = serde_json::to_value(&score).unwrap();
@@ -179,6 +180,7 @@ pub(crate) fn run(options: HealthOptions, out: &mut dyn Write) -> Result<Command
             return Err(unsupported_format("`health`", format, "tty, json, sarif"));
         }
         OutputFormat::Tty => {
+            crate::write_rule_overrides_line(out, &workspace.root)?;
             writeln!(out, "functions analyzed: {}", functions.len())?;
             super::analysis_commands::write_error_list(out, "analysis errors", &analysis_errors)?;
             super::analysis_commands::write_excluded_and_suppressed_lines(
