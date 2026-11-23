@@ -201,6 +201,11 @@ struct DeadCodeOptions {
     /// `pub` item only reachable from tests is still dead in production.
     #[arg(long)]
     include_tests: bool,
+    /// Expand proc macros and load build-script outputs (also
+    /// `[deep] expand = true` in judge.toml). Runs the workspace's build
+    /// scripts, i.e. executes workspace code.
+    #[arg(long)]
+    expand: bool,
     #[command(flatten)]
     baseline_args: BaselineArgs,
 }
@@ -233,6 +238,11 @@ struct ExplainOptions {
     /// Count a `#[test]`-only call as reaching the item.
     #[arg(long)]
     include_tests: bool,
+    /// Expand proc macros and load build-script outputs (also
+    /// `[deep] expand = true` in judge.toml). Runs the workspace's build
+    /// scripts, i.e. executes workspace code.
+    #[arg(long)]
+    expand: bool,
     /// Output format.
     #[arg(long, value_enum, default_value = "tty")]
     format: OutputFormat,
@@ -2409,6 +2419,7 @@ fn dup_two(x: i32) -> i32 {
                 item_path: "core::retry::backoff".to_string(),
                 why_live: true,
                 include_tests: false,
+                expand: false,
                 format: OutputFormat::Sarif,
             })),
             &mut out,
@@ -2422,6 +2433,138 @@ fn dup_two(x: i32) -> i32 {
                 );
             }
             other => panic!("expected CliError::Config, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "deep")]
+    fn dead_code_cli(format: OutputFormat, expand: bool) -> Cli {
+        cli_with(Command::DeadCode(DeadCodeOptions {
+            include_tests: false,
+            expand,
+            baseline_args: baseline_args(format, false, None),
+        }))
+    }
+
+    #[cfg(feature = "deep")]
+    fn explain_cli(item_path: &str, format: OutputFormat, expand: bool) -> Cli {
+        cli_with(Command::Explain(ExplainOptions {
+            item_path: item_path.to_string(),
+            why_live: true,
+            include_tests: false,
+            expand,
+            format,
+        }))
+    }
+
+    /// A one-package crate with a `build.rs` — failing or not.
+    #[cfg(feature = "deep")]
+    fn write_build_rs_crate(dir: &Path, name: &str, build_rs: &str) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("build.rs"), build_rs).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn item() -> i32 {\n    1\n}\n").unwrap();
+    }
+
+    /// Issue #56: with `--expand` (or `[deep] expand = true`), a failing
+    /// build script is an analysis error — exit 2, naming the build script —
+    /// not a silent fallback to the unexpanded load.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn dead_code_expand_with_a_failing_build_script_exits_2_naming_it() {
+        let dir = TempDir::new("dead-code-expand-failing-build");
+        write_build_rs_crate(
+            &dir,
+            "failing-build",
+            "fn main() {\n    panic!(\"fixture build script fails on purpose\");\n}\n",
+        );
+
+        let mut out = Vec::new();
+        let result = run_in_dir(&dir, dead_code_cli(OutputFormat::Json, true), &mut out);
+        assert_eq!(exit_code(&result), 2);
+        match result {
+            Err(CliError::Analyzer(message)) => assert!(
+                message.contains("build script") && message.contains("failing-build"),
+                "message: {message}"
+            ),
+            other => panic!("expected CliError::Analyzer, got {other:?}"),
+        }
+
+        std::fs::write(dir.join("judge.toml"), "[deep]\nexpand = true\n").unwrap();
+        let result = run_in_dir(&dir, dead_code_cli(OutputFormat::Json, false), &mut out);
+        assert_eq!(
+            exit_code(&result),
+            2,
+            "`[deep] expand = true` in judge.toml opts in like --expand: {result:?}"
+        );
+    }
+
+    /// Issue #56: every Deep Tier output format states the load fidelity.
+    #[cfg(feature = "deep")]
+    #[test]
+    fn deep_commands_state_the_load_fidelity_in_every_format() {
+        let dir = TempDir::new("deep-load-fidelity");
+        write_build_rs_crate(&dir, "fidelity-fixture", "fn main() {}\n");
+
+        for (expand, proc_macros, build_scripts) in [
+            (false, "not expanded", "not loaded"),
+            (true, "expanded", "loaded"),
+        ] {
+            let header = format!("proc_macros: {proc_macros}; build_scripts: {build_scripts}");
+            let json_fidelity = serde_json::json!({
+                "proc_macros": proc_macros,
+                "build_scripts": build_scripts,
+            });
+
+            let mut out = Vec::new();
+            run_in_dir(&dir, dead_code_cli(OutputFormat::Tty, expand), &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains(&header), "dead-code tty: {text}");
+
+            let mut out = Vec::new();
+            run_in_dir(&dir, dead_code_cli(OutputFormat::Json, expand), &mut out).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["analysis_universe"]["load_fidelity"], json_fidelity,
+                "dead-code json"
+            );
+
+            let mut out = Vec::new();
+            run_in_dir(&dir, dead_code_cli(OutputFormat::Sarif, expand), &mut out).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["runs"][0]["properties"]["analysis_universe"]["load_fidelity"], json_fidelity,
+                "dead-code sarif"
+            );
+
+            let mut out = Vec::new();
+            run_in_dir(
+                &dir,
+                explain_cli("item", OutputFormat::Tty, expand),
+                &mut out,
+            )
+            .unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.starts_with(&format!("{header}\n")),
+                "explain tty: {text}"
+            );
+
+            let mut out = Vec::new();
+            run_in_dir(
+                &dir,
+                explain_cli("item", OutputFormat::Json, expand),
+                &mut out,
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                value["analysis_universe"]["load_fidelity"], json_fidelity,
+                "explain json"
+            );
         }
     }
 

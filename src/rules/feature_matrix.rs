@@ -159,6 +159,18 @@ pub fn analyze_workspace(
     combinations: &[Vec<String>],
     include_tests: bool,
 ) -> Result<FeatureMatrixReport, DeadCodeError> {
+    analyze_workspace_with_expand(workspace, combinations, include_tests, false)
+}
+
+/// Same as [`analyze_workspace`], with each combination's workspace load
+/// expanded (`--expand`, see [`DeepContext::load_with`]) when `expand` is
+/// set.
+pub fn analyze_workspace_with_expand(
+    workspace: &Workspace,
+    combinations: &[Vec<String>],
+    include_tests: bool,
+    expand: bool,
+) -> Result<FeatureMatrixReport, DeadCodeError> {
     let mut report = FeatureMatrixReport::default();
     if combinations.is_empty() {
         return Ok(report);
@@ -177,7 +189,7 @@ pub fn analyze_workspace(
             features: combination.clone(),
             no_default_features: true,
         };
-        let ctx = match DeepContext::load_with_features(&workspace.root, features) {
+        let ctx = match DeepContext::load_with(&workspace.root, features, expand) {
             Ok(ctx) => ctx,
             Err(err) => {
                 report.errors.push(DeadCodeError::Deep(err));
@@ -185,6 +197,7 @@ pub fn analyze_workspace(
             }
         };
         let analysis = ctx.analysis();
+        let graph = reachability::CallGraph::new(&analysis, &ctx);
 
         let entries = match reachability::entry_point_positions(workspace, &ctx, include_tests) {
             Ok(entries) => entries,
@@ -214,7 +227,7 @@ pub fn analyze_workspace(
                 offset: candidate.offset.into(),
             };
             match reachability::is_reachable_from_entry(
-                &analysis,
+                &graph,
                 &entry_keys,
                 position,
                 include_tests,

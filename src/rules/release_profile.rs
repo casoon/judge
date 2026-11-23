@@ -608,22 +608,19 @@ fn catch_unwind_sites(
             {
                 continue;
             }
-            let text = match std::fs::read_to_string(&path) {
-                Ok(text) => text,
+            let parsed = match crate::functions::read_and_parse_source(
+                &path,
+                |err| ReleaseProfileError::Io(path.clone(), err),
+                |err| ReleaseProfileError::Source(path.clone(), err),
+            ) {
+                Ok(parsed) => parsed,
                 Err(err) => {
-                    errors.push(ReleaseProfileError::Io(path, err));
-                    continue;
-                }
-            };
-            let file = match syn::parse_file(&text) {
-                Ok(file) => file,
-                Err(err) => {
-                    errors.push(ReleaseProfileError::Source(path, err));
+                    errors.push(err);
                     continue;
                 }
             };
             let mut visitor = CatchUnwindVisitor::default();
-            visitor.visit_file(&file);
+            visitor.visit_file(&parsed.ast);
             let display = path
                 .strip_prefix(&workspace.root)
                 .unwrap_or(&path)
