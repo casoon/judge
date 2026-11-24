@@ -6,7 +6,7 @@ versions were published on crates.io.
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-11-23
+## [0.8.0] - 2026-11-24
 
 ### Added
 
