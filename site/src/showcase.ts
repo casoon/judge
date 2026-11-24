@@ -1,7 +1,7 @@
 import { ansiToHtml } from '@casoon/pages-theme/ansi';
 import type { ShowcaseExample } from '@casoon/pages-theme/showcase';
 
-// Real judge 0.7.0 output, captured by running judge on its own source tree.
+// Real judge 0.8.0 output, captured by running judge on its own source tree.
 // examples/capture.sh regenerates every file; it only strips the absolute checkout path
 // and terminal hyperlinks.
 const files = import.meta.glob<string>('../../examples/*.{ansi,txt,md}', {
@@ -51,7 +51,7 @@ const examples_ = [
     file: 'compare.txt',
     tags: ['baseline', 'ci', 'verdict'],
     description:
-      'The 0.7.0 tree compared with a baseline saved right after the source reorganisation (commit 8cfda89): resolved and introduced findings, and a verdict. A failing verdict exits with code 1, which is what a CI step checks.',
+      'The 0.8.0 tree compared with a baseline saved right after the source reorganisation (commit 8cfda89): resolved and introduced findings, and a verdict. A failing verdict exits with code 1, which is what a CI step checks.',
   },
   {
     slug: 'health-score',

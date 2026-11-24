@@ -12,8 +12,8 @@ importers:
         specifier: ^0.21.0
         version: 0.21.0(astro@7.3.5(@types/node@24.19.0)(yaml@2.9.1))
       '@casoon/pages-theme':
-        specifier: ^0.17.0
-        version: 0.17.0(@astrojs/markdown-satteri@0.4.2)(@types/node@24.19.0)(astro@7.3.5(@types/node@24.19.0)(yaml@2.9.1))
+        specifier: ^0.17.1
+        version: 0.17.1(@astrojs/markdown-satteri@0.4.2)(@types/node@24.19.0)(astro@7.3.5(@types/node@24.19.0)(yaml@2.9.1))
       astro:
         specifier: ^7.3.2
         version: 7.3.5(@types/node@24.19.0)(yaml@2.9.1)
@@ -225,8 +225,8 @@ packages:
       astro:
         optional: true
 
-  '@casoon/pages-theme@0.17.0':
-    resolution: {integrity: sha512-Zodlk0I/I4y+adF3iPj6IXwchmqKLl8DDdS422Wq81BtlCEhG10BgfHWj0aFq0jXkCikt+1hQlZlQv6Jh4HxHA==}
+  '@casoon/pages-theme@0.17.1':
+    resolution: {integrity: sha512-WY7vKLZzfyGd57DHRQJmBDd26ytjNGZ0DSPOhLr31qpoG7s5Gs2gYmLtJUkOLxXtO6iy3QIZ5BtdYgiWNawefA==}
     peerDependencies:
       astro: ^7.3.2
 
@@ -1988,8 +1988,8 @@ snapshots:
       js-yaml: 4.3.2
       picomatch: 4.0.7
       retext-smartypants: 6.2.0
-      shiki: 4.4.3
-      smol-toml: 1.9.0
+      shiki: 4.5.0
+      smol-toml: 1.9.1
       unified: 11.0.5
 
   '@astrojs/internal-helpers@0.13.0':
@@ -2109,7 +2109,7 @@ snapshots:
     optionalDependencies:
       astro: 7.3.5(@types/node@24.19.0)(yaml@2.9.1)
 
-  '@casoon/pages-theme@0.17.0(@astrojs/markdown-satteri@0.4.2)(@types/node@24.19.0)(astro@7.3.5(@types/node@24.19.0)(yaml@2.9.1))':
+  '@casoon/pages-theme@0.17.1(@astrojs/markdown-satteri@0.4.2)(@types/node@24.19.0)(astro@7.3.5(@types/node@24.19.0)(yaml@2.9.1))':
     dependencies:
       '@astrojs/mdx': 8.1.2(@astrojs/markdown-satteri@0.4.2)(astro@7.3.5(@types/node@24.19.0)(yaml@2.9.1))
       astro: 7.3.5(@types/node@24.19.0)(yaml@2.9.1)

@@ -30,11 +30,11 @@ import judgeSvg from '../../captures/judge.svg?url';
 import Diagram from '../components/Diagram.astro';
 import { fixture } from '../showcase';
 
-// Excerpts of real judge 0.7.0 runs on its own source tree (examples/, see examples/capture.sh),
+// Excerpts of real judge 0.8.0 runs on its own source tree (examples/, see examples/capture.sh),
 // cut by line so they stay what judge printed ("…" marks skipped lines).
 const lines = (file: string, from: number, to: number) =>
   fixture(file).split('\n').slice(from - 1, to).join('\n');
-const cloneFamily = lines('dupes.txt', 24, 27);
+const cloneFamily = lines('dupes.txt', 18, 22);
 const hotspots = lines('health.txt', 3, 9);
 const ruleCard = `${lines('explain-rule.txt', 1, 3)}\n  …\n${lines('explain-rule.txt', 7, 10)}`;
 
@@ -65,7 +65,7 @@ const latestRelease = config.changelog
         src={judgeSvg}
         width="578.4"
         height="440"
-        alt="Terminal, excerpts of two real judge 0.7.0 runs on its own source tree. cargo judge prints the start of the Judge summary: 671 evidence and 333 advisory findings, top rules duplicate-code (635), complexity-inflation (243), integer-cast-risk (39), maintainability-index (39) and panic-in-lib (22). cargo judge compare .judge/baseline.json then prints the count lines: verdict fail, unchanged 934, resolved 45, introduced 56, introduced advisory (no verdict effect) 14, severity changed 0. The full output of both runs is in the showcase."
+        alt="Terminal, excerpts of two real judge 0.8.0 runs on its own source tree. cargo judge prints the start of the Judge summary: 743 evidence and 359 advisory findings, top rules duplicate-code (696), complexity-inflation (257), maintainability-index (44), integer-cast-risk (41) and panic-in-lib (29). cargo judge compare .judge/baseline.json then prints the count lines: verdict fail, unchanged 967, resolved 11, introduced 97, introduced advisory (no verdict effect) 38, severity changed 0. The full output of both runs is in the showcase."
       />
     </picture>
   </Hero>
@@ -91,7 +91,7 @@ const latestRelease = config.changelog
     eyebrow="Left behind"
     title="Copied instead of moved."
     lead="Under time pressure, a helper gets copied into the new module and the old one stays. Both compile, both get tests, and the next fix lands in only one of them. judge groups repeated token spans into clone families across files and crates, largest first."
-    note="Real output: judge on its own tree found one cfg(test) check written out three times in three modules. It is a single shared function today."
+    note="Real output: judge on its own tree finds the same Error::source match in four error types, in four modules. The newest one came with 0.8.0."
     links={[
       { label: 'Duplicate code guide', href: url('docs/guides/duplicate-code/') },
       { label: 'All clone families', href: url('showcase/clone-families/') },
