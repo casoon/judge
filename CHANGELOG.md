@@ -8,7 +8,7 @@ versions were published on crates.io.
 
 ### Changed
 
-- **Pages:** the project site uses the current shared theme (0.18.0).
+- **Pages:** the project site uses the current shared theme (0.19.0).
 - **Project site:** examples and the start-page terminal scene show judge 0.8.0 output on its own source tree (theme 0.17.1).
 
 ## [0.8.0] - 2026-11-24
